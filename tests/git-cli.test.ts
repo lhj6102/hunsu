@@ -626,7 +626,7 @@ test("Hunsu runtime commits do not include unrelated staged files", async () => 
 function createRepo(): string {
   const repo = mkdtempSync(join(tmpdir(), "hunsu-test-"));
   run("git", ["init", "-b", "main"], repo);
-  run("git", ["config", "user.email", "test@example.com"], repo);
+  run("git", ["config", "user.email", "test@hunsu.app"], repo);
   run("git", ["config", "user.name", "Test User"], repo);
   return repo;
 }

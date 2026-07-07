@@ -86,7 +86,7 @@ test("Studio web config validates browser URL and exposes it for Vite define", (
 
 test("Studio launcher config resolves the npx Studio URL", () => {
   const fallback = unwrapConfigResult(resolveStudioLauncherConfig({}));
-  assert.equal(fallback.webUrl, "http://127.0.0.1:19688/studio");
+  assert.equal(fallback.webUrl, "https://hunsu.app/studio");
 
   const hosted = unwrapConfigResult(resolveStudioLauncherConfig({
     HUNSU_WEB_URL: "https://studio.example.test/studio/"

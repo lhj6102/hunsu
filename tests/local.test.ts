@@ -1085,7 +1085,7 @@ test("Local server exposes Codex provider status through the runner boundary", a
   runner.providerStatusResponse = {
     backend: "app-server",
     available: true,
-    account: { account: { type: "chatgpt", email: "test@example.com", planType: "plus" }, requiresOpenaiAuth: false },
+    account: { account: { type: "chatgpt", email: "test@hunsu.app", planType: "plus" }, requiresOpenaiAuth: false },
     rateLimits: { rateLimits: { limitId: "codex", primary: null, secondary: null, credits: null, planType: "plus", rateLimitReachedType: null } }
   };
   const server = createStudioServer({ cwd: "/repo", persist: false, runner });
@@ -1094,7 +1094,7 @@ test("Local server exposes Codex provider status through the runner boundary", a
   assert.equal(response.status, 200);
   assert.equal(response.body.backend, "app-server");
   assert.equal(response.body.available, true);
-  assert.equal(response.body.account.account.email, "test@example.com");
+  assert.equal(response.body.account.account.email, "test@hunsu.app");
 });
 
 test("Local server requires allowed browser origins and pairing tokens for protected APIs", async () => {
@@ -1964,7 +1964,7 @@ test("Local server browses server folders and marks Git-backed Roadmaps", async 
   mkdirSync(join(root, "node_modules"));
   run("git", ["init", "-b", "main"], gitOnlyFolder);
   run("git", ["init", "-b", "main"], roadmapFolder);
-  run("git", ["config", "user.email", "test@example.com"], roadmapFolder);
+  run("git", ["config", "user.email", "test@hunsu.app"], roadmapFolder);
   run("git", ["config", "user.name", "Test User"], roadmapFolder);
 
   await executeStudioCommands([
@@ -2911,7 +2911,7 @@ test("Local server accepts and rejects lines for review decisions", async () => 
 function createRepo(): string {
   const repo = mkdtempSync(join(tmpdir(), "hunsu-server-test-"));
   run("git", ["init", "-b", "main"], repo);
-  run("git", ["config", "user.email", "test@example.com"], repo);
+  run("git", ["config", "user.email", "test@hunsu.app"], repo);
   run("git", ["config", "user.name", "Test User"], repo);
   return repo;
 }

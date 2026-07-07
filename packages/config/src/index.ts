@@ -117,7 +117,7 @@ type PortSpec = {
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_LOCAL_HUB_API_URL = "http://127.0.0.1:8787";
-const DEFAULT_STUDIO_WEB_URL = "http://127.0.0.1:19688/studio";
+const DEFAULT_STUDIO_WEB_URL = "https://hunsu.app/studio";
 
 export const HUNSU_PORT_SPECS: Record<HunsuPortName, PortSpec> = {
   localApi: {

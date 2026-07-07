@@ -211,7 +211,7 @@ test("Artifact Action check runs finite commands and removes the detached worktr
 function createActionRepo(): string {
   const repo = mkdtempSync(join(tmpdir(), "hunsu-action-test-"));
   run("git", ["init", "-b", "main"], repo);
-  run("git", ["config", "user.email", "test@example.com"], repo);
+  run("git", ["config", "user.email", "test@hunsu.app"], repo);
   run("git", ["config", "user.name", "Test User"], repo);
   writeFileSync(join(repo, "app.txt"), "artifact action\n", "utf8");
   writeFileSync(join(repo, "docker-compose.yml"), "services:\n  web:\n    image: node:22\n  api:\n    image: node:22\n", "utf8");

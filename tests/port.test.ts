@@ -49,7 +49,7 @@ test("Hunsu Port apply writes Initial Team state without implicit Artifact Actio
 function createNodeRepo(): string {
   const repo = mkdtempSync(join(tmpdir(), "hunsu-port-test-"));
   run("git", ["init", "-b", "main"], repo);
-  run("git", ["config", "user.email", "test@example.com"], repo);
+  run("git", ["config", "user.email", "test@hunsu.app"], repo);
   run("git", ["config", "user.name", "Test User"], repo);
   writeFileSync(join(repo, "package.json"), JSON.stringify({
     scripts: {

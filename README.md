@@ -37,7 +37,7 @@ Prerequisites:
 Once the npm packages are published, the intended local-first launcher is:
 
 ```sh
-npx hunsu studio --web-url https://<your-studio-origin>/studio
+npx hunsu studio
 ```
 
 For repository development:
@@ -217,7 +217,7 @@ MOVE-scoped checks from depending on hardcoded ports.
 - `HUNSU_WEB_HOST` sets the Vite web bind host. Default: `127.0.0.1`.
 - `HUNSU_WEB_PORT` sets the Vite web port. Default: `19688`.
 - `HUNSU_WEB_URL` sets the Studio URL used by `hunsu studio` when `--web-url`
-  is omitted. Default: `http://127.0.0.1:19688/studio`.
+  is omitted. Default: `https://hunsu.app/studio`.
 - `HUNSU_WEB_STRICT_PORT` controls whether Vite may auto-increment when the
   requested port is busy. Default: `true`.
 - `HUNSU_LOCAL_API_PROXY_TARGET` sets the Vite `/api` proxy target. Default:
