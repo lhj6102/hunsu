@@ -6,7 +6,31 @@ dist/
 **/dist/
 .playwright-cli/
 handoffs/*
-apps/hub-api/.wrangler/
+**/.wrangler/
 playwright-report/
 test-results/
 ops/hub/env/*.env
+
+# Local secrets and environment files
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+
+# Local credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.csr
+id_rsa
+id_ed25519
+
+# Local runtime and agent state
+.hunsu/
+.agents/
+.codex/
