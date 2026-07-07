@@ -1,6 +1,6 @@
 {
   "name": "@hunsu/workspace",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Git-native board recorder and Human-on-the-loop development harness for coding agents.",

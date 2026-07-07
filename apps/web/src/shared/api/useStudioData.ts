@@ -15,7 +15,7 @@ import {
   fetchWorktree,
   subscribeAgentSessionEvents,
   subscribeRunEvents
-} from "@/shared/api/localClient";
+} from "@/shared/api/bridgeClient";
 import type {
   AgentMessage,
   AgentSession,
@@ -30,7 +30,7 @@ import type {
   StudioRunState,
   StudioSkillSummary,
   WorktreeStatus
-} from "@/shared/api/localTypes";
+} from "@/shared/api/bridgeTypes";
 import {
   buildRoadmapViewModel,
   type RoadmapDetailPanel,
@@ -90,7 +90,7 @@ export function useRoadmapRegistry(): AsyncState<RoadmapRegistryEntry[]> {
     return {
       data,
       status: "offline",
-      error: errorMessage(query.error, "Local API is offline.")
+      error: errorMessage(query.error, "Bridge API is offline.")
     };
   }
   if (query.isLoading && data.length === 0) {
@@ -183,7 +183,7 @@ export function useRoadmapWorkspace(roadmapId: string, selection?: RoadmapSelect
       })
       .catch(nextError => {
         if (!active) return;
-        setWorkspace(apiOfflineRoadmapWorkspace(roadmapId, errorMessage(nextError, "Local API is offline.")));
+        setWorkspace(apiOfflineRoadmapWorkspace(roadmapId, errorMessage(nextError, "Bridge API is offline.")));
       });
     return () => {
       active = false;
@@ -260,7 +260,7 @@ export function useRoadmapWorkspace(roadmapId: string, selection?: RoadmapSelect
       refreshFromLiveSnapshot(0, nextError => {
         setWorkspace(previous => {
           if (previous.kind !== "live" || previous.roadmapId !== roadmapId) return previous;
-          return { kind: "connecting", status: "connecting", roadmapId, snapshot: previous.snapshot, error: errorMessage(nextError, "Local API is offline.") };
+          return { kind: "connecting", status: "connecting", roadmapId, snapshot: previous.snapshot, error: errorMessage(nextError, "Bridge API is offline.") };
         });
       });
     });

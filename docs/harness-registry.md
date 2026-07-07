@@ -19,7 +19,7 @@ Hub
 Execute uses Executors. Hunsu uses Managers. Both import Skills & Plugins.
 Origin is the immutable read endpoint that serves package versions.
 `@hunsu/protocol-registry` defines the package manifest format, integrity
-rules, and resolver behavior used by Local and the Cloudflare Hub API.
+rules, and resolver behavior used by Bridge and the Cloudflare Hub API.
 
 ## Cloudflare-Native Hub
 
@@ -196,7 +196,7 @@ append-only and its manifest R2 key and integrity must not change.
 ## Origin And Runtime Locks
 
 Roadmap state records only registered Origins and package locks. `origin` is a
-committed alias, not an environment variable. Local resolves the alias, fetches
+committed alias, not an environment variable. Bridge resolves the alias, fetches
 `/v1/packages/:kind/:encodedKey/versions/:version`, verifies integrity, and
 fails closed on missing package, wrong kind, or mismatch.
 
@@ -263,7 +263,7 @@ local Worker without provisioning Cloudflare resources first. `dev` and
 `production` require explicit resource names and IDs so a deployment cannot
 silently point at the wrong D1 database or R2 bucket.
 
-Local Hub development seeds the built-in Team and Manager examples after the Worker becomes
+Bridge Hub development seeds the built-in Team and Manager examples after the Worker becomes
 reachable. `pnpm run dev` runs the Hub package `dev` script through Turbo; for
 the local target that script applies local D1 migrations, starts Wrangler with a
 local-only admin token, and publishes `hubSeedPackageManifests()` through the
@@ -285,8 +285,8 @@ environment-specific, so Hunsu generates the full config for each target instead
 of relying on inherited handwritten Wrangler blocks.
 
 Cloudflare Pages hosts `apps/web`. The Web build receives
-`VITE_HUNSU_HUB_API_URL` so `/hub` can call the hosted Worker. Local Web dev
+`VITE_HUNSU_HUB_API_URL` so `/hub` can call the hosted Worker. Bridge Web dev
 defaults to `http://127.0.0.1:8787`, or `HUNSU_HUB_PUBLIC_API_URL` when
 provided, so root `pnpm run dev` can show local Hub seeds without a separate
-Web env file. Local remains an npm-distributed runtime and never embeds Hub
+Web env file. Bridge remains an npm-distributed runtime and never embeds Hub
 secrets.

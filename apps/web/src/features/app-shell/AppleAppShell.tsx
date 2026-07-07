@@ -3,7 +3,7 @@ import { Boxes, ChevronLeft, ChevronRight, CircleDot, LayoutDashboard, Network }
 import { pushStudioPath, studioRoadmapPath } from "@/app/routes";
 import { cn } from "@/lib/utils";
 import { useRoadmapRegistry } from "@/shared/api/useStudioData";
-import type { RoadmapRegistryEntry } from "@/shared/api/localTypes";
+import type { RoadmapRegistryEntry } from "@/shared/api/bridgeTypes";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { ScrollArea } from "@/shared/ui/scroll-area";

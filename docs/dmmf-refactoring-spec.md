@@ -125,7 +125,7 @@ Current good examples:
 - `RouteRecord` with explicit `Plan`, `Path`, and `HunsuDraft` variants
 
 Patch-shaped Hunsu commands are intentionally not preserved. Hunsu Draft edits
-decoded request runtime files, Local validates those files as full runtime
+decoded request runtime files, Bridge validates those files as full runtime
 state, and `ConfirmHunsuDraft` records the changed files plus request Team
 snapshot.
 

@@ -11,7 +11,7 @@ import { figmaComponentNames } from "@/shared/design/figmaContracts";
 import { formatShortRef, type AgentSessionView, type GraphNodeView, type InspectorModel, type MoveArtifactActionView, type MoveMemberRuntimeView, type MoveSnapshotDestinationView } from "@/shared/domain/roadmapViewModel";
 import { AgentChat, type AgentChatMessage } from "@/features/inspector/AgentChat";
 import { MoveFileExplorer } from "@/features/inspector/MoveFileExplorer";
-import type { StudioEncodedRuntimeFile, StudioExecutionTransition, StudioHunsuDraftDiffArtifact, StudioHunsuDraftRuntimeFileDiff, StudioHunsuDraftSession } from "@/shared/api/localTypes";
+import type { StudioEncodedRuntimeFile, StudioExecutionTransition, StudioHunsuDraftDiffArtifact, StudioHunsuDraftRuntimeFileDiff, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
 
 type InspectorTab = "details" | "chat" | "files" | "hunsu-change";
 

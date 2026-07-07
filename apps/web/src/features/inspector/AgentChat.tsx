@@ -2,7 +2,7 @@ import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Bot, Brain, CircleDot, Code2, FileDiff, TerminalSquare, UserRound, Wrench } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { figmaComponentNames } from "@/shared/design/figmaContracts";
-import type { AgentSession } from "@/shared/api/localTypes";
+import type { AgentSession } from "@/shared/api/bridgeTypes";
 import {
   projectAgentTimeline,
   type AgentChatMessage,

@@ -168,7 +168,7 @@ test("CLI board, runs, and show support JSON output", async () => {
 test("CLI Initial Team and executable Destination commands record Git-backed domain events", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "request.md"), "Create the Studio control plane.\n", "utf8");
-  writeFileSync(join(repo, "destinations.md"), "- Define protocol commands\n- Scaffold Local server\n", "utf8");
+  writeFileSync(join(repo, "destinations.md"), "- Define protocol commands\n- Scaffold Bridge server\n", "utf8");
 
   assert.match(await captureCli(repo, [
     "request",

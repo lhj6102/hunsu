@@ -1,6 +1,6 @@
 import type { BoardProjection, Command } from "@hunsu/protocol";
 import { roadmapApiPath } from "@/app/routes";
-import { LOCAL_API_BASE_URL, localApiEventUrl, localApiRequestHeaders } from "@/shared/api/localApiBase";
+import { BRIDGE_API_BASE_URL, bridgeApiEventUrl, bridgeApiRequestHeaders } from "@/shared/api/bridgeApiBase";
 import type {
   AgentSessionEvent,
   AgentSessionListResult,
@@ -32,14 +32,14 @@ import type {
   StudioRunSummary,
   StudioSkillSummary,
   WorktreeStatus
-} from "@/shared/api/localTypes";
+} from "@/shared/api/bridgeTypes";
 
-const SERVER_URL = LOCAL_API_BASE_URL;
+const SERVER_URL = BRIDGE_API_BASE_URL;
 
-async function requestJson<T>(path: string, init?: RequestInit, label = "Local API request"): Promise<T> {
+async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge API request"): Promise<T> {
   const response = await fetch(`${SERVER_URL}${path}`, {
     ...init,
-    headers: localApiRequestHeaders(init?.headers)
+    headers: bridgeApiRequestHeaders(init?.headers)
   });
   if (!response.ok) {
     const result = await response.json().catch(() => ({ error: `${label} failed with ${response.status}` }));
@@ -202,7 +202,7 @@ export function postActionRunStop(roadmapId: string, runId: string): Promise<Act
 }
 
 export function subscribeRunEvents(roadmapId: string, onEvent: (event: StudioLiveEvent) => void, onError: () => void): () => void {
-  const source = new EventSource(localApiEventUrl(roadmapApiPath(roadmapId, "/runs/events")));
+  const source = new EventSource(bridgeApiEventUrl(roadmapApiPath(roadmapId, "/runs/events")));
   const handleEvent = (event: Event) => {
     const message = event as MessageEvent<string>;
     try {
@@ -224,7 +224,7 @@ export function subscribeRunEvents(roadmapId: string, onEvent: (event: StudioLiv
 }
 
 export function subscribeAgentSessionEvents(roadmapId: string, sessionId: string, onEvent: (event: AgentSessionEvent) => void, onError: () => void): () => void {
-  const source = new EventSource(localApiEventUrl(roadmapApiPath(roadmapId, `/agent-sessions/${encodeURIComponent(sessionId)}/events`)));
+  const source = new EventSource(bridgeApiEventUrl(roadmapApiPath(roadmapId, `/agent-sessions/${encodeURIComponent(sessionId)}/events`)));
   let closed = false;
   const handleEvent = (event: Event) => {
     if (closed) return;

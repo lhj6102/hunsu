@@ -1,6 +1,6 @@
 import { err, ok, type Result } from "@hunsu/protocol";
 import type { ReactNode } from "react";
-import type { AgentMessage, AgentSession } from "@/shared/api/localTypes";
+import type { AgentMessage, AgentSession } from "@/shared/api/bridgeTypes";
 
 export type AgentTimelineStatus = "waiting" | "running" | "done" | "failed";
 

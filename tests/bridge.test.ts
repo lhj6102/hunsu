@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { buildTeamPlanningPrompt, type CodexProviderStatus, type TeamPlanningInput, type HunsuDraftSessionInput, type HunsuDraftTurnInput, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerEvent, type RunnerRun } from "../packages/codex-runner/src/index.ts";
-import { resolveLocalRuntimeConfig, unwrapConfigResult } from "../packages/config/src/index.ts";
+import { resolveBridgeRuntimeConfig, unwrapConfigResult } from "../packages/config/src/index.ts";
 import { createDefaultHarness, createDefaultManagerConfig, createDefaultMemberConfig, harnessEntityFromSnapshot, makeNodeId, makePositiveInteger, promptTemplateFromText, rootHarnessSnapshot, type HubPackageLock, type Harness, type HarnessSnapshot, type HunsuOrigin, type NonEmptyText, type ExecutionPlan } from "../packages/protocol/src/index.ts";
 import {
   HUB_PACKAGE_MANIFEST_SCHEMA,
@@ -56,7 +56,7 @@ import {
   type AgentSessionEvent,
   type StudioLiveEvent,
   type StudioRunState
-} from "../apps/local/src/index.ts";
+} from "../apps/bridge/src/index.ts";
 import { HUNSU_CURRENT_EXECUTION_PATH, HUNSU_DESTINATIONS_PATH, HUNSU_EXECUTORS_PATH, HUNSU_HARNESS_PATH, HUNSU_HUNSU_DRAFT_PATH, HUNSU_PREVIOUS_EXECUTION_PATH, HUNSU_RESOURCES_PATH, HUNSU_RUNTIME_PATHS, decodeHunsuRuntimeFileText, readHunsuRuntimeStateAtRef, readPreviousExecutionChain, writeCommands, type ArtifactActionCommandRunner } from "../packages/core/src/index.ts";
 import type { ArtifactActionDefinition, BoardProjection, Command, Destination, NodeRecord } from "../packages/protocol/src/index.ts";
 
@@ -79,7 +79,7 @@ const HUNSU_DRAFT_REQUEST_RESOURCES_PATH = ".hunsu-request/resources.json";
 const HUNSU_DRAFT_REQUEST_ARTIFACT_ACTIONS_PATH = ".hunsu-request/artifact-actions.json";
 const HUNSU_DRAFT_RUNTIME_FILES = ["destinations.json", "harness.json", "executors.json", "resources.json", "artifact-actions.json"] as const;
 
-test("Local server command handler persists domain events through Git-backed store", async () => {
+test("Bridge server command handler persists domain events through Git-backed store", async () => {
   const repo = createRepo();
   const state = createStudioState();
 
@@ -97,7 +97,7 @@ test("Local server command handler persists domain events through Git-backed sto
   assert.match(readHunsuEventText(repo), /InitialTeamCreated/);
 });
 
-test("Local server creates an Initial Team in one protocol command", async () => {
+test("Bridge server creates an Initial Team in one protocol command", async () => {
   const repo = createRepo();
   const state = createStudioState();
 
@@ -117,7 +117,7 @@ test("Local server creates an Initial Team in one protocol command", async () =>
   assert.match(readHunsuEventText(repo), /InitialTeamCreated/);
 });
 
-test("Local server creates a Roadmap root inside an existing Git parent", () => {
+test("Bridge server creates a Roadmap root inside an existing Git parent", () => {
   const parent = createRepo();
   const child = join(parent, "t3");
   const registryPath = join(parent, "roadmaps.json");
@@ -158,7 +158,7 @@ test("Local server creates a Roadmap root inside an existing Git parent", () => 
   assert.equal(reopened.board.requests.length, 1);
 });
 
-test("Local server scopes runs to the selected Roadmap repository", async () => {
+test("Bridge server scopes runs to the selected Roadmap repository", async () => {
   const parent = createRepo();
   const repoA = join(parent, "roadmap-a");
   const repoB = join(parent, "roadmap-b");
@@ -189,7 +189,7 @@ test("Local server scopes runs to the selected Roadmap repository", async () => 
   assert.equal(firstResponse.body.runs[0].repositoryPath, first.repository.root);
 });
 
-test("Local HUNSU Draft commits request-file edits from draft agent turns", async () => {
+test("Bridge HUNSU Draft commits request-file edits from draft agent turns", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-agent-file-edit-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -272,7 +272,7 @@ test("Local HUNSU Draft commits request-file edits from draft agent turns", asyn
   assert.match(lastCommitFiles, /\.hunsu\/hunsu-draft\.hunsu/);
 });
 
-test("Local HUNSU Draft resolves locked Manager packages and materializes Manager Skills only in the Draft worktree", async () => {
+test("Bridge HUNSU Draft resolves locked Manager packages and materializes Manager Skills only in the Draft worktree", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-locked-manager-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -325,7 +325,7 @@ test("Local HUNSU Draft resolves locked Manager packages and materializes Manage
   }
 });
 
-test("Local HUNSU Draft streams runner items into the shared AgentSession", async () => {
+test("Bridge HUNSU Draft streams runner items into the shared AgentSession", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-agent-session-stream-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -398,7 +398,7 @@ test("Local HUNSU Draft streams runner items into the shared AgentSession", asyn
   assert.equal(draftSession.activeItemIds.length, 0);
 });
 
-test("Local HUNSU Draft creates DiffArtifacts and approval records changed files", async () => {
+test("Bridge HUNSU Draft creates DiffArtifacts and approval records changed files", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-action-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -505,7 +505,7 @@ test("Local HUNSU Draft creates DiffArtifacts and approval records changed files
   assert.equal(rehydratedDraft.diffArtifacts[diffArtifact.body.diffArtifact.diffArtifactId].files[0].path, HUNSU_DRAFT_REQUEST_ARTIFACT_ACTIONS_PATH);
 });
 
-test("Local HUNSU Draft composes Team snapshots from Harness and Executor runtime files", async () => {
+test("Bridge HUNSU Draft composes Team snapshots from Harness and Executor runtime files", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-member-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -573,7 +573,7 @@ test("Local HUNSU Draft composes Team snapshots from Harness and Executor runtim
   assert.equal(Object.prototype.hasOwnProperty.call(runtime?.harness.harness ?? {}, "plan"), false);
 });
 
-test("Local HUNSU Draft rejects Harness-owned Member definitions", async () => {
+test("Bridge HUNSU Draft rejects Harness-owned Member definitions", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-planner-members-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -599,7 +599,7 @@ test("Local HUNSU Draft rejects Harness-owned Member definitions", async () => {
   assert.equal(diffArtifact.body.draft.readyDraft, undefined);
 });
 
-test("Local HUNSU Draft DiffArtifact rejects ConfirmHunsuDraft projection failures", async () => {
+test("Bridge HUNSU Draft DiffArtifact rejects ConfirmHunsuDraft projection failures", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-invalid-projection-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -636,7 +636,7 @@ test("Local HUNSU Draft DiffArtifact rejects ConfirmHunsuDraft projection failur
   assert.match(diffArtifact.body.diffArtifact.errors[0], /Destination destination_002 request req_show-korean-time-main-screen does not match source request/);
 });
 
-test("Local HUNSU Draft DiffArtifact reports changed Artifact Action runtime files", async () => {
+test("Bridge HUNSU Draft DiffArtifact reports changed Artifact Action runtime files", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-action-diff-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -687,7 +687,7 @@ test("Local HUNSU Draft DiffArtifact reports changed Artifact Action runtime fil
   assert.match(reorderDiffArtifact.body.diffArtifact.files[0].diff, /diff --git a\/\.hunsu-prev\/artifact-actions\.json b\/\.hunsu-request\/artifact-actions\.json/);
 });
 
-test("Local HUNSU Draft approval rejects stale DiffArtifacts", async () => {
+test("Bridge HUNSU Draft approval rejects stale DiffArtifacts", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-stale-diff-artifact-roadmap");
   const registryPath = join(parent, "roadmaps.json");
@@ -734,7 +734,7 @@ test("Local HUNSU Draft approval rejects stale DiffArtifacts", async () => {
   assert.match(approve.body.error, /request files changed after this DiffArtifact/);
 });
 
-test("Local HUNSU Draft discard does not change board HUNSU count", async () => {
+test("Bridge HUNSU Draft discard does not change board HUNSU count", async () => {
   const parent = createRepo();
   const repo = join(parent, "hunsu-draft-discard");
   const registryPath = join(parent, "roadmaps.json");
@@ -752,7 +752,7 @@ test("Local HUNSU Draft discard does not change board HUNSU count", async () => 
   assert.equal(currentPersistedBoard(repo).hunsus.length, 0);
 });
 
-test("Local server preserves full access Member config in Initial Team snapshot", async () => {
+test("Bridge server preserves full access Member config in Initial Team snapshot", async () => {
   const state = createStudioState();
   const protocol = createDefaultHarness();
   if (protocol.kind === "team_execution_plan") {
@@ -770,7 +770,7 @@ test("Local server preserves full access Member config in Initial Team snapshot"
   assert.deepEqual(member.approval, { policy: "never" });
 });
 
-test("Local server projects BOARD from committed runtime state across worktrees", async () => {
+test("Bridge server projects BOARD from committed runtime state across worktrees", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "baseline.txt"), "baseline\n", "utf8");
   run("git", ["add", "baseline.txt"], repo);
@@ -804,7 +804,7 @@ test("Local server projects BOARD from committed runtime state across worktrees"
   }
 });
 
-test("Local server starts an injected runner with Team context", async () => {
+test("Bridge server starts an injected runner with Team context", async () => {
   const state = createStudioState();
   const runner = new FakeRunner();
   await seedRequestAndLine(state);
@@ -825,7 +825,7 @@ test("Local server starts an injected runner with Team context", async () => {
   assert.equal(state.runs["run/req_batch"].debugEvents[0].type, "runner.status.changed");
 });
 
-test("Local server scopes Roadmap run ids so parallel Roadmaps do not share runner events", async () => {
+test("Bridge server scopes Roadmap run ids so parallel Roadmaps do not share runner events", async () => {
   const state = createStudioState();
   const firstRunner = new FakeRunner();
   const secondRunner = new FakeRunner();
@@ -850,7 +850,7 @@ test("Local server scopes Roadmap run ids so parallel Roadmaps do not share runn
   assert.deepEqual(Object.keys(state.runs).sort(), [first.run.runId, second.run.runId].sort());
 });
 
-test("Local server resolves Origin manifest lock into Team input", async () => {
+test("Bridge server resolves Origin manifest lock into Team input", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const manifest = createHarnessManifest();
@@ -920,7 +920,7 @@ test("Local server resolves Origin manifest lock into Team input", async () => {
   }
 });
 
-test("Local server does not switch Origin from environment variables alone", async () => {
+test("Bridge server does not switch Origin from environment variables alone", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const manifest = createHarnessManifest();
@@ -971,7 +971,7 @@ test("Local server does not switch Origin from environment variables alone", asy
   }
 });
 
-test("Local server rejects team package lock integrity mismatch before Team execution", async () => {
+test("Bridge server rejects team package lock integrity mismatch before Team execution", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const manifest = createHarnessManifest();
@@ -994,7 +994,7 @@ test("Local server rejects team package lock integrity mismatch before Team exec
   }
 });
 
-test("Local server rejects missing and unsupported team package manifests before Team execution", async () => {
+test("Bridge server rejects missing and unsupported team package manifests before Team execution", async () => {
   const missingRepo = createRepo();
   const missingState = createStudioState();
   const missingOrigin = await startOriginServer(missingRepo, "motorhome");
@@ -1035,7 +1035,7 @@ test("Local server rejects missing and unsupported team package manifests before
   }
 });
 
-test("Local server derives assistant transcript from app-server item events", async () => {
+test("Bridge server derives assistant transcript from app-server item events", async () => {
   const state = createStudioState();
   const runner = new TranscriptRunner();
   await seedRequestAndLine(state);
@@ -1056,7 +1056,7 @@ test("Local server derives assistant transcript from app-server item events", as
   assert.equal(run.debugEvents.some(event => event.type === "runner.appServer.message"), false);
 });
 
-test("Local server accumulates Codex app-server items separately from raw transcript", async () => {
+test("Bridge server accumulates Codex app-server items separately from raw transcript", async () => {
   const state = createStudioState();
   const runner = new AppServerItemRunner();
   await seedRequestAndLine(state);
@@ -1080,7 +1080,7 @@ test("Local server accumulates Codex app-server items separately from raw transc
   assert.equal(run.liveStatus?.phase, "working");
 });
 
-test("Local server exposes Codex provider status through the runner boundary", async () => {
+test("Bridge server exposes Codex provider status through the runner boundary", async () => {
   const runner = new FakeRunner();
   runner.providerStatusResponse = {
     backend: "app-server",
@@ -1097,7 +1097,7 @@ test("Local server exposes Codex provider status through the runner boundary", a
   assert.equal(response.body.account.account.email, "test@hunsu.app");
 });
 
-test("Local server requires allowed browser origins and pairing tokens for protected APIs", async () => {
+test("Bridge server requires allowed browser origins and pairing tokens for protected APIs", async () => {
   const runner = new FakeRunner();
   runner.providerStatusResponse = { backend: "app-server", available: true };
   const server = createStudioServer({
@@ -1105,7 +1105,7 @@ test("Local server requires allowed browser origins and pairing tokens for prote
     persist: false,
     runner,
     security: {
-      authToken: "local-test-token",
+      authToken: "bridge-test-token",
       allowedOrigins: ["https://studio.example.test"]
     }
   });
@@ -1113,7 +1113,7 @@ test("Local server requires allowed browser origins and pairing tokens for prote
   const rejectedOrigin = await requestStudioServerJson(server, "GET", "/api/codex/status", undefined, {
     headers: {
       origin: "https://evil.example.test",
-      authorization: "Bearer local-test-token"
+      authorization: "Bearer bridge-test-token"
     }
   });
   assert.equal(rejectedOrigin.status, 403);
@@ -1128,7 +1128,7 @@ test("Local server requires allowed browser origins and pairing tokens for prote
   const accepted = await requestStudioServerJson(server, "GET", "/api/codex/status", undefined, {
     headers: {
       origin: "https://studio.example.test",
-      "x-hunsu-local-token": "local-test-token"
+      "x-hunsu-bridge-token": "bridge-test-token"
     }
   });
   assert.equal(accepted.status, 200);
@@ -1136,7 +1136,7 @@ test("Local server requires allowed browser origins and pairing tokens for prote
   assert.equal(accepted.body.available, true);
 });
 
-test("Local server default Codex runner uses resolved app-server config", async () => {
+test("Bridge server default Codex runner uses resolved app-server config", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-config-"));
   const scriptPath = join(root, "fake-codex-app-server.mjs");
   writeFileSync(scriptPath, `import { createInterface } from "node:readline";
@@ -1158,7 +1158,7 @@ rl.on("line", line => {
   }
 });
 `, "utf8");
-  const runtimeConfig = unwrapConfigResult(resolveLocalRuntimeConfig({}, {
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({}, {
     cwd: root,
     codexAppServer: {
       command: process.execPath,
@@ -1175,7 +1175,7 @@ rl.on("line", line => {
   assert.equal(response.body.initialized.env, "configured-env");
 });
 
-test("Local server uses resolved runtime config for Roadmap registry path", async () => {
+test("Bridge server uses resolved runtime config for Roadmap registry path", async () => {
   const runner = new FakeRunner();
   const root = mkdtempSync(join(tmpdir(), "hunsu-runtime-config-"));
   const registryPath = join(root, "roadmaps.json");
@@ -1189,7 +1189,7 @@ test("Local server uses resolved runtime config for Roadmap registry path", asyn
       health: "ok"
     }]
   })}\n`, "utf8");
-  const runtimeConfig = unwrapConfigResult(resolveLocalRuntimeConfig({}, {
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({}, {
     cwd: root,
     roadmapRegistryPath: registryPath
   }));
@@ -1200,7 +1200,7 @@ test("Local server uses resolved runtime config for Roadmap registry path", asyn
   assert.equal(response.body.roadmaps[0].roadmapId, "roadmap_config");
 });
 
-test("Local Route worktrees use resolved runtime config root", async () => {
+test("Bridge Route worktrees use resolved runtime config root", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new FakeRunner();
@@ -1222,7 +1222,7 @@ test("Local Route worktrees use resolved runtime config root", async () => {
   }
 });
 
-test("Local server starts the next Route worktree from the current MOVE commit", async () => {
+test("Bridge server starts the next Route worktree from the current MOVE commit", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "baseline.txt"), "baseline\n", "utf8");
   run("git", ["add", "baseline.txt"], repo);
@@ -1279,7 +1279,7 @@ test("Local server starts the next Route worktree from the current MOVE commit",
   }
 });
 
-test("Local server does not reuse persisted Execute branch ids after restart", async () => {
+test("Bridge server does not reuse persisted Execute branch ids after restart", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "baseline.txt"), "baseline\n", "utf8");
   run("git", ["add", "baseline.txt"], repo);
@@ -1332,7 +1332,7 @@ test("Local server does not reuse persisted Execute branch ids after restart", a
   }
 });
 
-test("Local server rejects non-executable Harness kinds before launching a worktree Execute", async () => {
+test("Bridge server rejects non-executable Harness kinds before launching a worktree Execute", async () => {
   const protocols = [
     nonExecutableHarness("role_squad"),
     nonExecutableHarness("council_vote"),
@@ -1355,7 +1355,7 @@ test("Local server rejects non-executable Harness kinds before launching a workt
   }
 });
 
-test("Local server publishes runner updates to live subscribers", async () => {
+test("Bridge server publishes runner updates to live subscribers", async () => {
   const state = createStudioState();
   const runner = new FakeRunner();
   const events: StudioLiveEvent[] = [];
@@ -1381,7 +1381,7 @@ test("Local server publishes runner updates to live subscribers", async () => {
   assert.equal("assistantTranscript" in (updated?.run ?? {}), false);
 });
 
-test("Local server streams AgentSession message deltas without full run snapshots", async () => {
+test("Bridge server streams AgentSession message deltas without full run snapshots", async () => {
   const state = createStudioState();
   const runner = new TranscriptRunner();
   const events: AgentSessionEvent[] = [];
@@ -1416,7 +1416,7 @@ test("Local server streams AgentSession message deltas without full run snapshot
   assert.equal(events.every(event => event.type === "agentSession.snapshot" || event.sessionId === planSession.sessionId), true);
 });
 
-test("Local server streams reasoning deltas as Reasoning AgentSession messages", async () => {
+test("Bridge server streams reasoning deltas as Reasoning AgentSession messages", async () => {
   const state = createStudioState();
   const runner = new ReasoningDeltaRunner();
   const events: AgentSessionEvent[] = [];
@@ -1447,7 +1447,7 @@ test("Local server streams reasoning deltas as Reasoning AgentSession messages",
   assert.deepEqual(planSession.messages[0].summary, ["Considering path options"]);
 });
 
-test("Local server keeps run summaries bounded during large streaming", async () => {
+test("Bridge server keeps run summaries bounded during large streaming", async () => {
   const state = createStudioState();
   const runner = new HeavyStreamingRunner();
   const events: StudioLiveEvent[] = [];
@@ -1492,7 +1492,7 @@ test("Local server keeps run summaries bounded during large streaming", async ()
   }
 });
 
-test("Local server bridges app-server session deltas to AgentSession SSE without waiting for completion", async () => {
+test("Bridge server bridges app-server session deltas to AgentSession SSE without waiting for completion", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const timeline = createSubscribeStreamTimeline();
@@ -1531,7 +1531,7 @@ test("Local server bridges app-server session deltas to AgentSession SSE without
   }
 });
 
-test("Local server removes AgentSession subscribers on close", async () => {
+test("Bridge server removes AgentSession subscribers on close", async () => {
   const state = createStudioState();
   const runner = new DelayedDeltaRunner();
   const events: AgentSessionEvent[] = [];
@@ -1553,7 +1553,7 @@ test("Local server removes AgentSession subscribers on close", async () => {
   assert.equal(state.agentSessionSubscribers.size, 0);
 });
 
-test("Local server exposes AgentSession snapshots for reconnect recovery", async () => {
+test("Bridge server exposes AgentSession snapshots for reconnect recovery", async () => {
   const state = createStudioState();
   const runner = new TranscriptRunner();
   await seedRequestAndLine(state, "/repo", false);
@@ -1575,7 +1575,7 @@ test("Local server exposes AgentSession snapshots for reconnect recovery", async
   assert.equal(sessionResponse.body.session.messages[0].text, "Hello");
 });
 
-test("Local server artifact lookup reads artifacts from the board projection", async () => {
+test("Bridge server artifact lookup reads artifacts from the board projection", async () => {
   const state = createStudioState();
   await seedRequestAndLine(state);
   const result = await executeStudioCommand({
@@ -1594,7 +1594,7 @@ test("Local server artifact lookup reads artifacts from the board projection", a
   assert.equal(artifact?.text, "Changed Studio runner event flow.");
 });
 
-test("Local server reports worktree visibility", () => {
+test("Bridge server reports worktree visibility", () => {
   const repo = createRepo();
   writeFileSync(join(repo, "scratch.txt"), "uncommitted\n", "utf8");
 
@@ -1604,7 +1604,7 @@ test("Local server reports worktree visibility", () => {
   assert.equal(status.changes[0].path, "scratch.txt");
 });
 
-test("Local server lists Codex skill folders as queryable Skill bindings", () => {
+test("Bridge server lists Codex skill folders as queryable Skill bindings", () => {
   const home = mkdtempSync(join(tmpdir(), "hunsu-home-"));
   const skillDir = join(home, ".codex", "skills", "playwright-cli");
   mkdirSync(skillDir, { recursive: true });
@@ -1623,7 +1623,7 @@ test("Local server lists Codex skill folders as queryable Skill bindings", () =>
   assert.match(skills[0].snapshotFiles?.[0]?.text ?? "", /Use for UI checks/);
 });
 
-test("Local server materializes local snapshot Member Skills into ignored Codex skill folders", async () => {
+test("Bridge server materializes local snapshot Member Skills into ignored Codex skill folders", async () => {
   const repo = createRepo();
   const protocol = createDefaultHarness("Use materialized skills.", [{
     kind: "local-snapshot",
@@ -1658,7 +1658,7 @@ test("Local server materializes local snapshot Member Skills into ignored Codex 
   );
 });
 
-test("Local server prepares local-root-installed Member Skills into isolated worktree config", async () => {
+test("Bridge server prepares local-root-installed Member Skills into isolated worktree config", async () => {
   const repo = createRepo();
   const home = mkdtempSync(join(tmpdir(), "hunsu-codex-home-"));
   const skillDir = join(home, ".codex", "skills", "ui-inspector");
@@ -1691,7 +1691,7 @@ test("Local server prepares local-root-installed Member Skills into isolated wor
   assert.equal(run("git", ["status", "--short"], repo), "");
 });
 
-test("Local server rejects missing and ambiguous local-root-installed Member Skills before Codex starts", async () => {
+test("Bridge server rejects missing and ambiguous local-root-installed Member Skills before Codex starts", async () => {
   const missingRepo = createRepo();
   const missingHome = mkdtempSync(join(tmpdir(), "hunsu-codex-home-"));
   const missingHarness = createDefaultHarness("Use missing skill.");
@@ -1729,7 +1729,7 @@ test("Local server rejects missing and ambiguous local-root-installed Member Ski
   );
 });
 
-test("Local server prepares Member Plugin bindings into isolated worktree config", async () => {
+test("Bridge server prepares Member Plugin bindings into isolated worktree config", async () => {
   const repo = createRepo();
   const home = mkdtempSync(join(tmpdir(), "hunsu-codex-home-"));
   mkdirSync(join(home, ".codex"), { recursive: true });
@@ -1771,7 +1771,7 @@ test("Local server prepares Member Plugin bindings into isolated worktree config
   );
 });
 
-test("Local server refuses to merge user-authored Codex config during environment preparation", async () => {
+test("Bridge server refuses to merge user-authored Codex config during environment preparation", async () => {
   const repo = createRepo();
   mkdirSync(join(repo, ".codex"), { recursive: true });
   writeFileSync(join(repo, ".codex", "config.toml"), "model = \"user-config\"\n", "utf8");
@@ -1786,7 +1786,7 @@ test("Local server refuses to merge user-authored Codex config during environmen
   );
 });
 
-test("Local server materializes APM Member Skills before Codex runs", async () => {
+test("Bridge server materializes APM Member Skills before Codex runs", async () => {
   const repo = createRepo();
   const lock = {
     kind: "registry-package",
@@ -1834,7 +1834,7 @@ test("Local server materializes APM Member Skills before Codex runs", async () =
   );
 });
 
-test("Local server installs skillMeta Member Skills before Codex runs", async () => {
+test("Bridge server installs skillMeta Member Skills before Codex runs", async () => {
   const repo = createRepo();
   const protocol = createDefaultHarness("Use skills CLI metadata.", [{
     kind: "skillMeta",
@@ -1867,7 +1867,7 @@ test("Local server installs skillMeta Member Skills before Codex runs", async ()
   assert.equal(run("git", ["status", "--short"], repo), "");
 });
 
-test("Local server selects a repository root for the control plane", () => {
+test("Bridge server selects a repository root for the control plane", () => {
   const repo = createRepo();
   const state = createStudioState();
 
@@ -1877,7 +1877,7 @@ test("Local server selects a repository root for the control plane", () => {
   assert.match(result.repository.branch, /main/);
 });
 
-test("Local server initializes an empty folder before creating the Initial Team", async () => {
+test("Bridge server initializes an empty folder before creating the Initial Team", async () => {
   const repo = mkdtempSync(join(tmpdir(), "hunsu-empty-project-"));
   const state = createStudioState();
 
@@ -1904,7 +1904,7 @@ test("Local server initializes an empty folder before creating the Initial Team"
   assert.match(readHunsuEventText(repo), /InitialTeamCreated/);
 });
 
-test("Local server Roadmap Registry stores only local reopen metadata", async () => {
+test("Bridge server Roadmap Registry stores only local reopen metadata", async () => {
   const repo = createRepo();
   const registryPath = join(mkdtempSync(join(tmpdir(), "hunsu-roadmap-registry-")), "roadmaps.json");
   const state = createStudioState();
@@ -1928,7 +1928,7 @@ test("Local server Roadmap Registry stores only local reopen metadata", async ()
   assert.match(readHunsuEventText(repo), /InitialTeamCreated/);
 });
 
-test("Local server ports existing Git projects instead of opening them implicitly", () => {
+test("Bridge server ports existing Git projects instead of opening them implicitly", () => {
   const repo = createRepo();
   writeFileSync(join(repo, "package.json"), JSON.stringify({
     scripts: { dev: "vite --host 127.0.0.1 --port 5173" },
@@ -1952,7 +1952,7 @@ test("Local server ports existing Git projects instead of opening them implicitl
   assert.equal(listRoadmapRegistry({ roadmapRegistryPath: registryPath }).length, 1);
 });
 
-test("Local server browses server folders and marks Git-backed Roadmaps", async () => {
+test("Bridge server browses server folders and marks Git-backed Roadmaps", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-folder-browser-"));
   const plainFolder = join(root, "plain-folder");
   const roadmapFolder = join(root, "roadmap-folder");
@@ -2016,7 +2016,7 @@ test("Local server browses server folders and marks Git-backed Roadmaps", async 
   assert.throws(() => openStudioRoadmap({ browseToken: "browse_missing" }, grantState, { persist: false, roadmapRegistryPath: registryPath }), /unknown/);
 });
 
-test("Local server completes a run by verifying and recording a MOVE", async () => {
+test("Bridge server completes a run by verifying and recording a MOVE", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "completed.txt"), "done\n", "utf8");
   run("git", ["add", "completed.txt"], repo);
@@ -2030,7 +2030,7 @@ test("Local server completes a run by verifying and recording a MOVE", async () 
     fromRef: "HEAD",
     summary: "Completed batch Destination",
     destinationIds: ["destination_001"],
-    evidence: ["node --test tests/local.test.ts"]
+    evidence: ["node --test tests/bridge.test.ts"]
   }, state, { cwd: repo, persist: false });
 
   assert.equal(result.moveId, "M0001");
@@ -2041,7 +2041,7 @@ test("Local server completes a run by verifying and recording a MOVE", async () 
   assert.equal(result.board.destinations.find(destination => destination.id === "destination_001")?.status, "reached");
 });
 
-test("Local server rejects multi-Destination Execute starts and completions", async () => {
+test("Bridge server rejects multi-Destination Execute starts and completions", async () => {
   const state = createStudioState();
   await seedRequestAndLine(state);
 
@@ -2060,7 +2060,7 @@ test("Local server rejects multi-Destination Execute starts and completions", as
       runId: "run/req_batch",
       fromRef: "HEAD",
       summary: "Invalid multi-Destination completion",
-      evidence: ["node --test tests/local.test.ts"]
+      evidence: ["node --test tests/bridge.test.ts"]
     }, state, { cwd: "/repo", persist: false }),
     /MOVE completion requires exactly one Destination/
   );
@@ -2072,13 +2072,13 @@ test("Local server rejects multi-Destination Execute starts and completions", as
       fromRef: "HEAD",
       summary: "Invalid explicit multi-Destination completion",
       destinationIds: ["destination_001", "destination_002"],
-      evidence: ["node --test tests/local.test.ts"]
+      evidence: ["node --test tests/bridge.test.ts"]
     }, state, { cwd: "/repo", persist: false }),
     /MOVE completion requires exactly one Destination/
   );
 });
 
-test("Local server rejects non-head Destination Execute starts", async () => {
+test("Bridge server rejects non-head Destination Execute starts", async () => {
   const state = createStudioState();
   await executeStudioCommands([{
     type: "CreateInitialTeam",
@@ -2102,7 +2102,7 @@ test("Local server rejects non-head Destination Execute starts", async () => {
   );
 });
 
-test("Local server executes Team ExecutionPlan without prebuilding Member Paths", async () => {
+test("Bridge server executes Team ExecutionPlan without prebuilding Member Paths", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new CompletingRunner();
@@ -2187,7 +2187,7 @@ test("Local server executes Team ExecutionPlan without prebuilding Member Paths"
   assert.equal(arrivedEvent?.type === "run.updated" ? arrivedEvent.board?.moves[0]?.outcome : undefined, "arrived");
 });
 
-test("Local server rejects Team delegation outside direct Harness members", async () => {
+test("Bridge server rejects Team delegation outside direct Harness members", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new GrandchildDelegationRunner();
@@ -2209,7 +2209,7 @@ test("Local server rejects Team delegation outside direct Harness members", asyn
   assert.deepEqual(runState.memberPathRuns ?? [], []);
 });
 
-test("Local server delegates through nested Teams with direct Member scope", async () => {
+test("Bridge server delegates through nested Teams with direct Member scope", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new NestedTeamDelegationRunner();
@@ -2285,7 +2285,7 @@ test("Local server delegates through nested Teams with direct Member scope", asy
   assert.deepEqual(runState?.memberPathRuns?.map(pathRun => pathRun.executorId), ["azir"]);
 });
 
-test("Local server auto-records a MOVE after terminal Path completion", async () => {
+test("Bridge server auto-records a MOVE after terminal Path completion", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new CompletingRunner();
@@ -2344,7 +2344,7 @@ test("Local server auto-records a MOVE after terminal Path completion", async ()
   assert.equal(run("git", ["status", "--short"], repo), "");
 });
 
-test("Local server prepares separate Codex environments for Team, Member Paths, and MOVE finalizer", async () => {
+test("Bridge server prepares separate Codex environments for Team, Member Paths, and MOVE finalizer", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const codexHome = mkdtempSync(join(tmpdir(), "hunsu-codex-home-"));
@@ -2412,7 +2412,7 @@ test("Local server prepares separate Codex environments for Team, Member Paths, 
   assert.equal(run("git", ["status", "--short"], repo), "");
 });
 
-test("Local server treats worktree-write as permission, not a required tree change per Path", async () => {
+test("Bridge server treats worktree-write as permission, not a required tree change per Path", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new CompletingRunner();
@@ -2444,7 +2444,7 @@ test("Local server treats worktree-write as permission, not a required tree chan
   assert.equal(runner.moveFinalizerRun?.terminalPathCommit, runState.pathCommits?.["selected-destination.evaluate.3"]);
 });
 
-test("Local server scopes runner event collection to each provider turn", async () => {
+test("Bridge server scopes runner event collection to each provider turn", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new SlowDetachingStreamingRunner();
@@ -2476,7 +2476,7 @@ test("Local server scopes runner event collection to each provider turn", async 
   assert.equal(runState.codexItems.some(item => item.itemId === "msg-other-run"), false);
 });
 
-test("Local server records an Accident when terminal Path completion has no MOVE product changes", async () => {
+test("Bridge server records an Accident when terminal Path completion has no MOVE product changes", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new CleanPassRunner();
@@ -2515,7 +2515,7 @@ test("Local server records an Accident when terminal Path completion has no MOVE
   assert.equal(run("git", ["status", "--short"], repo), "");
 });
 
-test("Local server records an Accident for malformed evaluator output", async () => {
+test("Bridge server records an Accident for malformed evaluator output", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new NaturalLanguageTerminalRunner();
@@ -2537,7 +2537,7 @@ test("Local server records an Accident for malformed evaluator output", async ()
   assert.equal(runState.liveStatus?.phase, "idle");
 });
 
-test("Local server can complete a MOVE directly from Execute completion facts", async () => {
+test("Bridge server can complete a MOVE directly from Execute completion facts", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "direct.txt"), "done\n", "utf8");
   const state = createStudioState();
@@ -2556,7 +2556,7 @@ test("Local server can complete a MOVE directly from Execute completion facts", 
   assert.deepEqual(result?.board.moves[0].reachedDestinationIds, ["destination_001"]);
 });
 
-test("Local server creates and removes an isolated Route worktree for persisted Team work", async () => {
+test("Bridge server creates and removes an isolated Route worktree for persisted Team work", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new CompletingRunner();
@@ -2615,7 +2615,7 @@ test("Local server creates and removes an isolated Route worktree for persisted 
   rmSync(join(tmpdir(), "hunsu-executes"), { recursive: true, force: true });
 });
 
-test("Local server rehydrates completed Execute metadata from previous execution after restart", async () => {
+test("Bridge server rehydrates completed Execute metadata from previous execution after restart", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new CompletingRunner();
@@ -2651,7 +2651,7 @@ test("Local server rehydrates completed Execute metadata from previous execution
   assert.equal(sessionSnapshot?.sessions.every(session => session.messages.length === 0), true);
 });
 
-test("Local server removes previous execution metadata on HUNSU", async () => {
+test("Bridge server removes previous execution metadata on HUNSU", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new CompletingRunner();
@@ -2678,7 +2678,7 @@ test("Local server removes previous execution metadata on HUNSU", async () => {
   );
 });
 
-test("Local server refuses to trust agent-authored Hunsu runtime file changes", async () => {
+test("Bridge server refuses to trust agent-authored Hunsu runtime file changes", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new RuntimeFileMutatingRunner();
@@ -2704,7 +2704,7 @@ test("Local server refuses to trust agent-authored Hunsu runtime file changes", 
   rmSync(join(tmpdir(), "hunsu-executes"), { recursive: true, force: true });
 });
 
-test("Local server records an Accident when Team execution throws", async () => {
+test("Bridge server records an Accident when Team execution throws", async () => {
   const repo = createRepo();
   const state = createStudioState();
   const runner = new ThrowingRunner();
@@ -2724,7 +2724,7 @@ test("Local server records an Accident when Team execution throws", async () => 
   assert.equal(board.destinations.find(destination => destination.id === "destination_001")?.status, "pending");
 });
 
-test("Local server requires approval before completing a risky MOVE", async () => {
+test("Bridge server requires approval before completing a risky MOVE", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "risky.txt"), "done\n", "utf8");
   run("git", ["add", "risky.txt"], repo);
@@ -2738,12 +2738,12 @@ test("Local server requires approval before completing a risky MOVE", async () =
     fromRef: "HEAD",
     summary: "Risky completion",
     destinationIds: ["destination_001"],
-    evidence: ["node --test tests/local.test.ts"],
+    evidence: ["node --test tests/bridge.test.ts"],
     risks: ["Touches orchestration behavior"]
   }, state, { cwd: repo, persist: false }), /requires explicit approval/);
 });
 
-test("Local server reads structured MOVE diff against the previous MOVE", async () => {
+test("Bridge server reads structured MOVE diff against the previous MOVE", async () => {
   const repo = createRepo();
   writeFileSync(join(repo, "diff.txt"), "previous\n", "utf8");
   run("git", ["add", "diff.txt"], repo);
@@ -2810,7 +2810,7 @@ test("Local server reads structured MOVE diff against the previous MOVE", async 
   }
 });
 
-test("Local server plans and starts Roadmap-scoped Artifact Action Runs", () => {
+test("Bridge server plans and starts Roadmap-scoped Artifact Action Runs", () => {
   const repo = createRepo();
   writeActionFixture(repo);
   run("git", ["add", "."], repo);
@@ -2836,7 +2836,7 @@ test("Local server plans and starts Roadmap-scoped Artifact Action Runs", () => 
   assert.equal(runRecord.aliases?.web.directUrl, "http://127.0.0.1:59173");
 });
 
-test("Local server Artifact Action Runs use resolved runtime config root", async () => {
+test("Bridge server Artifact Action Runs use resolved runtime config root", async () => {
   const repo = createRepo();
   writeActionFixture(repo);
   run("git", ["add", "."], repo);
@@ -2845,8 +2845,8 @@ test("Local server Artifact Action Runs use resolved runtime config root", async
   const registryPath = join(mkdtempSync(join(tmpdir(), "hunsu-action-registry-")), "roadmaps.json");
   const ported = applyStudioPort({ path: repo, title: "Action Product", goal: "Run Artifact Actions" }, state, { roadmapRegistryPath: registryPath });
   addHostAction(repo, ported.board);
-  const actionWorktreeRoot = mkdtempSync(join(tmpdir(), "hunsu-local-action-root-"));
-  const runtimeConfig = unwrapConfigResult(resolveLocalRuntimeConfig({}, {
+  const actionWorktreeRoot = mkdtempSync(join(tmpdir(), "hunsu-bridge-action-root-"));
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({}, {
     cwd: repo,
     actionWorktreeRoot
   }));
@@ -2871,7 +2871,7 @@ test("Local server Artifact Action Runs use resolved runtime config root", async
   }
 });
 
-test("Local server controls runtime pause, resume, and stop state", async () => {
+test("Bridge server controls runtime pause, resume, and stop state", async () => {
   const state = createStudioState();
   const runner = new FakeRunner();
   await seedRequestAndLine(state);
@@ -2892,7 +2892,7 @@ test("Local server controls runtime pause, resume, and stop state", async () => 
   assert.deepEqual(runner.stopped, ["run/req_batch"]);
 });
 
-test("Local server accepts and rejects lines for review decisions", async () => {
+test("Bridge server accepts and rejects lines for review decisions", async () => {
   const state = createStudioState();
   await seedRequestAndLine(state);
   state.runs["run/req_batch"] = studioRunFixture();

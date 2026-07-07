@@ -37,13 +37,13 @@ execution record, and route-local Hunsu Draft metadata:
 ```
 
 `.hunsu/current-execution.hunsu` exists only on execution NODE commits. It
-stores a closure-free `ExecutionPlan` value that Hunsu Local can interpret:
+stores a closure-free `ExecutionPlan` value that Hunsu Bridge can interpret:
 `QueueExecutionPlan` for ordered composition and `GoalExecutionPlan` for an
 executor/evaluator loop. Goal executions are staged so one interpreter step
 dispatches at most one agent turn before returning the next continuation,
 terminal success, or failure. It stores data, not JavaScript source or closures.
 It does not pre-create Member Path records; those records are created only
-when Local actually dispatches the next evaluator or executor turn.
+when Bridge actually dispatches the next evaluator or executor turn.
 
 `.hunsu/previous-execution.hunsu` exists only on completed MOVE commits. It is
 metadata-only: Team plan lifecycle, Member Path lifecycle, provider session
@@ -65,7 +65,7 @@ encoded runtime bundle:
 .hunsu-request/
 ```
 
-`.hunsu-prev` is Local-owned baseline state decoded from the selected source
+`.hunsu-prev` is Bridge-owned baseline state decoded from the selected source
 runtime. `.hunsu-request` is the editable request runtime copy used by the
 Draft agent. Both folders contain readable JSON copies of the runtime files
 that are editable in v1: `destinations.json`, `harness.json`,
@@ -74,14 +74,14 @@ Executor definitions are sourced only from `executors.json`. Resource
 requirements and bindings are sourced only from `resources.json`.
 `harness.json` stores the locked root Team, route policy, guardrails, package
 locks, and Artifact Action references without embedded Executor definitions.
-Local composes `harness.json`, `executors.json`, and `resources.json` into the
+Bridge composes `harness.json`, `executors.json`, and `resources.json` into the
 resolved `HarnessSnapshot` only at run, check, and Team snapshot boundaries.
 
 These folders are committed only on the Draft Route branch so the requested
 changes can be inspected and resumed; they are not durable Roadmap runtime
 state. Draft agents edit `.hunsu-request/*` only. Product files, encoded
-`.hunsu/*`, and `.hunsu-prev/*` are Local-owned and must not be edited by the
-Draft agent. The Draft agent creates a DiffArtifact by asking Local to validate
+`.hunsu/*`, and `.hunsu-prev/*` are Bridge-owned and must not be edited by the
+Draft agent. The Draft agent creates a DiffArtifact by asking Bridge to validate
 `.hunsu-prev` and `.hunsu-request` against the runtime schemas and compare their
 decoded contents. Confirm Hunsu requires a passing, non-stale DiffArtifact,
 records the changed files and request Team snapshot, and regenerates encoded
@@ -107,7 +107,7 @@ provider prompt, runs the agent, then updates and re-encodes the state after the
 agent stops.
 
 The exception is a Hunsu Draft agent operating in a Draft Route worktree: it may
-edit files under `.hunsu-request/` when Local explicitly provides a file-backed
+edit files under `.hunsu-request/` when Bridge explicitly provides a file-backed
 Draft surface. It still must not edit `.hunsu/` encoded runtime files,
 `.hunsu-prev/`, or product files for that Draft turn.
 
@@ -193,7 +193,7 @@ Custom refs such as `refs/hunsu/*` may exist during migration or as optional
 markers, but they are not the source of truth in the target model. If a marker
 ref is missing, the app must be able to rebuild its view from commits.
 
-## Local Cache
+## Bridge Cache
 
 Hunsu may keep a local app cache for speed:
 
@@ -266,23 +266,23 @@ materializing skills. It also gives later readers a package-lock-style record
 for reproducibility, tamper detection, debugging, and audit.
 
 Codex Environment Preparation is a runtime step before Codex starts a thread.
-Local writes Hunsu-managed `.agents/skills/<skill-name>/` folders and a
+Bridge writes Hunsu-managed `.agents/skills/<skill-name>/` folders and a
 worktree-local `.codex/config.toml`, enabling only the Skills and Plugins
 requested by the active Member Path or Hunsu Draft Manager. Team planning and
 MOVE finalizer currently request no Skills or Plugins.
 `local-snapshot` entries use stored snapshot files; APM `registry-package`
 entries fetch and verify the exact locked package; `local-root-installed`
-entries copy an already-installed local Codex Skill after Local verifies that
+entries copy an already-installed local Codex Skill after Bridge verifies that
 the name or source path resolves unambiguously; `skillMeta` entries install one
 Codex Skill with `npx skills add <source> --skill <name> --agent codex` in a
-staging workspace before Local copies the installed files into the managed
+staging workspace before Bridge copies the installed files into the managed
 runtime environment. Missing local-root-installed resources or failed
 `skillMeta` installs fail preparation before Codex starts, so Execute records an
 Accident or Hunsu Draft records a failed Draft route instead of running with an
 ambient environment. Skill content should not be copied into Member Path or
 Manager prompts. The prompt nudges the execution agent with only Member or
 Manager guidance, a focused goal, and minimal constraints; Hunsu orchestration
-metadata stays in Local.
+metadata stays in Bridge.
 
 Member execution and approval permissions are part of the Harness
 snapshot, not runtime heuristics. `read_only`, `worktree_write`, and

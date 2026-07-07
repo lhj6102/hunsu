@@ -25,7 +25,7 @@ It contains:
 
 The Roadmap is reconstructed from reachable Git commits that contain the encoded
 `.hunsu/` runtime bundle. Given a commit, decoding that bundle should produce
-the same Roadmap state every time. Local caches and optional refs may accelerate
+the same Roadmap state every time. Bridge caches and optional refs may accelerate
 reconstruction, but they are not the source of truth.
 
 The Roadmap is selected through a local Roadmap Registry entry in Studio, but
@@ -176,7 +176,7 @@ events.
 ### ExecutionPlan
 
 An ExecutionPlan is a closure-free executable continuation emitted by the Team
-for an Execute. It is data that Hunsu Local interprets, not JavaScript source and
+for an Execute. It is data that Hunsu Bridge interprets, not JavaScript source and
 not an agent-owned closure.
 
 Initial executable shapes:
@@ -221,9 +221,9 @@ type GoalNeedsExecution = {
 
 `QueueExecutionPlan` composes other executions in order. `GoalExecutionPlan`
 delegates to one assignee Executor and may include one evaluator Executor.
-If the assignee is a Team, Local creates a Plan route and asks that Team planner
+If the assignee is a Team, Bridge creates a Plan route and asks that Team planner
 to emit the next scoped ExecutionPlan using only direct Membership profiles. If
-the assignee is a Member, Local creates a Path route and runs one Codex turn in
+the assignee is a Member, Bridge creates a Path route and runs one Codex turn in
 that Member's prepared environment. `needs_evaluation` dispatches exactly one
 evaluator turn when an evaluator is present. A failed evaluation writes
 `needs_execution` with evaluator feedback captured as explicit data.
@@ -238,7 +238,7 @@ storing a JavaScript closure or opaque agent state.
 
 Member Paths still appear as the provider-turn and Path-commit record shape:
 each evaluator or executor turn receives a focused Member Path prompt, and
-Hunsu records a Path commit after Local has written the next
+Hunsu records a Path commit after Bridge has written the next
 `.hunsu/current-execution.hunsu` state or removed it for finalizer-ready state.
 Path commits are automated execution commits. They record the Path id, Member
 id, Path goal, and dependencies so the direct Git history remains debuggable.
@@ -261,7 +261,7 @@ Variants:
   materialization.
 
 Runtime materializes Member Skill Metadata into `.agents/skills/<skill-name>/`
-before a Path starts. Local snapshots use stored `snapshotFiles`; APM registry
+before a Path starts. Bridge snapshots use stored `snapshotFiles`; APM registry
 packages are fetched by exact version and verified against the lock. `skillMeta`
 entries are installed into a staging workspace, then copied through the same
 Hunsu-managed materialization path as other Member Skills.
@@ -343,7 +343,7 @@ Execute statuses are UI/runtime statuses. The durable result is the resulting
 MOVE.
 
 An Execute must have exactly one selected Destination: the current open
-Destination queue head. Local may auto-select that queue head when the start
+Destination queue head. Bridge may auto-select that queue head when the start
 request omits an explicit selection. Explicit multi-Destination starts and
 explicit starts for any non-head Destination are invalid.
 
@@ -434,7 +434,7 @@ The session has one agent role: the Draft agent, configured by the resolved
 Manager. It is conversational, explains, asks follow-up questions, and may edit
 decoded request files in the Draft Route worktree.
 
-Local creates two decoded top-level folders in the HUNSU Draft Route worktree:
+Bridge creates two decoded top-level folders in the HUNSU Draft Route worktree:
 
 - `.hunsu-prev/`: read-only decoded snapshot of the selected source node.
 - `.hunsu-request/`: editable decoded request state.
@@ -446,10 +446,10 @@ files, but are readable JSON. `executors.json` is the source of truth for
 Team and Member definitions. `resources.json` is the source of truth for
 Skill bindings and Plugin requirements. `harness.json` stores locked root Team,
 budget, guardrails, package locks, and route policy without embedding Executor
-definitions. Local composes Harness, Executor, and Resource runtime state into
+definitions. Bridge composes Harness, Executor, and Resource runtime state into
 the resolved Team Snapshot at check, approval, and run boundaries. The Draft
-agent asks Local to create a
-DiffArtifact after editing `.hunsu-request`; Local validates both decoded
+agent asks Bridge to create a
+DiffArtifact after editing `.hunsu-request`; Bridge validates both decoded
 bundles, compares `.hunsu-prev` and `.hunsu-request`, records changed files with
 git-style unified file diffs, records the request Team snapshot, and
 regenerates the final encoded `.hunsu/*` state through the
@@ -484,13 +484,13 @@ bodies remain AgentSession/provider operational data; compact Draft Route
 metadata is encoded in `.hunsu/hunsu-draft.hunsu` and committed in the route
 worktree after meaningful Draft state transitions.
 
-At Draft start, Local stores the source Harness snapshot in a
-content-addressed artifact cache and assigns a hash id. Local resolves the
+At Draft start, Bridge stores the source Harness snapshot in a
+content-addressed artifact cache and assigns a hash id. Bridge resolves the
 selected Manager lock or built-in default Manager, records that Manager
 snapshot in route runtime state, materializes only the Manager's Skills and
 Plugins in the Draft worktree, writes the decoded baseline and request files
 into the route worktree, writes the encoded route runtime state, and commits
-only Local-owned `.hunsu`, `.hunsu-prev`, and `.hunsu-request` Draft files.
+only Bridge-owned `.hunsu`, `.hunsu-prev`, and `.hunsu-request` Draft files.
 
 An approval-ready HUNSU Draft additionally has:
 
@@ -533,7 +533,7 @@ Fields:
 - active item ids
 - revision and timestamps
 
-Execute runs and Hunsu Draft sessions reference AgentSessions by id. Local keeps a
+Execute runs and Hunsu Draft sessions reference AgentSessions by id. Bridge keeps a
 common `agentSessions` registry so `/agent-sessions` can return Execute Plan/Path
 and Hunsu Draft/Create sessions through the same API.
 
@@ -560,7 +560,7 @@ Access modes:
 Team conversations expose read-only inspection to the user. Hunsu Draft agent
 conversations can allow conversation and transaction while active.
 
-## Local App Models
+## Bridge App Models
 
 These models are local Studio state, not Roadmap history.
 

@@ -34,7 +34,7 @@ importers:
         specifier: 4.104.0
         version: 4.104.0
 
-  apps/local:
+  apps/bridge:
     dependencies:
       '@hunsu/codex-runner':
         specifier: workspace:*
@@ -142,9 +142,9 @@ importers:
       '@hunsu/core':
         specifier: workspace:*
         version: link:../core
-      '@hunsu/local':
+      '@hunsu/bridge':
         specifier: workspace:*
-        version: link:../../apps/local
+        version: link:../../apps/bridge
       '@hunsu/protocol':
         specifier: workspace:*
         version: link:../protocol

@@ -1,6 +1,6 @@
 # Security Policy
 
-Hunsu is local-first. Hunsu Web is a browser UI, while Hunsu Local is the
+Hunsu is local-first. Hunsu Web is a browser UI, while Hunsu Bridge is the
 localhost runtime that can read repositories, create Git worktrees, run Codex,
 and execute Artifact Actions.
 
@@ -22,21 +22,21 @@ Include:
 - affected version or commit
 - operating system and Node version
 - exact Hunsu command or API route involved
-- whether Hunsu Local was bound to `127.0.0.1` or another host
+- whether Hunsu Bridge was bound to `127.0.0.1` or another host
 - whether a pairing token or Artifact Action command was involved
 
-## Local API Boundary
+## Bridge API Boundary
 
-Hunsu Local defaults to localhost and should stay bound to `127.0.0.1` for
-normal use. Browser access to protected Local APIs requires:
+Hunsu Bridge defaults to localhost and should stay bound to `127.0.0.1` for
+normal use. Browser access to protected Bridge APIs requires:
 
 - an allowed `Origin`
-- a short-lived pairing token supplied by the Local launcher
+- a short-lived pairing token supplied by the Bridge launcher
 - no cookies or ambient browser credentials
 
-Do not expose Hunsu Local directly to a public network. If you intentionally bind
+Do not expose Hunsu Bridge directly to a public network. If you intentionally bind
 to `0.0.0.0`, put it behind your own authenticated transport and understand that
-Local can operate on repositories and execute configured commands.
+Bridge can operate on repositories and execute configured commands.
 
 ## Artifact Actions
 

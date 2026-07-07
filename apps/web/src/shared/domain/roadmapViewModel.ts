@@ -1,5 +1,5 @@
 import type { BoardEdge, BoardProjection, Destination, HarnessSnapshot, HunsuRecord, LineRecord, MoveRecord, NodeRecord, NonEmptyText, PositiveInteger } from "@hunsu/protocol";
-import type { AgentSession, StudioActionRun, StudioArtifactAction, StudioEncodedRuntimeFile, StudioExecutionTransition, StudioHunsuDraftSession, StudioRunState, StudioSkillSummary, WorktreeStatus } from "@/shared/api/localTypes";
+import type { AgentSession, StudioActionRun, StudioArtifactAction, StudioEncodedRuntimeFile, StudioExecutionTransition, StudioHunsuDraftSession, StudioRunState, StudioSkillSummary, WorktreeStatus } from "@/shared/api/bridgeTypes";
 import { teamColorForName, teamToneForName, teamToneMap } from "@/shared/design/teamTone";
 import type { FigmaTeamTone, HunsuMoveProgress, NodeDetailPanelState } from "@/shared/design/figmaContracts";
 
@@ -2337,12 +2337,12 @@ export const fallbackRuns: StudioRunState[] = [{
   maxAttemptCount: 4,
   executionPlanPlan: [
     { id: "design", executorId: "faker", goal: "Translate Figma dashboard structure into native shadcn components.", requires: "PrevMove" },
-    { id: "model", executorId: "canyon", goal: "Keep protocol and Local API contracts explicit.", requires: "PrevMove" },
+    { id: "model", executorId: "canyon", goal: "Keep protocol and Bridge API contracts explicit.", requires: "PrevMove" },
     { id: "compose", executorId: "ruler", goal: "Assemble the Roadmap workspace without legacy CSS.", requires: ["design", "model"] }
   ],
   memberPathRuns: [
     { pathId: "design", executorId: "faker", goal: "Translate Figma dashboard structure into native shadcn components.", requires: "PrevMove", attempt: 1, status: "completed", session: { providerThreadId: "thread-design", providerTurnId: "turn-design" }, dependencyPathIds: [], dependencyOutputs: [], finalResponse: "Design path completed.", commit: "a11ce0000", startedAt: new Date().toISOString(), completedAt: new Date().toISOString() },
-    { pathId: "model", executorId: "canyon", goal: "Keep protocol and Local API contracts explicit.", requires: "PrevMove", attempt: 1, status: "completed", session: { providerThreadId: "thread-model", providerTurnId: "turn-model" }, dependencyPathIds: [], dependencyOutputs: [], finalResponse: "Model path completed.", commit: "b10c0000", startedAt: new Date().toISOString(), completedAt: new Date().toISOString() },
+    { pathId: "model", executorId: "canyon", goal: "Keep protocol and Bridge API contracts explicit.", requires: "PrevMove", attempt: 1, status: "completed", session: { providerThreadId: "thread-model", providerTurnId: "turn-model" }, dependencyPathIds: [], dependencyOutputs: [], finalResponse: "Model path completed.", commit: "b10c0000", startedAt: new Date().toISOString(), completedAt: new Date().toISOString() },
     { pathId: "compose", executorId: "ruler", goal: "Assemble the Roadmap workspace without legacy CSS.", requires: ["design", "model"], attempt: 1, status: "executing", session: { providerThreadId: "thread-compose", providerTurnId: "turn-compose" }, dependencyPathIds: ["design", "model"], dependencyOutputs: [], startedAt: new Date().toISOString() }
   ],
   pathCommits: { PrevMove: "f00dbabe", design: "a11ce0000", model: "b10c0000" },
@@ -2489,7 +2489,7 @@ function move(id: string, fromNodeId: string, toNodeId: string, ordinal: number,
     ordinal,
     summary,
     commit: `${id.replace("_", "")}0000000000000000000000000000000000`,
-    evidence: ["Figma contract checked", "Local API contract preserved"],
+    evidence: ["Figma contract checked", "Bridge API contract preserved"],
     risks: [],
     recordedBy: "SYSTEM",
     recordedAt: new Date().toISOString(),

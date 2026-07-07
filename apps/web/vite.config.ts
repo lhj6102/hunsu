@@ -14,7 +14,7 @@ export default defineConfig({
     }
   },
   define: {
-    __HUNSU_LOCAL_API_BASE_URL__: JSON.stringify(hunsuWeb.browserLocalUrl ?? ""),
+    __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(hunsuWeb.browserBridgeUrl ?? ""),
     __HUNSU_HUB_API_BASE_URL__: JSON.stringify(hunsuWeb.browserHubApiUrl ?? "")
   },
   server: {

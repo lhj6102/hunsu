@@ -10,9 +10,10 @@ pnpm install
 pnpm run check
 ```
 
-For the local Studio launcher:
+For the Bridge Studio launcher:
 
 ```sh
+pnpm --filter @hunsu/bridge bridge --dry-run
 pnpm hunsu studio --dry-run
 pnpm hunsu studio --no-open
 ```
@@ -49,7 +50,7 @@ pnpm --filter @hunsu/web build
 
 Be especially careful when changing:
 
-- Hunsu Local HTTP routes, CORS, pairing tokens, or filesystem browsing
+- Hunsu Bridge HTTP routes, CORS, pairing tokens, or filesystem browsing
 - Artifact Action command execution
 - Git worktree creation or cleanup
 - provider runner permissions, sandbox mode, approval policy, or network access

@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { fetchHunsuDraftDiffArtifact, postArtifactActionRun, postHunsuDraftApprove, postHunsuDraftDiscard, postHunsuDraftMessage, postHunsuDraftStart, postRunAction } from "@/shared/api/localClient";
-import type { StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/localTypes";
+import { fetchHunsuDraftDiffArtifact, postArtifactActionRun, postHunsuDraftApprove, postHunsuDraftDiscard, postHunsuDraftMessage, postHunsuDraftStart, postRunAction } from "@/shared/api/bridgeClient";
+import type { StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
 import { useRoadmapWorkspace } from "@/shared/api/useStudioData";
 import { Button } from "@/shared/ui/button";
 import type { RoadmapActionModel, RoadmapDetailPanel, RoadmapSelection } from "@/shared/domain/roadmapViewModel";

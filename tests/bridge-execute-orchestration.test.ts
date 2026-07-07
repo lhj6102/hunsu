@@ -2,13 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { makePositiveInteger } from "../packages/protocol/src/index.ts";
 import type { BoardProjection, Destination, LineRecord, NodeRecord } from "../packages/protocol/src/index.ts";
-import type { ExecuteStepResult } from "../apps/local/src/execute/execute-model.ts";
-import { parseGoalEvaluation, parseExecutionPlan } from "../apps/local/src/execute/execution-plan.ts";
+import type { ExecuteStepResult } from "../apps/bridge/src/execute/execute-model.ts";
+import { parseGoalEvaluation, parseExecutionPlan } from "../apps/bridge/src/execute/execution-plan.ts";
 import {
   ensureTerminalOutput,
   planExecuteStart,
   planMaxAttemptsExceeded
-} from "../apps/local/src/execute/execute-workflow.ts";
+} from "../apps/bridge/src/execute/execute-workflow.ts";
 
 test("Execute orchestration parses closure-free ExecutionPlan format", () => {
   const execution = unwrap(parseExecutionPlan(JSON.stringify({

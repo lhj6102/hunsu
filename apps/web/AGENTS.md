@@ -3,7 +3,7 @@
 ## Boundary
 
 - `apps/web` is the React/Vite browser app for `/studio`, `/studio/roadmaps/:roadmapId`, `/hub`, and `/dev/handoffs/roadmap-v3`.
-- Keep Git, Codex execution, worktree mutation, and runtime persistence out of this app. Use Local API calls for runtime control.
+- Keep Git, Codex execution, worktree mutation, and runtime persistence out of this app. Use Bridge API calls for runtime control.
 - Do not inspect or edit `.hunsu/state.hunsu` from web code.
 
 ## Styling

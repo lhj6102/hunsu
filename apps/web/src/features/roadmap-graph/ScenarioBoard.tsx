@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 import { Badge } from "@/shared/ui/badge";
 import { figmaComponentNames } from "@/shared/design/figmaContracts";
 import { teamToneMap } from "@/shared/design/teamTone";
-import type { StudioRunState } from "@/shared/api/localTypes";
+import type { StudioRunState } from "@/shared/api/bridgeTypes";
 import { buildRoadmapViewModel, fallbackBoard, fallbackSkills, fallbackWorktree, type RoadmapViewModel } from "@/shared/domain/roadmapViewModel";
 import {
   componentMatrixNodes,

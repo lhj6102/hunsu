@@ -1,8 +1,8 @@
 {
   "name": "@hunsu/codex-runner",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
-  "description": "Codex app-server runner boundary for Hunsu Local.",
+  "description": "Codex app-server runner boundary for Hunsu Bridge.",
   "license": "Apache-2.0",
   "type": "module",
   "exports": {

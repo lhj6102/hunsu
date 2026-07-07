@@ -6,8 +6,8 @@ import {
   endpointUrl,
   resolveCodexAppServerConfig,
   resolveHunsuPorts,
-  resolveLocalApiServerConfig,
-  resolveLocalRuntimeConfig,
+  resolveBridgeApiServerConfig,
+  resolveBridgeRuntimeConfig,
   resolveStudioLauncherConfig,
   resolveStudioWebServerConfig,
   resolveValidatedHunsuPorts,
@@ -23,10 +23,10 @@ import {
 
 const ROOT = new URL("..", import.meta.url).pathname;
 
-test("Hunsu config resolves canonical local ports", () => {
+test("Hunsu config resolves canonical Bridge ports", () => {
   const ports = unwrapConfigResult(resolveHunsuPorts({}));
 
-  assert.equal(ports.localApi.port, 19687);
+  assert.equal(ports.bridgeApi.port, 19687);
   assert.equal(ports.studioWeb.port, 19688);
   assert.equal(ports.agentPreview.port, 19673);
   assert.equal(ports.agentPreview.reserved, true);
@@ -36,7 +36,7 @@ test("Studio web config keeps Hunsu services in the dedicated port block", () =>
   const config = unwrapConfigResult(resolveStudioWebServerConfig({}));
 
   assert.equal(config.web.port, 19688);
-  assert.equal(config.localApi.port, 19687);
+  assert.equal(config.bridgeApi.port, 19687);
   assert.equal(config.strictPort, true);
   assert.equal(config.apiProxyTarget, "http://127.0.0.1:19687");
   assert.equal(config.browserHubApiUrl, "http://127.0.0.1:8787");
@@ -47,8 +47,8 @@ test("Studio web config honors env overrides through one resolver", () => {
     HUNSU_WEB_HOST: "0.0.0.0",
     HUNSU_WEB_PORT: "29688",
     HUNSU_WEB_STRICT_PORT: "false",
-    HUNSU_LOCAL_PORT: "29687",
-    HUNSU_LOCAL_API_PROXY_TARGET: "http://127.0.0.1:29699"
+    HUNSU_BRIDGE_PORT: "29687",
+    HUNSU_BRIDGE_API_PROXY_TARGET: "http://127.0.0.1:29699"
   }));
 
   assert.equal(config.web.host, "0.0.0.0");
@@ -59,11 +59,11 @@ test("Studio web config honors env overrides through one resolver", () => {
 
 test("Studio web config validates browser URL and exposes it for Vite define", () => {
   const config = unwrapConfigResult(resolveStudioWebServerConfig({
-    VITE_HUNSU_LOCAL_URL: "http://127.0.0.1:19687/",
+    VITE_HUNSU_BRIDGE_URL: "http://127.0.0.1:19687/",
     VITE_HUNSU_HUB_API_URL: "https://hub.example.test/"
   }));
 
-  assert.equal(config.browserLocalUrl, "http://127.0.0.1:19687");
+  assert.equal(config.browserBridgeUrl, "http://127.0.0.1:19687");
   assert.equal(config.browserHubApiUrl, "https://hub.example.test");
   assert.equal(config.apiProxyTarget, "http://127.0.0.1:19687");
 
@@ -77,7 +77,7 @@ test("Studio web config validates browser URL and exposes it for Vite define", (
   }));
   assert.equal(hostedWithoutHub.browserHubApiUrl, undefined);
 
-  const invalid = resolveStudioWebServerConfig({ VITE_HUNSU_LOCAL_URL: "not a url" });
+  const invalid = resolveStudioWebServerConfig({ VITE_HUNSU_BRIDGE_URL: "not a url" });
   assert.equal(invalid.ok, false);
   if (!invalid.ok) {
     assert.equal(invalid.error.code, "invalid_url");
@@ -104,20 +104,20 @@ test("Hunsu config rejects active port conflicts", () => {
   const result = resolveValidatedHunsuPorts({
     HUNSU_WEB_PORT: "19687"
   }, {
-    activePortNames: ["localApi", "studioWeb"]
+    activePortNames: ["bridgeApi", "studioWeb"]
   });
 
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.equal(result.error.code, "port_conflict");
-    assert.match(result.error.message, /localApi and studioWeb/);
+    assert.match(result.error.message, /bridgeApi and studioWeb/);
   }
 });
 
 test("Hunsu config rejects invalid env values", () => {
-  const portResult = resolveLocalApiServerConfig({ HUNSU_LOCAL_PORT: "abc" });
+  const portResult = resolveBridgeApiServerConfig({ HUNSU_BRIDGE_PORT: "abc" });
   const booleanResult = resolveStudioWebServerConfig({ HUNSU_WEB_STRICT_PORT: "maybe" });
-  const enumResult = resolveLocalRuntimeConfig({ HUNSU_CODEX_SANDBOX_MODE: "root" });
+  const enumResult = resolveBridgeRuntimeConfig({ HUNSU_CODEX_SANDBOX_MODE: "root" });
   const jsonResult = resolveCodexAppServerConfig({ HUNSU_CODEX_APP_SERVER_ARGS: "[1]" });
   const missingResult = resolveCodexAppServerConfig({}, { command: "" });
 
@@ -143,7 +143,7 @@ test("Hunsu config rejects invalid env values", () => {
   }
 });
 
-test("endpointUrl formats local service endpoints", () => {
+test("endpointUrl formats Bridge service endpoints", () => {
   assert.equal(endpointUrl({ host: "127.0.0.1", port: 19688 }), "http://127.0.0.1:19688");
 });
 
@@ -154,8 +154,8 @@ test("Reserved agent preview port participates only when requested", () => {
   assert.equal(validateNoPortConflicts(ports, ["studioWeb", "agentPreview"]).ok, false);
 });
 
-test("Local runtime config resolves paths and Codex app-server settings at the app boundary", () => {
-  const config = unwrapConfigResult(resolveLocalRuntimeConfig({
+test("Bridge runtime config resolves paths and Codex app-server settings at the app boundary", () => {
+  const config = unwrapConfigResult(resolveBridgeRuntimeConfig({
     HUNSU_ROADMAP_REGISTRY_PATH: "roadmaps.json",
     HUNSU_ROUTE_WORKTREE_ROOT: "routes",
     HUNSU_ACTION_WORKTREE_ROOT: "actions",
@@ -167,13 +167,13 @@ test("Local runtime config resolves paths and Codex app-server settings at the a
     HUNSU_CODEX_NETWORK_ACCESS: "on",
     HUNSU_CODEX_ADDITIONAL_DIRECTORIES: "/opt/a, /opt/b"
   }, {
-    cwd: "/tmp/hunsu-local",
+    cwd: "/tmp/hunsu-bridge",
     homeDir: "/tmp/hunsu-home"
   }));
 
-  assert.equal(config.roadmapRegistryPath, "/tmp/hunsu-local/roadmaps.json");
-  assert.equal(config.routeWorktreeRoot, "/tmp/hunsu-local/routes");
-  assert.equal(config.actionWorktreeRoot, "/tmp/hunsu-local/actions");
+  assert.equal(config.roadmapRegistryPath, "/tmp/hunsu-bridge/roadmaps.json");
+  assert.equal(config.routeWorktreeRoot, "/tmp/hunsu-bridge/routes");
+  assert.equal(config.actionWorktreeRoot, "/tmp/hunsu-bridge/actions");
   assert.equal(config.codexAppServer.command, "codex-dev");
   assert.deepEqual(config.codexAppServer.args, ["app-server", "--stdio", "--debug"]);
   assert.equal(config.codexThreadOptions.sandboxMode, "workspace-write");
@@ -188,8 +188,8 @@ test("Local runtime config resolves paths and Codex app-server settings at the a
   assert.deepEqual(whitespaceArgs.args, ["app-server", "--stdio", "--debug"]);
 });
 
-test("Local runtime config keeps process env separate from Codex app-server env overrides", () => {
-  const config = unwrapConfigResult(resolveLocalRuntimeConfig({
+test("Bridge runtime config keeps process env separate from Codex app-server env overrides", () => {
+  const config = unwrapConfigResult(resolveBridgeRuntimeConfig({
     SHARED: "ambient",
     CODEX_HOME: "/ambient/codex"
   }, {

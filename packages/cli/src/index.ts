@@ -1,9 +1,7 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { currentProcessEnv, endpointUrl, resolveLocalRuntimeConfig, resolveStudioLauncherConfig, unwrapConfigResult } from "@hunsu/config";
 import {
   buildMoveCommitMessage,
   buildHunsuCommitMessage,
@@ -32,7 +30,7 @@ import {
   updateMainToMove,
   writeCommands
 } from "@hunsu/core";
-import { createLocalApiAuthToken, createStudioServer } from "@hunsu/local";
+import { startStudioBridge } from "@hunsu/bridge";
 import type { ArtifactActionRunInput, ArtifactActionRunPlan, ArtifactActionRunRecord, Board, HunsuEvent, HunsuPortPlan, MoveEvent, MoveEventStatus, RunTimeline } from "@hunsu/core";
 import { validateHarness } from "@hunsu/protocol";
 import type { BoardProjection, Command, DomainEvent, HarnessSnapshot, NodeRecord, Destination, DestinationSeedInput } from "@hunsu/protocol";
@@ -127,80 +125,13 @@ function initCommand(): void {
 }
 
 async function studioCommand(parsed: ParsedArgs): Promise<void> {
-  const cwd = getFlag(parsed, "cwd") ?? process.cwd();
-  const env = currentProcessEnv();
-  const runtimeConfig = unwrapConfigResult(resolveLocalRuntimeConfig(env, { cwd }));
-  const authToken = createLocalApiAuthToken();
-  const localApiUrl = endpointUrl(runtimeConfig.localApi);
-  const webUrl = resolveStudioWebUrl(parsed, env);
-  const pairingUrl = studioPairingUrl(webUrl, authToken);
-  const allowedOrigin = new URL(webUrl).origin;
-  const startInfo = {
-    localApiUrl,
-    studioUrl: pairingUrl,
-    allowedOrigin
-  };
-
-  if (hasFlag(parsed, "dry-run")) {
-    printStudioStartInfo(parsed, startInfo);
-    return;
-  }
-
-  const server = createStudioServer({
-    cwd,
-    runtimeConfig,
-    security: {
-      authToken,
-      allowedOrigins: [allowedOrigin]
-    }
+  await startStudioBridge({
+    cwd: getFlag(parsed, "cwd") ?? process.cwd(),
+    webUrl: getFlag(parsed, "web-url"),
+    noOpen: hasFlag(parsed, "no-open"),
+    dryRun: hasFlag(parsed, "dry-run"),
+    json: hasFlag(parsed, "json")
   });
-
-  await new Promise<void>((resolve, reject) => {
-    const shutdown = () => {
-      server.close(() => resolve());
-    };
-    server.once("error", reject);
-    server.listen(runtimeConfig.localApi.port, runtimeConfig.localApi.host, () => {
-      printStudioStartInfo(parsed, startInfo);
-      if (!hasFlag(parsed, "no-open")) {
-        openBrowser(pairingUrl);
-      }
-    });
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
-  });
-}
-
-function resolveStudioWebUrl(parsed: ParsedArgs, env: Record<string, string | undefined>): string {
-  const raw = getFlag(parsed, "web-url") ?? unwrapConfigResult(resolveStudioLauncherConfig(env)).webUrl;
-  try {
-    return new URL(raw).toString();
-  } catch (_error) {
-    throw new Error(`Invalid Studio web URL: ${raw}`);
-  }
-}
-
-function studioPairingUrl(webUrl: string, authToken: string): string {
-  const url = new URL(webUrl);
-  url.searchParams.set("hunsuLocalToken", authToken);
-  return url.toString();
-}
-
-function printStudioStartInfo(parsed: ParsedArgs, info: { localApiUrl: string; studioUrl: string; allowedOrigin: string }): void {
-  if (hasFlag(parsed, "json")) {
-    console.log(JSON.stringify(info, null, 2));
-    return;
-  }
-  console.log(`Hunsu Local: ${info.localApiUrl}`);
-  console.log(`Hunsu Studio: ${info.studioUrl}`);
-  console.log(`Allowed Studio origin: ${info.allowedOrigin}`);
-}
-
-function openBrowser(url: string): void {
-  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  const child = spawn(command, args, { detached: true, stdio: "ignore" });
-  child.unref();
 }
 
 function boardCommand(parsed: ParsedArgs): void {

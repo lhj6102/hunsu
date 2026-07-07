@@ -397,7 +397,7 @@ export function validateDraftRuntimeBundle(
     return domainStoreError(".hunsu-prev no longer matches the source runtime bundle");
   }
   if (stableJson(request.destinations.compatibility) !== stableJson(sourceRuntime.destinations.compatibility)) {
-    return domainStoreError(".hunsu-request/destinations.json compatibility is Local-owned and must not be edited");
+    return domainStoreError(".hunsu-request/destinations.json compatibility is Bridge-owned and must not be edited");
   }
   try {
     const requestRuntime = validateRuntimeState({

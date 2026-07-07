@@ -1,6 +1,6 @@
 {
   "name": "@hunsu/protocol",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "description": "Hunsu Roadmap, MOVE, HUNSU, and Artifact Action protocol types.",
   "license": "Apache-2.0",

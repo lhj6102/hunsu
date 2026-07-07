@@ -1,6 +1,6 @@
 {
   "name": "hunsu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "description": "Local-first Hunsu CLI and Studio launcher.",
   "license": "Apache-2.0",
@@ -35,7 +35,7 @@
   "dependencies": {
     "@hunsu/config": "workspace:*",
     "@hunsu/core": "workspace:*",
-    "@hunsu/local": "workspace:*",
+    "@hunsu/bridge": "workspace:*",
     "@hunsu/protocol": "workspace:*"
   }
 }

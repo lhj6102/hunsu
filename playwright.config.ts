@@ -4,11 +4,11 @@ import { join } from "node:path";
 
 const baseURL = process.env.HUNSU_E2E_BASE_URL ?? "http://127.0.0.1:19789";
 const baseUrl = new URL(baseURL);
-const localHost = process.env.HUNSU_LOCAL_HOST ?? "127.0.0.1";
-const localPort = parsePort(process.env.HUNSU_LOCAL_PORT, 19788);
+const bridgeHost = process.env.HUNSU_BRIDGE_HOST ?? "127.0.0.1";
+const bridgePort = parsePort(process.env.HUNSU_BRIDGE_PORT, 19788);
 const webHost = process.env.HUNSU_WEB_HOST ?? baseUrl.hostname;
 const webPort = parsePort(process.env.HUNSU_WEB_PORT ?? baseUrl.port, 19688);
-const localUrl = `http://${localHost}:${localPort}`;
+const bridgeUrl = `http://${bridgeHost}:${bridgePort}`;
 
 function parsePort(value: string | undefined, fallback: number): number {
   const parsed = value ? Number.parseInt(value, 10) : fallback;
@@ -37,17 +37,17 @@ export default defineConfig({
   },
   webServer: [
     {
-      name: "hunsu-local",
-      command: "pnpm --filter @hunsu/local dev",
-      port: localPort,
+      name: "hunsu-bridge",
+      command: "pnpm --filter @hunsu/bridge dev",
+      port: bridgePort,
       timeout: 120 * 1000,
       reuseExistingServer: !process.env.CI,
       gracefulShutdown: { signal: "SIGINT", timeout: 1_000 },
       env: envWith({
-        HUNSU_LOCAL_HOST: localHost,
-        HUNSU_LOCAL_PORT: String(localPort),
-        HUNSU_LOCAL_TEST_RUNNER: process.env.HUNSU_LOCAL_TEST_RUNNER ?? "deterministic",
-        HUNSU_ROADMAP_REGISTRY_PATH: process.env.HUNSU_ROADMAP_REGISTRY_PATH ?? join(tmpdir(), `hunsu-e2e-roadmaps-${localPort}.json`)
+        HUNSU_BRIDGE_HOST: bridgeHost,
+        HUNSU_BRIDGE_PORT: String(bridgePort),
+        HUNSU_BRIDGE_TEST_RUNNER: process.env.HUNSU_BRIDGE_TEST_RUNNER ?? "deterministic",
+        HUNSU_ROADMAP_REGISTRY_PATH: process.env.HUNSU_ROADMAP_REGISTRY_PATH ?? join(tmpdir(), `hunsu-e2e-roadmaps-${bridgePort}.json`)
       })
     },
     {
@@ -58,12 +58,12 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       gracefulShutdown: { signal: "SIGINT", timeout: 1_000 },
       env: envWith({
-        HUNSU_LOCAL_HOST: localHost,
-        HUNSU_LOCAL_PORT: String(localPort),
+        HUNSU_BRIDGE_HOST: bridgeHost,
+        HUNSU_BRIDGE_PORT: String(bridgePort),
         HUNSU_WEB_HOST: webHost,
         HUNSU_WEB_PORT: String(webPort),
-        VITE_HUNSU_LOCAL_URL: process.env.VITE_HUNSU_LOCAL_URL ?? localUrl,
-        HUNSU_LOCAL_API_PROXY_TARGET: process.env.HUNSU_LOCAL_API_PROXY_TARGET ?? localUrl
+        VITE_HUNSU_BRIDGE_URL: process.env.VITE_HUNSU_BRIDGE_URL ?? bridgeUrl,
+        HUNSU_BRIDGE_API_PROXY_TARGET: process.env.HUNSU_BRIDGE_API_PROXY_TARGET ?? bridgeUrl
       })
     }
   ],

@@ -16,7 +16,7 @@ export type HunsuConfigError = {
   allowed?: readonly string[];
 };
 
-export type HunsuPortName = "localApi" | "studioWeb" | "agentPreview";
+export type HunsuPortName = "bridgeApi" | "studioWeb" | "agentPreview";
 
 export type HunsuEndpoint = {
   name: HunsuPortName;
@@ -50,10 +50,10 @@ export type HunsuPortValidationOptions = {
 
 export type StudioWebServerConfig = {
   web: HunsuEndpoint;
-  localApi: HunsuEndpoint;
+  bridgeApi: HunsuEndpoint;
   strictPort: boolean;
   apiProxyTarget: string;
-  browserLocalUrl?: string;
+  browserBridgeUrl?: string;
   browserHubApiUrl?: string;
 };
 
@@ -61,8 +61,8 @@ export type StudioLauncherConfig = {
   webUrl: string;
 };
 
-export type LocalApiServerConfig = {
-  localApi: HunsuEndpoint;
+export type BridgeApiServerConfig = {
+  bridgeApi: HunsuEndpoint;
 };
 
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
@@ -83,8 +83,8 @@ export type CodexAppServerConfig = {
   environment: Record<string, string>;
 };
 
-export type LocalRuntimeConfig = {
-  localApi: HunsuEndpoint;
+export type BridgeRuntimeConfig = {
+  bridgeApi: HunsuEndpoint;
   processEnv: Record<string, string>;
   roadmapRegistryPath: string;
   routeWorktreeRoot?: string;
@@ -94,7 +94,7 @@ export type LocalRuntimeConfig = {
   codexThreadOptions: CodexThreadOptionsConfig;
 };
 
-export type LocalRuntimeConfigOptions = {
+export type BridgeRuntimeConfigOptions = {
   cwd?: string;
   homeDir?: string;
   processEnv?: Env;
@@ -120,12 +120,12 @@ const DEFAULT_LOCAL_HUB_API_URL = "http://127.0.0.1:8787";
 const DEFAULT_STUDIO_WEB_URL = "https://hunsu.app/studio";
 
 export const HUNSU_PORT_SPECS: Record<HunsuPortName, PortSpec> = {
-  localApi: {
-    name: "localApi",
+  bridgeApi: {
+    name: "bridgeApi",
     defaultHost: DEFAULT_HOST,
-    hostEnv: ["HUNSU_LOCAL_HOST", "HOST"],
+    hostEnv: ["HUNSU_BRIDGE_HOST", "HOST"],
     defaultPort: 19687,
-    portEnv: ["HUNSU_LOCAL_PORT", "PORT"],
+    portEnv: ["HUNSU_BRIDGE_PORT", "PORT"],
     reserved: false,
     allowPortZero: false
   },
@@ -149,12 +149,12 @@ export const HUNSU_PORT_SPECS: Record<HunsuPortName, PortSpec> = {
   }
 };
 
-export const HUNSU_ACTIVE_SERVICE_PORTS = ["localApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
-export const HUNSU_STUDIO_WEB_ACTIVE_PORTS = ["localApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
+export const HUNSU_ACTIVE_SERVICE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
+export const HUNSU_STUDIO_WEB_ACTIVE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
 const CODEX_SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
 const CODEX_APPROVAL_POLICIES = ["never", "on-request", "on-failure", "untrusted"] as const;
 const CODEX_APPROVALS_REVIEWERS = ["user", "auto_review"] as const;
-const LOCAL_TEST_RUNNERS = ["deterministic"] as const;
+const BRIDGE_TEST_RUNNERS = ["deterministic"] as const;
 
 export function ok<T>(value: T): ConfigResult<T> {
   return { ok: true, value };
@@ -180,9 +180,9 @@ export function unwrapConfigResult<T>(result: ConfigResult<T>): T {
 }
 
 export function resolveHunsuPorts(env: Env, options: HunsuPortResolveOptions = {}): ConfigResult<HunsuPortConfig> {
-  const localApi = resolveEndpoint(HUNSU_PORT_SPECS.localApi, env, options.overrides?.localApi);
-  if (!localApi.ok) {
-    return localApi;
+  const bridgeApi = resolveEndpoint(HUNSU_PORT_SPECS.bridgeApi, env, options.overrides?.bridgeApi);
+  if (!bridgeApi.ok) {
+    return bridgeApi;
   }
 
   const studioWeb = resolveEndpoint(HUNSU_PORT_SPECS.studioWeb, env, options.overrides?.studioWeb);
@@ -196,7 +196,7 @@ export function resolveHunsuPorts(env: Env, options: HunsuPortResolveOptions = {
   }
 
   return ok({
-    localApi: localApi.value,
+    bridgeApi: bridgeApi.value,
     studioWeb: studioWeb.value,
     agentPreview: agentPreview.value
   });
@@ -210,14 +210,14 @@ export function resolveStudioWebServerConfig(env: Env): ConfigResult<StudioWebSe
   return flatMapConfigResult(
     resolveValidatedHunsuPorts(env, { activePortNames: HUNSU_STUDIO_WEB_ACTIVE_PORTS }),
     ports => flatMapConfigResult(readConfigBoolean(env, "HUNSU_WEB_STRICT_PORT", true), strictPort =>
-      flatMapConfigResult(readOptionalUrl(env, "VITE_HUNSU_LOCAL_URL"), browserLocalUrl =>
+      flatMapConfigResult(readOptionalUrl(env, "VITE_HUNSU_BRIDGE_URL"), browserBridgeUrl =>
         flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_HUB_API_URL", "HUNSU_HUB_PUBLIC_API_URL"], defaultBrowserHubApiUrl(env)), browserHubApiUrl =>
-          mapConfigResult(readFirstUrl(env, ["HUNSU_LOCAL_API_PROXY_TARGET"], browserLocalUrl ?? endpointUrl(ports.localApi)), apiProxyTarget => ({
+          mapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_API_PROXY_TARGET"], browserBridgeUrl ?? endpointUrl(ports.bridgeApi)), apiProxyTarget => ({
             web: ports.studioWeb,
-            localApi: ports.localApi,
+            bridgeApi: ports.bridgeApi,
             strictPort,
             apiProxyTarget,
-            browserLocalUrl,
+            browserBridgeUrl,
             browserHubApiUrl
           }))
         )
@@ -242,16 +242,16 @@ function defaultBrowserHubApiUrl(env: Env): string | undefined {
   return undefined;
 }
 
-export function resolveLocalApiServerConfig(env: Env): ConfigResult<LocalApiServerConfig> {
+export function resolveBridgeApiServerConfig(env: Env): ConfigResult<BridgeApiServerConfig> {
   return mapConfigResult(
-    resolveValidatedHunsuPorts(env, { activePortNames: ["localApi"] }),
-    ports => ({ localApi: ports.localApi })
+    resolveValidatedHunsuPorts(env, { activePortNames: ["bridgeApi"] }),
+    ports => ({ bridgeApi: ports.bridgeApi })
   );
 }
 
-export function resolveLocalRuntimeConfig(env: Env, options: LocalRuntimeConfigOptions = {}): ConfigResult<LocalRuntimeConfig> {
+export function resolveBridgeRuntimeConfig(env: Env, options: BridgeRuntimeConfigOptions = {}): ConfigResult<BridgeRuntimeConfig> {
   const processEnv = filterEnv(options.processEnv ?? env);
-  return flatMapConfigResult(resolveLocalApiServerConfig(env), ({ localApi }) =>
+  return flatMapConfigResult(resolveBridgeApiServerConfig(env), ({ bridgeApi }) =>
     flatMapConfigResult(resolveRequiredConfiguredPath(
       options.roadmapRegistryPath,
       env,
@@ -261,10 +261,10 @@ export function resolveLocalRuntimeConfig(env: Env, options: LocalRuntimeConfigO
     ), roadmapRegistryPath =>
       flatMapConfigResult(resolveConfiguredPath(options.routeWorktreeRoot, env, "HUNSU_ROUTE_WORKTREE_ROOT", undefined, options.cwd), routeWorktreeRoot =>
         flatMapConfigResult(resolveConfiguredPath(options.actionWorktreeRoot, env, "HUNSU_ACTION_WORKTREE_ROOT", undefined, options.cwd), actionWorktreeRoot =>
-          flatMapConfigResult(readOptionalEnum(env, "HUNSU_LOCAL_TEST_RUNNER", LOCAL_TEST_RUNNERS), testRunner =>
+          flatMapConfigResult(readOptionalEnum(env, "HUNSU_BRIDGE_TEST_RUNNER", BRIDGE_TEST_RUNNERS), testRunner =>
             flatMapConfigResult(resolveCodexAppServerConfig(env, options.codexAppServer), codexAppServer =>
               mapConfigResult(resolveCodexThreadOptions(env, options.codexThreadOptions), codexThreadOptions => ({
-                localApi,
+                bridgeApi,
                 processEnv,
                 roadmapRegistryPath,
                 routeWorktreeRoot,
@@ -347,7 +347,7 @@ export function readConfigPath(env: Env, envName: string, fallback: string, cwd?
   return validatePath(raw === undefined || raw.trim() === "" ? fallback : raw, envName, cwd);
 }
 
-export function resolveCodexAppServerConfig(env: Env, overrides: LocalRuntimeConfigOptions["codexAppServer"] = {}): ConfigResult<CodexAppServerConfig> {
+export function resolveCodexAppServerConfig(env: Env, overrides: BridgeRuntimeConfigOptions["codexAppServer"] = {}): ConfigResult<CodexAppServerConfig> {
   const command = overrides.command ?? firstNonEmpty(env, ["HUNSU_CODEX_APP_SERVER_COMMAND"])?.value ?? "codex";
   if (command.trim() === "") {
     return err({

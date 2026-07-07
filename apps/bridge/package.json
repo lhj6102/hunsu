@@ -1,10 +1,13 @@
 {
-  "name": "@hunsu/local",
-  "version": "0.1.0",
+  "name": "@hunsu/bridge",
+  "version": "0.1.1",
   "private": false,
-  "description": "Hunsu localhost runtime and Studio API server.",
+  "description": "Hunsu Bridge localhost runtime and Studio API server.",
   "license": "Apache-2.0",
   "type": "module",
+  "bin": {
+    "hunsu-bridge": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "development": "./src/index.ts",
@@ -25,6 +28,7 @@
   },
   "scripts": {
     "dev": "node --watch src/index.ts",
+    "bridge": "node --conditions=development src/cli.ts",
     "build": "tsc -p tsconfig.build.json",
     "prepack": "pnpm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit"

@@ -53,7 +53,7 @@ switch (command) {
     break;
   case "db:migrate:remote":
     writeGeneratedConfig();
-    runWrangler(["--config", configPath, "d1", "migrations", "apply", config.d1DatabaseName, ...extraArgs]);
+    runWrangler(["--config", configPath, "d1", "migrations", "apply", config.d1DatabaseName, "--remote", ...extraArgs]);
     break;
   default:
     console.error(`Unknown hub-api Cloudflare config command: ${command}`);

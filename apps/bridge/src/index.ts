@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { Buffer } from "node:buffer";
@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, normalize, relative, resolve } fro
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createDefaultCodexRunner, GOAL_EVALUATION_SCHEMA, type CodexProviderStatus, type TeamRunEvent, type HunsuDraftConversationMessage, type HunsuDraftSessionInput, type HunsuDraftSourceSnapshot, type HunsuDraftTurnInput, type JsonRpcMessage, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerAppServerCommandAction, type RunnerAppServerItem, type RunnerRun, type StartRunInput } from "@hunsu/codex-runner";
-import { endpointUrl, resolveLocalRuntimeConfig, unwrapConfigResult, type LocalRuntimeConfig } from "@hunsu/config";
+import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
 import {
   createFinalizedMoveCommit,
   createMoveCommitFromWorktree,
@@ -197,9 +197,9 @@ const FILESYSTEM_CAPABILITY_TTL_MS = 15 * 60 * 1000;
 const MOVE_FILE_TEXT_MAX_BYTES = 256 * 1024;
 const queuedRunUpdates = new WeakMap<StudioServerState, Map<string, ReturnType<typeof setTimeout>>>();
 const responseSecurityHeaders = new WeakMap<object, Record<string, string>>();
-const LOCAL_API_TOKEN_QUERY_PARAM = "hunsuLocalToken";
-const LOCAL_API_TOKEN_HEADER = "x-hunsu-local-token";
-const DEFAULT_LOCAL_STUDIO_ORIGINS = [
+const BRIDGE_API_TOKEN_QUERY_PARAM = "hunsuBridgeToken";
+const BRIDGE_API_TOKEN_HEADER = "x-hunsu-bridge-token";
+const DEFAULT_BRIDGE_STUDIO_ORIGINS = [
   "http://127.0.0.1:19688",
   "http://localhost:19688"
 ];
@@ -580,7 +580,7 @@ export type StudioServerOptions = {
   actionRunner?: ArtifactActionCommandRunner;
   apmSkillRegistryClient?: ApmSkillRegistryClient;
   roadmapRegistryPath?: string;
-  runtimeConfig?: LocalRuntimeConfig;
+  runtimeConfig?: BridgeRuntimeConfig;
   security?: StudioServerSecurityOptions;
 };
 
@@ -1060,16 +1060,110 @@ export function createStudioState(events: DomainEvent[] = []): StudioServerState
   return { events, runs: {}, agentSessions: {}, hunsuDrafts: {}, hunsuDraftArtifacts: {}, filesystemCapabilities: {}, liveSubscribers: new Set(), agentSessionSubscribers: new Set() };
 }
 
-export function createLocalApiAuthToken(): string {
-  return `hunsu_local_${randomBytes(24).toString("base64url")}`;
+export function createBridgeApiAuthToken(): string {
+  return `hunsu_bridge_${randomBytes(24).toString("base64url")}`;
 }
 
-function createStudioServerSecurity(options: StudioServerSecurityOptions | undefined, runtimeConfig: LocalRuntimeConfig): StudioServerSecurity {
+export type StudioBridgeStartOptions = {
+  cwd?: string;
+  webUrl?: string;
+  noOpen?: boolean;
+  dryRun?: boolean;
+  json?: boolean;
+  env?: Record<string, string | undefined>;
+};
+
+export type StudioBridgeStartInfo = {
+  bridgeApiUrl: string;
+  studioUrl: string;
+  allowedOrigin: string;
+};
+
+export async function startStudioBridge(options: StudioBridgeStartOptions = {}): Promise<StudioBridgeStartInfo> {
+  const cwd = options.cwd ?? process.cwd();
+  const env = options.env ?? currentProcessEnv();
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig(env, { cwd }));
+  const authToken = createBridgeApiAuthToken();
+  const bridgeApiUrl = endpointUrl(runtimeConfig.bridgeApi);
+  const webUrl = resolveStudioBridgeWebUrl(options.webUrl, env);
+  const studioUrl = studioBridgePairingUrl(webUrl, authToken);
+  const allowedOrigin = new URL(webUrl).origin;
+  const startInfo = {
+    bridgeApiUrl,
+    studioUrl,
+    allowedOrigin
+  };
+
+  if (options.dryRun) {
+    printStudioBridgeStartInfo(startInfo, options);
+    return startInfo;
+  }
+
+  const server = createStudioServer({
+    cwd,
+    runtimeConfig,
+    security: {
+      authToken,
+      allowedOrigins: [allowedOrigin]
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const shutdown = () => {
+      server.close(() => resolve());
+    };
+    server.once("error", reject);
+    server.listen(runtimeConfig.bridgeApi.port, runtimeConfig.bridgeApi.host, () => {
+      printStudioBridgeStartInfo(startInfo, options);
+      if (!options.noOpen) {
+        openStudioBridgeBrowser(studioUrl);
+      }
+    });
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+
+  return startInfo;
+}
+
+function resolveStudioBridgeWebUrl(webUrl: string | undefined, env: Record<string, string | undefined>): string {
+  const raw = webUrl ?? unwrapConfigResult(resolveStudioLauncherConfig(env)).webUrl;
+  try {
+    return new URL(raw).toString();
+  } catch (_error) {
+    throw new Error(`Invalid Studio web URL: ${raw}`);
+  }
+}
+
+function studioBridgePairingUrl(webUrl: string, authToken: string): string {
+  const url = new URL(webUrl);
+  url.searchParams.set(BRIDGE_API_TOKEN_QUERY_PARAM, authToken);
+  return url.toString();
+}
+
+function printStudioBridgeStartInfo(info: StudioBridgeStartInfo, options: Pick<StudioBridgeStartOptions, "json">): void {
+  if (options.json) {
+    console.log(JSON.stringify(info, null, 2));
+    return;
+  }
+  console.log(`Hunsu Bridge: ${info.bridgeApiUrl}`);
+  console.log(`Hunsu Studio: ${info.studioUrl}`);
+  console.log(`Allowed Studio origin: ${info.allowedOrigin}`);
+}
+
+function openStudioBridgeBrowser(url: string): void {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  child.unref();
+}
+
+function createStudioServerSecurity(options: StudioServerSecurityOptions | undefined, runtimeConfig: BridgeRuntimeConfig): StudioServerSecurity {
   return {
     authToken: nonEmptyString(options?.authToken),
     allowedOrigins: uniqueStrings([
-      ...DEFAULT_LOCAL_STUDIO_ORIGINS,
-      ...localStudioOriginsFromEnv(runtimeConfig.processEnv),
+      ...DEFAULT_BRIDGE_STUDIO_ORIGINS,
+      ...bridgeStudioOriginsFromEnv(runtimeConfig.processEnv),
       ...(options?.allowedOrigins ?? [])
     ].map(normalizeOrigin).filter((origin): origin is string => origin !== undefined)),
     allowNoOrigin: options?.allowNoOrigin ?? true
@@ -1083,7 +1177,7 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
     return {
       allowed: false,
       status: 403,
-      error: `Origin is not allowed for Hunsu Local: ${origin}`,
+      error: `Origin is not allowed for Hunsu Bridge: ${origin}`,
       corsHeaders: baseCorsHeaders()
     };
   }
@@ -1096,11 +1190,11 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
     };
   }
   const headers = corsHeaders ?? baseCorsHeaders();
-  if (security.authToken && !isPublicLocalRequest(url) && !hasValidLocalApiToken(request, url, security.authToken)) {
+  if (security.authToken && !isPublicBridgeRequest(url) && !hasValidBridgeApiToken(request, url, security.authToken)) {
     return {
       allowed: false,
       status: 401,
-      error: "Missing or invalid Hunsu Local pairing token.",
+      error: "Missing or invalid Hunsu Bridge pairing token.",
       corsHeaders: headers
     };
   }
@@ -1110,7 +1204,7 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
 function baseCorsHeaders(): Record<string, string> {
   return {
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": `authorization,content-type,${LOCAL_API_TOKEN_HEADER}`,
+    "access-control-allow-headers": `authorization,content-type,${BRIDGE_API_TOKEN_HEADER}`,
     "vary": "origin"
   };
 }
@@ -1129,15 +1223,15 @@ function corsHeadersForOrigin(origin: string | undefined, security: StudioServer
   };
 }
 
-function isPublicLocalRequest(url: URL): boolean {
+function isPublicBridgeRequest(url: URL): boolean {
   return url.pathname === "/health";
 }
 
-function hasValidLocalApiToken(request: IncomingMessage, url: URL, expected: string): boolean {
+function hasValidBridgeApiToken(request: IncomingMessage, url: URL, expected: string): boolean {
   const authorization = requestHeader(request, "authorization");
   const bearerToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  const headerToken = requestHeader(request, LOCAL_API_TOKEN_HEADER);
-  const queryToken = url.searchParams.get(LOCAL_API_TOKEN_QUERY_PARAM) ?? undefined;
+  const headerToken = requestHeader(request, BRIDGE_API_TOKEN_HEADER);
+  const queryToken = url.searchParams.get(BRIDGE_API_TOKEN_QUERY_PARAM) ?? undefined;
   return [bearerToken, headerToken, queryToken].some(token => token !== undefined && safeTokenEquals(token, expected));
 }
 
@@ -1156,11 +1250,11 @@ function requestHeader(request: IncomingMessage, name: string): string | undefin
   return raw;
 }
 
-function localStudioOriginsFromEnv(env: Record<string, string | undefined>): string[] {
+function bridgeStudioOriginsFromEnv(env: Record<string, string | undefined>): string[] {
   const port = nonEmptyString(env.HUNSU_WEB_PORT);
   const host = nonEmptyString(env.HUNSU_WEB_HOST);
   return [
-    ...commaSeparatedOrigins(env.HUNSU_LOCAL_ALLOWED_ORIGINS),
+    ...commaSeparatedOrigins(env.HUNSU_BRIDGE_ALLOWED_ORIGINS),
     port ? `http://127.0.0.1:${port}` : undefined,
     port ? `http://localhost:${port}` : undefined,
     host && port && !isWildcardHost(host) ? `http://${host}:${port}` : undefined
@@ -1195,7 +1289,7 @@ function isWildcardHost(host: string): boolean {
   return host === "0.0.0.0" || host === "::" || host === "[::]";
 }
 
-function createConfiguredRunner(runtimeConfig: LocalRuntimeConfig): Runner {
+function createConfiguredRunner(runtimeConfig: BridgeRuntimeConfig): Runner {
   if (runtimeConfig.testRunner === "deterministic") {
     return new DeterministicLocalTestRunner();
   }
@@ -1593,7 +1687,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
   const state = options.state ?? createStudioState();
   const persist = options.persist ?? true;
   let repositoryPath = options.cwd ?? APP_WORKSPACE_ROOT;
-  const runtimeConfig = options.runtimeConfig ?? unwrapConfigResult(resolveLocalRuntimeConfig(process.env, {
+  const runtimeConfig = options.runtimeConfig ?? unwrapConfigResult(resolveBridgeRuntimeConfig(process.env, {
     cwd: repositoryPath,
     roadmapRegistryPath: options.roadmapRegistryPath
   }));
@@ -1613,12 +1707,12 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
       if (!requestSecurity.allowed) {
-        sendJson(response, requestSecurity.status ?? 403, { error: requestSecurity.error ?? "Local API request is not allowed." });
+        sendJson(response, requestSecurity.status ?? 403, { error: requestSecurity.error ?? "Bridge API request is not allowed." });
         return;
       }
 
       if (request.method === "GET" && pathname === "/health") {
-        sendJson(response, 200, { ok: true, service: "hunsu-local" });
+        sendJson(response, 200, { ok: true, service: "hunsu-bridge" });
         return;
       }
 
@@ -1702,8 +1796,8 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           actionRunner,
           apmSkillRegistryClient: options.apmSkillRegistryClient,
           roadmapRegistryPath,
-          localApiBaseUrl: endpointUrl(runtimeConfig.localApi),
-          localApiAuthToken: security.authToken,
+          bridgeApiBaseUrl: endpointUrl(runtimeConfig.bridgeApi),
+          bridgeApiAuthToken: security.authToken,
           routeWorktreeRoot: runtimeConfig.routeWorktreeRoot,
           actionAmbientEnv: runtimeConfig.processEnv,
           actionProcessEnv: runtimeConfig.processEnv,
@@ -1931,8 +2025,8 @@ type ScopedRoadmapOptions = {
   actionRunner?: ArtifactActionCommandRunner;
   apmSkillRegistryClient?: ApmSkillRegistryClient;
   roadmapRegistryPath?: string;
-  localApiBaseUrl?: string;
-  localApiAuthToken?: string;
+  bridgeApiBaseUrl?: string;
+  bridgeApiAuthToken?: string;
   routeWorktreeRoot?: string;
   actionAmbientEnv?: Record<string, string | undefined>;
   actionProcessEnv?: Record<string, string | undefined>;
@@ -2026,8 +2120,8 @@ async function handleRoadmapApiRequest(
       persist,
       roadmapId,
       runner: options.runner,
-      localApiBaseUrl: options.localApiBaseUrl ?? defaultLocalApiBaseUrl(cwd),
-      localApiAuthToken: options.localApiAuthToken,
+      bridgeApiBaseUrl: options.bridgeApiBaseUrl ?? defaultBridgeApiBaseUrl(cwd),
+      bridgeApiAuthToken: options.bridgeApiAuthToken,
       apmSkillRegistryClient: options.apmSkillRegistryClient,
       routeWorktreeRoot: options.routeWorktreeRoot
     });
@@ -2229,14 +2323,14 @@ type HunsuDraftApiOptions = {
   persist: boolean;
   roadmapId: string;
   runner: Runner;
-  localApiBaseUrl: string;
-  localApiAuthToken?: string;
+  bridgeApiBaseUrl: string;
+  bridgeApiAuthToken?: string;
   apmSkillRegistryClient?: ApmSkillRegistryClient;
   routeWorktreeRoot?: string;
 };
 
-function defaultLocalApiBaseUrl(cwd: string): string {
-  return endpointUrl(unwrapConfigResult(resolveLocalRuntimeConfig(process.env, { cwd })).localApi);
+function defaultBridgeApiBaseUrl(cwd: string): string {
+  return endpointUrl(unwrapConfigResult(resolveBridgeRuntimeConfig(process.env, { cwd })).bridgeApi);
 }
 
 async function handleHunsuDraftApiRequest(
@@ -2719,10 +2813,10 @@ function writeReadableJson(path: string, value: unknown): void {
 }
 
 function hunsuDraftCheckCommand(draft: StudioHunsuDraftSession, options: HunsuDraftApiOptions): string {
-  const url = `${options.localApiBaseUrl}/api/roadmaps/${encodeURIComponent(options.roadmapId)}/hunsu/drafts/${encodeURIComponent(draft.draftSessionId)}/diff-artifacts?response=${HUNSU_DRAFT_CHECK_COMMAND_RESPONSE}`;
+  const url = `${options.bridgeApiBaseUrl}/api/roadmaps/${encodeURIComponent(options.roadmapId)}/hunsu/drafts/${encodeURIComponent(draft.draftSessionId)}/diff-artifacts?response=${HUNSU_DRAFT_CHECK_COMMAND_RESPONSE}`;
   const headers: Record<string, string> = { "content-type": "application/json" };
-  if (options.localApiAuthToken) {
-    headers.authorization = `Bearer ${options.localApiAuthToken}`;
+  if (options.bridgeApiAuthToken) {
+    headers.authorization = `Bearer ${options.bridgeApiAuthToken}`;
   }
   const script = [
     `const url = ${JSON.stringify(url)};`,
@@ -8781,7 +8875,7 @@ function writeCodexEnvironmentConfig(
   ].sort((left, right) => left.id.localeCompare(right.id));
   const lines = [
     HUNSU_CODEX_ENV_CONFIG_MARKER,
-    "# Generated by Hunsu Local for a Route worktree. Do not edit by hand.",
+    "# Generated by Hunsu Bridge for a Route worktree. Do not edit by hand.",
     ""
   ];
   for (const entry of skillEntries) {
@@ -9587,10 +9681,5 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
-  const runtimeConfig = unwrapConfigResult(resolveLocalRuntimeConfig(process.env, { cwd: APP_WORKSPACE_ROOT }));
-  const authToken = createLocalApiAuthToken();
-  createStudioServer({ cwd: APP_WORKSPACE_ROOT, runtimeConfig, security: { authToken } }).listen(runtimeConfig.localApi.port, runtimeConfig.localApi.host, () => {
-    console.log(`Hunsu Local listening on http://${runtimeConfig.localApi.host}:${runtimeConfig.localApi.port}`);
-    console.log(`Hunsu Local pairing token: ${authToken}`);
-  });
+  await startStudioBridge({ cwd: APP_WORKSPACE_ROOT, noOpen: true });
 }

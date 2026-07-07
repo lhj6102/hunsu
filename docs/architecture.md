@@ -1,11 +1,11 @@
 # Architecture
 
-Hunsu is split into Hunsu Web, Hunsu Local, Cloudflare Hub API, and Git-backed
+Hunsu is split into Hunsu Web, Hunsu Bridge, Cloudflare Hub API, and Git-backed
 protocol packages.
 
 ```text
 Hunsu Web
-  -> Hunsu Local
+  -> Hunsu Bridge
     -> Protocol package
     -> Core Git store
     -> Codex runner
@@ -38,7 +38,7 @@ Hunsu Web owns the human workflow:
 - HUNSU Draft request-file checks and confirmation.
 - Skill Draft review.
 
-The web app never writes Git directly. `/studio` calls Hunsu Local for local
+The web app never writes Git directly. `/studio` calls Hunsu Bridge for local
 runtime control. `/hub` calls the hosted Hub API Worker for Team, Member,
 Manager, Skill, and Plugin requirement discovery.
 
@@ -54,9 +54,9 @@ The active Roadmap must be derived from the URL:
 React state may cache loaded projections, selected nodes, or panel state, but
 it must not be the source of truth for which repository is open.
 
-## Hunsu Local
+## Hunsu Bridge
 
-Hunsu Local owns local orchestration:
+Hunsu Bridge owns local orchestration:
 
 - repository path resolution
 - Roadmap Registry registration
@@ -72,15 +72,15 @@ Hunsu Local owns local orchestration:
 - HUNSU Draft confirmation
 - Git-backed event writes
 
-Local is the boundary that keeps the Team focused. The Team receives a
-prepared worktree and a narrow objective. Recording outcomes remains a Local
+Bridge is the boundary that keeps the Team focused. The Team receives a
+prepared worktree and a narrow objective. Recording outcomes remains a Bridge
 responsibility.
 
-Local is also the authority for mapping `roadmapId` to a canonical local
+Bridge is also the authority for mapping `roadmapId` to a canonical local
 repository path. Browser routes should never have to parse raw filesystem paths
 as nested SPA routes.
 
-Local is the authority for mapping an Artifact Action alias to the concrete
+Bridge is the authority for mapping an Artifact Action alias to the concrete
 runtime endpoint for a MOVE or commit. Browser routes and E2E tests should use
 alias URLs, not host port numbers.
 
@@ -94,7 +94,7 @@ Cloudflare Hub API owns hosted reusable package storage:
 - R2 blobs for immutable manifests and Skill/package files.
 - future authentication and transport policies.
 
-Local resolves committed `origin/key/version/integrity` locks through Origin
+Bridge resolves committed `origin/key/version/integrity` locks through Origin
 endpoints. Hub UX can help users create or publish those versions, but runtime
 execution depends on the committed lock rather than ambient Hub state.
 
@@ -159,7 +159,7 @@ The Codex runner owns provider-specific execution:
 - passing the Team planning structured output schema
 
 The runner does not own the Roadmap. It returns execution output and events to
-Hunsu Local.
+Hunsu Bridge.
 
 ## Execute Flow
 
@@ -284,12 +284,12 @@ fallbacks, but alias routing remains the Studio-facing abstraction.
 ```text
 select MOVE
   -> start Hunsu Draft
-  -> Local creates a Draft Route worktree and AgentSession(owner=HunsuDraft)
-  -> Local registers the source Harness snapshot in a content-addressed Draft artifact cache
-  -> Local resolves the selected Manager lock or built-in default Manager
-  -> Local records the Manager snapshot and optional lock in .hunsu/hunsu-draft.hunsu
-  -> Local materializes only that Manager's Skills and Plugins in the Draft worktree
-  -> Local decodes the source runtime into .hunsu-prev/*.json and .hunsu-request/*.json
+  -> Bridge creates a Draft Route worktree and AgentSession(owner=HunsuDraft)
+  -> Bridge registers the source Harness snapshot in a content-addressed Draft artifact cache
+  -> Bridge resolves the selected Manager lock or built-in default Manager
+  -> Bridge records the Manager snapshot and optional lock in .hunsu/hunsu-draft.hunsu
+  -> Bridge materializes only that Manager's Skills and Plugins in the Draft worktree
+  -> Bridge decodes the source runtime into .hunsu-prev/*.json and .hunsu-request/*.json
   -> Studio displays a compact HunsuDraft Route node between the source MOVE and the future Hunsu fork
   -> Draft agent receives Manager instructions, Team Snapshot, editable request runtime files, and surrounding Roadmap context
   -> user and Draft agent discuss the desired route change
@@ -297,9 +297,9 @@ select MOVE
   -> harness.json changes only for explicit root Team, Harness policy, guardrail, lock, or Artifact Action requests
   -> executors.json is the Team/Member source of truth and changes only for explicit Executor requests
   -> resources.json is the Skill/Plugin/resource-binding source of truth and changes only for explicit Resource requests
-  -> Local composes harness.json, executors.json, and resources.json into the resolved Harness Snapshot and run prompt
+  -> Bridge composes harness.json, executors.json, and resources.json into the resolved Harness Snapshot and run prompt
   -> new Destinations do not create Executor or Resource bindings
-  -> Draft agent runs Local's Draft check command and creates a DiffArtifact
+  -> Draft agent runs Bridge's Draft check command and creates a DiffArtifact
   -> Draft agent includes the DiffArtifact marker in chat
   -> Studio renders the DiffArtifact card with changed files and Confirm Hunsu
   -> Studio renders all Draft progress from the shared AgentSession item stream, using Reasoning as the user-facing activity label
@@ -314,7 +314,7 @@ Direct command/delta Hunsu mutation APIs are not part of the v1 Draft contract.
 Route changes go through decoded request runtime files and the same check and
 approval path.
 
-Hunsu Draft Local APIs:
+Hunsu Draft Bridge APIs:
 
 - `GET /api/roadmaps/:roadmapId/hunsu/drafts`
 - `POST /api/roadmaps/:roadmapId/hunsu/drafts`
@@ -331,24 +331,24 @@ decoded runtime files under `.hunsu-request/` in the route worktree.
 snapshot, and dry-runs `ConfirmHunsuDraft`. `/approve` requires a passing
 DiffArtifact id and rejects it if the request files have changed since the
 artifact was created.
-Local still records meaningful Draft Route transitions in the route worktree's
+Bridge still records meaningful Draft Route transitions in the route worktree's
 `.hunsu/hunsu-draft.hunsu`. Only `/approve` writes `ConfirmHunsuDraft` to the
 main Git-backed Roadmap runtime bundle. `/discard` and failed DiffArtifacts leave
 HUNSU counts, forked Team routes, and MOVE counts unchanged while preserving
 terminal Draft Route state.
 
-AgentSession Local APIs:
+AgentSession Bridge APIs:
 
 - `GET /api/agent-sessions`
 - `GET /api/roadmaps/:roadmapId/agent-sessions`
 
-Local keeps a common in-memory `agentSessions` registry. Route runs and Hunsu
+Bridge keeps a common in-memory `agentSessions` registry. Route runs and Hunsu
 Draft sessions hold only AgentSession ids and active-session ids at their
 boundary. AgentSessions use one Route reference shape with `routeId`, route
 kind, source line/node, optional target node, and optional worktree. Plan, Path,
 finalizer, Draft, and create turns differ by owner and Route kind, not by
 separate route reference families. List endpoints may return bounded summaries,
-while the Local registry remains the source for live AgentSession detail.
+while the Bridge registry remains the source for live AgentSession detail.
 
 ## Git Persistence Policy
 
@@ -398,16 +398,16 @@ under the user's config directory.
 - missing-path state
 
 The registry is not the Roadmap source of truth. Selecting a Roadmap causes
-Hunsu Local to read reachable route commits, decode `.hunsu` runtime files, and
+Hunsu Bridge to read reachable route commits, decode `.hunsu` runtime files, and
 reconstruct or refresh the local Roadmap projection cache.
 
 Opening a folder should follow this flow:
 
 ```text
 browser opens /studio/open?path=<encoded-path>
-  -> Hunsu Local canonicalizes the path
-  -> Hunsu Local verifies it is already a Hunsu Roadmap
-  -> Hunsu Local registers or updates the Roadmap Registry entry
+  -> Hunsu Bridge canonicalizes the path
+  -> Hunsu Bridge verifies it is already a Hunsu Roadmap
+  -> Hunsu Bridge registers or updates the Roadmap Registry entry
   -> browser redirects to /studio/roadmaps/<roadmapId>
   -> Roadmap View loads Roadmap projection from decoded commit state
 ```
@@ -416,18 +416,18 @@ Porting a Git project should follow a separate flow:
 
 ```text
 browser opens /studio/port?path=<encoded-path>
-  -> Hunsu Local canonicalizes the path
-  -> Hunsu Local prepares a Port plan
+  -> Hunsu Bridge canonicalizes the path
+  -> Hunsu Bridge prepares a Port plan
   -> user reviews Roadmap state and optional Artifact Action changes
-  -> Hunsu Local applies the Port plan
-  -> Hunsu Local registers or updates the Roadmap Registry entry
+  -> Hunsu Bridge applies the Port plan
+  -> Hunsu Bridge registers or updates the Roadmap Registry entry
   -> browser redirects to /studio/roadmaps/<roadmapId>
 ```
 
 The registry may be deleted and rebuilt from user-selected folders. Deleting it
 must not delete Roadmap history.
 
-## Local HTTP Shape
+## Bridge HTTP Shape
 
 Target local API:
 
@@ -460,7 +460,7 @@ from a validated cache derived from decoded commit state.
 Port should be explicit:
 
 1. User selects an existing Git repository.
-2. Hunsu Local inspects Git, scripts, environment usage, Docker files, and
+2. Hunsu Bridge inspects Git, scripts, environment usage, Docker files, and
    candidate Artifact Action surfaces.
 3. Studio shows the Port plan.
 4. User accepts the plan.

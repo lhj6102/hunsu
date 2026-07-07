@@ -296,14 +296,14 @@ Target flow:
 ```text
 select MOVE
   -> start Hunsu Draft
-  -> Local creates a Draft Route worktree and Draft AgentSession
-  -> Local writes .hunsu-prev and .hunsu-request decoded draft surfaces
+  -> Bridge creates a Draft Route worktree and Draft AgentSession
+  -> Bridge writes .hunsu-prev and .hunsu-request decoded draft surfaces
   -> Studio displays a Plan-style compact HunsuDraft Route node between the source MOVE and the future Hunsu-created MOVE
   -> user selects route=hunsu-draft:<draftSessionId>
   -> Draft agent receives Team Snapshot, decoded local Roadmap context, and current request files
   -> Director chats with Draft agent
   -> Draft agent asks follow-up questions or edits decoded runtime files in .hunsu-request/
-  -> Draft agent runs Local's Draft check command and creates a DiffArtifact
+  -> Draft agent runs Bridge's Draft check command and creates a DiffArtifact
   -> Draft agent includes the DiffArtifact marker in chat
   -> Studio renders the inline DiffArtifact card with changed files and Confirm Hunsu
   -> approval calls ConfirmHunsuDraft with the DiffArtifact id, updates encoded runtime state, and creates a new Team route
@@ -313,7 +313,7 @@ select MOVE
 
 The Draft agent is conversational and owns the interactive Draft Route
 AgentSession. DiffArtifact cards in chat are the review surface for what will be
-confirmed. Confirm is enabled only for a passing DiffArtifact, and Local rejects
+confirmed. Confirm is enabled only for a passing DiffArtifact, and Bridge rejects
 confirmation if `.hunsu-request` changed after that artifact was created. Raw
 request files remain a route-worktree editing surface, not durable Roadmap
 state. The detail inspector renders as a centered modal over the Roadmap canvas
@@ -342,7 +342,7 @@ is edited only when the user explicitly asks to change Executor definitions or
 Executor config. `resources.json` is the Skill/Plugin/resource-binding source
 of truth and is edited only when the user explicitly asks to change Resource
 bindings or requirements. New Destinations do not need Executor or Resource
-binding changes. Local composes Harness runtime state from `harness.json`,
+binding changes. Bridge composes Harness runtime state from `harness.json`,
 `executors.json`, and `resources.json` when it renders Team Snapshots and starts
 execution.
 
@@ -354,7 +354,7 @@ nodes label the recorded files as Runtime Changes and Changed Files.
 
 Discarding a HUNSU Draft leaves Roadmap Hunsu, fork, MOVE, and Team counts
 unchanged. Before approval, the Draft Route is route runtime state, not an
-accepted Roadmap transition. Local writes compact route metadata to
+accepted Roadmap transition. Bridge writes compact route metadata to
 `.hunsu/hunsu-draft.hunsu`; raw conversation bodies remain AgentSession/provider
 operational data. The conversation reference is recorded in the accepted Hunsu
 only when approval creates it.

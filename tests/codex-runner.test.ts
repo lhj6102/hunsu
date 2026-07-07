@@ -106,7 +106,7 @@ test("Codex runner TEAM prompt stays focused on objective and hides Hunsu domain
       {
         id: destinationId("destination_001"),
         requestId: requestId("req_001"),
-        title: destinationTitle("Wire Local server commands"),
+        title: destinationTitle("Wire Bridge server commands"),
         status: "pending",
         source: "initial-execute-team",
         createdBy: "SYSTEM",
@@ -120,7 +120,7 @@ test("Codex runner TEAM prompt stays focused on objective and hides Hunsu domain
   assert.match(prompt, /^<role>[\s\S]*<\/role>\n\n<goal>[\s\S]*<\/goal>\n\n<member_profiles>[\s\S]*<\/member_profiles>\n\n<rules>[\s\S]*<\/rules>$/);
   assert.match(prompt, /<purpose>[\s\S]*Plan a closure-free executable ExecutionPlan/);
   assert.match(prompt, /<instructions>[\s\S]*Keep changes small/);
-  assert.match(prompt, /Wire Local server commands/);
+  assert.match(prompt, /Wire Bridge server commands/);
   assert.match(prompt, /Keep the GUI local-first/);
   assert.match(prompt, /<member id="azir">[\s\S]*Plan briefly, then implement/);
   assert.match(prompt, /<member id="galio">[\s\S]*Verify the completed work/);
@@ -193,7 +193,7 @@ test("Codex runner planning prompt lists available Members", () => {
     ...createRunInput(),
     harness: protocol
   });
-  assert.match(prompt, /<instructions>[\s\S]*Plan for Wire Local server commands first/);
+  assert.match(prompt, /<instructions>[\s\S]*Plan for Wire Bridge server commands first/);
   assert.match(prompt, /<member id="planner">[\s\S]*<profile>[\s\S]*Plan first/);
   assert.match(prompt, /<member id="integrator">[\s\S]*<profile>[\s\S]*Integrate/);
 });
@@ -304,7 +304,7 @@ test("CodexAppServerRunner starts a Team turn and maps app-server events", async
   assert.equal(turnStart.params?.sandboxPolicy?.type, "readOnly");
   assert.equal(turnStart.params?.sandboxPolicy?.networkAccess, false);
   assert.deepEqual(turnStart.params?.outputSchema, TEAM_EXECUTION_PLAN_SCHEMA);
-  assert.match(turnStart.params?.input?.[0]?.text ?? "", /Wire Local server commands/);
+  assert.match(turnStart.params?.input?.[0]?.text ?? "", /Wire Bridge server commands/);
   respondTo(turnStart, transport, { turn: { id: "turn_team_001", status: "inProgress", items: [] } });
 
   transport.emit({
@@ -1127,7 +1127,7 @@ function createRunInput(overrides: Partial<StartRunInput> = {}): StartRunInput {
       {
         id: destinationId("destination_001"),
         requestId: requestId("req_001"),
-        title: destinationTitle("Wire Local server commands"),
+        title: destinationTitle("Wire Bridge server commands"),
         status: "pending",
         source: "initial-execute-team",
         createdBy: "SYSTEM",
@@ -1155,7 +1155,7 @@ function createHunsuDraftInput() {
     baseArtifact: {
       kind: "source-protocol",
       team: { teamName: "Faker" },
-      destinations: [{ id: "destination_001", title: "Wire Local server commands" }]
+      destinations: [{ id: "destination_001", title: "Wire Bridge server commands" }]
     },
     sourceSnapshot: {
       sourceLineId: "run/req_001",
@@ -1166,7 +1166,7 @@ function createHunsuDraftInput() {
       summary: "Faker M000",
       destinationSummaries: [{
         id: "destination_001",
-        title: "Wire Local server commands",
+        title: "Wire Bridge server commands",
         status: "pending"
       }]
     },
@@ -1409,7 +1409,7 @@ async function respondToTeamGoal(transport: MockAppServerTransport, threadId: st
   const goalSet = await transport.waitForRequest("thread/goal/set");
   assert.equal(goalSet.params?.threadId, threadId);
   if (expectRequestContext) {
-    assert.match(goalSet.params?.objective ?? "", /Wire Local server commands/);
+    assert.match(goalSet.params?.objective ?? "", /Wire Bridge server commands/);
     assert.doesNotMatch(goalSet.params?.objective ?? "", /Current TODO|Resolved Prompt Template/);
   }
   assert.match(goalSet.params?.objective ?? "", expectedPrompt);

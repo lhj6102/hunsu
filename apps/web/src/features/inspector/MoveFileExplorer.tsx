@@ -3,8 +3,8 @@ import { Editor } from "@monaco-editor/react";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronRight, Code2, File, FileDiff, FileWarning, Folder, FolderOpen, GitCommit, LockKeyhole, RotateCw } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { fetchMoveFileBlob, fetchMoveFileDiff, fetchMoveFileTree } from "@/shared/api/localClient";
-import type { MoveDiffFile, MoveDiffTreeNode, MoveFileBlob, MoveFileDiff, MoveFileNode, MoveFileTree } from "@/shared/api/localTypes";
+import { fetchMoveFileBlob, fetchMoveFileDiff, fetchMoveFileTree } from "@/shared/api/bridgeClient";
+import type { MoveDiffFile, MoveDiffTreeNode, MoveFileBlob, MoveFileDiff, MoveFileNode, MoveFileTree } from "@/shared/api/bridgeTypes";
 import { Button } from "@/shared/ui/button";
 
 export function MoveFileExplorer({

@@ -60,7 +60,7 @@ apps/web
   -> packages/config
   -> packages/protocol
 
-apps/local
+apps/bridge
   -> packages/config
   -> packages/core
   -> packages/protocol
@@ -71,7 +71,7 @@ apps/hub-api
   -> packages/protocol-registry
 
 packages/cli (`hunsu`)
-  -> apps/local (`@hunsu/local`)
+  -> apps/bridge (`@hunsu/bridge`)
   -> packages/config
   -> packages/core
   -> packages/protocol
@@ -93,7 +93,7 @@ packages/protocol
   -> no workspace dependencies
 ```
 
-`packages/protocol` is the foundation. Runtime, registry, runner, CLI, Local,
+`packages/protocol` is the foundation. Runtime, registry, runner, CLI, Bridge,
 and Web can depend on it. It should not depend on application or
 runtime infrastructure.
 
@@ -119,11 +119,11 @@ Dependencies:
 - React, React DOM, Vite, and Vite React plugin.
 
 It does not own Git access, Codex execution, or Hunsu runtime mutation. Those
-belong to Hunsu Local.
+belong to Hunsu Bridge.
 
-### `apps/local`
+### `apps/bridge`
 
-Local bridge, runtime, and server for Hunsu.
+Bridge runtime and server for Hunsu.
 
 Responsibilities:
 
@@ -251,7 +251,7 @@ Responsibilities:
 
 - Parse and validate environment variables into explicit `ConfigResult`
   values.
-- Own Local, Web, Hub, Cloudflare deploy, Artifact Action, and Codex runner
+- Own Bridge, Web, Hub, Cloudflare deploy, Artifact Action, and Codex runner
   environment contracts.
 - Keep lower-level packages from reading ambient process environment.
 - Provide a Worker-safe `@hunsu/config/cloudflare` entrypoint with no Node
@@ -263,37 +263,37 @@ Dependency:
 
 ### `packages/cli`
 
-Command-line interface package published as `hunsu`.
+Repository command-line interface package.
 
 Responsibilities:
 
 - Expose early Hunsu commands for Roadmap inspection and mutation.
 - Bridge CLI input into core/protocol commands.
-- Provide the root `pnpm hunsu` entrypoint and npm `npx hunsu studio`
+- Provide the root `pnpm hunsu` entrypoint and npm `npx @hunsu/bridge@latest`
   launcher.
-- Start Hunsu Local with a pairing token and hand the browser to Hunsu Web.
+- Start Hunsu Bridge with a pairing token and hand the browser to Hunsu Web.
 
 Dependencies:
 
 - `@hunsu/core`.
 - `@hunsu/config`.
-- `@hunsu/local`.
+- `@hunsu/bridge`.
 - `@hunsu/protocol`.
 
 ## Runtime Relationship
 
-Hub, Origin, Local, and the Hunsu runtime are separate layers.
+Hub, Origin, Bridge, and the Hunsu runtime are separate layers.
 
 Hub is the web UX for discovering, editing, forking, and publishing reusable
 Team, Member, Manager, and Skill packages. `apps/hub-api` is the stateless
 Cloudflare Worker backend for that UX. D1 and R2 are the stateful Hub resources.
-Origin is the immutable endpoint role served by the Worker. Local is the
+Origin is the immutable endpoint role served by the Worker. Bridge is the
 privileged localhost runtime.
 
 During Execute, the Hunsu runtime decodes a Roadmap commit, selects the active
 Destinations and their Team/Member/Skill package locks, resolves only the
 required Origin references, builds the Member execution environment, runs the
-Team, and records the next commit. During Hunsu Draft, Local resolves the
+Team, and records the next commit. During Hunsu Draft, Bridge resolves the
 selected Manager lock or built-in default Manager, records the Manager snapshot
 in the Draft route runtime, materializes only that Manager's Skills/Plugins in
 the Draft worktree, and asks Codex to run the draft turn. Roadmap state stores
@@ -311,7 +311,7 @@ The root tests intentionally exercise package boundaries together:
   Manager manifests, prompt templates, and skill hydration.
 - `codex-runner.test.ts`: Team planning and Member Path prompt construction
   plus Codex app-server runner behavior.
-- `local.test.ts`: Local control plane, Git persistence, Execute
+- `local.test.ts`: Bridge control plane, Git persistence, Execute
   lifecycle, Origin package resolution, and runtime safety.
 - `web.test.ts`: frontend request builders and planned UI behavior.
 - `git-cli.test.ts`: CLI and Git-backed command behavior.
@@ -329,7 +329,7 @@ reliable full verification command.
   templates, and skill materialization in `packages/protocol-registry`.
 - Put Codex app-server integration in `packages/codex-runner`.
 - Put local orchestration, Git access, Codex integration, and Artifact Action
-  Run control in `apps/local`.
+  Run control in `apps/bridge`.
 - Put browser UI routes in `apps/web`.
 - Put Cloudflare Worker Hub API and Origin endpoint request handling in
   `apps/hub-api`.

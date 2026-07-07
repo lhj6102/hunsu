@@ -8,9 +8,9 @@ documents should use consistently.
 
 Hunsu is the overall product.
 
-Users install Codex and Hunsu locally, start Hunsu Local, and then use the Hunsu
+Users install Codex and Hunsu locally, start Hunsu Bridge, and then use the Hunsu
 web product to work in Studio or Hub. The web product can show Hub discovery
-without a local connection, but Studio actions require Local to be available.
+without a Bridge connection, but Studio actions require Bridge to be available.
 
 ## Studio
 
@@ -39,13 +39,13 @@ Executors, Managers, and Skills & Plugins, modify them, and publish new
 immutable versions. Hub is not the local runtime and does not directly control
 Git, Codex, worktrees, or Action Runs.
 
-## Local
+## Bridge
 
-Local is the installed localhost bridge/runtime started from the user's machine.
+Bridge is the installed localhost runtime started from the user's machine.
 
-After `npx hunsu studio` starts Local, Local owns access to Git repositories,
-Codex app-server, Route worktrees, Artifact Actions, and local control APIs.
-Hunsu Web checks Local readiness before enabling Studio actions that mutate a
+After `npx @hunsu/bridge@latest` starts Bridge, Bridge owns access to Git
+repositories, Codex app-server, Route worktrees, Artifact Actions, and Bridge
+control APIs. Hunsu Web checks Bridge readiness before enabling Studio actions that mutate a
 Roadmap or start an Execute.
 
 ## Origin
@@ -56,7 +56,7 @@ and Skill package versions.
 Roadmap state records only minimal Origin reference metadata such as
 `origin/key/version/integrity`. The Hunsu runtime resolves those references
 before building the agent execution environment. Origin is not the Hub UX and
-not the Local runtime.
+not the Bridge runtime.
 
 ## Roadmap
 
@@ -128,7 +128,7 @@ The Roadmap Registry can store:
 - missing-path state
 
 The Roadmap Registry must not store the durable Roadmap graph. Selecting a
-Roadmap causes Hunsu Local to read reachable commits, decode Hunsu state, and
+Roadmap causes Hunsu Bridge to read reachable commits, decode Hunsu state, and
 reconstruct the Roadmap.
 
 ## Roadmap View
@@ -273,10 +273,10 @@ type GoalExecutionPlan =
 
 `QueueExecutionPlan` runs nested ExecutionPlans in order. `GoalExecutionPlan`
 delegates a goal to one assignee Executor and may name an evaluator Executor.
-When the assignee is a Team, Local creates a Plan route and runs that Team's
+When the assignee is a Team, Bridge creates a Plan route and runs that Team's
 planner with only its direct Membership scope. When the assignee is a Member,
-Local creates a Path route and runs one Member turn. Member Path records are not
-created from the Team plan in advance. They are created only as Local interprets
+Bridge creates a Path route and runs one Member turn. Member Path records are not
+created from the Team plan in advance. They are created only as Bridge interprets
 the continuation and dispatches the next Team or Member turn.
 
 Future ExecutionPlan kinds follow the same rule: one interpreter step dispatches
@@ -389,17 +389,17 @@ A Skill is a folder-level Codex skill resource.
 
 A Skill is not merely a path string or prose field. Studio must be able to
 query the folder contents, show the files, and pass the accepted Skill binding
-to Local. A Harness binds Skills per Member by runtime metadata:
+to Bridge. A Harness binds Skills per Member by runtime metadata:
 immutable `local-snapshot`, exact `registry-package`, `skillMeta` for
 pre-runtime `npx skills add` installation, or `local-root-installed` for Skills
-already installed in an allowed local Codex root. During execution, Local
+already installed in an allowed local Codex root. During execution, Bridge
 prepares accepted Skills into the Route worktree as Codex skill folders,
 normally under `.agents/skills/<skill-name>/`. Member Path prompts should not
 inline Skill files.
 
 ## Member Codex Environment
 
-A Member Codex Environment is the worktree-local Codex runtime surface Local
+A Member Codex Environment is the worktree-local Codex runtime surface Bridge
 prepares before a Codex thread starts.
 
 It includes Hunsu-managed `.agents/skills/<skill-name>/` folders and
@@ -413,26 +413,26 @@ environment. Member Path phases use the active Member config.
 
 ## local-root-installed Skill
 
-A local-root-installed Skill is a Member Skill binding that means: Local must
+A local-root-installed Skill is a Member Skill binding that means: Bridge must
 find an already-installed Codex Skill in an allowed local Codex root before the
 session starts.
 
 It does not permit the agent to install, discover, or choose a Skill during
 execution. If the requested Skill is missing, duplicated by name, or ambiguous
-by path, Local fails environment preparation before Codex starts.
+by path, Bridge fails environment preparation before Codex starts.
 
 ## Member Plugin Binding
 
 A Member Plugin Binding is a Member config entry that requests a Codex Plugin
 by exact local config key, such as `github@openai-curated`.
 
-Plugins are available only through `local-root-installed` bindings in v1. Local
+Plugins are available only through `local-root-installed` bindings in v1. Bridge
 enables requested Plugins in the worktree `.codex/config.toml` and disables all
 other discovered Plugins before starting Codex.
 
 ## Environment Preparation Failure
 
-An Environment Preparation Failure is a fail-closed Local runtime error before
+An Environment Preparation Failure is a fail-closed Bridge runtime error before
 Codex starts a thread.
 
 Typical causes are a missing local-root-installed Skill, an ambiguous Skill

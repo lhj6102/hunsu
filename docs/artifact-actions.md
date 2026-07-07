@@ -51,7 +51,7 @@ v1; dependencies and chained workflows are intentionally reserved for later.
 
 ## Runtime
 
-Local creates a detached worktree from the selected source commit, injects the
+Bridge creates a detached worktree from the selected source commit, injects the
 declared environment, runs the configured action, and records Action Run state in
 a local operational store under `.hunsu/action-runs`.
 
@@ -70,7 +70,7 @@ because its envelope checksum and schema are valid.
 
 Artifact Actions are added, updated, removed, and reordered by editing decoded
 runtime files through Hunsu Draft.
-When a Draft starts from a selected MOVE or node, Local creates decoded draft
+When a Draft starts from a selected MOVE or node, Bridge creates decoded draft
 surfaces in the Draft Route worktree:
 
 ```text
@@ -102,7 +102,7 @@ The Artifact Action file uses readable JSON with the same schema as encoded
 edits may change `.hunsu-request/artifact-actions.json`; they must not change
 encoded `.hunsu/*`, `.hunsu-prev/*`, or product files for the Draft turn.
 
-The Draft agent creates a DiffArtifact after editing request files. Local
+The Draft agent creates a DiffArtifact after editing request files. Bridge
 validates `.hunsu-request/artifact-actions.json`, compares `.hunsu-prev` and
 `.hunsu-request`, reports changed files with git-style unified file diffs, and
 dry-runs the Hunsu workflow checks against the current source node. Confirm
@@ -113,7 +113,7 @@ runtime state plus the confirmed Hunsu record.
 
 ## API
 
-Local exposes Artifact Action endpoints:
+Bridge exposes Artifact Action endpoints:
 
 - `GET /api/roadmaps/:roadmapId/artifact-actions`
 - `POST /api/roadmaps/:roadmapId/artifact-actions/:actionId/runs`
@@ -121,7 +121,7 @@ Local exposes Artifact Action endpoints:
 - `GET /api/roadmaps/:roadmapId/action-runs/:runId`
 - `POST /api/roadmaps/:roadmapId/action-runs/:runId/stop`
 
-Local also exposes Hunsu Draft endpoints for runtime-file editing:
+Bridge also exposes Hunsu Draft endpoints for runtime-file editing:
 
 - `POST /api/roadmaps/:roadmapId/hunsu/drafts/:draftId/diff-artifacts`
 - `GET /api/roadmaps/:roadmapId/hunsu/drafts/:draftId/diff-artifacts/:artifactId`

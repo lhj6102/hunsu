@@ -8,7 +8,7 @@ const SCAN_ROOTS = ["apps", "packages"];
 const ALLOWED_ENV_READ_FILES = new Set([
   "apps/hub-api/scripts/cloudflare-config.mjs",
   "apps/hub-api/scripts/seed-local.mjs",
-  "apps/local/src/index.ts",
+  "apps/bridge/src/index.ts",
   "apps/web/scripts/verify-handoffs.mjs",
   "apps/web/vite.config.ts",
   "packages/config/src/index.ts"

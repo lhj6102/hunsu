@@ -50,14 +50,14 @@ The web app does not call the runner directly.
 
 ## App-Server Boundary
 
-Hunsu Local constructs the default runner with `createDefaultCodexRunner()`.
+Hunsu Bridge constructs the default runner with `createDefaultCodexRunner()`.
 That factory always creates a `CodexAppServerRunner`.
 
 The app-server client manages a local `codex app-server --stdio` process. The
 wire format is one JSON-RPC object per line on stdio. Hunsu Web does not expose
 a browser-direct websocket to Codex. Unix sockets are an acceptable future
-transport for Hunsu Local, but browser clients must continue to talk through
-Hunsu Local APIs.
+transport for Hunsu Bridge, but browser clients must continue to talk through
+Hunsu Bridge APIs.
 
 Lifecycle:
 
@@ -167,7 +167,7 @@ Hunsu does not depend on ambient Codex CLI defaults:
 - Member turns use the approval mode declared by `MemberConfig.approval`.
   `on_request` can ask the user or delegate to Codex app-server
   `auto_review`; `never` cannot cross the configured sandbox boundary.
-- `networkAccessEnabled: false` keeps network access off unless a run or Local
+- `networkAccessEnabled: false` keeps network access off unless a run or Bridge
   setting explicitly enables it.
 
 Member Path turns use sandboxing and approval review from the Member config.
@@ -219,7 +219,7 @@ a schema.
 ## Nudge The Execution Agent
 
 Member Path turns should nudge the execution agent toward focused work, not
-teach it the Hunsu runtime model. Local keeps Member Path ids, Member ids,
+teach it the Hunsu runtime model. Bridge keeps Member Path ids, Member ids,
 dependencies, Harness locks, and Hunsu runtime state as orchestration
 metadata. Those fields are not part of the Member Path prompt.
 
@@ -244,13 +244,13 @@ The prompt manifest is the primary contract. When a turn already has an
 app-server `outputSchema`, Hunsu clears any provider thread goal before
 starting the turn; goal context can create a second instruction surface that
 competes with the schema-bound turn. Team planning remains the place where
-Local asks for an ExecutionPlan; execution turns receive the already-selected
+Bridge asks for an ExecutionPlan; execution turns receive the already-selected
 work.
 
 ## Member Codex Environment Preparation
 
 Skills and Plugins are Codex runtime resources, not prompt text. Before each
-Codex thread starts, Local prepares a worktree-local Member Codex Environment
+Codex thread starts, Bridge prepares a worktree-local Member Codex Environment
 for that phase:
 
 - Team planning uses the default no-skill/no-plugin environment.
@@ -267,12 +267,12 @@ under:
 ```
 
 For `local-snapshot` skills, each `snapshotFiles[]` entry is written into that
-skill folder after path validation. For `registry-package` APM skills, Local
+skill folder after path validation. For `registry-package` APM skills, Bridge
 fetches the exact `package@version`, verifies the `integrity`/`contentHash`
-lock, then writes the fetched files. For `skillMeta` skills, Local runs
+lock, then writes the fetched files. For `skillMeta` skills, Bridge runs
 `npx skills add <source> --skill <name> --agent codex --copy --yes` in a
 staging workspace, reads the installed Codex Skill files, and writes those
-files into the Route worktree. For `local-root-installed` skills, Local resolves
+files into the Route worktree. For `local-root-installed` skills, Bridge resolves
 the Skill from allowed local Codex skill roots and copies the resolved files
 into the worktree. Missing, duplicated, path-ambiguous `local-root-installed`
 Skills or failed `skillMeta` installs fail environment preparation before Codex
@@ -280,9 +280,9 @@ starts.
 
 The generated `.codex/config.toml` enables only requested materialized Skills
 and requested Plugins. Other discovered environment-affecting Skills and
-Plugins are written with `enabled = false`. Local overwrites only files with
+Plugins are written with `enabled = false`. Bridge overwrites only files with
 the Hunsu-managed marker; a user-authored worktree `.codex/config.toml` fails
-closed instead of being merged. Local adds `.agents/skills/` and
+closed instead of being merged. Bridge adds `.agents/skills/` and
 `.codex/config.toml` to the worktree's Git exclude file so runtime preparation
 does not enter Path or MOVE commits. The runner must not inline Skill files
 into Member Path prompts.
@@ -437,7 +437,7 @@ type GoalExecutionPlan =
     };
 ```
 
-Local interprets that value directly. `QueueExecutionPlan` pops completed heads
+Bridge interprets that value directly. `QueueExecutionPlan` pops completed heads
 or replaces the head with a returned `NextExecution`; `GoalExecutionPlan`
 separates evaluator and executor Members into agent-unit stages. The evaluator
 stage runs one evaluator turn and writes `needs_execution` on fail. The executor
@@ -445,7 +445,7 @@ stage runs one executor turn and writes the next `needs_evaluation`
 continuation. Every dispatcher must dispatch at most one agent turn per
 interpreter step before returning `next`, `done`, or `fail`; future multi-agent
 flows should add explicit stages instead of hidden closures.
-Local does not expand the Team plan into concrete Member Paths up front.
+Bridge does not expand the Team plan into concrete Member Paths up front.
 Each Member Path is created only at the moment the interpreter chooses and
 dispatches that evaluator or executor turn.
 
@@ -481,29 +481,29 @@ execution constraints are permissions, not obligations: `worktree_write` means
 the Member may edit the Route worktree, not that every Path must change the
 product tree. The terminal Member Path is the final execution boundary, not a
 verdict contract. It does not receive a PASS/RETRY structured output schema,
-and natural-language terminal output remains the Path output. Local derives
+and natural-language terminal output remains the Path output. Bridge derives
 MOVE completion facts from the terminal Path run, provider session, Path commit,
 selected Destination, and the source-MOVE-to-terminal-Path diff. If the
 terminal Path leaves no product diff from the source MOVE to the terminal Path
-commit, Local cannot promote it into an Arrived MOVE and records an Accident at
+commit, Bridge cannot promote it into an Arrived MOVE and records an Accident at
 MOVE promotion time. Verification is represented as a Member Path, not as a
 separate required Inspector role.
 
 Studio records each Member Path output, provider thread or turn id, status,
 and Path commit in the Execute log. Evidence and risks recorded on MOVEs are
-Roadmap/Local/finalizer facts, not executor-supplied verdict fields.
+Roadmap/Bridge/finalizer facts, not executor-supplied verdict fields.
 
 ## MOVE Finalizer Contract
 
 The MOVE finalizer is a separate agent turn after all Member Paths complete
-and Local validates that the terminal Path can become an Arrived MOVE. It
+and Bridge validates that the terminal Path can become an Arrived MOVE. It
 receives the source MOVE commit, terminal Path commit, changed paths, diff
 summary, Path outputs, completion summary, and the selected Destination title
 and acceptance details. It must return only the commit message content for MOVE
 N+1. It must not edit files or create Git commits; Studio creates the MOVE
 commit after the terminal Path commit and records that commit on the Roadmap.
 
-Before the MOVE finalizer provider turn begins, Local prepares the default
+Before the MOVE finalizer provider turn begins, Bridge prepares the default
 Member Codex Environment with no requested Skills or Plugins. Member-specific
 Skill and Plugin bindings apply only to Member Path turns.
 
@@ -512,7 +512,7 @@ Skill and Plugin bindings apply only to Member Path turns.
 The runner can instruct Codex to act as the conversational Hunsu Draft agent
 configured by a resolved Manager.
 
-Local records the Draft agent turn in an `AgentSession(owner=HunsuDraft,
+Bridge records the Draft agent turn in an `AgentSession(owner=HunsuDraft,
 routeRef=Route, routeKind=HunsuDraft)`. That session is the Route inspector's
 interactive chat log. Studio renders the app-server item lifecycle from that
 AgentSession directly, including `reasoning`, `agentMessage`,
@@ -522,8 +522,8 @@ visible with elapsed time so the Draft route does not look idle while the
 provider is working.
 
 The Draft agent receives the Hunsu Draft Route worktree path. It does not
-operate in the control checkout. Local writes compact Draft Route
-metadata to `.hunsu/hunsu-draft.hunsu` and commits only Local-owned `.hunsu`
+operate in the control checkout. Bridge writes compact Draft Route
+metadata to `.hunsu/hunsu-draft.hunsu` and commits only Bridge-owned `.hunsu`
 runtime files in that route worktree after meaningful state transitions. The
 route metadata includes the selected Manager snapshot and optional Manager
 package lock. Raw chat message bodies remain AgentSession/provider operational
@@ -541,14 +541,14 @@ only when the user explicitly asks to change Team or Member definitions/config,
 and that file is the Executor source of truth. Adding a Destination must not create,
 copy, or update Executor bindings or assignment entries. The agent must not edit
 `.hunsu/` encoded runtime files, `.hunsu-prev/`, product files, or create Git commits.
-After editing request files, the agent runs the Local-provided Draft check
+After editing request files, the agent runs the Bridge-provided Draft check
 command to create a DiffArtifact.
 That command uses a compact check-command response: it returns the
 DiffArtifact id, final marker, changed file paths on success, and validation
 errors on failure, not the full Draft, Board, or file diff payload. The Draft
 Route worktree remains the source for raw request file inspection.
 
-When a Hunsu Draft Route is created, Local may prewarm the Draft provider
+When a Hunsu Draft Route is created, Bridge may prewarm the Draft provider
 thread before the first user message. That prewarm starts the thread, renders
 the Manager promptTemplate into the provider goal, and sets the stable Draft
 goal once. The first conversational turn should reuse the prepared
@@ -581,23 +581,23 @@ The Draft agent prompt should include:
   Resource binding or requirement requests
 - rule that new Destinations do not require Executor binding changes
 - rule that encoded `.hunsu/*`, `.hunsu-prev/*`, and product files are
-  Local-owned during a Hunsu Draft
-- Local-provided Draft check command for creating a DiffArtifact
+  Bridge-owned during a Hunsu Draft
+- Bridge-provided Draft check command for creating a DiffArtifact
 - rule that the final reply must include
   `::hunsu-diff{draftSessionId="..." diffArtifactId="..." status="pass|failed"}`
   after running the check command
-- rule that confirmation is handled by Hunsu Local from the DiffArtifact id
+- rule that confirmation is handled by Hunsu Bridge from the DiffArtifact id
 - conversation permission mode
 
-Local stores the original source Harness snapshot in an in-memory
-content-addressed artifact cache when the Draft starts. Local also writes the
+Bridge stores the original source Harness snapshot in an in-memory
+content-addressed artifact cache when the Draft starts. Bridge also writes the
 decoded `.hunsu-prev/` baseline and `.hunsu-request/` editable request surface
-into the route worktree. Before provider startup, Local materializes only the
+into the route worktree. Before provider startup, Bridge materializes only the
 resolved Manager's Skills and Plugins into that Draft worktree. DiffArtifact
 creation validates both decoded runtime bundles, compares `.hunsu-prev` and
 `.hunsu-request`, builds `ReadyHunsuDraft` with changed files and the request
 Harness snapshot, and dry-runs `ConfirmHunsuDraft`. Studio enables approval
-only from a passing DiffArtifact card, and Local rejects approval if request
+only from a passing DiffArtifact card, and Bridge rejects approval if request
 files changed after that artifact was created.
 The confirmed transaction records Hunsu and leaves the HunsuDraft Route visible
 as a completed route log between the source MOVE and the new Team MOVE.

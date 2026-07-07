@@ -37,7 +37,7 @@ Prerequisites:
 Once the npm packages are published, the intended local-first launcher is:
 
 ```sh
-npx hunsu studio
+npx @hunsu/bridge@latest
 ```
 
 For repository development:
@@ -45,23 +45,25 @@ For repository development:
 ```sh
 corepack enable
 pnpm install
+pnpm --filter @hunsu/bridge bridge --dry-run
 pnpm hunsu studio --dry-run
 pnpm hunsu studio --no-open
 ```
 
-`hunsu studio` starts Hunsu Local on `127.0.0.1`, creates a pairing token, and
-prints a Studio URL with that token. Hunsu Web uses the token to call protected
-Local APIs. Do not expose Hunsu Local directly to a public network.
+`npx @hunsu/bridge@latest` starts Hunsu Bridge on `127.0.0.1`, creates a
+pairing token, and prints or opens a Studio URL with that token. Hunsu Web uses
+the token to call protected Bridge APIs. Do not expose Hunsu Bridge directly to
+a public network.
 
 ## Open Source Model
 
 Hunsu is intended to be local-first open source:
 
 - Hunsu Web can be deployed as a public website.
-- Hunsu Local, CLI, protocol, registry, runner boundary, and Git-backed runtime
+- Hunsu Bridge, CLI, protocol, registry, runner boundary, and Git-backed runtime
   code are inspectable and Apache-2.0 licensed.
 - Hunsu Hub can host public reusable Team, Member, Manager, and Skill package
-  metadata, while Local keeps repository and worktree access on the user's
+  metadata, while Bridge keeps repository and worktree access on the user's
   machine.
 
 It is not a harness whose main purpose is to make agents execute harder. It is
@@ -120,7 +122,7 @@ Hunsu Web
   - Skill Draft review before accepted Skill Snapshots become history
   - Agent Conversation views for live-listen, transcript replay, and debugging
 
-Hunsu Local
+Hunsu Bridge
   - owns Git access
   - owns Roadmap Registry path resolution
   - owns Codex runner integration
@@ -143,7 +145,7 @@ Hunsu CLI and core
   - stable command contract for Studio, Inspector, Director, and recovery tools
 ```
 
-Hunsu Web is the human-facing orchestration surface. Hunsu Local is the
+Hunsu Web is the human-facing orchestration surface. Hunsu Bridge is the
 privileged localhost runtime. Hunsu Hub API is the remote or self-hosted
 Team, Member, and Skills & Plugins repository. The CLI is the harness surface.
 The core package is implementation detail.
@@ -166,7 +168,7 @@ The repository contains a `pnpm` and `turbo` TypeScript workspace:
   Execute execution, Inspector evaluation, prompt construction, model settings,
   reasoning settings, service-tier mapping, provider status, and streamed event
   mapping.
-- `apps/local` exposes the local command/event/projection control plane with
+- `apps/bridge` exposes the local command/event/projection control plane with
   Roadmap Registry routing, repository selection, Execute lifecycle, live
   updates, artifact lookup, worktree visibility, Codex integration, and Artifact
   Action control.
@@ -176,7 +178,7 @@ The repository contains a `pnpm` and `turbo` TypeScript workspace:
   Origin endpoints for package manifest resolution.
 - Tests cover trailer parsing, Roadmap reconstruction, Git-backed move
   creation, Hunsu commits, CLI behavior, harness invariants, runner prompts,
-  runner event mapping, and Local runtime control.
+  runner event mapping, and Bridge runtime control.
 
 ## Artifact Actions Direction
 
@@ -208,23 +210,23 @@ or created.
 
 ## Runtime Controls
 
-Local and Web ports and proxy targets are controlled from outside the process through
+Bridge and Web ports and proxy targets are controlled from outside the process through
 environment variables. This keeps local development, Artifact Action hosts, and
 MOVE-scoped checks from depending on hardcoded ports.
 
-- `HUNSU_LOCAL_HOST` sets the Local bind host. Default: `127.0.0.1`.
-- `HUNSU_LOCAL_PORT` sets the Local server port. Default: `19687`.
+- `HUNSU_BRIDGE_HOST` sets the Bridge bind host. Default: `127.0.0.1`.
+- `HUNSU_BRIDGE_PORT` sets the Bridge server port. Default: `19687`.
 - `HUNSU_WEB_HOST` sets the Vite web bind host. Default: `127.0.0.1`.
 - `HUNSU_WEB_PORT` sets the Vite web port. Default: `19688`.
-- `HUNSU_WEB_URL` sets the Studio URL used by `hunsu studio` when `--web-url`
-  is omitted. Default: `https://hunsu.app/studio`.
+- `HUNSU_WEB_URL` sets the Studio URL used by Hunsu Bridge when `--web-url` is
+  omitted. Default: `https://hunsu.app/studio`.
 - `HUNSU_WEB_STRICT_PORT` controls whether Vite may auto-increment when the
   requested port is busy. Default: `true`.
-- `HUNSU_LOCAL_API_PROXY_TARGET` sets the Vite `/api` proxy target. Default:
-  `http://<HUNSU_LOCAL_HOST>:<HUNSU_LOCAL_PORT>`.
-- `HUNSU_LOCAL_ALLOWED_ORIGINS` adds comma-separated browser Origins allowed to
-  call protected Hunsu Local APIs when using a deployed Studio website.
-- `VITE_HUNSU_LOCAL_URL` can point the browser directly at Hunsu Local instead
+- `HUNSU_BRIDGE_API_PROXY_TARGET` sets the Vite `/api` proxy target. Default:
+  `http://<HUNSU_BRIDGE_HOST>:<HUNSU_BRIDGE_PORT>`.
+- `HUNSU_BRIDGE_ALLOWED_ORIGINS` adds comma-separated browser Origins allowed to
+  call protected Hunsu Bridge APIs when using a deployed Studio website.
+- `VITE_HUNSU_BRIDGE_URL` can point the browser directly at Hunsu Bridge instead
   of relying on same-origin `/api` proxying.
 - `HUNSU_HUB_PUBLIC_API_URL` and `VITE_HUNSU_HUB_API_URL` point `/hub` at the
   Cloudflare Hub API Worker.
@@ -235,10 +237,10 @@ MOVE-scoped checks from depending on hardcoded ports.
 - `HUNSU_AGENT_PREVIEW_PORT` reserves the default Preview debug fallback port:
   `19673`.
 - `HUNSU_ROADMAP_REGISTRY_PATH`, `HUNSU_ROUTE_WORKTREE_ROOT`, and
-  `HUNSU_ACTION_WORKTREE_ROOT` control Local runtime paths.
+  `HUNSU_ACTION_WORKTREE_ROOT` control Bridge runtime paths.
 - `HUNSU_CODEX_APP_SERVER_COMMAND`, `HUNSU_CODEX_APP_SERVER_ARGS`, and
   `HUNSU_CODEX_*` thread option variables are resolved by `@hunsu/config`
-  before Local constructs the Codex runner.
+  before Bridge constructs the Codex runner.
 
 ## Docs
 
@@ -247,7 +249,7 @@ MOVE-scoped checks from depending on hardcoded ports.
 - [Ubiquitous Language](docs/ubiquitous-language.md): canonical domain terms
   and retired vocabulary.
 - [Architecture](docs/architecture.md): system boundaries across Hunsu Web,
-  Hunsu Local, Hub API, CLI, core, runner, Git, and event storage.
+  Hunsu Bridge, Hub API, CLI, core, runner, Git, and event storage.
 - [Workspace Structure](docs/workspace-structure.md): pnpm workspace, Turbo
   tasks, package roles, dependencies, and test layout.
 - [Executable Runtime State](docs/executable-runtime-state.md): Git commit as
@@ -271,7 +273,7 @@ above describe the current product direction. This root README is the source of
 truth for the published docs index.
 
 Markdown documents should use the current product language: Hunsu, Studio, Hub,
-Local, Origin, Roadmap, Team, Director, Destination, Harness, Execute,
+Bridge, Origin, Roadmap, Team, Director, Destination, Harness, Execute,
 Inspector, Arrived, Accident, Team Snapshot, Studio Launcher, Roadmap
 Registry, Roadmap View, Artifact Actions, Action Runs, Action Alias,
 Action Evidence, Executable Runtime State, Provider Goal, Harness
