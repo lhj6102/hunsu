@@ -12,7 +12,7 @@ import {
   type HubPackageSummary,
   type HubResourceSummary
 } from "../apps/web/src/features/hub/hubMarketplace.ts";
-import { parseStudioRoute } from "../apps/web/src/app/routes.ts";
+import { parseStudioRoute, setupPath } from "../apps/web/src/app/routes.ts";
 
 test("Hub marketplace model groups Executors, Managers, and independent Skills & Plugins", () => {
   assert.deepEqual(hubMarketplaceSections.map(section => section.label), [
@@ -100,6 +100,19 @@ test("Hub marketplace URL strategy maps list and detail routes", () => {
   });
   assert.equal(hubPackageDetailPath(packageSummary("manager", "manager.researcher")), "/hub/hunsu/manager/@motorhome/manager.researcher/versions/1.0.0");
   assert.deepEqual(parseStudioRoute({ pathname: "/hub/hunsu", search: "?tag=manager" } as Location), { kind: "hub" });
+});
+
+test("Studio setup route preserves only internal Studio next paths", () => {
+  assert.deepEqual(parseStudioRoute({ pathname: "/studio/setup", search: "?next=%2Fstudio%2Fopen%3Fpath%3D%252Ftmp%252Fdemo" } as Location), {
+    kind: "setup",
+    next: "/studio/open?path=%2Ftmp%2Fdemo"
+  });
+  assert.deepEqual(parseStudioRoute({ pathname: "/studio/setup", search: "?next=https%3A%2F%2Fevil.example%2Fstudio" } as Location), {
+    kind: "setup",
+    next: "/studio"
+  });
+  assert.equal(setupPath("/studio/roadmaps/demo"), "/studio/setup?next=%2Fstudio%2Froadmaps%2Fdemo");
+  assert.equal(setupPath("https://evil.example/studio"), "/studio/setup?next=%2Fstudio");
 });
 
 

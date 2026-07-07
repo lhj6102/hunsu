@@ -22,7 +22,8 @@ export default defineConfig({
     port: hunsuWeb.web.port,
     strictPort: hunsuWeb.strictPort,
     proxy: {
-      "/api": hunsuWeb.apiProxyTarget
+      "/api": hunsuWeb.apiProxyTarget,
+      "/health": hunsuWeb.apiProxyTarget
     }
   }
 });

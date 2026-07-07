@@ -1,5 +1,6 @@
 export type StudioRoute =
   | { kind: "hub" }
+  | { kind: "setup"; next: string }
   | { kind: "launcher" }
   | { kind: "open"; path: string | undefined; browseToken?: string; rootId?: string }
   | { kind: "port"; path: string | undefined; browseToken?: string; rootId?: string }
@@ -8,6 +9,10 @@ export type StudioRoute =
 export function parseStudioRoute(location: Location): StudioRoute {
   if (location.pathname === "/hub" || location.pathname.startsWith("/hub/")) {
     return { kind: "hub" };
+  }
+  if (location.pathname === "/studio/setup") {
+    const params = new URLSearchParams(location.search);
+    return { kind: "setup", next: safeStudioNext(params.get("next")) };
   }
   if (location.pathname === "/" || location.pathname === "" || location.pathname === "/studio") {
     return { kind: "launcher" };
@@ -27,6 +32,10 @@ export function parseStudioRoute(location: Location): StudioRoute {
   return { kind: "launcher" };
 }
 
+export function isBridgeBackedStudioRoute(route: StudioRoute): boolean {
+  return route.kind === "launcher" || route.kind === "open" || route.kind === "port" || route.kind === "roadmap";
+}
+
 export function roadmapApiPath(roadmapId: string, suffix: string): string {
   return `/api/roadmaps/${encodeURIComponent(roadmapId)}${suffix}`;
 }
@@ -38,4 +47,27 @@ export function studioRoadmapPath(roadmapId: string): string {
 export function pushStudioPath(path: string): void {
   window.history.pushState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+export function replaceStudioPath(path: string): void {
+  window.history.replaceState({}, "", path);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+export function setupPath(next = "/studio"): string {
+  return `/studio/setup?next=${encodeURIComponent(safeStudioNext(next))}`;
+}
+
+export function currentStudioNext(location: Location): string {
+  return safeStudioNext(`${location.pathname}${location.search}${location.hash}`);
+}
+
+export function safeStudioNext(next: string | null | undefined): string {
+  if (!next?.startsWith("/studio")) {
+    return "/studio";
+  }
+  if (next.startsWith("//")) {
+    return "/studio";
+  }
+  return next;
 }
