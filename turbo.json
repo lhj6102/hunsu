@@ -1,0 +1,56 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalPassThroughEnv": [
+    "HUNSU_LOCAL_HOST",
+    "HUNSU_LOCAL_PORT",
+    "HUNSU_LOCAL_ALLOWED_ORIGINS",
+    "HUNSU_WEB_URL",
+    "HUNSU_WEB_HOST",
+    "HUNSU_WEB_PORT",
+    "HUNSU_WEB_STRICT_PORT",
+    "HUNSU_LOCAL_API_PROXY_TARGET",
+    "VITE_HUNSU_LOCAL_URL",
+    "VITE_HUNSU_HUB_API_URL",
+    "HUNSU_AGENT_PREVIEW_HOST",
+    "HUNSU_AGENT_PREVIEW_PORT",
+    "HUNSU_ROADMAP_REGISTRY_PATH",
+    "HUNSU_ROUTE_WORKTREE_ROOT",
+    "HUNSU_ACTION_WORKTREE_ROOT",
+    "HUNSU_LOCAL_TEST_RUNNER",
+    "HUNSU_CODEX_APP_SERVER_COMMAND",
+    "HUNSU_CODEX_APP_SERVER_ARGS",
+    "HUNSU_CODEX_SANDBOX_MODE",
+    "HUNSU_CODEX_APPROVAL_POLICY",
+    "HUNSU_CODEX_APPROVALS_REVIEWER",
+    "HUNSU_CODEX_NETWORK_ACCESS",
+    "HUNSU_CODEX_ADDITIONAL_DIRECTORIES",
+    "HUNSU_HANDOFF_PORT",
+    "HUNSU_DEPLOY_TARGET",
+    "HUNSU_HUB_WORKER_NAME",
+    "HUNSU_HUB_ORIGIN_NAME",
+    "HUNSU_HUB_PUBLIC_API_URL",
+    "HUNSU_HUB_D1_DATABASE_NAME",
+    "HUNSU_HUB_D1_DATABASE_ID",
+    "HUNSU_HUB_R2_BUCKET_NAME",
+    "HUNSU_HUB_PUBLISH_QUEUE_NAME",
+    "HUNSU_HUB_ADMIN_TOKEN"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^test"],
+      "outputs": []
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

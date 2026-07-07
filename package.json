@@ -1,0 +1,27 @@
+{
+  "name": "@hunsu/workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Git-native board recorder and Human-on-the-loop development harness for coding agents.",
+  "packageManager": "pnpm@10.30.2",
+  "scripts": {
+    "dev": "turbo run dev --parallel",
+    "build": "turbo run build",
+    "e2e:local": "PLAYWRIGHT_HTML_OPEN=never playwright test",
+    "e2e:local:headed": "PLAYWRIGHT_HTML_OPEN=never playwright test --headed",
+    "test": "node --conditions=development --test tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "pnpm run typecheck && pnpm test",
+    "hunsu": "pnpm --filter hunsu hunsu"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "@types/node": "^22.15.17",
+    "turbo": "^2.6.1",
+    "typescript": "^5.8.3"
+  }
+}

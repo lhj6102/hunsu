@@ -1,0 +1,12 @@
+node_modules/
+npm-debug.log*
+.turbo/
+**/.turbo/
+dist/
+**/dist/
+.playwright-cli/
+handoffs/*
+apps/hub-api/.wrangler/
+playwright-report/
+test-results/
+ops/hub/env/*.env
