@@ -1125,6 +1125,17 @@ test("Bridge server requires allowed browser origins and pairing tokens for prot
   assert.equal(missingToken.status, 401);
   assert.equal(missingToken.headers["access-control-allow-origin"], "https://studio.example.test");
 
+  const preflight = await requestStudioServerJson(server, "OPTIONS", "/api/filesystem/grants", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      "access-control-request-method": "POST",
+      "access-control-request-headers": "authorization,content-type"
+    }
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers["access-control-allow-origin"], "https://studio.example.test");
+  assert.match(preflight.headers["access-control-allow-headers"], /authorization/);
+
   const accepted = await requestStudioServerJson(server, "GET", "/api/codex/status", undefined, {
     headers: {
       origin: "https://studio.example.test",

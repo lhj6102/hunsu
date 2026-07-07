@@ -1170,7 +1170,7 @@ function createStudioServerSecurity(options: StudioServerSecurityOptions | undef
   };
 }
 
-function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, security: StudioServerSecurity): StudioRequestSecurity {
+function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, security: StudioServerSecurity, options: { skipAuth?: boolean } = {}): StudioRequestSecurity {
   const origin = requestHeader(request, "origin");
   const corsHeaders = corsHeadersForOrigin(origin, security);
   if (origin && corsHeaders === undefined) {
@@ -1190,7 +1190,7 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
     };
   }
   const headers = corsHeaders ?? baseCorsHeaders();
-  if (security.authToken && !isPublicBridgeRequest(url) && !hasValidBridgeApiToken(request, url, security.authToken)) {
+  if (!options.skipAuth && security.authToken && !isPublicBridgeRequest(url) && !hasValidBridgeApiToken(request, url, security.authToken)) {
     return {
       allowed: false,
       status: 401,
@@ -1700,7 +1700,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
       const pathname = url.pathname;
-      const requestSecurity = evaluateStudioRequestSecurity(request, url, security);
+      const requestSecurity = evaluateStudioRequestSecurity(request, url, security, { skipAuth: request.method === "OPTIONS" });
       responseSecurityHeaders.set(response, requestSecurity.corsHeaders);
       if (request.method === "OPTIONS") {
         sendJson(response, requestSecurity.allowed ? 204 : requestSecurity.status ?? 403, requestSecurity.allowed ? {} : { error: requestSecurity.error ?? "Origin is not allowed." });
