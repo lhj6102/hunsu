@@ -4,6 +4,8 @@ npm-debug.log*
 **/.turbo/
 dist/
 **/dist/
+apps/bridge-desktop/.sidecar-cache/
+apps/bridge-desktop/native-sidecars/
 .playwright-cli/
 handoffs/*
 **/.wrangler/

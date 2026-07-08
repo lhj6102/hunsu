@@ -1,10 +1,10 @@
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Folder, GitBranch, Plus, Search } from "lucide-react";
+import { AlertTriangle, ExternalLink, Folder, GitBranch, Plus, Search, Trash2 } from "lucide-react";
 import { pushStudioPath, studioRoadmapPath } from "@/app/routes";
 import { cn } from "@/lib/utils";
-import { postFilesystemGrant, postRoadmapCreate, postRoadmapOpen } from "@/shared/api/bridgeClient";
-import { ROADMAP_REGISTRY_QUERY_KEY, upsertRoadmapRegistryCache, useFilesystemBrowser } from "@/shared/api/useStudioData";
+import { postFilesystemGrant, postRoadmapCreate, postRoadmapOpen, postRoadmapPortApply, postRoadmapRegistryRemove } from "@/shared/api/bridgeClient";
+import { ROADMAP_REGISTRY_QUERY_KEY, upsertRoadmapRegistryCache, useFilesystemBrowser, useRoadmapRegistry } from "@/shared/api/useStudioData";
 import type { BrowseRootId, FilesystemBrowseEntry, RoadmapRegistryEntry } from "@/shared/api/bridgeTypes";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -31,9 +31,10 @@ export function StudioLauncher({
   const requestedPath = path.trim();
   const canUsePath = isAbsoluteLocalPath(requestedPath);
   const browser = useFilesystemBrowser(canUsePath ? requestedPath : undefined, rootId);
+  const registry = useRoadmapRegistry();
   const queryClient = useQueryClient();
   const [message, setMessage] = useState<string | undefined>();
-  const [busyAction, setBusyAction] = useState<"open" | "create" | undefined>();
+  const [busyAction, setBusyAction] = useState<"open" | "create" | "repair" | "remove" | undefined>();
 
   const finderItems = useMemo<FinderItem[]>(() => {
     const items: FinderItem[] = [
@@ -56,19 +57,24 @@ export function StudioLauncher({
   }, [browser.data.entries, canUsePath, requestedPath]);
 
   async function openRoadmap(entry: FilesystemBrowseEntry) {
-    setMessage("Opening Roadmap...");
+    setMessage(entry.isRoadmap ? "Opening Roadmap..." : entry.isGitRepository ? "Porting Git project..." : "Creating Roadmap...");
     setBusyAction("open");
     try {
       const capability = await grantPath(entry.path, entry.rootId);
-      if (!entry.isRoadmap) {
-        pushStudioPath(`/studio/port?path=${encodeURIComponent(entry.path)}&browseToken=${encodeURIComponent(capability.browseToken)}&rootId=${encodeURIComponent(capability.rootId)}`);
-        return;
-      }
-      const result = await postRoadmapOpen({ browseToken: capability.browseToken, path: entry.path });
+      const result = entry.isRoadmap
+        ? await postRoadmapOpen({ browseToken: capability.browseToken, path: entry.path })
+        : entry.isGitRepository
+          ? await postRoadmapPortApply({
+              browseToken: capability.browseToken,
+              path: entry.path,
+              title: entry.name,
+              goal: `Port ${entry.name} into Hunsu.`
+            })
+          : await postRoadmapCreate({ browseToken: capability.browseToken, path: entry.path });
       refreshRoadmapRegistry(result.roadmap);
       pushStudioPath(studioRoadmapPath(result.roadmap.roadmapId));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Unable to open Roadmap.");
+      setMessage(error instanceof Error ? error.message : "Unable to complete project action.");
     } finally {
       setBusyAction(undefined);
     }
@@ -103,6 +109,39 @@ export function StudioLauncher({
     void queryClient.invalidateQueries({ queryKey: ROADMAP_REGISTRY_QUERY_KEY });
   }
 
+  async function removeRecentRoadmap(roadmap: RoadmapRegistryEntry) {
+    setBusyAction("remove");
+    setMessage("Removing recent Roadmap...");
+    try {
+      const roadmaps = await postRoadmapRegistryRemove({ roadmapId: roadmap.roadmapId });
+      queryClient.setQueryData<RoadmapRegistryEntry[]>(ROADMAP_REGISTRY_QUERY_KEY, roadmaps);
+      setMessage("Removed from recent Roadmaps.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to remove recent Roadmap.");
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function repairRecentRoadmap(roadmap: RoadmapRegistryEntry) {
+    setBusyAction("repair");
+    setMessage("Repairing Roadmap...");
+    try {
+      const capability = await grantPath(roadmap.repositoryPath);
+      const result = await postRoadmapCreate({
+        browseToken: capability.browseToken,
+        path: roadmap.repositoryPath,
+        title: roadmap.displayName
+      });
+      refreshRoadmapRegistry(result.roadmap);
+      pushStudioPath(studioRoadmapPath(result.roadmap.roadmapId));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to repair Roadmap.");
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
   return (
     <main className="apple-page h-screen overflow-hidden">
       <section className="mx-auto flex h-full w-full max-w-[1180px] flex-col px-6 py-8 lg:px-10 lg:py-12">
@@ -111,7 +150,33 @@ export function StudioLauncher({
           <h1 className="mt-1 font-[family-name:var(--apple-font-display)] text-[44px] font-semibold leading-[1.08] tracking-normal text-[color:var(--apple-ink)]">
             Project Finder
           </h1>
+          <div className="mt-5 flex flex-wrap gap-3">
+            <Button type="button" size="lg" onClick={() => openBridgeLink("hunsu://open-project")}>
+              <ExternalLink className="size-4" />
+              Choose Folder in Bridge App
+            </Button>
+            <Button type="button" size="lg" variant="outline" onClick={() => openBridgeLink("hunsu://pair?next=/studio")}>
+              <ExternalLink className="size-4" />
+              Open Hunsu Bridge
+            </Button>
+          </div>
         </div>
+
+        {registry.data.length > 0 ? (
+          <section className="mt-6 shrink-0 rounded-[18px] border border-[color:var(--apple-hairline)] bg-white/58 px-4 py-3">
+            <div className="grid gap-2">
+              {registry.data.slice(0, 5).map(roadmap => (
+                <RecentRoadmapRow
+                  key={roadmap.roadmapId}
+                  roadmap={roadmap}
+                  busy={busyAction !== undefined}
+                  onRepair={repairRecentRoadmap}
+                  onRemove={removeRecentRoadmap}
+                />
+              ))}
+            </div>
+          </section>
+        ) : null}
 
         <div className="apple-glass-strong mt-8 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] p-4">
           <div className="flex shrink-0 flex-col gap-3 md:flex-row md:items-center">
@@ -157,6 +222,57 @@ export function StudioLauncher({
         </div>
       </section>
     </main>
+  );
+}
+
+function RecentRoadmapRow({
+  roadmap,
+  busy,
+  onRepair,
+  onRemove
+}: {
+  roadmap: RoadmapRegistryEntry;
+  busy: boolean;
+  onRepair: (roadmap: RoadmapRegistryEntry) => void;
+  onRemove: (roadmap: RoadmapRegistryEntry) => void;
+}) {
+  const primaryAction = roadmap.primaryAction ?? (roadmap.health === "ok" ? "open" : "remove");
+  const canOpen = primaryAction === "open";
+  const canRepair = primaryAction === "repair";
+  const unhealthy = !canOpen;
+  return (
+    <div className="grid min-h-12 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-[12px] px-2 py-2 hover:bg-white/46">
+      <button
+        type="button"
+        className="flex min-w-0 items-center gap-3 text-left"
+        onClick={() => canOpen ? pushStudioPath(studioRoadmapPath(roadmap.roadmapId)) : undefined}
+      >
+        <span className={cn(
+          "flex size-8 shrink-0 items-center justify-center rounded-full",
+          unhealthy ? "bg-[color:var(--apple-orange)]/12 text-[color:var(--apple-orange)]" : "bg-white text-[color:var(--apple-green)]"
+        )}>
+          {unhealthy ? <AlertTriangle className="size-4" /> : <Folder className="size-4" />}
+        </span>
+        <span className="min-w-0">
+          <span className="block truncate text-[13px] font-semibold text-[color:var(--apple-ink)]">{roadmap.displayName}</span>
+          <span className="block truncate text-[11px] leading-4 text-muted-foreground">{roadmap.health} · {roadmap.repositoryPath}</span>
+        </span>
+      </button>
+      {canOpen ? (
+        <Button type="button" size="sm" disabled={busy} onClick={() => pushStudioPath(studioRoadmapPath(roadmap.roadmapId))}>
+          Open
+        </Button>
+      ) : canRepair ? (
+        <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => onRepair(roadmap)}>
+          Repair
+        </Button>
+      ) : (
+        <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => onRemove(roadmap)}>
+          <Trash2 className="size-4" />
+          Remove
+        </Button>
+      )}
+    </div>
   );
 }
 
@@ -206,9 +322,9 @@ function FinderRow({
         </span>
       </button>
       <div className="flex shrink-0 items-center gap-2">
-        {entry.isRoadmap ? <Badge variant="success">Roadmap</Badge> : entry.isGitRepository ? <Badge variant="outline">Git</Badge> : null}
+        {entry.isRoadmap ? <Badge variant="success">Roadmap</Badge> : entry.isGitRepository ? <Badge variant="outline">Git</Badge> : <Badge variant="muted">New</Badge>}
         <Button type="button" size="sm" variant={entry.isRoadmap ? "default" : "outline"} disabled={busy} onClick={() => onOpen(entry)}>
-          {entry.isRoadmap ? "Open" : "Inspect"}
+          {entry.isRoadmap ? "Open" : entry.isGitRepository ? "Port" : "Create"}
         </Button>
       </div>
     </div>
@@ -232,7 +348,11 @@ function FinderSkeleton() {
 }
 
 function isAbsoluteLocalPath(value: string): boolean {
-  return value.startsWith("/");
+  return value.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(value);
+}
+
+function openBridgeLink(url: string): void {
+  window.location.href = url;
 }
 
 function modeLabel(mode: "launcher" | "open" | "port"): string {

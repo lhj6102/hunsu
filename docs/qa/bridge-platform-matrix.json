@@ -1,0 +1,109 @@
+{
+  "schema": "hunsu.bridge-platform-qa.v1",
+  "updatedAt": "2026-07-07",
+  "nativeHostResults": {
+    "status": "not-run-in-this-workspace",
+    "recordedAt": "2026-07-08",
+    "workspace": "Linux no-GUI development workspace",
+    "realRuns": [],
+    "externalBlocker": "macOS, Windows, Linux GUI, packaged installer, tray/menu-bar, and real native host daemon QA require external hosts. This matrix records contract coverage only until those native-host runs are executed and appended here."
+  },
+  "targets": [
+    {
+      "target": "macOS",
+      "status": "validated-by-contract",
+      "nativeHostExecuted": false,
+      "evidence": [
+        "apps/bridge-desktop/src-tauri/Info.plist",
+        "apps/bridge-desktop/src-tauri/tauri.conf.json",
+        "apps/bridge-desktop/scripts/build-native-sidecars.mjs",
+        "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
+        "tests/bridge-desktop.test.ts"
+      ],
+      "checks": [
+        "fresh install bundle contains hunsu:// URL scheme",
+        "folder picker command is exposed through Tauri dialog plugin",
+        "native sidecar artifacts are generated for x86_64-apple-darwin and aarch64-apple-darwin",
+        "Bridge App can launch Studio through a fresh pairing URL",
+        "sidecar supervisor records crash restart logs"
+      ]
+    },
+    {
+      "target": "Windows",
+      "status": "validated-by-contract",
+      "nativeHostExecuted": false,
+      "evidence": [
+        "apps/bridge-desktop/src-tauri/windows/hunsu-protocol.wxs",
+        "apps/bridge-desktop/src-tauri/tauri.conf.json",
+        "apps/bridge-desktop/scripts/build-native-sidecars.mjs",
+        "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
+        "tests/bridge-desktop.test.ts"
+      ],
+      "checks": [
+        "installer registers hunsu:// protocol through WiX fragment",
+        "native sidecar .exe artifacts are generated for x86_64-pc-windows-msvc and aarch64-pc-windows-msvc",
+        "DPAPI-backed credential adapter command boundary is covered with mocks",
+        "open project and launch Studio use the same Bridge App command surface",
+        "uninstall and reinstall preserve no committed user data"
+      ]
+    },
+    {
+      "target": "Linux GUI",
+      "status": "validated-by-contract",
+      "nativeHostExecuted": false,
+      "evidence": [
+        "apps/bridge-desktop/src/native-shell.ts",
+        "apps/bridge-desktop/src-tauri/tauri.conf.json",
+        "apps/bridge-desktop/scripts/build-native-sidecars.mjs",
+        "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
+        "tests/bridge-desktop.test.ts"
+      ],
+      "checks": [
+        "native folder picker command is exposed",
+        "xdg hunsu:// protocol registration plan is generated",
+        "Secret Service credential adapter command boundary is covered with mocks",
+        "native sidecar artifacts are generated for Linux GNU targets",
+        "launch Studio uses a fresh pairing URL"
+      ]
+    },
+    {
+      "target": "Linux no-GUI",
+      "status": "validated-by-contract",
+      "nativeHostExecuted": false,
+      "evidence": [
+        "apps/bridge-desktop/src/main.ts",
+        "apps/bridge-desktop/src/auth.ts",
+        "apps/bridge-desktop/src/relay.ts",
+        "tests/bridge-desktop.test.ts",
+        "tests/relay.test.ts"
+      ],
+      "checks": [
+        "hunsu-bridge login uses Device Authorization Flow",
+        "hunsu-bridge projects grant persists Project Grant scopes",
+        "hunsu-bridge start --remote registers device and starts outbound Relay when configured",
+        "hunsu-bridge service install writes a systemd user unit",
+        "hunsu-bridge service start and stop call systemctl --user when available",
+        "structured JSON logs include service, relay, supervisor, and bridge lifecycle events"
+      ]
+    },
+    {
+      "target": "Browsers",
+      "status": "validated-by-contract",
+      "nativeHostExecuted": false,
+      "browsers": ["Chrome", "Safari", "Edge", "Firefox"],
+      "evidence": [
+        "apps/web/src/shared/api/bridgeApiBase.ts",
+        "apps/web/src/shared/api/bridgeClient.ts",
+        "apps/web/src/features/connection/ConnectionCenter.tsx",
+        "tests/web-roadmap-view-model.test.ts"
+      ],
+      "checks": [
+        "hunsuBridgeToken is captured then removed from the URL",
+        "hunsuRelayToken is captured then removed from the URL",
+        "Connection Center lists and selects Remote Bridge devices",
+        "remote Roadmap, Execute, Artifact Action, live, and agent event paths map to typed Relay commands",
+        "advanced CLI recovery remains secondary to opening Hunsu Bridge App"
+      ]
+    }
+  ]
+}

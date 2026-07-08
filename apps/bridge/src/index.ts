@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, normalize, relative, resolve } fro
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createDefaultCodexRunner, GOAL_EVALUATION_SCHEMA, type CodexProviderStatus, type TeamRunEvent, type HunsuDraftConversationMessage, type HunsuDraftSessionInput, type HunsuDraftSourceSnapshot, type HunsuDraftTurnInput, type JsonRpcMessage, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerAppServerCommandAction, type RunnerAppServerItem, type RunnerRun, type StartRunInput } from "@hunsu/codex-runner";
-import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
+import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveRelayClientConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
 import {
   createFinalizedMoveCommit,
   createMoveCommitFromWorktree,
@@ -199,10 +199,28 @@ const queuedRunUpdates = new WeakMap<StudioServerState, Map<string, ReturnType<t
 const responseSecurityHeaders = new WeakMap<object, Record<string, string>>();
 const BRIDGE_API_TOKEN_QUERY_PARAM = "hunsuBridgeToken";
 const BRIDGE_API_TOKEN_HEADER = "x-hunsu-bridge-token";
+const BRIDGE_CONTROL_TOKEN_HEADER = "x-hunsu-bridge-control-token";
+const DEFAULT_PAIRING_TOKEN_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_BRIDGE_STUDIO_ORIGINS = [
   "http://127.0.0.1:19688",
   "http://localhost:19688"
 ];
+const HUNSU_BRIDGE_VERSION = "0.1.2";
+const HUNSU_BRIDGE_PROTOCOL_VERSION = "local-bridge-v1";
+const HUNSU_BRIDGE_SUPPORTED_FEATURES = [
+  "local-pairing",
+  "project-finder",
+  "roadmap-registry",
+  "artifact-actions",
+  "connection-status",
+  "bridge-supervisor",
+  "remote-ready"
+];
+const DEFAULT_STUDIO_BRIDGE_REQUIREMENT: StudioBridgeRequirement = {
+  minBridgeVersion: HUNSU_BRIDGE_VERSION,
+  requiredProtocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
+  requiredFeatures: ["local-pairing", "connection-status"]
+};
 
 export type StudioRunStatus = ExecuteRunStatus;
 
@@ -555,12 +573,18 @@ export type StudioServerState = {
 
 export type StudioServerSecurityOptions = {
   authToken?: string;
+  controlToken?: string;
+  pairingSession?: BridgePairingSession;
+  pairingTokenTtlMs?: number;
   allowedOrigins?: string[];
   allowNoOrigin?: boolean;
 };
 
 type StudioServerSecurity = {
   authToken?: string;
+  controlToken?: string;
+  pairingSession?: BridgePairingSession;
+  pairingTokenTtlMs: number;
   allowedOrigins: string[];
   allowNoOrigin: boolean;
 };
@@ -569,6 +593,7 @@ type StudioRequestSecurity = {
   allowed: boolean;
   status?: number;
   error?: string;
+  code?: string;
   corsHeaders: Record<string, string>;
 };
 
@@ -606,7 +631,9 @@ export type RoadmapRegistryEntry = {
   repositoryPath: string;
   lastOpenedAt: string;
   lastKnownBranch?: string;
-  health: "ok" | "missing";
+  health: "ok" | "missing" | "missing-runtime" | "needs-upgrade" | "git-dirty" | "unknown";
+  type?: "roadmap" | "git-project" | "missing";
+  primaryAction?: "open" | "port" | "repair" | "remove";
 };
 
 export type RoadmapOpenRequest = {
@@ -614,6 +641,11 @@ export type RoadmapOpenRequest = {
   cwd?: string;
   browseToken?: string;
   title?: string;
+};
+
+export type RoadmapRemoveRequest = {
+  roadmapId?: string;
+  path?: string;
 };
 
 export type RoadmapPortRequest = RoadmapOpenRequest & {
@@ -635,6 +667,270 @@ export type RoadmapPortInspectResult = {
 export type RoadmapPortApplyResult = RoadmapOpenResult & {
   port: HunsuPortApplyResult;
 };
+
+export type ProjectInspection =
+  | {
+      kind: "hunsu-roadmap";
+      path: string;
+      roadmapId: string;
+      displayName: string;
+      health: "ok" | "missing-runtime" | "needs-upgrade" | "git-dirty" | "unknown";
+      recommendedAction: "open";
+      stackHints: string[];
+    }
+  | {
+      kind: "git-project";
+      path: string;
+      branch?: string;
+      clean?: boolean;
+      stackHints: string[];
+      recommendedAction: "port";
+    }
+  | {
+      kind: "new-project";
+      path: string;
+      recommendedAction: "create";
+    }
+  | {
+      kind: "missing-roadmap";
+      path: string;
+      roadmapId: string;
+      displayName: string;
+      health: "missing-path" | "missing-runtime";
+      reason: string;
+      recommendedAction: "repair" | "remove";
+    }
+  | {
+      kind: "unsupported";
+      path: string;
+      reason: string;
+      recommendedAction: "explain";
+    };
+
+export type ProjectInspectionRequest = RoadmapOpenRequest;
+
+export type BridgeRuntimeStatus = "starting" | "running" | "stopping" | "stopped" | "error";
+
+export type BridgePairingSession = {
+  token: string;
+  issuedAt: string;
+  expiresAt: string;
+  revokedAt?: string;
+};
+
+export type BridgeRuntimeHandle = {
+  bridgeApiUrl: string;
+  studioUrl?: string;
+  allowedOrigin: string;
+  authToken: string;
+  controlToken: string;
+  pairing: BridgePairingSession;
+  status: BridgeRuntimeStatus;
+  startedAt?: string;
+  error?: string;
+};
+
+export type BridgeMode = "local" | "remote-ready";
+export type StudioPairingTokenQueryParam = "hunsuBridgeToken";
+
+export type StartBridgeInput = {
+  cwd?: string;
+  webUrl?: string;
+  noOpen?: boolean;
+  allowedOrigins?: string[];
+  mode?: BridgeMode;
+  authToken?: string;
+  controlToken?: string;
+  pairingTtlMs?: number;
+  runtimeConfig?: BridgeRuntimeConfig;
+  tokenQueryParam?: StudioPairingTokenQueryParam;
+};
+
+export type CreatePairingUrlInput = {
+  webUrl?: string;
+  authToken?: string;
+  roadmapId?: string;
+  tokenQueryParam?: StudioPairingTokenQueryParam;
+};
+
+export type OpenStudioInput = CreatePairingUrlInput & {
+  url?: string;
+};
+
+export type BridgeSupervisor = {
+  start(input?: StartBridgeInput): Promise<BridgeRuntimeHandle>;
+  stop(): Promise<void>;
+  restart(input?: StartBridgeInput): Promise<BridgeRuntimeHandle>;
+  status(): Promise<BridgeRuntimeHandle | undefined>;
+  createPairingUrl(input?: CreatePairingUrlInput): Promise<string>;
+  openStudio(input?: OpenStudioInput): Promise<void>;
+  rotatePairing(input?: CreatePairingUrlInput): Promise<BridgeRuntimeHandle>;
+  revokePairing(): Promise<BridgeRuntimeHandle | undefined>;
+};
+
+export type BridgeVersionInfo = {
+  bridgeVersion: string;
+  bridgeAppVersion?: string;
+  protocolVersion: string;
+  minSupportedStudioVersion?: string;
+  supportedFeatures: string[];
+};
+
+export type StudioBridgeRequirement = {
+  minBridgeVersion: string;
+  minBridgeAppVersionForRelay?: string;
+  requiredProtocolVersion: string;
+  requiredFeatures: string[];
+};
+
+export type BridgeCompatibility =
+  | { compatible: true }
+  | { compatible: false; reason: "bridge_update_needed" | "studio_update_needed" | "feature_unavailable" | "bridge_app_update_needed"; message: string };
+
+export type StudioConnectionStatus = {
+  mode: "none" | "local" | "remote";
+  transport: "direct" | "relay" | "unreachable";
+  health: "checking" | "connected" | "disconnected" | "error";
+  auth: "paired" | "missing_token" | "expired" | "account_mismatch" | "unknown";
+  projectAccess: "granted" | "needs_grant" | "denied" | "not_applicable";
+  bridge?: {
+    id?: string;
+    name?: string;
+    version?: string;
+    protocolVersion?: string;
+    startedAt?: string;
+    lastSeenAt?: string;
+  };
+  endpoint?: {
+    apiUrl?: string;
+    relayLabel?: string;
+  };
+  account?: {
+    webUserId?: string;
+    bridgeUserId?: string;
+    sameUser?: boolean;
+  };
+  project?: {
+    roadmapId?: string;
+    displayName?: string;
+    repositoryPath?: string;
+  };
+  warnings: Array<
+    | "public_bind"
+    | "version_mismatch"
+    | "origin_not_allowed"
+    | "relay_unavailable"
+    | "project_missing"
+  >;
+  error?: string;
+  version: BridgeVersionInfo;
+  compatibility?: BridgeCompatibility;
+};
+
+export type RemoteBridgeDevice = {
+  deviceId: string;
+  deviceName: string;
+  userId: string;
+  registeredAt: string;
+  lastSeenAt?: string;
+  status: "online" | "offline";
+  bridgeVersion?: string;
+  bridgeAppVersion?: string;
+  protocolVersion?: string;
+};
+
+export type RemoteBridgeDeviceListResult = {
+  devices: RemoteBridgeDevice[];
+};
+
+export type RemoteBridgeConnectRequest = {
+  deviceId?: string;
+  webUserId?: string;
+  projectPath?: string;
+  minBridgeVersion?: string;
+  requiredProtocolVersion?: string;
+  requiredFeatures?: string[];
+};
+
+export type RemoteBridgeConnectResult = {
+  connection: StudioConnectionStatus;
+  device?: RemoteBridgeDevice;
+  compatibility: BridgeCompatibility;
+};
+
+export type RemoteProjectGrantStatus = "granted" | "needs_grant" | "denied";
+
+export type RemoteProjectGrantStatusRequest = {
+  deviceId: string;
+  projectPath: string;
+  requestedScopes?: BridgeCommandScope[];
+};
+
+export type RemoteProjectGrantStatusResult = {
+  projectAccess: RemoteProjectGrantStatus;
+  missingScopes?: BridgeCommandScope[];
+  message?: string;
+};
+
+export type RelayCommandName =
+  | "health"
+  | "connection.status"
+  | "roadmap.registry.list"
+  | "roadmap.registry.remove"
+  | "roadmap.open"
+  | "roadmap.port.inspect"
+  | "roadmap.port.apply"
+  | "roadmap.create"
+  | "roadmap.board"
+  | "roadmap.worktree"
+  | "roadmap.skills"
+  | "roadmap.commands"
+  | "execute.start"
+  | "execute.pause"
+  | "execute.resume"
+  | "execute.stop"
+  | "execute.completeMove"
+  | "execute.status"
+  | "artifactAction.list"
+  | "artifactAction.runs"
+  | "artifactAction.start"
+  | "artifactAction.stop"
+  | "moveFile.tree"
+  | "moveFile.blob"
+  | "moveFile.diff"
+  | "hunsuDraft.list"
+  | "hunsuDraft.start"
+  | "hunsuDraft.get"
+  | "hunsuDraft.message"
+  | "hunsuDraft.diffArtifact.create"
+  | "hunsuDraft.diffArtifact.get"
+  | "hunsuDraft.approve"
+  | "hunsuDraft.discard"
+  | "line.accept"
+  | "line.reject"
+  | "agentSession.list"
+  | "agentSession.get"
+  | "agentSession.events"
+  | "live.events";
+
+export type BridgeCommandScope =
+  | "execute.start"
+  | "artifactAction.run"
+  | "env.read"
+  | "hostAlias.expose"
+  | "remoteRelay.access";
+
+export type RemoteBridgeCommandRequest = {
+  deviceId: string;
+  command: RelayCommandName;
+  projectPath?: string;
+  requestedScopes?: BridgeCommandScope[];
+  payload?: unknown;
+};
+
+export type RemoteBridgeCommandResult =
+  | { ok: true; status: number; body?: unknown }
+  | { ok: false; status?: number; error?: string; reason?: string; message?: string };
 
 export type BrowseRootId = string & { readonly __brand: "BrowseRootId" };
 export type BrowseToken = string & { readonly __brand: "BrowseToken" };
@@ -1064,6 +1360,95 @@ export function createBridgeApiAuthToken(): string {
   return `hunsu_bridge_${randomBytes(24).toString("base64url")}`;
 }
 
+export function createBridgeControlToken(): string {
+  return `hunsu_bridge_control_${randomBytes(24).toString("base64url")}`;
+}
+
+export function createBridgePairingSession(input: {
+  token?: string;
+  ttlMs?: number;
+  issuedAt?: Date;
+} = {}): BridgePairingSession {
+  const issuedAt = input.issuedAt ?? new Date();
+  const ttlMs = Math.max(1, input.ttlMs ?? DEFAULT_PAIRING_TOKEN_TTL_MS);
+  return {
+    token: input.token ?? createBridgeApiAuthToken(),
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: new Date(issuedAt.getTime() + ttlMs).toISOString()
+  };
+}
+
+export function revokeBridgePairingSession(session: BridgePairingSession, revokedAt = new Date()): BridgePairingSession {
+  session.revokedAt = revokedAt.toISOString();
+  return session;
+}
+
+export function bridgePairingSessionState(session: BridgePairingSession, now = new Date()): "active" | "expired" | "revoked" {
+  if (session.revokedAt) {
+    return "revoked";
+  }
+  const expiresAt = Date.parse(session.expiresAt);
+  if (Number.isFinite(expiresAt) && expiresAt <= now.getTime()) {
+    return "expired";
+  }
+  return "active";
+}
+
+export function bridgeVersionInfo(input: { bridgeAppVersion?: string } = {}): BridgeVersionInfo {
+  return {
+    bridgeVersion: HUNSU_BRIDGE_VERSION,
+    bridgeAppVersion: input.bridgeAppVersion,
+    protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
+    supportedFeatures: [...HUNSU_BRIDGE_SUPPORTED_FEATURES]
+  };
+}
+
+export function evaluateBridgeCompatibility(
+  version: BridgeVersionInfo,
+  requirement: StudioBridgeRequirement,
+  studioVersion = "0.1.0"
+): BridgeCompatibility {
+  if (compareDottedVersions(version.bridgeVersion, requirement.minBridgeVersion) < 0) {
+    return {
+      compatible: false,
+      reason: "bridge_update_needed",
+      message: `Bridge ${version.bridgeVersion} is older than required ${requirement.minBridgeVersion}.`
+    };
+  }
+  if (version.protocolVersion !== requirement.requiredProtocolVersion) {
+    return {
+      compatible: false,
+      reason: "bridge_update_needed",
+      message: `Bridge protocol ${version.protocolVersion} does not match required ${requirement.requiredProtocolVersion}.`
+    };
+  }
+  const missingFeature = requirement.requiredFeatures.find(feature => !version.supportedFeatures.includes(feature));
+  if (missingFeature) {
+    return {
+      compatible: false,
+      reason: "feature_unavailable",
+      message: `Bridge feature is unavailable: ${missingFeature}.`
+    };
+  }
+  if (requirement.minBridgeAppVersionForRelay) {
+    if (!version.bridgeAppVersion || compareDottedVersions(version.bridgeAppVersion, requirement.minBridgeAppVersionForRelay) < 0) {
+      return {
+        compatible: false,
+        reason: "bridge_app_update_needed",
+        message: `Remote Relay requires Bridge App ${requirement.minBridgeAppVersionForRelay} or newer.`
+      };
+    }
+  }
+  if (version.minSupportedStudioVersion && compareDottedVersions(studioVersion, version.minSupportedStudioVersion) < 0) {
+    return {
+      compatible: false,
+      reason: "studio_update_needed",
+      message: `Studio ${studioVersion} is older than Bridge requires ${version.minSupportedStudioVersion}.`
+    };
+  }
+  return { compatible: true };
+}
+
 export type StudioBridgeStartOptions = {
   cwd?: string;
   webUrl?: string;
@@ -1083,10 +1468,10 @@ export async function startStudioBridge(options: StudioBridgeStartOptions = {}):
   const cwd = options.cwd ?? process.cwd();
   const env = options.env ?? currentProcessEnv();
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig(env, { cwd }));
-  const authToken = createBridgeApiAuthToken();
   const bridgeApiUrl = endpointUrl(runtimeConfig.bridgeApi);
+  const authToken = createBridgeApiAuthToken();
   const webUrl = resolveStudioBridgeWebUrl(options.webUrl, env);
-  const studioUrl = studioBridgePairingUrl(webUrl, authToken);
+  const studioUrl = createStudioPairingUrl({ webUrl, authToken });
   const allowedOrigin = new URL(webUrl).origin;
   const startInfo = {
     bridgeApiUrl,
@@ -1099,26 +1484,29 @@ export async function startStudioBridge(options: StudioBridgeStartOptions = {}):
     return startInfo;
   }
 
-  const server = createStudioServer({
+  const supervisor = createBridgeSupervisor();
+  const handle = await supervisor.start({
     cwd,
+    webUrl,
+    noOpen: true,
+    authToken,
     runtimeConfig,
-    security: {
-      authToken,
-      allowedOrigins: [allowedOrigin]
-    }
+    allowedOrigins: [allowedOrigin]
   });
+  const runningStartInfo = {
+    bridgeApiUrl: handle.bridgeApiUrl,
+    studioUrl: handle.studioUrl ?? studioUrl,
+    allowedOrigin: handle.allowedOrigin
+  };
+  printStudioBridgeStartInfo(runningStartInfo, options);
+  if (!options.noOpen) {
+    await supervisor.openStudio({ url: runningStartInfo.studioUrl });
+  }
 
   await new Promise<void>((resolve, reject) => {
     const shutdown = () => {
-      server.close(() => resolve());
+      supervisor.stop().then(resolve, reject);
     };
-    server.once("error", reject);
-    server.listen(runtimeConfig.bridgeApi.port, runtimeConfig.bridgeApi.host, () => {
-      printStudioBridgeStartInfo(startInfo, options);
-      if (!options.noOpen) {
-        openStudioBridgeBrowser(studioUrl);
-      }
-    });
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
   });
@@ -1126,7 +1514,7 @@ export async function startStudioBridge(options: StudioBridgeStartOptions = {}):
   return startInfo;
 }
 
-function resolveStudioBridgeWebUrl(webUrl: string | undefined, env: Record<string, string | undefined>): string {
+export function resolveStudioBridgeWebUrl(webUrl: string | undefined, env: Record<string, string | undefined>): string {
   const raw = webUrl ?? unwrapConfigResult(resolveStudioLauncherConfig(env)).webUrl;
   try {
     return new URL(raw).toString();
@@ -1135,10 +1523,22 @@ function resolveStudioBridgeWebUrl(webUrl: string | undefined, env: Record<strin
   }
 }
 
-function studioBridgePairingUrl(webUrl: string, authToken: string): string {
-  const url = new URL(webUrl);
-  url.searchParams.set(BRIDGE_API_TOKEN_QUERY_PARAM, authToken);
+export function createStudioPairingUrl(input: CreatePairingUrlInput & { authToken: string }): string {
+  const authToken = input.authToken.trim();
+  if (!authToken) {
+    throw new Error("Pairing token is required");
+  }
+  const url = new URL(resolveStudioBridgeWebUrl(input.webUrl, process.env));
+  if (input.roadmapId?.trim()) {
+    const studioPath = url.pathname.replace(/\/$/, "");
+    url.pathname = `${studioPath.endsWith("/studio") ? studioPath : "/studio"}/roadmaps/${encodeURIComponent(input.roadmapId.trim())}`;
+  }
+  url.searchParams.set(input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM, authToken);
   return url.toString();
+}
+
+function studioBridgePairingUrl(webUrl: string, authToken: string): string {
+  return createStudioPairingUrl({ webUrl, authToken });
 }
 
 function printStudioBridgeStartInfo(info: StudioBridgeStartInfo, options: Pick<StudioBridgeStartOptions, "json">): void {
@@ -1158,9 +1558,340 @@ function openStudioBridgeBrowser(url: string): void {
   child.unref();
 }
 
-function createStudioServerSecurity(options: StudioServerSecurityOptions | undefined, runtimeConfig: BridgeRuntimeConfig): StudioServerSecurity {
+export function openStudioInBrowser(url: string): void {
+  openStudioBridgeBrowser(url);
+}
+
+export function createStudioConnectionStatus(input: {
+  bridgeApiUrl: string;
+  repositoryPath?: string;
+  roadmapId?: string;
+  roadmapDisplayName?: string;
+  runtimeConfig: BridgeRuntimeConfig;
+  startedAt?: string;
+  auth?: StudioConnectionStatus["auth"];
+  projectAccess?: StudioConnectionStatus["projectAccess"];
+  bridgeVersion?: BridgeVersionInfo;
+  requirement?: StudioBridgeRequirement;
+  studioVersion?: string;
+  error?: string;
+}): StudioConnectionStatus {
+  const warnings: StudioConnectionStatus["warnings"] = [];
+  if (isWildcardHost(input.runtimeConfig.bridgeApi.host)) {
+    warnings.push("public_bind");
+  }
+  if (input.repositoryPath && !existsSync(input.repositoryPath)) {
+    warnings.push("project_missing");
+  }
+  const version = input.bridgeVersion ?? bridgeVersionInfo();
+  const compatibility = evaluateBridgeCompatibility(version, input.requirement ?? DEFAULT_STUDIO_BRIDGE_REQUIREMENT, input.studioVersion);
+  if (!compatibility.compatible) {
+    warnings.push("version_mismatch");
+  }
+  const error = input.error ?? (compatibility.compatible ? undefined : compatibility.message);
+  const healthy = error === undefined;
   return {
-    authToken: nonEmptyString(options?.authToken),
+    mode: "local",
+    transport: "direct",
+    health: healthy ? "connected" : "error",
+    auth: input.auth ?? "paired",
+    projectAccess: input.projectAccess ?? (input.repositoryPath ? "granted" : "not_applicable"),
+    bridge: {
+      id: `local:${input.runtimeConfig.bridgeApi.host}:${input.runtimeConfig.bridgeApi.port}`,
+      name: "Local Bridge",
+      version: version.bridgeVersion,
+      protocolVersion: version.protocolVersion,
+      startedAt: input.startedAt,
+      lastSeenAt: new Date().toISOString()
+    },
+    endpoint: {
+      apiUrl: input.bridgeApiUrl
+    },
+    project: input.repositoryPath ? {
+      roadmapId: input.roadmapId,
+      displayName: input.roadmapDisplayName,
+      repositoryPath: input.repositoryPath
+    } : undefined,
+    warnings,
+    error,
+    version,
+    compatibility
+  };
+}
+
+export function createDisconnectedStudioConnectionStatus(error?: string): StudioConnectionStatus {
+  return {
+    mode: "none",
+    transport: "unreachable",
+    health: "disconnected",
+    auth: "unknown",
+    projectAccess: "not_applicable",
+    warnings: [],
+    error,
+    version: bridgeVersionInfo(),
+    compatibility: { compatible: true }
+  };
+}
+
+export function createRemoteStudioConnectionStatus(input: {
+  device: RemoteBridgeDevice;
+  account?: StudioConnectionStatus["account"];
+  projectAccess?: StudioConnectionStatus["projectAccess"];
+  projectPath?: string;
+  roadmapId?: string;
+  roadmapDisplayName?: string;
+  requirement?: StudioBridgeRequirement;
+  studioVersion?: string;
+  error?: string;
+}): StudioConnectionStatus {
+  const connected = input.device.status === "online" && input.error === undefined;
+  const version: BridgeVersionInfo = {
+    ...bridgeVersionInfo(),
+    bridgeVersion: input.device.bridgeVersion ?? "unknown",
+    bridgeAppVersion: input.device.bridgeAppVersion,
+    protocolVersion: input.device.protocolVersion ?? "unknown"
+  };
+  const compatibility = evaluateBridgeCompatibility(version, input.requirement ?? DEFAULT_STUDIO_BRIDGE_REQUIREMENT, input.studioVersion);
+  const warnings: StudioConnectionStatus["warnings"] = [];
+  if (!connected) {
+    warnings.push("relay_unavailable");
+  }
+  if (!compatibility.compatible) {
+    warnings.push("version_mismatch");
+  }
+  return {
+    mode: "remote",
+    transport: "relay",
+    health: connected && compatibility.compatible ? "connected" : input.error || !compatibility.compatible ? "error" : "disconnected",
+    auth: input.account?.sameUser === false ? "account_mismatch" : "paired",
+    projectAccess: input.projectAccess ?? "needs_grant",
+    bridge: {
+      id: input.device.deviceId,
+      name: input.device.deviceName,
+      version: input.device.bridgeVersion,
+      protocolVersion: input.device.protocolVersion,
+      lastSeenAt: input.device.lastSeenAt
+    },
+    endpoint: {
+      relayLabel: "Hunsu Relay"
+    },
+    account: input.account,
+    project: input.projectPath ? {
+      roadmapId: input.roadmapId,
+      displayName: input.roadmapDisplayName,
+      repositoryPath: input.projectPath
+    } : undefined,
+    warnings,
+    error: input.error ?? (compatibility.compatible ? undefined : compatibility.message),
+    version,
+    compatibility
+  };
+}
+
+export function createBridgeSupervisor(): BridgeSupervisor {
+  let server: Server | undefined;
+  let handle: BridgeRuntimeHandle | undefined;
+  let runtimeConfig: BridgeRuntimeConfig | undefined;
+  let repositoryPath: string | undefined;
+  let webUrl: string | undefined;
+  let allowedOrigins: string[] = [];
+  let pairingSession: BridgePairingSession | undefined;
+  let controlToken: string | undefined;
+  let stopping = false;
+
+  const supervisor: BridgeSupervisor = {
+    async start(input: StartBridgeInput = {}) {
+      if (handle?.status === "running" || handle?.status === "starting") {
+        return handle;
+      }
+
+      repositoryPath = input.cwd ?? repositoryPath ?? process.cwd();
+      runtimeConfig = input.runtimeConfig ?? unwrapConfigResult(resolveBridgeRuntimeConfig(process.env, { cwd: repositoryPath }));
+      webUrl = resolveStudioBridgeWebUrl(input.webUrl ?? webUrl, runtimeConfig.processEnv);
+      const allowedOrigin = new URL(webUrl).origin;
+      allowedOrigins = uniqueStrings([allowedOrigin, ...(input.allowedOrigins ?? allowedOrigins)]);
+      pairingSession = createBridgePairingSession({ token: input.authToken, ttlMs: input.pairingTtlMs });
+      const authToken = pairingSession.token;
+      controlToken = input.controlToken ?? controlToken ?? createBridgeControlToken();
+      const initialBridgeApiUrl = endpointUrl(runtimeConfig.bridgeApi);
+      const tokenQueryParam = input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM;
+      const studioUrl = createStudioPairingUrl({ webUrl, authToken, tokenQueryParam });
+      handle = {
+        bridgeApiUrl: initialBridgeApiUrl,
+        studioUrl,
+        allowedOrigin,
+        authToken,
+        controlToken,
+        pairing: pairingSession,
+        status: "starting"
+      };
+      stopping = false;
+
+      server = createStudioServer({
+        cwd: repositoryPath,
+        runtimeConfig,
+        security: {
+          pairingSession,
+          controlToken,
+          allowedOrigins
+        }
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        const activeServer = server;
+        if (!activeServer || !runtimeConfig) {
+          reject(new Error("Bridge server could not be created."));
+          return;
+        }
+        const onError = (error: Error) => {
+          handle = {
+            ...handle!,
+            status: "error",
+            error: error.message
+          };
+          reject(error);
+        };
+        activeServer.once("error", onError);
+        activeServer.once("close", () => {
+          if (handle && !stopping && handle.status !== "error") {
+            handle = { ...handle, status: "stopped" };
+          }
+        });
+        activeServer.listen(runtimeConfig.bridgeApi.port, runtimeConfig.bridgeApi.host, () => {
+          activeServer.off("error", onError);
+          const bridgeApiUrl = bridgeApiUrlForServer(activeServer, runtimeConfig!);
+          const startedAt = new Date().toISOString();
+          handle = {
+            ...handle!,
+            bridgeApiUrl,
+            studioUrl: createStudioPairingUrl({ webUrl: webUrl!, authToken, tokenQueryParam }),
+            controlToken: controlToken!,
+            status: "running",
+            startedAt
+          };
+          if (!input.noOpen) {
+            openStudioBridgeBrowser(handle.studioUrl!);
+          }
+          resolve();
+        });
+      });
+
+      return handle;
+    },
+    async stop() {
+      if (!server) {
+        if (handle) {
+          handle = { ...handle, status: "stopped" };
+        }
+        return;
+      }
+      stopping = true;
+      if (handle) {
+        handle = { ...handle, status: "stopping" };
+      }
+      const closing = server;
+      server = undefined;
+      await new Promise<void>((resolve, reject) => {
+        closing.close(error => {
+          if (error) {
+            if (handle) {
+              handle = { ...handle, status: "error", error: error.message };
+            }
+            reject(error);
+            return;
+          }
+          if (handle) {
+            handle = { ...handle, status: "stopped" };
+          }
+          stopping = false;
+          resolve();
+        });
+      });
+    },
+    async restart(input: StartBridgeInput = {}) {
+      await supervisor.stop();
+      return supervisor.start({
+        cwd: repositoryPath,
+        webUrl,
+        allowedOrigins,
+        ...input
+      });
+    },
+    async status() {
+      return handle;
+    },
+    async createPairingUrl(input: CreatePairingUrlInput = {}) {
+      if (handle && pairingSession && bridgePairingSessionState(pairingSession) !== "active") {
+        await supervisor.rotatePairing(input);
+      }
+      const authToken = input.authToken ?? handle?.authToken;
+      if (!authToken) {
+        throw new Error("Bridge is not running and no pairing token was provided.");
+      }
+      return createStudioPairingUrl({
+        webUrl: input.webUrl ?? webUrl,
+        authToken,
+        roadmapId: input.roadmapId,
+        tokenQueryParam: input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM
+      });
+    },
+    async openStudio(input: OpenStudioInput = {}) {
+      openStudioBridgeBrowser(input.url ?? await supervisor.createPairingUrl(input));
+    },
+    async rotatePairing(input: CreatePairingUrlInput = {}) {
+      return supervisor.restart({
+        cwd: repositoryPath,
+        webUrl: input.webUrl ?? webUrl,
+        allowedOrigins,
+        noOpen: true,
+        authToken: input.authToken ?? createBridgeApiAuthToken(),
+        controlToken,
+        tokenQueryParam: input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM
+      });
+    },
+    async revokePairing() {
+      if (!pairingSession || !handle) {
+        return handle;
+      }
+      revokeBridgePairingSession(pairingSession);
+      handle = {
+        ...handle,
+        pairing: pairingSession
+      };
+      return handle;
+    }
+  };
+
+  return supervisor;
+}
+
+function bridgeApiUrlForServer(server: Server, runtimeConfig: BridgeRuntimeConfig): string {
+  const address = server.address();
+  if (typeof address === "object" && address) {
+    const host = isWildcardHost(runtimeConfig.bridgeApi.host) ? "127.0.0.1" : runtimeConfig.bridgeApi.host;
+    return `http://${host}:${address.port}`;
+  }
+  return endpointUrl(runtimeConfig.bridgeApi);
+}
+
+function bridgeApiUrlForRequest(request: IncomingMessage, runtimeConfig: BridgeRuntimeConfig): string {
+  const hostHeader = requestHeader(request, "host");
+  if (hostHeader) {
+    const host = isWildcardHost(runtimeConfig.bridgeApi.host) ? hostHeader.replace(/^(0\.0\.0\.0|\[::\])(?=:|$)/, "127.0.0.1") : hostHeader;
+    return `http://${host}`;
+  }
+  return endpointUrl(runtimeConfig.bridgeApi);
+}
+
+function createStudioServerSecurity(options: StudioServerSecurityOptions | undefined, runtimeConfig: BridgeRuntimeConfig): StudioServerSecurity {
+  const pairingSession = options?.pairingSession ?? (options?.authToken
+    ? createBridgePairingSession({ token: options.authToken, ttlMs: options.pairingTokenTtlMs })
+    : undefined);
+  return {
+    authToken: pairingSession?.token ?? nonEmptyString(options?.authToken),
+    controlToken: nonEmptyString(options?.controlToken),
+    pairingSession,
+    pairingTokenTtlMs: Math.max(1, options?.pairingTokenTtlMs ?? DEFAULT_PAIRING_TOKEN_TTL_MS),
     allowedOrigins: uniqueStrings([
       ...DEFAULT_BRIDGE_STUDIO_ORIGINS,
       ...bridgeStudioOriginsFromEnv(runtimeConfig.processEnv),
@@ -1178,6 +1909,7 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
       allowed: false,
       status: 403,
       error: `Origin is not allowed for Hunsu Bridge: ${origin}`,
+      code: "origin_not_allowed",
       corsHeaders: baseCorsHeaders()
     };
   }
@@ -1186,15 +1918,20 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
       allowed: false,
       status: 403,
       error: "Requests without an Origin header are not allowed.",
+      code: "origin_missing",
       corsHeaders: baseCorsHeaders()
     };
   }
   const headers = corsHeaders ?? baseCorsHeaders();
-  if (!options.skipAuth && security.authToken && !isPublicBridgeRequest(url) && !hasValidBridgeApiToken(request, url, security.authToken)) {
+  const tokenValidation = !options.skipAuth && security.authToken && !isPublicBridgeRequest(url)
+    ? validateBridgeApiToken(request, url, security)
+    : { valid: true as const };
+  if (!tokenValidation.valid) {
     return {
       allowed: false,
       status: 401,
-      error: "Missing or invalid Hunsu Bridge pairing token.",
+      error: tokenValidation.error,
+      code: tokenValidation.code,
       corsHeaders: headers
     };
   }
@@ -1204,7 +1941,7 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
 function baseCorsHeaders(): Record<string, string> {
   return {
     "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": `authorization,content-type,${BRIDGE_API_TOKEN_HEADER}`,
+    "access-control-allow-headers": `authorization,content-type,${BRIDGE_API_TOKEN_HEADER},${BRIDGE_CONTROL_TOKEN_HEADER}`,
     "vary": "origin"
   };
 }
@@ -1227,12 +1964,81 @@ function isPublicBridgeRequest(url: URL): boolean {
   return url.pathname === "/health";
 }
 
-function hasValidBridgeApiToken(request: IncomingMessage, url: URL, expected: string): boolean {
+function isBridgeControlRequest(pathname: string): boolean {
+  return pathname === "/api/bridge/pairing/rotate"
+    || pathname === "/api/bridge/pairing/revoke";
+}
+
+function validateBridgeControlToken(request: IncomingMessage, security: StudioServerSecurity): StudioRequestSecurity {
+  const expected = security.controlToken;
+  if (!expected) {
+    return {
+      allowed: false,
+      status: 404,
+      error: "Bridge control endpoint is not enabled.",
+      code: "bridge_control_unavailable",
+      corsHeaders: baseCorsHeaders()
+    };
+  }
+  const candidate = requestHeader(request, BRIDGE_CONTROL_TOKEN_HEADER);
+  if (!candidate || !safeTokenEquals(candidate, expected)) {
+    return {
+      allowed: false,
+      status: 401,
+      error: "Missing or invalid Hunsu Bridge control token.",
+      code: "bridge_control_token_invalid",
+      corsHeaders: baseCorsHeaders()
+    };
+  }
+  return { allowed: true, corsHeaders: baseCorsHeaders() };
+}
+
+type BridgeTokenValidation =
+  | { valid: true }
+  | { valid: false; code: "pairing_token_missing" | "pairing_token_invalid" | "pairing_token_expired" | "pairing_token_revoked"; error: string };
+
+function validateBridgeApiToken(request: IncomingMessage, url: URL, security: StudioServerSecurity): BridgeTokenValidation {
+  const expected = security.authToken;
+  if (!expected) {
+    return { valid: true };
+  }
   const authorization = requestHeader(request, "authorization");
   const bearerToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const headerToken = requestHeader(request, BRIDGE_API_TOKEN_HEADER);
   const queryToken = url.searchParams.get(BRIDGE_API_TOKEN_QUERY_PARAM) ?? undefined;
-  return [bearerToken, headerToken, queryToken].some(token => token !== undefined && safeTokenEquals(token, expected));
+  const candidate = [bearerToken, headerToken, queryToken].find(token => token !== undefined);
+  if (candidate === undefined) {
+    return {
+      valid: false,
+      code: "pairing_token_missing",
+      error: "Missing Hunsu Bridge pairing token."
+    };
+  }
+  if (!safeTokenEquals(candidate, expected)) {
+    return {
+      valid: false,
+      code: "pairing_token_invalid",
+      error: "Invalid Hunsu Bridge pairing token."
+    };
+  }
+  if (security.pairingSession) {
+    const state = bridgePairingSessionState(security.pairingSession);
+    if (state === "expired") {
+      return {
+        valid: false,
+        code: "pairing_token_expired",
+        error: "Hunsu Bridge pairing token expired. Pair Studio again from the Bridge App."
+      };
+    }
+    if (state === "revoked") {
+      return {
+        valid: false,
+        code: "pairing_token_revoked",
+        error: "Hunsu Bridge pairing token was revoked. Pair Studio again from the Bridge App."
+      };
+    }
+  }
+  return { valid: true };
 }
 
 function safeTokenEquals(left: string, right: string): boolean {
@@ -1283,6 +2089,20 @@ function nonEmptyString(value: string | undefined): string | undefined {
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function compareDottedVersions(left: string, right: string): number {
+  const leftParts = left.split(/[.-]/).map(part => Number.parseInt(part, 10));
+  const rightParts = right.split(/[.-]/).map(part => Number.parseInt(part, 10));
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = Number.isFinite(leftParts[index]) ? leftParts[index] : 0;
+    const rightPart = Number.isFinite(rightParts[index]) ? rightParts[index] : 0;
+    if (leftPart !== rightPart) {
+      return leftPart > rightPart ? 1 : -1;
+    }
+  }
+  return 0;
 }
 
 function isWildcardHost(host: string): boolean {
@@ -1700,19 +2520,109 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
       const pathname = url.pathname;
-      const requestSecurity = evaluateStudioRequestSecurity(request, url, security, { skipAuth: request.method === "OPTIONS" });
+      const requestSecurity = evaluateStudioRequestSecurity(request, url, security, {
+        skipAuth: request.method === "OPTIONS" || isBridgeControlRequest(pathname)
+      });
       responseSecurityHeaders.set(response, requestSecurity.corsHeaders);
       if (request.method === "OPTIONS") {
-        sendJson(response, requestSecurity.allowed ? 204 : requestSecurity.status ?? 403, requestSecurity.allowed ? {} : { error: requestSecurity.error ?? "Origin is not allowed." });
+        sendJson(response, requestSecurity.allowed ? 204 : requestSecurity.status ?? 403, requestSecurity.allowed ? {} : { error: requestSecurity.error ?? "Origin is not allowed.", code: requestSecurity.code });
         return;
       }
       if (!requestSecurity.allowed) {
-        sendJson(response, requestSecurity.status ?? 403, { error: requestSecurity.error ?? "Bridge API request is not allowed." });
+        sendJson(response, requestSecurity.status ?? 403, { error: requestSecurity.error ?? "Bridge API request is not allowed.", code: requestSecurity.code });
         return;
       }
 
       if (request.method === "GET" && pathname === "/health") {
-        sendJson(response, 200, { ok: true, service: "hunsu-bridge" });
+        sendJson(response, 200, { ok: true, service: "hunsu-bridge", version: bridgeVersionInfo() });
+        return;
+      }
+
+      if (isBridgeControlRequest(pathname)) {
+        const controlSecurity = validateBridgeControlToken(request, security);
+        if (!controlSecurity.allowed) {
+          sendJson(response, controlSecurity.status ?? 401, {
+            error: controlSecurity.error ?? "Bridge control request is not allowed.",
+            code: controlSecurity.code
+          });
+          return;
+        }
+        if (request.method !== "POST") {
+          sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (pathname === "/api/bridge/pairing/revoke") {
+          if (security.pairingSession) {
+            revokeBridgePairingSession(security.pairingSession);
+          }
+          sendJson(response, 202, {
+            pairing: security.pairingSession,
+            revoked: true
+          });
+          return;
+        }
+        const body = await readJson<Partial<CreatePairingUrlInput>>(request);
+        security.pairingSession = createBridgePairingSession({ ttlMs: security.pairingTokenTtlMs });
+        security.authToken = security.pairingSession.token;
+        const requestWebUrl = typeof body.webUrl === "string" && body.webUrl.trim() ? body.webUrl : undefined;
+        const requestRoadmapId = typeof body.roadmapId === "string" && body.roadmapId.trim() ? body.roadmapId : undefined;
+        const requestTokenQueryParam = body.tokenQueryParam === BRIDGE_API_TOKEN_QUERY_PARAM ? body.tokenQueryParam : BRIDGE_API_TOKEN_QUERY_PARAM;
+        sendJson(response, 202, {
+          bridgeApiUrl: bridgeApiUrlForRequest(request, runtimeConfig),
+          studioUrl: createStudioPairingUrl({
+            webUrl: requestWebUrl,
+            authToken: security.pairingSession.token,
+            roadmapId: requestRoadmapId,
+            tokenQueryParam: requestTokenQueryParam
+          }),
+          authToken: security.pairingSession.token,
+          pairing: security.pairingSession
+        });
+        return;
+      }
+
+      if (request.method === "GET" && pathname === "/api/connection/status") {
+        const currentRoadmap = findRoadmapRegistryEntryByPath(repositoryPath, { roadmapRegistryPath });
+        sendJson(response, 200, createStudioConnectionStatus({
+          bridgeApiUrl: endpointUrl(runtimeConfig.bridgeApi),
+          repositoryPath,
+          roadmapId: currentRoadmap?.roadmapId,
+          roadmapDisplayName: currentRoadmap?.displayName,
+          runtimeConfig
+        }));
+        return;
+      }
+
+      if (request.method === "GET" && pathname === "/api/remote/devices") {
+        sendJson(response, 200, { devices: await listRemoteBridgeDevicesForRequest(request, runtimeConfig, {
+          relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH,
+          userId: url.searchParams.get("userId") ?? undefined
+        }) });
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/remote/connect") {
+        const body = await readJson<RemoteBridgeConnectRequest>(request);
+        sendJson(response, 202, await connectRemoteBridgeForRequest(body, request, runtimeConfig, {
+          relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH
+        }));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/remote/commands") {
+        const body = await readJson<RemoteBridgeCommandRequest>(request);
+        const result = await routeRemoteBridgeCommand(body, request, runtimeConfig);
+        sendJson(response, result.ok ? result.status : result.status ?? 502, result);
+        return;
+      }
+
+      if (request.method === "GET" && pathname === "/api/remote/commands/events") {
+        const command = remoteBridgeCommandFromEventUrl(url);
+        if (!command) {
+          sendJson(response, 400, { ok: false, error: "Remote event stream command payload is invalid." });
+          return;
+        }
+        await streamRemoteBridgeCommand(command, request, response, runtimeConfig);
         return;
       }
 
@@ -1723,6 +2633,18 @@ export function createStudioServer(options: StudioServerOptions = {}) {
 
       if (request.method === "GET" && pathname === "/api/roadmaps/recent") {
         sendJson(response, 200, { roadmaps: listRoadmapRegistry({ roadmapRegistryPath }) });
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/roadmaps/recent/remove") {
+        const body = await readJson<RoadmapRemoveRequest>(request);
+        sendJson(response, 202, removeRoadmapRegistryEntry(body, { roadmapRegistryPath }));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/projects/inspect") {
+        const body = await readJson<ProjectInspectionRequest>(request);
+        sendJson(response, 200, { project: inspectProject(resolveRoadmapOpenRequestPath(body, state), { roadmapRegistryPath }) });
         return;
       }
 
@@ -2017,6 +2939,11 @@ type RoadmapApiRoute = {
 type RoadmapRegistryStore = {
   version: 1;
   roadmaps: RoadmapRegistryEntry[];
+};
+
+type RemoteBridgeDeviceStore = {
+  schema: "hunsu.relay-registry.v1";
+  devices: RemoteBridgeDevice[];
 };
 
 type ScopedRoadmapOptions = {
@@ -4136,17 +5063,482 @@ export function readWorktreeStatus(cwd = process.cwd()): WorktreeStatus {
     .map(line => ({ status: line.slice(0, 2), path: line.slice(3) }));
   return {
     root,
-    branch: branchLine ? branchLine.slice(3) : "unknown",
+    branch: normalizeGitStatusBranch(branchLine ? branchLine.slice(3) : undefined),
     clean: changes.length === 0,
     changes
   };
 }
 
+function normalizeGitStatusBranch(value: string | undefined): string {
+  if (!value) {
+    return "unknown";
+  }
+  const unborn = value.match(/^No commits yet on (.+)$/);
+  return unborn?.[1] ?? value;
+}
+
 export function listRoadmapRegistry(options: { roadmapRegistryPath?: string } = {}): RoadmapRegistryEntry[] {
-  return readRoadmapRegistry(options).roadmaps.map(entry => ({
+  return readRoadmapRegistry(options).roadmaps.map(entry => roadmapRegistryEntryWithInspection(entry, options));
+}
+
+function roadmapRegistryEntryWithInspection(
+  entry: RoadmapRegistryEntry,
+  options: { roadmapRegistryPath?: string } = {}
+): RoadmapRegistryEntry {
+  const inspection = inspectProject({ path: entry.repositoryPath }, options);
+  if (inspection.kind === "missing-roadmap") {
+    return {
+      ...entry,
+      repositoryPath: inspection.path,
+      health: inspection.health === "missing-path" ? "missing" : inspection.health,
+      type: "missing",
+      primaryAction: inspection.recommendedAction
+    };
+  }
+  if (inspection.kind === "hunsu-roadmap") {
+    return {
+      ...entry,
+      roadmapId: inspection.roadmapId,
+      displayName: inspection.displayName,
+      repositoryPath: inspection.path,
+      health: inspection.health,
+      type: "roadmap",
+      primaryAction: inspection.health === "ok" || inspection.health === "git-dirty" ? "open" : "repair"
+    };
+  }
+  if (inspection.kind === "git-project") {
+    return {
+      ...entry,
+      repositoryPath: inspection.path,
+      lastKnownBranch: inspection.branch ?? entry.lastKnownBranch,
+      health: "missing-runtime",
+      type: "git-project",
+      primaryAction: "repair"
+    };
+  }
+  return {
     ...entry,
-    health: existsSync(entry.repositoryPath) ? "ok" : "missing"
-  }));
+    health: inspection.kind === "unsupported" ? "unknown" : "missing-runtime",
+    type: inspection.kind === "unsupported" ? "missing" : "roadmap",
+    primaryAction: inspection.kind === "unsupported" ? "remove" : "repair"
+  };
+}
+
+export function listRemoteBridgeDevices(options: { relayRegistryPath?: string; userId?: string } = {}): RemoteBridgeDevice[] {
+  const devices = readRemoteBridgeDeviceStore(options).devices;
+  return options.userId ? devices.filter(device => device.userId === options.userId) : devices;
+}
+
+export async function listRemoteBridgeDevicesForRequest(
+  request: IncomingMessage,
+  runtimeConfig: BridgeRuntimeConfig,
+  options: { relayRegistryPath?: string; userId?: string } = {}
+): Promise<RemoteBridgeDevice[]> {
+  const relay = relayRequestConfig(request, runtimeConfig);
+  if (!relay) {
+    return listRemoteBridgeDevices(options);
+  }
+  const response = await fetch(new URL("/v1/devices", relay.relayApiUrl), {
+    headers: {
+      "authorization": `Bearer ${relay.accessToken}`
+    }
+  });
+  const body = await response.json().catch(() => undefined) as { devices?: RemoteBridgeDevice[]; error?: string } | undefined;
+  if (!response.ok) {
+    throw new Error(body?.error ?? `Relay device list failed with HTTP ${response.status}.`);
+  }
+  const devices = Array.isArray(body?.devices) ? body.devices.filter(isRemoteBridgeDevice) : [];
+  return options.userId ? devices.filter(device => device.userId === options.userId) : devices;
+}
+
+export function connectRemoteBridge(
+  request: RemoteBridgeConnectRequest,
+  options: { relayRegistryPath?: string } = {}
+): RemoteBridgeConnectResult {
+  const deviceId = request.deviceId?.trim();
+  const requirement: StudioBridgeRequirement = {
+    minBridgeVersion: request.minBridgeVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.minBridgeVersion,
+    requiredProtocolVersion: request.requiredProtocolVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredProtocolVersion,
+    requiredFeatures: request.requiredFeatures?.length ? request.requiredFeatures : DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredFeatures
+  };
+  if (!deviceId) {
+    const compatibility: BridgeCompatibility = { compatible: false, reason: "bridge_update_needed", message: "Choose a Remote Bridge device before connecting." };
+    return {
+      connection: {
+        ...createDisconnectedStudioConnectionStatus("Choose a Remote Bridge device before connecting."),
+        compatibility
+      },
+      compatibility
+    };
+  }
+  const device = listRemoteBridgeDevices(options).find(candidate => candidate.deviceId === deviceId);
+  if (!device) {
+    const compatibility: BridgeCompatibility = { compatible: false, reason: "bridge_update_needed", message: "Remote Bridge device is not registered." };
+    return {
+      compatibility,
+      connection: {
+        mode: "remote",
+        transport: "relay",
+        health: "disconnected",
+        auth: "unknown",
+        projectAccess: "not_applicable",
+        warnings: ["relay_unavailable"],
+        error: "Remote Bridge device is not registered.",
+        version: bridgeVersionInfo(),
+        compatibility
+      }
+    };
+  }
+  const account = request.webUserId?.trim()
+    ? {
+        webUserId: request.webUserId.trim(),
+        bridgeUserId: device.userId,
+        sameUser: request.webUserId.trim() === device.userId
+      }
+    : {
+        bridgeUserId: device.userId,
+        sameUser: undefined
+      };
+  const connection = createRemoteStudioConnectionStatus({
+    device,
+    account,
+    projectAccess: request.projectPath?.trim() ? "needs_grant" : "not_applicable",
+    projectPath: request.projectPath?.trim() || undefined,
+    requirement
+  });
+  return {
+    connection,
+    device,
+    compatibility: connection.compatibility ?? { compatible: true }
+  };
+}
+
+export async function connectRemoteBridgeForRequest(
+  request: RemoteBridgeConnectRequest,
+  httpRequest: IncomingMessage,
+  runtimeConfig: BridgeRuntimeConfig,
+  options: { relayRegistryPath?: string } = {}
+): Promise<RemoteBridgeConnectResult> {
+  const relay = relayRequestConfig(httpRequest, runtimeConfig);
+  if (!relay) {
+    return connectRemoteBridge(request, options);
+  }
+  const devices = await listRemoteBridgeDevicesForRequest(httpRequest, runtimeConfig);
+  const device = devices.find(candidate => candidate.deviceId === request.deviceId?.trim());
+  if (!device) {
+    const compatibility: BridgeCompatibility = { compatible: false, reason: "bridge_update_needed", message: "Remote Bridge device is not registered." };
+    return {
+      compatibility,
+      connection: {
+        mode: "remote",
+        transport: "relay",
+        health: "disconnected",
+        auth: "unknown",
+        projectAccess: "not_applicable",
+        warnings: ["relay_unavailable"],
+        error: "Remote Bridge device is not registered.",
+        version: bridgeVersionInfo(),
+        compatibility
+      }
+    };
+  }
+  const connection = createRemoteStudioConnectionStatus({
+    device,
+    account: {
+      webUserId: request.webUserId,
+      bridgeUserId: device.userId,
+      sameUser: request.webUserId ? request.webUserId === device.userId : undefined
+    },
+    projectAccess: await remoteProjectAccessForRequest(request, httpRequest, runtimeConfig),
+    projectPath: request.projectPath?.trim() || undefined,
+    requirement: {
+      minBridgeVersion: request.minBridgeVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.minBridgeVersion,
+      requiredProtocolVersion: request.requiredProtocolVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredProtocolVersion,
+      requiredFeatures: request.requiredFeatures?.length ? request.requiredFeatures : DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredFeatures
+    }
+  });
+  return {
+    connection,
+    device,
+    compatibility: connection.compatibility ?? { compatible: true }
+  };
+}
+
+async function remoteProjectAccessForRequest(
+  request: RemoteBridgeConnectRequest,
+  httpRequest: IncomingMessage,
+  runtimeConfig: BridgeRuntimeConfig
+): Promise<StudioConnectionStatus["projectAccess"]> {
+  const projectPath = request.projectPath?.trim();
+  if (!projectPath) {
+    return "not_applicable";
+  }
+  const relay = relayRequestConfig(httpRequest, runtimeConfig);
+  if (!relay || !request.deviceId?.trim()) {
+    return "needs_grant";
+  }
+  const response = await fetch(new URL("/v1/project-grants/status", relay.relayApiUrl), {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${relay.accessToken}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      deviceId: request.deviceId.trim(),
+      projectPath,
+      requestedScopes: ["remoteRelay.access"]
+    } satisfies RemoteProjectGrantStatusRequest)
+  });
+  const body = await response.json().catch(() => undefined) as Partial<RemoteProjectGrantStatusResult> | undefined;
+  if (!response.ok || (body?.projectAccess !== "granted" && body?.projectAccess !== "needs_grant" && body?.projectAccess !== "denied")) {
+    return "denied";
+  }
+  return body.projectAccess;
+}
+
+export async function routeRemoteBridgeCommand(
+  command: RemoteBridgeCommandRequest,
+  request: IncomingMessage,
+  runtimeConfig: BridgeRuntimeConfig
+): Promise<RemoteBridgeCommandResult> {
+  const relay = relayRequestConfig(request, runtimeConfig);
+  if (!relay) {
+    return { ok: false, status: 503, error: "Remote Relay is not configured for this Bridge API." };
+  }
+  const response = await fetch(new URL("/v1/commands", relay.relayApiUrl), {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${relay.accessToken}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(command)
+  });
+  const body = await response.json().catch(() => undefined) as RemoteBridgeCommandResult | undefined;
+  if (!body) {
+    return { ok: false, status: response.status, error: `Relay command returned HTTP ${response.status}.` };
+  }
+  return body.status === undefined ? { ...body, status: response.status } : body;
+}
+
+export async function streamRemoteBridgeCommand(
+  command: RemoteBridgeCommandRequest,
+  request: IncomingMessage,
+  response: ServerResponse,
+  runtimeConfig: BridgeRuntimeConfig
+): Promise<void> {
+  const relay = relayRequestConfig(request, runtimeConfig);
+  if (!relay) {
+    sendJson(response, 503, { ok: false, error: "Remote Relay is not configured for this Bridge API." });
+    return;
+  }
+  const controller = new AbortController();
+  request.on("close", () => controller.abort());
+  const upstream = await fetch(new URL("/v1/commands/events", relay.relayApiUrl), {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${relay.accessToken}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(command),
+    signal: controller.signal
+  }).catch(error => {
+    if (error instanceof Error && error.name === "AbortError") {
+      return undefined;
+    }
+    throw error;
+  });
+  if (!upstream) {
+    return;
+  }
+  if (!upstream.ok) {
+    const body = await upstream.json().catch(() => undefined) as { error?: string; message?: string } | undefined;
+    sendJson(response, upstream.status, { ok: false, error: body?.error ?? body?.message ?? `Relay event stream returned HTTP ${upstream.status}.` });
+    return;
+  }
+  if (!upstream.body) {
+    sendJson(response, 502, { ok: false, error: "Relay did not return an event stream." });
+    return;
+  }
+  response.writeHead(200, {
+    ...securityHeadersForResponse(response),
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    "connection": "keep-alive"
+  });
+  response.flushHeaders?.();
+  const reader = upstream.body.getReader();
+  try {
+    while (!response.destroyed) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      response.write(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+    if (!response.destroyed) {
+      response.end();
+    }
+  }
+}
+
+function remoteBridgeCommandFromEventUrl(url: URL): RemoteBridgeCommandRequest | undefined {
+  const raw = url.searchParams.get("command");
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<RemoteBridgeCommandRequest>;
+    return isRemoteBridgeCommandRequest(parsed) ? parsed : undefined;
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function isRemoteBridgeCommandRequest(value: unknown): value is RemoteBridgeCommandRequest {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<RemoteBridgeCommandRequest>;
+  return typeof candidate.deviceId === "string"
+    && candidate.deviceId.trim().length > 0
+    && typeof candidate.command === "string"
+    && isRelayCommandName(candidate.command);
+}
+
+export function removeRoadmapRegistryEntry(
+  request: RoadmapRemoveRequest,
+  options: { roadmapRegistryPath?: string } = {}
+): { removed: boolean; roadmaps: RoadmapRegistryEntry[] } {
+  const store = readRoadmapRegistry(options);
+  const normalizedPath = request.path ? normalizeRepositoryPath(request.path) : undefined;
+  const nextRoadmaps = store.roadmaps.filter(entry => {
+    if (request.roadmapId && entry.roadmapId === request.roadmapId) {
+      return false;
+    }
+    if (normalizedPath && normalizeRepositoryPath(entry.repositoryPath) === normalizedPath) {
+      return false;
+    }
+    return true;
+  });
+  const removed = nextRoadmaps.length !== store.roadmaps.length;
+  if (removed) {
+    writeRoadmapRegistry({ version: 1, roadmaps: nextRoadmaps }, options);
+  }
+  return {
+    removed,
+    roadmaps: listRoadmapRegistry(options)
+  };
+}
+
+export function inspectProject(
+  request: ProjectInspectionRequest | string,
+  options: { roadmapRegistryPath?: string } = {}
+): ProjectInspection {
+  const rawPath = typeof request === "string" ? request : request.path ?? request.cwd;
+  if (!rawPath?.trim()) {
+    return {
+      kind: "unsupported",
+      path: "",
+      reason: "Choose a folder before Hunsu can inspect it.",
+      recommendedAction: "explain"
+    };
+  }
+
+  const requestedPath = resolve(rawPath);
+  const registered = findRoadmapRegistryEntryByPath(requestedPath, options);
+  const existingPath = safeRealpath(requestedPath);
+  if (!existingPath) {
+    if (registered) {
+      return {
+        kind: "missing-roadmap",
+        path: requestedPath,
+        roadmapId: registered.roadmapId,
+        displayName: registered.displayName,
+        health: "missing-path",
+        reason: "This Roadmap was registered before, but its last known path is missing.",
+        recommendedAction: "remove"
+      };
+    }
+    return canCreateProjectFolder(requestedPath)
+      ? { kind: "new-project", path: requestedPath, recommendedAction: "create" }
+      : {
+          kind: "unsupported",
+          path: requestedPath,
+          reason: "This path is not accessible from the local Bridge.",
+          recommendedAction: "explain"
+        };
+  }
+
+  let stat;
+  try {
+    stat = statSync(existingPath);
+  } catch (error) {
+    return {
+      kind: "unsupported",
+      path: requestedPath,
+      reason: error instanceof Error ? error.message : "This path could not be inspected.",
+      recommendedAction: "explain"
+    };
+  }
+  if (!stat.isDirectory()) {
+    return {
+      kind: "unsupported",
+      path: existingPath,
+      reason: "Choose a folder, not a file.",
+      recommendedAction: "explain"
+    };
+  }
+
+  const gitRoot = safeGitRepositoryRoot(existingPath);
+  if (gitRoot) {
+    const stackHints = detectStackHints(gitRoot);
+    if (isHunsuRoadmapRepository(gitRoot) || registered) {
+      const repository = safeReadWorktreeStatus(gitRoot);
+      const hasRuntime = safeHasHunsuRuntimeState(gitRoot);
+      if (registered && !hasRuntime) {
+        return {
+          kind: "missing-roadmap",
+          path: gitRoot,
+          roadmapId: registered.roadmapId,
+          displayName: registered.displayName,
+          health: "missing-runtime",
+          reason: "This registered Roadmap is missing Hunsu runtime files.",
+          recommendedAction: "repair"
+        };
+      }
+      return {
+        kind: "hunsu-roadmap",
+        path: gitRoot,
+        roadmapId: registered?.roadmapId ?? createRoadmapId(gitRoot),
+        displayName: registered?.displayName ?? basename(gitRoot),
+        health: !hasRuntime ? "missing-runtime" : repository?.clean === false ? "git-dirty" : "ok",
+        recommendedAction: "open",
+        stackHints
+      };
+    }
+    const repository = safeReadWorktreeStatus(gitRoot);
+    return {
+      kind: "git-project",
+      path: gitRoot,
+      branch: repository?.branch,
+      clean: repository?.clean,
+      stackHints,
+      recommendedAction: "port"
+    };
+  }
+
+  if (directoryLooksNew(existingPath)) {
+    return { kind: "new-project", path: existingPath, recommendedAction: "create" };
+  }
+
+  return {
+    kind: "unsupported",
+    path: existingPath,
+    reason: "This folder is not a Git repository or an empty folder that Hunsu can initialize.",
+    recommendedAction: "explain"
+  };
 }
 
 export function openStudioRoadmap(
@@ -4476,6 +5868,122 @@ function hashText(value: string): string {
 function safeRealpath(path: string): string | undefined {
   try {
     return realpathSync(path);
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function safeGitRepositoryRoot(path: string): string | undefined {
+  try {
+    return ensureGitRepository(path);
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function safeReadWorktreeStatus(path: string): WorktreeStatus | undefined {
+  try {
+    return readWorktreeStatus(path);
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function safeHasHunsuRuntimeState(path: string): boolean {
+  try {
+    return hasHunsuRuntimeState(path);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function findRoadmapRegistryEntryByPath(path: string, options: { roadmapRegistryPath?: string } = {}): RoadmapRegistryEntry | undefined {
+  const normalized = normalizeRepositoryPath(path);
+  return readRoadmapRegistry(options).roadmaps.find(entry => normalizeRepositoryPath(entry.repositoryPath) === normalized);
+}
+
+function canCreateProjectFolder(path: string): boolean {
+  const existingParent = nearestExistingParentDirectory(path);
+  if (!existingParent) {
+    return false;
+  }
+  try {
+    return statSync(existingParent).isDirectory();
+  } catch (_error) {
+    return false;
+  }
+}
+
+function nearestExistingParentDirectory(path: string): string | undefined {
+  let current = resolve(path);
+  while (true) {
+    const parent = dirname(current);
+    if (parent === current) {
+      return safeRealpath(current);
+    }
+    const canonical = safeRealpath(parent);
+    if (canonical) {
+      return canonical;
+    }
+    current = parent;
+  }
+}
+
+function directoryLooksNew(path: string): boolean {
+  try {
+    return readdirSync(path).filter(name => !IGNORED_NEW_PROJECT_NAMES.has(name)).length === 0;
+  } catch (_error) {
+    return false;
+  }
+}
+
+const IGNORED_NEW_PROJECT_NAMES = new Set([".DS_Store", "Thumbs.db"]);
+
+function detectStackHints(path: string): string[] {
+  const hints = new Set<string>();
+  const packageJson = readJsonFile<{ dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: Record<string, string> }>(join(path, "package.json"));
+  if (packageJson) {
+    hints.add("Node");
+    const packageNames = new Set([
+      ...Object.keys(packageJson.dependencies ?? {}),
+      ...Object.keys(packageJson.devDependencies ?? {})
+    ]);
+    const scripts = Object.values(packageJson.scripts ?? {}).join("\n");
+    if (packageNames.has("vite") || existsAny(path, ["vite.config.ts", "vite.config.js", "vite.config.mjs"]) || /\bvite\b/.test(scripts)) {
+      hints.add("Vite");
+    }
+    if (packageNames.has("next") || existsAny(path, ["next.config.ts", "next.config.js", "next.config.mjs"])) {
+      hints.add("Next.js");
+    }
+    if (packageNames.has("react")) {
+      hints.add("React");
+    }
+  }
+  if (existsAny(path, ["pyproject.toml", "requirements.txt", "setup.py", "uv.lock"])) {
+    hints.add("Python");
+  }
+  if (existsSync(join(path, "Cargo.toml"))) {
+    hints.add("Rust");
+  }
+  if (existsSync(join(path, "go.mod"))) {
+    hints.add("Go");
+  }
+  if (existsAny(path, ["deno.json", "deno.jsonc"])) {
+    hints.add("Deno");
+  }
+  return [...hints];
+}
+
+function existsAny(path: string, names: string[]): boolean {
+  return names.some(name => existsSync(join(path, name)));
+}
+
+function readJsonFile<T>(path: string): T | undefined {
+  if (!existsSync(path)) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as T;
   } catch (_error) {
     return undefined;
   }
@@ -5186,7 +6694,9 @@ function upsertRoadmapRegistryEntry(
     repositoryPath: repository.root,
     lastOpenedAt: now,
     lastKnownBranch: repository.branch,
-    health: "ok"
+    health: "ok",
+    type: "roadmap",
+    primaryAction: "open"
   };
   const nextStore: RoadmapRegistryStore = {
     version: 1,
@@ -5213,6 +6723,93 @@ function readRoadmapRegistry(options: { roadmapRegistryPath?: string } = {}): Ro
   }
 }
 
+function readRemoteBridgeDeviceStore(options: { relayRegistryPath?: string } = {}): RemoteBridgeDeviceStore {
+  const path = remoteBridgeDeviceRegistryPath(options);
+  if (!existsSync(path)) {
+    return { schema: "hunsu.relay-registry.v1", devices: [] };
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RemoteBridgeDeviceStore>;
+    return {
+      schema: "hunsu.relay-registry.v1",
+      devices: Array.isArray(parsed.devices) ? parsed.devices.filter(isRemoteBridgeDevice) : []
+    };
+  } catch (_error) {
+    return { schema: "hunsu.relay-registry.v1", devices: [] };
+  }
+}
+
+function relayRequestConfig(request: IncomingMessage, runtimeConfig: BridgeRuntimeConfig): { relayApiUrl: string; accessToken: string } | undefined {
+  const relayConfig = unwrapConfigResult(resolveRelayClientConfig(runtimeConfig.processEnv));
+  const relayApiUrl = relayConfig.relayApiUrl;
+  const accessToken = requestHeader(request, "x-hunsu-relay-token")
+    ?? relayAccessTokenFromAuthorization(request)
+    ?? relayAccessTokenFromQuery(request)
+    ?? runtimeConfig.processEnv.HUNSU_RELAY_WEB_TOKEN?.trim();
+  return relayApiUrl && accessToken
+    ? { relayApiUrl, accessToken }
+    : undefined;
+}
+
+function relayAccessTokenFromAuthorization(request: IncomingMessage): string | undefined {
+  const authorization = requestHeader(request, "authorization");
+  const match = authorization?.match(/^Relay\s+(.+)$/i);
+  return match?.[1]?.trim();
+}
+
+function relayAccessTokenFromQuery(request: IncomingMessage): string | undefined {
+  try {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    return url.searchParams.get("hunsuRelayToken")?.trim() || undefined;
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function isRelayCommandName(value: string): value is RelayCommandName {
+  return [
+    "health",
+    "connection.status",
+    "roadmap.registry.list",
+    "roadmap.registry.remove",
+    "roadmap.open",
+    "roadmap.port.inspect",
+    "roadmap.port.apply",
+    "roadmap.create",
+    "roadmap.board",
+    "roadmap.worktree",
+    "roadmap.skills",
+    "roadmap.commands",
+    "execute.start",
+    "execute.pause",
+    "execute.resume",
+    "execute.stop",
+    "execute.completeMove",
+    "execute.status",
+    "artifactAction.list",
+    "artifactAction.runs",
+    "artifactAction.start",
+    "artifactAction.stop",
+    "moveFile.tree",
+    "moveFile.blob",
+    "moveFile.diff",
+    "hunsuDraft.list",
+    "hunsuDraft.start",
+    "hunsuDraft.get",
+    "hunsuDraft.message",
+    "hunsuDraft.diffArtifact.create",
+    "hunsuDraft.diffArtifact.get",
+    "hunsuDraft.approve",
+    "hunsuDraft.discard",
+    "line.accept",
+    "line.reject",
+    "agentSession.list",
+    "agentSession.get",
+    "agentSession.events",
+    "live.events"
+  ].includes(value);
+}
+
 function writeRoadmapRegistry(store: RoadmapRegistryStore, options: { roadmapRegistryPath?: string } = {}): void {
   const path = roadmapRegistryPath(options);
   mkdirSync(dirname(path), { recursive: true });
@@ -5221,6 +6818,10 @@ function writeRoadmapRegistry(store: RoadmapRegistryStore, options: { roadmapReg
 
 function roadmapRegistryPath(options: { roadmapRegistryPath?: string } = {}): string {
   return resolve(options.roadmapRegistryPath ?? join(homedir(), ".config", "hunsu", "roadmaps.json"));
+}
+
+function remoteBridgeDeviceRegistryPath(options: { relayRegistryPath?: string } = {}): string {
+  return resolve(options.relayRegistryPath ?? join(homedir(), ".config", "hunsu", "relay-devices.json"));
 }
 
 function isRoadmapRegistryEntry(value: unknown): value is RoadmapRegistryEntry {
@@ -5232,6 +6833,18 @@ function isRoadmapRegistryEntry(value: unknown): value is RoadmapRegistryEntry {
     && typeof candidate.displayName === "string"
     && typeof candidate.repositoryPath === "string"
     && typeof candidate.lastOpenedAt === "string";
+}
+
+function isRemoteBridgeDevice(value: unknown): value is RemoteBridgeDevice {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<RemoteBridgeDevice>;
+  return typeof candidate.deviceId === "string"
+    && typeof candidate.deviceName === "string"
+    && typeof candidate.userId === "string"
+    && typeof candidate.registeredAt === "string"
+    && (candidate.status === "online" || candidate.status === "offline");
 }
 
 function createRoadmapId(repositoryPath: string): string {
@@ -9680,6 +11293,9 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
-  await startStudioBridge({ cwd: APP_WORKSPACE_ROOT, noOpen: true });
+if (!(globalThis as { __HUNSU_BRIDGE_BUNDLED_SIDECAR?: boolean }).__HUNSU_BRIDGE_BUNDLED_SIDECAR && process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
+  startStudioBridge({ cwd: APP_WORKSPACE_ROOT, noOpen: true }).catch(error => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
 }

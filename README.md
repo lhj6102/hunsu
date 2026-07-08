@@ -30,14 +30,37 @@ Hunsu exists for that human layer.
 
 Prerequisites:
 
-- Node.js 22.18 or newer
 - Git
 - Codex installed and authenticated when you want to run agent Executes
 
-Once the npm packages are published, the intended local-first launcher is:
+Recommended local-first path:
+
+```text
+Install Hunsu Bridge App
+Open the app
+Choose or create a project
+Hunsu Bridge starts locally
+Studio opens in the browser
+```
+
+The Bridge App starts Hunsu Bridge on `127.0.0.1`, creates a temporary pairing
+session, opens Studio, and keeps local repository access on your machine. Login
+is optional for local use; signing in enables Remote Bridge access through
+authenticated Relay commands.
+
+Advanced developer fallback:
 
 ```sh
 npx @hunsu/bridge@latest
+```
+
+Headless Linux/devbox path:
+
+```sh
+hunsu-bridge login
+hunsu-bridge remote status
+hunsu-bridge projects grant /path/to/project
+hunsu-bridge start --remote
 ```
 
 For repository development:
@@ -45,15 +68,34 @@ For repository development:
 ```sh
 corepack enable
 pnpm install
+pnpm --filter @hunsu/bridge-desktop bridge-app status
+pnpm --filter @hunsu/bridge-desktop bridge-app inspect /path/to/project
+pnpm --filter @hunsu/bridge-desktop bridge-app service install
 pnpm --filter @hunsu/bridge bridge --dry-run
 pnpm hunsu studio --dry-run
 pnpm hunsu studio --no-open
 ```
 
-`npx @hunsu/bridge@latest` starts Hunsu Bridge on `127.0.0.1`, creates a
-pairing token, and prints or opens a Studio URL with that token. Hunsu Web uses
-the token to call protected Bridge APIs. Do not expose Hunsu Bridge directly to
-a public network.
+The `npx @hunsu/bridge@latest` flow remains supported for development,
+automation, and recovery. It is not the primary onboarding path for ordinary
+users. Hunsu Bridge must not be exposed directly to a public network; Remote
+Bridge access goes through authenticated Relay commands, not a public HTTP
+proxy.
+
+Studio recovery links use the Bridge App protocol surface:
+
+```text
+hunsu://open
+hunsu://pair?next=/studio
+hunsu://open-project?path=/path/to/project
+hunsu://open-roadmap?roadmapId=<id>
+hunsu://sign-in
+hunsu://remote-disable
+```
+
+The desktop bundle includes macOS and Windows installer metadata for the
+`hunsu://` protocol. Linux GUI installs can register the user-level handler with
+`hunsu-bridge protocol install`.
 
 ## Open Source Model
 
@@ -124,6 +166,7 @@ Hunsu Web
 
 Hunsu Bridge
   - owns Git access
+  - is normally managed by Hunsu Bridge App
   - owns Roadmap Registry path resolution
   - owns Codex runner integration
   - owns Agent Conversation storage
@@ -143,6 +186,7 @@ Hunsu CLI and core
   - immutable Team Snapshot reconstruction
   - Preview manifest parsing and command contract
   - stable command contract for Studio, Inspector, Director, and recovery tools
+  - advanced `npx @hunsu/bridge@latest` launcher fallback
 ```
 
 Hunsu Web is the human-facing orchestration surface. Hunsu Bridge is the

@@ -67,8 +67,16 @@ apps/bridge
   -> packages/protocol-registry
   -> packages/codex-runner
 
+apps/bridge-desktop
+  -> apps/bridge (`@hunsu/bridge`)
+  -> packages/config
+  -> Tauri CLI/Rust toolchain for native desktop bundles only
+
 apps/hub-api
   -> packages/protocol-registry
+
+apps/relay
+  -> packages/config
 
 packages/cli (`hunsu`)
   -> apps/bridge (`@hunsu/bridge`)
@@ -145,6 +153,30 @@ Dependencies:
 - `@hunsu/codex-runner` for app-server-backed Team planning and Member Path
   execution.
 
+### `apps/bridge-desktop`
+
+Companion app and headless command package for Hunsu Bridge.
+
+Responsibilities:
+
+- Start, stop, and report local Bridge runtime status through the shared Bridge
+  supervisor API.
+- Open Studio with fresh local pairing sessions.
+- Classify local folders through Project Finder.
+- Open existing Roadmaps, port Git projects, and create new Roadmaps without
+  requiring ordinary users to type `npx`.
+- Provide the no-GUI command foundation for login, project grants, diagnostics,
+  and future Remote Access.
+- Package the small Tauri desktop shell, native folder picker, protocol
+  handoff, and supervised sidecar process.
+
+Dependencies:
+
+- `@hunsu/bridge` for supervised runtime, Project Finder, Roadmap Registry, and
+  Roadmap open/create/port primitives.
+- `@hunsu/config` for service endpoint resolution.
+- `@tauri-apps/cli` and Cargo for native desktop builds and installers.
+
 ### `apps/hub-api`
 
 Cloudflare Worker Hub API and Origin endpoint.
@@ -174,6 +206,26 @@ Production deploy uses `wrangler deploy` and D1 migrations through the package
 scripts or CI. Scripts must invoke Wrangler with
 `apps/hub-api/.wrangler/generated.toml`, which is derived from environment
 variables and never committed.
+
+### `apps/relay`
+
+Node HTTP/WebSocket service for authenticated Remote Bridge access.
+
+Responsibilities:
+
+- Device Authorization and PKCE-compatible token endpoints for Bridge App and
+  no-GUI daemon sign-in.
+- Authenticated `/v1/devices` APIs for Studio to list signed-in devices.
+- Authenticated `/v1/commands` APIs that route typed Relay commands to an
+  outbound Bridge device WebSocket.
+- Project Grant and command-scope checks before remote Execute, Artifact
+  Action, host alias, or Relay access commands are forwarded.
+- No blind public HTTP proxying to Bridge.
+
+Dependencies:
+
+- `@hunsu/config` for Relay host/port, public API/WebSocket URLs, auth issuer,
+  and storage path resolution.
 
 ## Packages
 
@@ -333,4 +385,6 @@ reliable full verification command.
 - Put browser UI routes in `apps/web`.
 - Put Cloudflare Worker Hub API and Origin endpoint request handling in
   `apps/hub-api`.
+- Put authenticated Remote Bridge device sessions and typed Relay command
+  routing in `apps/relay`.
 - Avoid dependencies from lower layers back into apps or runner-specific code.

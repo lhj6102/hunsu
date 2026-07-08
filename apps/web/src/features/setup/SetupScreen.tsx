@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Check, CheckCircle2, Clipboard, ExternalLink, Loader2, RefreshCw, Terminal, Wifi, WifiOff } from "lucide-react";
+import { Check, CheckCircle2, Clipboard, Download, ExternalLink, Loader2, RefreshCw, Terminal, Wifi, WifiOff } from "lucide-react";
 import { pushStudioPath, safeStudioNext } from "@/app/routes";
 import { cn } from "@/lib/utils";
+import { bridgeApiHttpUrl } from "@/shared/api/bridgeApiBase";
 import { useBridgeConnection } from "@/shared/api/bridgeConnection";
 import { Button } from "@/shared/ui/button";
 
 export function SetupScreen({ next = "/studio" }: { next?: string }) {
   const safeNext = safeStudioNext(next);
   const command = useMemo(() => bridgeCommandForCurrentOrigin(safeNext), [safeNext]);
+  const healthEndpoint = useMemo(() => bridgeApiHttpUrl("/health"), []);
   const connection = useBridgeConnection({ enabled: true, intervalMs: 1800 });
   const [copied, setCopied] = useState(false);
   const canContinue = connection.status === "online" && connection.tokenPresent;
@@ -55,27 +57,41 @@ export function SetupScreen({ next = "/studio" }: { next?: string }) {
               Studio runs in the browser, while Bridge runs on your machine and gives it temporary access to your local repositories.
             </p>
 
-            <div className="mt-8 overflow-hidden rounded-[18px] border border-[color:var(--apple-hairline)] bg-[color:var(--apple-ink)] text-white shadow-[0_22px_54px_rgba(29,29,31,0.18)]">
-              <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
-                <span className="flex items-center gap-2 text-[13px] font-semibold">
-                  <Terminal className="size-4" />
-                  Terminal
-                </span>
-                <Button type="button" size="sm" variant="secondary" className="h-8 bg-white/12 text-white hover:bg-white/18" onClick={copyCommand}>
-                  {copied ? <Check className="size-4" /> : <Clipboard className="size-4" />}
-                  {copied ? "Copied" : "Copy"}
-                </Button>
-              </div>
-              <pre className="overflow-x-auto px-4 py-5 text-[13px] leading-6 text-white sm:text-[14px]">
-                <code>{command}</code>
-              </pre>
+            <div className="mt-8 flex flex-wrap gap-3">
+              <Button type="button" size="lg" onClick={() => openBridgeLink(pairLink(safeNext))}>
+                <ExternalLink className="size-4" />
+                Open Hunsu Bridge App
+              </Button>
+              <Button type="button" variant="outline" size="lg" onClick={() => openBridgeLink("https://hunsu.app/download/bridge")}>
+                <Download className="size-4" />
+                Download Hunsu Bridge App
+              </Button>
             </div>
 
             <div className="mt-7 grid gap-3 sm:grid-cols-3">
-              <SetupStep number="1" title="Run" body="Paste the command in your project terminal." />
-              <SetupStep number="2" title="Pair" body="Bridge opens a Studio URL with a pairing token." />
-              <SetupStep number="3" title="Continue" body="Choose or create a Roadmap from your local repo." />
+              <SetupStep number="1" title="Open" body="Launch the Bridge App on this machine." />
+              <SetupStep number="2" title="Pair" body="Bridge opens Studio with a fresh pairing session." />
+              <SetupStep number="3" title="Continue" body="Choose or create a Roadmap from Project Finder." />
             </div>
+
+            <details className="mt-6 rounded-[18px] border border-[color:var(--apple-hairline)] bg-white/64 px-4 py-3">
+              <summary className="flex cursor-pointer items-center gap-2 text-[13px] font-semibold text-[color:var(--apple-ink)]">
+                <Terminal className="size-4" />
+                Advanced terminal command
+              </summary>
+              <div className="mt-4 overflow-hidden rounded-[14px] border border-[color:var(--apple-hairline)] bg-[color:var(--apple-ink)] text-white">
+                <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
+                  <span className="text-[13px] font-semibold">CLI fallback</span>
+                  <Button type="button" size="sm" variant="secondary" className="h-8 bg-white/12 text-white hover:bg-white/18" onClick={copyCommand}>
+                    {copied ? <Check className="size-4" /> : <Clipboard className="size-4" />}
+                    {copied ? "Copied" : "Copy"}
+                  </Button>
+                </div>
+                <pre className="overflow-x-auto px-4 py-4 text-[13px] leading-6 text-white sm:text-[14px]">
+                  <code>{command}</code>
+                </pre>
+              </div>
+            </details>
           </section>
 
           <aside className="apple-glass-strong min-w-0 rounded-[24px] p-5 sm:p-6">
@@ -83,7 +99,7 @@ export function SetupScreen({ next = "/studio" }: { next?: string }) {
               <StatusIcon status={connection.status} tokenPresent={connection.tokenPresent} />
               <div className="min-w-0 flex-1">
                 <h2 className="text-[22px] font-semibold leading-7 text-[color:var(--apple-ink)]">{statusTitle(connection.status, connection.tokenPresent)}</h2>
-                <p className="mt-2 text-[13px] leading-6 text-muted-foreground">{statusBody(connection.status, connection.tokenPresent)}</p>
+                <p className="mt-2 text-[13px] leading-6 text-muted-foreground">{statusBody(connection.status, connection.tokenPresent, healthEndpoint)}</p>
               </div>
             </div>
 
@@ -100,7 +116,7 @@ export function SetupScreen({ next = "/studio" }: { next?: string }) {
 
             {bridgeRunningWithoutToken ? (
               <div className="mt-5 rounded-[14px] border border-[color:var(--apple-orange)]/28 bg-white/54 px-4 py-3 text-[12px] leading-5 text-[color:var(--apple-body)]">
-                Bridge is reachable, but this browser tab does not have the pairing token yet. Use the Studio tab opened by the terminal command, or run the command again from this page.
+                Bridge is reachable, but this browser tab does not have the pairing token yet. Pair again from the Bridge App or use the advanced CLI fallback.
               </div>
             ) : null}
           </aside>
@@ -155,11 +171,19 @@ function statusTitle(status: string, tokenPresent: boolean): string {
   return "Start Bridge to continue.";
 }
 
-function statusBody(status: string, tokenPresent: boolean): string {
+function statusBody(status: string, tokenPresent: boolean, healthEndpoint: string): string {
   if (status === "online" && tokenPresent) return "This browser has a valid pairing token. Studio will open automatically.";
-  if (status === "online") return "Bridge answered locally, but Studio still needs the pairing token from the URL opened by Bridge.";
-  if (status === "checking") return "Checking http://127.0.0.1:19687 for a local Bridge session.";
-  return "Run the command on this page. Bridge will open Studio with a temporary pairing token.";
+  if (status === "online") return "Bridge answered locally, but Studio still needs a fresh pairing token.";
+  if (status === "checking") return `Checking ${healthEndpoint} for a local Bridge session.`;
+  return "Open the Bridge App. It will start Bridge and open Studio with a temporary pairing token.";
+}
+
+function openBridgeLink(url: string): void {
+  window.location.href = url;
+}
+
+function pairLink(next: string): string {
+  return `hunsu://pair?next=${encodeURIComponent(next)}`;
 }
 
 function bridgeCommandForCurrentOrigin(next: string): string {

@@ -16,7 +16,7 @@ export type HunsuConfigError = {
   allowed?: readonly string[];
 };
 
-export type HunsuPortName = "bridgeApi" | "studioWeb" | "agentPreview";
+export type HunsuPortName = "bridgeApi" | "studioWeb" | "agentPreview" | "relay";
 
 export type HunsuEndpoint = {
   name: HunsuPortName;
@@ -55,6 +55,7 @@ export type StudioWebServerConfig = {
   apiProxyTarget: string;
   browserBridgeUrl?: string;
   browserHubApiUrl?: string;
+  browserRelayApiUrl?: string;
 };
 
 export type StudioLauncherConfig = {
@@ -92,6 +93,27 @@ export type BridgeRuntimeConfig = {
   testRunner?: "deterministic";
   codexAppServer: CodexAppServerConfig;
   codexThreadOptions: CodexThreadOptionsConfig;
+};
+
+export type RelayServerConfig = {
+  relay: HunsuEndpoint;
+  publicApiUrl: string;
+  publicWsUrl: string;
+  issuer: string;
+  storagePath: string;
+  processEnv: Record<string, string>;
+};
+
+export type RelayClientConfig = {
+  authBaseUrl: string;
+  relayApiUrl?: string;
+  relayWsUrl?: string;
+};
+
+export type BridgeSidecarPackagingConfig = {
+  nativeSidecarDir?: string;
+  sidecarCacheDir?: string;
+  sidecarNodeVersion?: string;
 };
 
 export type BridgeRuntimeConfigOptions = {
@@ -146,11 +168,21 @@ export const HUNSU_PORT_SPECS: Record<HunsuPortName, PortSpec> = {
     portEnv: ["HUNSU_AGENT_PREVIEW_PORT"],
     reserved: true,
     allowPortZero: false
+  },
+  relay: {
+    name: "relay",
+    defaultHost: DEFAULT_HOST,
+    hostEnv: ["HUNSU_RELAY_HOST"],
+    defaultPort: 19690,
+    portEnv: ["HUNSU_RELAY_PORT"],
+    reserved: false,
+    allowPortZero: true
   }
 };
 
 export const HUNSU_ACTIVE_SERVICE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
 export const HUNSU_STUDIO_WEB_ACTIVE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
+export const HUNSU_RELAY_ACTIVE_PORTS = ["relay"] as const satisfies readonly HunsuPortName[];
 const CODEX_SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
 const CODEX_APPROVAL_POLICIES = ["never", "on-request", "on-failure", "untrusted"] as const;
 const CODEX_APPROVALS_REVIEWERS = ["user", "auto_review"] as const;
@@ -195,10 +227,16 @@ export function resolveHunsuPorts(env: Env, options: HunsuPortResolveOptions = {
     return agentPreview;
   }
 
+  const relay = resolveEndpoint(HUNSU_PORT_SPECS.relay, env, options.overrides?.relay);
+  if (!relay.ok) {
+    return relay;
+  }
+
   return ok({
     bridgeApi: bridgeApi.value,
     studioWeb: studioWeb.value,
-    agentPreview: agentPreview.value
+    agentPreview: agentPreview.value,
+    relay: relay.value
   });
 }
 
@@ -212,14 +250,17 @@ export function resolveStudioWebServerConfig(env: Env): ConfigResult<StudioWebSe
     ports => flatMapConfigResult(readConfigBoolean(env, "HUNSU_WEB_STRICT_PORT", true), strictPort =>
       flatMapConfigResult(readOptionalUrl(env, "VITE_HUNSU_BRIDGE_URL"), browserBridgeUrl =>
         flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_HUB_API_URL", "HUNSU_HUB_PUBLIC_API_URL"], defaultBrowserHubApiUrl(env)), browserHubApiUrl =>
-          mapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_API_PROXY_TARGET"], browserBridgeUrl ?? endpointUrl(ports.bridgeApi)), apiProxyTarget => ({
-            web: ports.studioWeb,
-            bridgeApi: ports.bridgeApi,
-            strictPort,
-            apiProxyTarget,
-            browserBridgeUrl,
-            browserHubApiUrl
-          }))
+          flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_RELAY_API_URL", "HUNSU_RELAY_PUBLIC_API_URL"]), browserRelayApiUrl =>
+            mapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_API_PROXY_TARGET"], browserBridgeUrl ?? endpointUrl(ports.bridgeApi)), apiProxyTarget => ({
+              web: ports.studioWeb,
+              bridgeApi: ports.bridgeApi,
+              strictPort,
+              apiProxyTarget,
+              browserBridgeUrl,
+              browserHubApiUrl,
+              browserRelayApiUrl
+            }))
+          )
         )
       )
     )
@@ -232,6 +273,14 @@ export function resolveStudioLauncherConfig(env: Env): ConfigResult<StudioLaunch
 
 export function currentProcessEnv(): Env {
   return process.env;
+}
+
+export function resolveBridgeSidecarPackagingConfig(env: Env): ConfigResult<BridgeSidecarPackagingConfig> {
+  return ok({
+    nativeSidecarDir: firstNonEmpty(env, ["HUNSU_BRIDGE_NATIVE_SIDECAR_DIR"])?.value,
+    sidecarCacheDir: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_CACHE_DIR"])?.value,
+    sidecarNodeVersion: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_NODE_VERSION"])?.value
+  });
 }
 
 function defaultBrowserHubApiUrl(env: Env): string | undefined {
@@ -277,6 +326,43 @@ export function resolveBridgeRuntimeConfig(env: Env, options: BridgeRuntimeConfi
           )
         )
       )
+    )
+  );
+}
+
+export function resolveRelayServerConfig(env: Env, options: { storagePath?: string; homeDir?: string } = {}): ConfigResult<RelayServerConfig> {
+  const processEnv = filterEnv(env);
+  return flatMapConfigResult(resolveValidatedHunsuPorts(env, { activePortNames: HUNSU_RELAY_ACTIVE_PORTS }), ports =>
+    flatMapConfigResult(readFirstOptionalUrl(env, ["HUNSU_RELAY_PUBLIC_API_URL", "HUNSU_RELAY_API_URL"], endpointUrl(ports.relay)), publicApiUrl =>
+      flatMapConfigResult(readFirstOptionalWebSocketUrl(env, ["HUNSU_RELAY_PUBLIC_WS_URL", "HUNSU_RELAY_WS_URL"], httpUrlToWebSocketUrl(`${publicApiUrl ?? endpointUrl(ports.relay)}/v1/device/connect`)), publicWsUrl =>
+        flatMapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_AUTH_BASE_URL"], publicApiUrl ?? endpointUrl(ports.relay)), issuer =>
+          mapConfigResult(resolveRequiredConfiguredPath(
+            options.storagePath,
+            env,
+            "HUNSU_RELAY_STORAGE_PATH",
+            join(options.homeDir ?? homedir(), ".config", "hunsu", "relay-service.json")
+          ), storagePath => ({
+            relay: ports.relay,
+            publicApiUrl: publicApiUrl ?? endpointUrl(ports.relay),
+            publicWsUrl: publicWsUrl ?? httpUrlToWebSocketUrl(`${publicApiUrl ?? endpointUrl(ports.relay)}/v1/device/connect`),
+            issuer,
+            storagePath,
+            processEnv
+          }))
+        )
+      )
+    )
+  );
+}
+
+export function resolveRelayClientConfig(env: Env): ConfigResult<RelayClientConfig> {
+  return flatMapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_AUTH_BASE_URL"], "https://hunsu.app"), authBaseUrl =>
+    flatMapConfigResult(readFirstOptionalUrl(env, ["HUNSU_RELAY_PUBLIC_API_URL", "HUNSU_RELAY_API_URL"]), relayApiUrl =>
+      mapConfigResult(readFirstOptionalWebSocketUrl(env, ["HUNSU_RELAY_PUBLIC_WS_URL", "HUNSU_RELAY_WS_URL"], relayApiUrl ? httpUrlToWebSocketUrl(`${relayApiUrl}/v1/device/connect`) : undefined), relayWsUrl => ({
+        authBaseUrl,
+        relayApiUrl,
+        relayWsUrl
+      }))
     )
   );
 }
@@ -484,6 +570,12 @@ function readFirstOptionalUrl(env: Env, envNames: readonly string[], fallback?: 
   return value === undefined ? ok(undefined) : validateUrl(value, raw?.env ?? envNames[0]);
 }
 
+function readFirstOptionalWebSocketUrl(env: Env, envNames: readonly string[], fallback?: string): ConfigResult<string | undefined> {
+  const raw = firstNonEmpty(env, envNames);
+  const value = raw?.value ?? fallback;
+  return value === undefined ? ok(undefined) : validateWebSocketUrl(value, raw?.env ?? envNames[0]);
+}
+
 function validateUrl(value: string, envName: string | undefined): ConfigResult<string> {
   try {
     const url = new URL(value);
@@ -502,6 +594,32 @@ function validateUrl(value: string, envName: string | undefined): ConfigResult<s
     });
   }
 }
+
+function validateWebSocketUrl(value: string, envName: string | undefined): ConfigResult<string> {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+      throw new Error("Unsupported protocol");
+    }
+    return ok(url.toString().replace(/\/$/, ""));
+  } catch (_error) {
+    return err({
+      code: "invalid_url",
+      env: envName,
+      value,
+      message: envName
+        ? `Invalid ${envName}: ${value}. Expected a ws or wss URL.`
+        : `Invalid WebSocket URL: ${value}. Expected a ws or wss URL.`
+    });
+  }
+}
+
+function httpUrlToWebSocketUrl(value: string): string {
+  const url = new URL(value);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString().replace(/\/$/, "");
+}
+
 
 function resolveConfiguredPath(override: string | undefined, env: Env, envName: string, fallback: string | undefined, cwd?: string): ConfigResult<string | undefined> {
   if (override !== undefined) {

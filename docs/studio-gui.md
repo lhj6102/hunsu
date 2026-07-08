@@ -24,6 +24,34 @@ The URL, not React-only internal state, identifies the active Roadmap. Refresh,
 copying a link, opening a second browser window, or reconnecting through a
 remote tunnel should all preserve the selected Roadmap.
 
+## Bridge Connection UI
+
+Studio always shows Bridge connection state at the bottom of the left
+navigation. The card is visible in expanded and collapsed navigation states and
+opens Connection Center when clicked.
+
+Required visible states include:
+
+- Local Bridge · Connected
+- Local Bridge · Pairing needed
+- Bridge not connected
+- Remote Bridge · Connected
+- Remote Bridge · Reconnecting
+- Session expired
+- Project access needed
+- Bridge update needed
+- Bridge error
+
+Connection Center explains missing app install, Bridge not running, missing
+pairing token, wrong allowed origin, old Bridge version, missing Project Grant,
+Remote Bridge offline, Relay unavailable, and Web/Bridge account mismatch.
+The primary recovery action is opening Hunsu Bridge App. Download and advanced
+CLI paths remain available as secondary actions.
+
+When a paired local Bridge exposes Relay registry data, Connection Center also
+lists available Remote Bridges with online/offline state so the same panel can
+represent both local direct and Remote Relay modes.
+
 ## Launcher
 
 The launcher is the default `/studio` page.

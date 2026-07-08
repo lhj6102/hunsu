@@ -6,13 +6,14 @@ import { RoadmapWorkspace } from "@/features/roadmap-workspace/RoadmapWorkspace"
 import { SetupScreen } from "@/features/setup/SetupScreen";
 import { StudioLauncher } from "@/features/studio-launcher/StudioLauncher";
 import { useBridgeConnection } from "@/shared/api/bridgeConnection";
-import { hasBridgeApiAuthToken } from "@/shared/api/bridgeApiBase";
+import { hasBridgeApiAuthToken, hasRemoteBridgeSession } from "@/shared/api/bridgeApiBase";
 
 export function App() {
   const [route, setRoute] = useState<StudioRoute>(() => parseStudioRoute(window.location));
   const routeNeedsBridge = isBridgeBackedStudioRoute(route);
-  const hasPairingToken = hasBridgeApiAuthToken();
-  const bridge = useBridgeConnection({ enabled: routeNeedsBridge && hasPairingToken });
+  const hasLocalBridgeSession = hasBridgeApiAuthToken();
+  const hasRemoteSession = hasRemoteBridgeSession();
+  const bridge = useBridgeConnection({ enabled: routeNeedsBridge && hasLocalBridgeSession && !hasRemoteSession });
 
   useEffect(() => {
     const handlePopState = () => setRoute(parseStudioRoute(window.location));
@@ -24,10 +25,15 @@ export function App() {
     if (!routeNeedsBridge) {
       return;
     }
-    if (!hasPairingToken || bridge.status === "offline") {
+    if (shouldRedirectBridgeBackedStudioRoute({
+      routeNeedsBridge,
+      hasLocalBridgeSession,
+      hasRemoteBridgeSession: hasRemoteSession,
+      bridgeStatus: bridge.status
+    })) {
       replaceStudioPath(setupPath(currentStudioNext(window.location)));
     }
-  }, [bridge.status, hasPairingToken, routeNeedsBridge]);
+  }, [bridge.status, hasLocalBridgeSession, hasRemoteSession, routeNeedsBridge]);
 
   if (route.kind === "setup") {
     return <SetupScreen next={route.next} />;
@@ -41,7 +47,12 @@ export function App() {
     );
   }
 
-  if (routeNeedsBridge && (!hasPairingToken || bridge.status === "checking" || bridge.status === "offline")) {
+  if (shouldRenderBridgeBackedSetup({
+    routeNeedsBridge,
+    hasLocalBridgeSession,
+    hasRemoteBridgeSession: hasRemoteSession,
+    bridgeStatus: bridge.status
+  })) {
     return <SetupScreen next={currentStudioNext(window.location)} />;
   }
 
@@ -74,4 +85,28 @@ export function App() {
       <StudioLauncher />
     </AppleAppShell>
   );
+}
+
+export function shouldRedirectBridgeBackedStudioRoute(input: {
+  routeNeedsBridge: boolean;
+  hasLocalBridgeSession: boolean;
+  hasRemoteBridgeSession: boolean;
+  bridgeStatus: "idle" | "checking" | "online" | "offline";
+}): boolean {
+  if (!input.routeNeedsBridge || input.hasRemoteBridgeSession) {
+    return false;
+  }
+  return !input.hasLocalBridgeSession || input.bridgeStatus === "offline";
+}
+
+export function shouldRenderBridgeBackedSetup(input: {
+  routeNeedsBridge: boolean;
+  hasLocalBridgeSession: boolean;
+  hasRemoteBridgeSession: boolean;
+  bridgeStatus: "idle" | "checking" | "online" | "offline";
+}): boolean {
+  if (!input.routeNeedsBridge || input.hasRemoteBridgeSession) {
+    return false;
+  }
+  return !input.hasLocalBridgeSession || input.bridgeStatus === "checking" || input.bridgeStatus === "offline";
 }

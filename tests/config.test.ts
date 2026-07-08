@@ -5,9 +5,12 @@ import { join } from "node:path";
 import {
   endpointUrl,
   resolveCodexAppServerConfig,
+  resolveRelayClientConfig,
+  resolveRelayServerConfig,
   resolveHunsuPorts,
   resolveBridgeApiServerConfig,
   resolveBridgeRuntimeConfig,
+  resolveBridgeSidecarPackagingConfig,
   resolveStudioLauncherConfig,
   resolveStudioWebServerConfig,
   resolveValidatedHunsuPorts,
@@ -29,6 +32,7 @@ test("Hunsu config resolves canonical Bridge ports", () => {
   assert.equal(ports.bridgeApi.port, 19687);
   assert.equal(ports.studioWeb.port, 19688);
   assert.equal(ports.agentPreview.port, 19673);
+  assert.equal(ports.relay.port, 19690);
   assert.equal(ports.agentPreview.reserved, true);
 });
 
@@ -60,11 +64,13 @@ test("Studio web config honors env overrides through one resolver", () => {
 test("Studio web config validates browser URL and exposes it for Vite define", () => {
   const config = unwrapConfigResult(resolveStudioWebServerConfig({
     VITE_HUNSU_BRIDGE_URL: "http://127.0.0.1:19687/",
-    VITE_HUNSU_HUB_API_URL: "https://hub.example.test/"
+    VITE_HUNSU_HUB_API_URL: "https://hub.example.test/",
+    VITE_HUNSU_RELAY_API_URL: "https://relay.example.test/"
   }));
 
   assert.equal(config.browserBridgeUrl, "http://127.0.0.1:19687");
   assert.equal(config.browserHubApiUrl, "https://hub.example.test");
+  assert.equal(config.browserRelayApiUrl, "https://relay.example.test");
   assert.equal(config.apiProxyTarget, "http://127.0.0.1:19687");
 
   const publicHub = unwrapConfigResult(resolveStudioWebServerConfig({
@@ -81,6 +87,12 @@ test("Studio web config validates browser URL and exposes it for Vite define", (
   assert.equal(invalid.ok, false);
   if (!invalid.ok) {
     assert.equal(invalid.error.code, "invalid_url");
+  }
+
+  const invalidRelay = resolveStudioWebServerConfig({ VITE_HUNSU_RELAY_API_URL: "not a url" });
+  assert.equal(invalidRelay.ok, false);
+  if (!invalidRelay.ok) {
+    assert.equal(invalidRelay.error.code, "invalid_url");
   }
 });
 
@@ -188,6 +200,18 @@ test("Bridge runtime config resolves paths and Codex app-server settings at the 
   assert.deepEqual(whitespaceArgs.args, ["app-server", "--stdio", "--debug"]);
 });
 
+test("Bridge sidecar packaging config resolves native artifact build inputs", () => {
+  const config = unwrapConfigResult(resolveBridgeSidecarPackagingConfig({
+    HUNSU_BRIDGE_NATIVE_SIDECAR_DIR: "/tmp/hunsu-sidecars",
+    HUNSU_BRIDGE_SIDECAR_CACHE_DIR: "/tmp/hunsu-sidecar-cache",
+    HUNSU_BRIDGE_SIDECAR_NODE_VERSION: "22.22.0"
+  }));
+
+  assert.equal(config.nativeSidecarDir, "/tmp/hunsu-sidecars");
+  assert.equal(config.sidecarCacheDir, "/tmp/hunsu-sidecar-cache");
+  assert.equal(config.sidecarNodeVersion, "22.22.0");
+});
+
 test("Bridge runtime config keeps process env separate from Codex app-server env overrides", () => {
   const config = unwrapConfigResult(resolveBridgeRuntimeConfig({
     SHARED: "ambient",
@@ -201,6 +225,37 @@ test("Bridge runtime config keeps process env separate from Codex app-server env
   assert.equal(config.processEnv.SHARED, "ambient");
   assert.equal(config.processEnv.CODEX_HOME, "/ambient/codex");
   assert.equal(config.codexAppServer.environment.CODEX_HOME, "/codex/only");
+});
+
+test("Relay config resolves hosted auth and WebSocket endpoints explicitly", () => {
+  const server = unwrapConfigResult(resolveRelayServerConfig({
+    HUNSU_RELAY_PORT: "0",
+    HUNSU_RELAY_PUBLIC_API_URL: "https://relay.example.test/",
+    HUNSU_RELAY_PUBLIC_WS_URL: "wss://relay.example.test/v1/device/connect/",
+    HUNSU_BRIDGE_AUTH_BASE_URL: "https://auth.example.test/",
+    HUNSU_RELAY_STORAGE_PATH: "relay-state.json"
+  }, {
+    homeDir: "/tmp/hunsu-home"
+  }));
+
+  assert.equal(server.relay.port, 0);
+  assert.equal(server.publicApiUrl, "https://relay.example.test");
+  assert.equal(server.publicWsUrl, "wss://relay.example.test/v1/device/connect");
+  assert.equal(server.issuer, "https://auth.example.test");
+  assert.equal(server.storagePath, join(ROOT, "relay-state.json"));
+
+  const client = unwrapConfigResult(resolveRelayClientConfig({
+    HUNSU_BRIDGE_AUTH_BASE_URL: "https://auth.example.test/",
+    HUNSU_RELAY_PUBLIC_API_URL: "https://relay.example.test/",
+    HUNSU_RELAY_PUBLIC_WS_URL: "wss://relay.example.test/v1/device/connect/"
+  }));
+  assert.equal(client.authBaseUrl, "https://auth.example.test");
+  assert.equal(client.relayApiUrl, "https://relay.example.test");
+  assert.equal(client.relayWsUrl, "wss://relay.example.test/v1/device/connect");
+
+  const invalidWs = resolveRelayClientConfig({ HUNSU_RELAY_PUBLIC_WS_URL: "https://relay.example.test/ws" });
+  assert.equal(invalidWs.ok, false);
+  if (!invalidWs.ok) assert.equal(invalidWs.error.code, "invalid_url");
 });
 
 test("Hub Cloudflare config resolves local defaults and deterministic dev config", () => {
