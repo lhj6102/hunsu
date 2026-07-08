@@ -9,6 +9,8 @@ import { createServer, type Server } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { buildTeamPlanningPrompt, type CodexProviderStatus, type TeamPlanningInput, type HunsuDraftSessionInput, type HunsuDraftTurnInput, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerEvent, type RunnerRun } from "../packages/codex-runner/src/index.ts";
 import { resolveBridgeRuntimeConfig, unwrapConfigResult } from "../packages/config/src/index.ts";
+import type { RelayServerConfig } from "../packages/config/src/index.ts";
+import { createHunsuRelayServer } from "../apps/relay/src/index.ts";
 import { createDefaultHarness, createDefaultManagerConfig, createDefaultMemberConfig, harnessEntityFromSnapshot, makeNodeId, makePositiveInteger, promptTemplateFromText, rootHarnessSnapshot, type HubPackageLock, type Harness, type HarnessSnapshot, type HunsuOrigin, type NonEmptyText, type ExecutionPlan } from "../packages/protocol/src/index.ts";
 import {
   HUB_PACKAGE_MANIFEST_SCHEMA,
@@ -20,20 +22,29 @@ import {
 import {
   boardFromEvents,
   applyStudioPort,
+  bridgePairingSessionState,
   browseFilesystem,
+  bridgeVersionInfo,
   completeStudioMoveFromExecuteCompletion,
   completeStudioMove,
+  connectRemoteBridge,
+  createBridgePairingSession,
+  createBridgeSupervisor,
   createFilesystemBrowseGrant,
+  createRemoteStudioConnectionStatus,
+  createStudioConnectionStatus,
   createStudioServer,
   createStudioRoadmap,
   createStudioState,
   decideStudioLine,
+  evaluateBridgeCompatibility,
   executeStudioCommand,
   executeStudioCommands,
   findArtifact,
   listCodexSkills,
   listRoadmapRegistry,
   filesystemBrowseRoots,
+  inspectProject,
   inspectStudioPort,
   openStudioRoadmap,
   pauseStudioRun,
@@ -42,7 +53,9 @@ import {
   readMoveDiff,
   readMoveFileTree,
   readWorktreeStatus,
+  removeRoadmapRegistryEntry,
   resumeStudioRun,
+  revokeBridgePairingSession,
   resolveRoadmapRepositoryPath,
   selectStudioRepository,
   startStudioArtifactActionRun,
@@ -53,6 +66,7 @@ import {
   listCodexPlugins,
   materializeCodexSkillsForExecute,
   prepareMemberCodexEnvironmentForExecute,
+  listRemoteBridgeDevices,
   type AgentSessionEvent,
   type StudioLiveEvent,
   type StudioRunState
@@ -1097,6 +1111,104 @@ test("Bridge server exposes Codex provider status through the runner boundary", 
   assert.equal(response.body.account.account.email, "test@hunsu.app");
 });
 
+test("Bridge supervisor starts, stops, and creates pairing URLs", async () => {
+  const repo = createRepo();
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({}, { cwd: repo }));
+  const supervisor = createBridgeSupervisor();
+  const handle = await supervisor.start({
+    cwd: repo,
+    webUrl: "http://127.0.0.1:19688/studio",
+    noOpen: true,
+    runtimeConfig: {
+      ...runtimeConfig,
+      bridgeApi: {
+        ...runtimeConfig.bridgeApi,
+        port: 0
+      }
+    }
+  });
+
+  try {
+    assert.equal(handle.status, "running");
+    assert.match(handle.bridgeApiUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.match(handle.authToken, /^hunsu_bridge_/);
+    assert.equal(bridgePairingSessionState(handle.pairing), "active");
+    const health = await fetch(`${handle.bridgeApiUrl}/health`);
+    assert.equal(health.status, 200);
+    const healthBody = await health.json() as { ok: boolean; service: string; version: { protocolVersion: string } };
+    assert.equal(healthBody.ok, true);
+    assert.equal(healthBody.service, "hunsu-bridge");
+    assert.equal(healthBody.version.protocolVersion, bridgeVersionInfo().protocolVersion);
+
+    const pairingUrl = await supervisor.createPairingUrl({ roadmapId: "roadmap_pairing" });
+    assert.match(pairingUrl, /\/studio\/roadmaps\/roadmap_pairing/);
+    assert.match(pairingUrl, new RegExp(`hunsuBridgeToken=${handle.authToken}`));
+
+    const connectionStatus = createStudioConnectionStatus({
+      bridgeApiUrl: handle.bridgeApiUrl,
+      runtimeConfig: {
+        ...runtimeConfig,
+        bridgeApi: {
+          ...runtimeConfig.bridgeApi,
+          host: "0.0.0.0"
+        }
+      }
+    });
+    assert.equal(connectionStatus.version.protocolVersion, bridgeVersionInfo().protocolVersion);
+    assert.deepEqual(connectionStatus.warnings, ["public_bind"]);
+
+    const oldToken = handle.authToken;
+    assert.match(handle.controlToken, /^hunsu_bridge_control_/);
+    const rejectedControl = await fetch(`${handle.bridgeApiUrl}/api/bridge/pairing/rotate`, {
+      method: "POST",
+      headers: {
+        "x-hunsu-bridge-control-token": "wrong-control-token",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+    assert.equal(rejectedControl.status, 401);
+    assert.equal((await rejectedControl.json()).code, "bridge_control_token_invalid");
+
+    const controlledRevoke = await fetch(`${handle.bridgeApiUrl}/api/bridge/pairing/revoke`, {
+      method: "POST",
+      headers: { "x-hunsu-bridge-control-token": handle.controlToken }
+    });
+    assert.equal(controlledRevoke.status, 202);
+    assert.equal((await controlledRevoke.json()).revoked, true);
+    const controlledRevokedResponse = await fetch(`${handle.bridgeApiUrl}/api/roadmaps/recent`, {
+      headers: { "x-hunsu-bridge-token": oldToken }
+    });
+    assert.equal(controlledRevokedResponse.status, 401);
+    assert.equal((await controlledRevokedResponse.json()).code, "pairing_token_revoked");
+
+    const controlledRotate = await fetch(`${handle.bridgeApiUrl}/api/bridge/pairing/rotate`, {
+      method: "POST",
+      headers: {
+        "x-hunsu-bridge-control-token": handle.controlToken,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ webUrl: "http://127.0.0.1:19688/studio", roadmapId: "roadmap_pairing" })
+    });
+    assert.equal(controlledRotate.status, 202);
+    const controlledRotateBody = await controlledRotate.json() as { authToken: string; studioUrl: string };
+    assert.notEqual(controlledRotateBody.authToken, oldToken);
+    assert.match(controlledRotateBody.studioUrl, /\/studio\/roadmaps\/roadmap_pairing/);
+    const controlledAccepted = await fetch(`${handle.bridgeApiUrl}/api/roadmaps/recent`, {
+      headers: { "x-hunsu-bridge-token": controlledRotateBody.authToken }
+    });
+    assert.equal(controlledAccepted.status, 200);
+
+    const rotated = await supervisor.rotatePairing();
+    assert.notEqual(rotated.authToken, oldToken);
+    assert.equal(bridgePairingSessionState(rotated.pairing), "active");
+  } finally {
+    await supervisor.stop();
+  }
+
+  assert.equal((await supervisor.status())?.status, "stopped");
+});
+
 test("Bridge server requires allowed browser origins and pairing tokens for protected APIs", async () => {
   const runner = new FakeRunner();
   runner.providerStatusResponse = { backend: "app-server", available: true };
@@ -1123,7 +1235,22 @@ test("Bridge server requires allowed browser origins and pairing tokens for prot
     headers: { origin: "https://studio.example.test" }
   });
   assert.equal(missingToken.status, 401);
+  assert.equal(missingToken.body.code, "pairing_token_missing");
   assert.equal(missingToken.headers["access-control-allow-origin"], "https://studio.example.test");
+
+  const invalidToken = await requestStudioServerJson(server, "GET", "/api/codex/status", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      "x-hunsu-bridge-token": "wrong-token"
+    }
+  });
+  assert.equal(invalidToken.status, 401);
+  assert.equal(invalidToken.body.code, "pairing_token_invalid");
+
+  const publicHealth = await requestStudioServerJson(server, "GET", "/health");
+  assert.equal(publicHealth.status, 200);
+  assert.equal(publicHealth.body.service, "hunsu-bridge");
+  assert.equal(publicHealth.body.version.protocolVersion, bridgeVersionInfo().protocolVersion);
 
   const preflight = await requestStudioServerJson(server, "OPTIONS", "/api/filesystem/grants", undefined, {
     headers: {
@@ -1145,6 +1272,258 @@ test("Bridge server requires allowed browser origins and pairing tokens for prot
   assert.equal(accepted.status, 200);
   assert.equal(accepted.headers["access-control-allow-origin"], "https://studio.example.test");
   assert.equal(accepted.body.available, true);
+
+  const connection = await requestStudioServerJson(server, "GET", "/api/connection/status", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      authorization: "Bearer bridge-test-token"
+    }
+  });
+  assert.equal(connection.status, 200);
+  assert.equal(connection.body.mode, "local");
+  assert.equal(connection.body.auth, "paired");
+});
+
+test("Bridge API exposes Remote Bridge devices and remote connection status", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-remote-devices-"));
+  const relayRegistryPath = join(root, "relay-devices.json");
+  writeFileSync(relayRegistryPath, JSON.stringify({
+    schema: "hunsu.relay-registry.v1",
+    devices: [{
+      deviceId: "device_123",
+      deviceName: "devbox",
+      userId: "user_123",
+      registeredAt: new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
+      status: "online",
+      bridgeVersion: "0.1.2",
+      protocolVersion: "local-bridge-v1"
+    }]
+  }), "utf8");
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+    HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath
+  }, { cwd: root }));
+  const server = createStudioServer({ cwd: root, persist: false, runner: new FakeRunner(), runtimeConfig });
+
+  try {
+    assert.equal(listRemoteBridgeDevices({ relayRegistryPath })[0]?.deviceName, "devbox");
+    const response = await requestStudioServerJson(server, "GET", "/api/remote/devices");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.devices[0].deviceId, "device_123");
+    const connected = await requestStudioServerJson(server, "POST", "/api/remote/connect", {
+      deviceId: "device_123",
+      webUserId: "user_123",
+      projectPath: root
+    });
+    assert.equal(connected.status, 202);
+    assert.equal(connected.body.connection.mode, "remote");
+    assert.equal(connected.body.connection.projectAccess, "needs_grant");
+    assert.equal(connected.body.connection.account.sameUser, true);
+    const remoteStatus = createRemoteStudioConnectionStatus({
+      device: response.body.devices[0],
+      account: { webUserId: "user_123", bridgeUserId: "user_123", sameUser: true },
+      projectAccess: "granted"
+    });
+    assert.equal(remoteStatus.mode, "remote");
+    assert.equal(remoteStatus.transport, "relay");
+    assert.equal(remoteStatus.health, "connected");
+    assert.equal(remoteStatus.projectAccess, "granted");
+    const mismatch = connectRemoteBridge({
+      deviceId: "device_123",
+      webUserId: "someone-else@example.test"
+    }, { relayRegistryPath });
+    assert.equal(mismatch.connection.auth, "account_mismatch");
+    assert.equal(mismatch.connection.account?.sameUser, false);
+    const oldDevice = connectRemoteBridge({
+      deviceId: "device_123",
+      minBridgeVersion: "9.0.0"
+    }, { relayRegistryPath });
+    assert.equal(oldDevice.compatibility.compatible, false);
+    assert.equal(oldDevice.connection.warnings.includes("version_mismatch"), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge API reports Relay-backed Remote Bridge Project Grant status", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-remote-grant-status-"));
+  const relay = createHunsuRelayServer({
+    config: bridgeRelayTestConfig(join(root, "relay-state.json")),
+    commandTimeoutMs: 1000
+  });
+  const urls = await relay.listen();
+  let server: ReturnType<typeof createStudioServer> | undefined;
+  try {
+    const token = await bridgeRelayPasswordlessToken(urls.apiUrl);
+    await bridgeRelayJson(`${urls.apiUrl}/v1/devices`, token.access_token, {
+      device: {
+        deviceId: "device_grant",
+        deviceName: "grant-devbox",
+        userId: token.user_id,
+        registeredAt: new Date().toISOString(),
+        status: "offline",
+        bridgeVersion: "0.1.2",
+        protocolVersion: "local-bridge-v1"
+      },
+      projectGrants: [{
+        path: root,
+        grantedAt: new Date().toISOString(),
+        scopes: ["remoteRelay.access"]
+      }]
+    }, 202);
+
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      HUNSU_RELAY_PUBLIC_API_URL: urls.apiUrl
+    }, { cwd: root }));
+    server = createStudioServer({ cwd: root, persist: false, runner: new FakeRunner(), runtimeConfig });
+
+    const granted = await requestStudioServerJson(server, "POST", "/api/remote/connect", {
+      deviceId: "device_grant",
+      webUserId: token.user_id,
+      projectPath: root
+    }, {
+      headers: { "x-hunsu-relay-token": token.access_token }
+    });
+    assert.equal(granted.body.connection.projectAccess, "granted");
+
+    const needsGrant = await requestStudioServerJson(server, "POST", "/api/remote/connect", {
+      deviceId: "device_grant",
+      webUserId: token.user_id,
+      projectPath: join(root, "other")
+    }, {
+      headers: { "x-hunsu-relay-token": token.access_token }
+    });
+    assert.equal(needsGrant.body.connection.projectAccess, "needs_grant");
+  } finally {
+    server?.close();
+    await relay.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge pairing sessions expire and can be revoked without exposing protected APIs", async () => {
+  const expiredPairing = createBridgePairingSession({
+    token: "expired-token",
+    ttlMs: 1,
+    issuedAt: new Date(Date.now() - 60_000)
+  });
+  const expiredServer = createStudioServer({
+    cwd: "/repo",
+    persist: false,
+    runner: new FakeRunner(),
+    security: {
+      pairingSession: expiredPairing,
+      allowedOrigins: ["https://studio.example.test"]
+    }
+  });
+
+  const expired = await requestStudioServerJson(expiredServer, "GET", "/api/roadmaps/recent", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      authorization: "Bearer expired-token"
+    }
+  });
+  assert.equal(expired.status, 401);
+  assert.equal(expired.body.code, "pairing_token_expired");
+
+  const revokedPairing = revokeBridgePairingSession(createBridgePairingSession({ token: "revoked-token" }));
+  const revokedServer = createStudioServer({
+    cwd: "/repo",
+    persist: false,
+    runner: new FakeRunner(),
+    security: {
+      pairingSession: revokedPairing,
+      allowedOrigins: ["https://studio.example.test"]
+    }
+  });
+
+  const revoked = await requestStudioServerJson(revokedServer, "GET", "/api/roadmaps/recent", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      "x-hunsu-bridge-token": "revoked-token"
+    }
+  });
+  assert.equal(revoked.status, 401);
+  assert.equal(revoked.body.code, "pairing_token_revoked");
+});
+
+test("Bridge shutdown control endpoint requires control token", async () => {
+  const server = createStudioServer({
+    cwd: "/repo",
+    persist: false,
+    runner: new FakeRunner(),
+    security: {
+      controlToken: "control-token",
+      authToken: "browser-token",
+      allowedOrigins: ["https://studio.example.test"]
+    }
+  });
+
+  const rejected = await requestStudioServerJson(server, "POST", "/api/bridge/control/shutdown", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      "x-hunsu-bridge-control-token": "wrong-token"
+    }
+  });
+  assert.equal(rejected.status, 401);
+  assert.equal(rejected.body.code, "bridge_control_token_invalid");
+
+  const accepted = await requestStudioServerJson(server, "POST", "/api/bridge/control/shutdown", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      "x-hunsu-bridge-control-token": "control-token"
+    }
+  });
+  assert.equal(accepted.status, 202);
+  assert.equal(accepted.body.shuttingDown, true);
+});
+
+test("Bridge version compatibility reports update and feature requirements", () => {
+  const current = bridgeVersionInfo();
+  assert.deepEqual(evaluateBridgeCompatibility(current, {
+    minBridgeVersion: current.bridgeVersion,
+    requiredProtocolVersion: current.protocolVersion,
+    requiredFeatures: ["local-pairing", "remote-ready"]
+  }), { compatible: true });
+
+  const tooOldBridge = evaluateBridgeCompatibility(current, {
+    minBridgeVersion: "99.0.0",
+    requiredProtocolVersion: current.protocolVersion,
+    requiredFeatures: []
+  });
+  assert.equal(tooOldBridge.compatible, false);
+  if (!tooOldBridge.compatible) assert.equal(tooOldBridge.reason, "bridge_update_needed");
+
+  const missingFeature = evaluateBridgeCompatibility(current, {
+    minBridgeVersion: current.bridgeVersion,
+    requiredProtocolVersion: current.protocolVersion,
+    requiredFeatures: ["missing-feature"]
+  });
+  assert.equal(missingFeature.compatible, false);
+  if (!missingFeature.compatible) assert.equal(missingFeature.reason, "feature_unavailable");
+
+  const tooOldStudio = evaluateBridgeCompatibility({
+    ...current,
+    minSupportedStudioVersion: "99.0.0"
+  }, {
+    minBridgeVersion: current.bridgeVersion,
+    requiredProtocolVersion: current.protocolVersion,
+    requiredFeatures: []
+  }, "0.1.0");
+  assert.equal(tooOldStudio.compatible, false);
+  if (!tooOldStudio.compatible) assert.equal(tooOldStudio.reason, "studio_update_needed");
+
+  const oldBridgeApp = evaluateBridgeCompatibility({
+    ...current,
+    bridgeAppVersion: "0.1.0"
+  }, {
+    minBridgeVersion: current.bridgeVersion,
+    minBridgeAppVersionForRelay: "9.0.0",
+    requiredProtocolVersion: current.protocolVersion,
+    requiredFeatures: []
+  });
+  assert.equal(oldBridgeApp.compatible, false);
+  if (!oldBridgeApp.compatible) assert.equal(oldBridgeApp.reason, "bridge_app_update_needed");
 });
 
 test("Bridge server default Codex runner uses resolved app-server config", async () => {
@@ -1961,6 +2340,77 @@ test("Bridge server ports existing Git projects instead of opening them implicit
   assert.deepEqual(ported.port.writtenFiles, []);
   assert.equal(opened.roadmap.roadmapId, ported.roadmap.roadmapId);
   assert.equal(listRoadmapRegistry({ roadmapRegistryPath: registryPath }).length, 1);
+});
+
+test("Bridge Project Finder classifies Roadmaps, Git projects, new folders, and missing recent paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-project-finder-"));
+  const gitProject = join(root, "git-project");
+  const roadmapPath = join(root, "roadmap");
+  const missingRoadmap = join(root, "missing-roadmap");
+  const missingRuntimeRoadmap = join(root, "missing-runtime-roadmap");
+  const registryPath = join(root, "roadmaps.json");
+  mkdirSync(gitProject);
+  run("git", ["init", "-b", "main"], gitProject);
+  writeFileSync(join(gitProject, "package.json"), JSON.stringify({
+    scripts: { dev: "vite --host 127.0.0.1" },
+    dependencies: { "@vitejs/plugin-react": "latest", react: "latest" },
+    devDependencies: { vite: "latest" }
+  }), "utf8");
+  mkdirSync(missingRuntimeRoadmap);
+  run("git", ["init", "-b", "main"], missingRuntimeRoadmap);
+
+  const state = createStudioState();
+  const roadmap = createStudioRoadmap({ path: roadmapPath, title: "Finder Roadmap" }, state, { persist: true, roadmapRegistryPath: registryPath });
+  writeFileSync(registryPath, JSON.stringify({
+    version: 1,
+    roadmaps: [
+      ...listRoadmapRegistry({ roadmapRegistryPath: registryPath }),
+      {
+        roadmapId: "roadmap_missing",
+        displayName: "Missing Roadmap",
+        repositoryPath: missingRoadmap,
+        lastOpenedAt: "2026-01-01T00:00:00.000Z",
+        health: "ok"
+      },
+      {
+        roadmapId: "roadmap_missing_runtime",
+        displayName: "Missing Runtime Roadmap",
+        repositoryPath: missingRuntimeRoadmap,
+        lastOpenedAt: "2026-01-02T00:00:00.000Z",
+        health: "ok"
+      }
+    ]
+  }, null, 2), "utf8");
+
+  const inspectedRoadmap = inspectProject({ path: roadmap.repository.root }, { roadmapRegistryPath: registryPath });
+  const inspectedGit = inspectProject({ path: gitProject }, { roadmapRegistryPath: registryPath });
+  const inspectedNew = inspectProject({ path: join(root, "new-folder") }, { roadmapRegistryPath: registryPath });
+  const inspectedUnsupported = inspectProject({ path: join(gitProject, "package.json") }, { roadmapRegistryPath: registryPath });
+  const inspectedMissing = inspectProject({ path: missingRoadmap }, { roadmapRegistryPath: registryPath });
+  const inspectedMissingRuntime = inspectProject({ path: missingRuntimeRoadmap }, { roadmapRegistryPath: registryPath });
+  const recent = listRoadmapRegistry({ roadmapRegistryPath: registryPath });
+
+  assert.equal(inspectedRoadmap.kind, "hunsu-roadmap");
+  assert.equal(inspectedRoadmap.kind === "hunsu-roadmap" ? inspectedRoadmap.roadmapId : undefined, roadmap.roadmap.roadmapId);
+  assert.equal(inspectedRoadmap.kind === "hunsu-roadmap" ? inspectedRoadmap.health : undefined, "ok");
+  assert.equal(inspectedGit.kind, "git-project");
+  assert.equal(inspectedGit.kind === "git-project" ? inspectedGit.branch : undefined, "main");
+  assert.deepEqual(inspectedGit.kind === "git-project" ? inspectedGit.stackHints : [], ["Node", "Vite", "React"]);
+  assert.deepEqual(inspectedNew, { kind: "new-project", path: join(root, "new-folder"), recommendedAction: "create" });
+  assert.equal(inspectedUnsupported.kind, "unsupported");
+  assert.equal(inspectedMissing.kind, "missing-roadmap");
+  assert.equal(inspectedMissing.kind === "missing-roadmap" ? inspectedMissing.recommendedAction : undefined, "remove");
+  assert.equal(inspectedMissingRuntime.kind, "missing-roadmap");
+  assert.equal(inspectedMissingRuntime.kind === "missing-roadmap" ? inspectedMissingRuntime.health : undefined, "missing-runtime");
+  assert.equal(inspectedMissingRuntime.kind === "missing-roadmap" ? inspectedMissingRuntime.recommendedAction : undefined, "repair");
+  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing")?.health, "missing");
+  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing")?.type, "missing");
+  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing")?.primaryAction, "remove");
+  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing_runtime")?.health, "missing-runtime");
+  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing_runtime")?.primaryAction, "repair");
+  const removed = removeRoadmapRegistryEntry({ roadmapId: "roadmap_missing" }, { roadmapRegistryPath: registryPath });
+  assert.equal(removed.removed, true);
+  assert.equal(removed.roadmaps.some(entry => entry.roadmapId === "roadmap_missing"), false);
 });
 
 test("Bridge server browses server folders and marks Git-backed Roadmaps", async () => {
@@ -2974,6 +3424,69 @@ async function requestStudioServerJson(
 
 function lowerCaseHeaders(headers: Record<string, string>): Record<string, string> {
   return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));
+}
+
+function bridgeRelayTestConfig(storagePath: string): RelayServerConfig {
+  return {
+    relay: {
+      name: "relay",
+      host: "127.0.0.1",
+      hostSource: "override",
+      port: 0,
+      portSource: "override",
+      reserved: false
+    },
+    publicApiUrl: "http://127.0.0.1:0",
+    publicWsUrl: "ws://127.0.0.1:0/v1/device/connect",
+    issuer: "http://127.0.0.1:0",
+    storagePath,
+    processEnv: {}
+  };
+}
+
+async function bridgeRelayPasswordlessToken(apiUrl: string): Promise<{ access_token: string; user_id: string }> {
+  const deviceCodeResponse = await bridgePostForm(`${apiUrl}/oauth/device/code`, {
+    client_id: "hunsu-bridge-headless",
+    device_id: "device_grant",
+    device_name: "grant-devbox",
+    scope: "bridge device relay"
+  }) as {
+    device_code: string;
+    verification_uri_complete: string;
+  };
+  await fetch(deviceCodeResponse.verification_uri_complete);
+  return await bridgePostForm(`${apiUrl}/oauth/token`, {
+    grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    client_id: "hunsu-bridge-headless",
+    device_code: deviceCodeResponse.device_code
+  }) as { access_token: string; user_id: string };
+}
+
+async function bridgePostForm(url: string, fields: Record<string, string>): Promise<unknown> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields)
+  });
+  if (!response.ok) {
+    assert.fail(await response.text());
+  }
+  return response.json() as Promise<unknown>;
+}
+
+async function bridgeRelayJson(url: string, accessToken: string, body: unknown, expectedStatus = 200): Promise<unknown> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${accessToken}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  if (response.status !== expectedStatus) {
+    assert.fail(await response.text());
+  }
+  return response.json() as Promise<unknown>;
 }
 
 function readHunsuEventText(cwd: string): string {

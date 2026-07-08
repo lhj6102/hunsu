@@ -1,0 +1,30 @@
+{
+  "name": "@hunsu/bridge-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hunsu Bridge companion app and headless command surface.",
+  "type": "module",
+  "bin": {
+    "hunsu-bridge-app": "./dist/main.js",
+    "hunsu-bridge": "./dist/main.js"
+  },
+  "scripts": {
+    "bridge-app": "node --conditions=development src/main.ts",
+    "desktop:dev": "pnpm run typecheck && pnpm exec tauri dev",
+    "desktop:build": "pnpm exec tauri build",
+    "build": "pnpm run build:ui && tsc -p tsconfig.build.json && node --conditions=development scripts/build-native-sidecars.mjs",
+    "build:ui": "node scripts/build-ui.mjs",
+    "sidecars:build": "node --conditions=development scripts/build-native-sidecars.mjs",
+    "sidecars:prepare": "node --conditions=development scripts/prepare-sidecars.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@hunsu/bridge": "workspace:*",
+    "@hunsu/config": "workspace:*"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "esbuild": "^0.28.1",
+    "postject": "1.0.0-alpha.6"
+  }
+}

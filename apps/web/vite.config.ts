@@ -15,7 +15,8 @@ export default defineConfig({
   },
   define: {
     __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(hunsuWeb.browserBridgeUrl ?? ""),
-    __HUNSU_HUB_API_BASE_URL__: JSON.stringify(hunsuWeb.browserHubApiUrl ?? "")
+    __HUNSU_HUB_API_BASE_URL__: JSON.stringify(hunsuWeb.browserHubApiUrl ?? ""),
+    __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(hunsuWeb.browserRelayApiUrl ?? "")
   },
   server: {
     host: hunsuWeb.web.host,

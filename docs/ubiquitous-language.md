@@ -43,9 +43,11 @@ Git, Codex, worktrees, or Action Runs.
 
 Bridge is the installed localhost runtime started from the user's machine.
 
-After `npx @hunsu/bridge@latest` starts Bridge, Bridge owns access to Git
-repositories, Codex app-server, Route worktrees, Artifact Actions, and Bridge
-control APIs. Hunsu Web checks Bridge readiness before enabling Studio actions that mutate a
+Hunsu Bridge App is the primary way to start Bridge for ordinary users. The
+advanced `npx @hunsu/bridge@latest` launcher remains available for developers
+and recovery. Once Bridge is running, it owns access to Git repositories, Codex
+app-server, Route worktrees, Artifact Actions, and Bridge control APIs. Hunsu
+Web checks Bridge readiness before enabling Studio actions that mutate a
 Roadmap or start an Execute.
 
 ## Origin

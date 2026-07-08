@@ -426,11 +426,154 @@ export type RoadmapRegistryEntry = {
   repositoryPath: string;
   lastOpenedAt: string;
   lastKnownBranch?: string;
-  health: "ok" | "missing";
+  health: "ok" | "missing" | "missing-runtime" | "needs-upgrade" | "git-dirty" | "unknown";
+  type?: "roadmap" | "git-project" | "missing";
+  primaryAction?: "open" | "port" | "repair" | "remove";
 };
 
 export type RoadmapListResult = { roadmaps: RoadmapRegistryEntry[] };
 export type RoadmapOpenResult = { roadmap: RoadmapRegistryEntry; repository: WorktreeStatus; board: BoardProjection };
+
+export type ProjectInspection =
+  | {
+      kind: "hunsu-roadmap";
+      path: string;
+      roadmapId: string;
+      displayName: string;
+      health: "ok" | "missing-runtime" | "needs-upgrade" | "git-dirty" | "unknown";
+      recommendedAction: "open";
+      stackHints: string[];
+    }
+  | {
+      kind: "git-project";
+      path: string;
+      branch?: string;
+      clean?: boolean;
+      stackHints: string[];
+      recommendedAction: "port";
+    }
+  | {
+      kind: "new-project";
+      path: string;
+      recommendedAction: "create";
+    }
+  | {
+      kind: "missing-roadmap";
+      path: string;
+      roadmapId: string;
+      displayName: string;
+      health: "missing-path" | "missing-runtime";
+      reason: string;
+      recommendedAction: "repair" | "remove";
+    }
+  | {
+      kind: "unsupported";
+      path: string;
+      reason: string;
+      recommendedAction: "explain";
+    };
+
+export type ProjectInspectionResult = { project: ProjectInspection };
+
+export type BridgeVersionInfo = {
+  bridgeVersion: string;
+  bridgeAppVersion?: string;
+  protocolVersion: string;
+  minSupportedStudioVersion?: string;
+  supportedFeatures: string[];
+};
+
+export type StudioBridgeRequirement = {
+  minBridgeVersion: string;
+  minBridgeAppVersionForRelay?: string;
+  requiredProtocolVersion: string;
+  requiredFeatures: string[];
+};
+
+export type StudioConnectionStatus = {
+  mode: "none" | "local" | "remote";
+  transport: "direct" | "relay" | "unreachable";
+  health: "checking" | "connected" | "disconnected" | "error";
+  auth: "paired" | "missing_token" | "expired" | "invalid" | "account_mismatch" | "unknown";
+  projectAccess: "granted" | "needs_grant" | "denied" | "not_applicable";
+  bridge?: {
+    id?: string;
+    name?: string;
+    version?: string;
+    protocolVersion?: string;
+    startedAt?: string;
+    lastSeenAt?: string;
+  };
+  endpoint?: {
+    apiUrl?: string;
+    relayLabel?: string;
+  };
+  account?: {
+    webUserId?: string;
+    bridgeUserId?: string;
+    sameUser?: boolean;
+  };
+  project?: {
+    roadmapId?: string;
+    displayName?: string;
+    repositoryPath?: string;
+  };
+  warnings: Array<
+    | "public_bind"
+    | "version_mismatch"
+    | "origin_not_allowed"
+    | "relay_unavailable"
+    | "project_missing"
+  >;
+  error?: string;
+  version: BridgeVersionInfo;
+  compatibility?: BridgeCompatibility;
+};
+
+export type StudioConnectionStatusResult = StudioConnectionStatus;
+
+export type BridgeCompatibility =
+  | { compatible: true }
+  | { compatible: false; reason: "bridge_update_needed" | "studio_update_needed" | "feature_unavailable" | "bridge_app_update_needed"; message: string };
+
+export type RemoteBridgeDevice = {
+  deviceId: string;
+  deviceName: string;
+  userId: string;
+  registeredAt: string;
+  lastSeenAt?: string;
+  status: "online" | "offline";
+  bridgeVersion?: string;
+  bridgeAppVersion?: string;
+  protocolVersion?: string;
+};
+
+export type RemoteBridgeDeviceListResult = {
+  devices: RemoteBridgeDevice[];
+};
+
+export type RemoteBridgeConnectRequest = {
+  deviceId: string;
+  webUserId?: string;
+  projectPath?: string;
+  minBridgeVersion?: string;
+  requiredProtocolVersion?: string;
+  requiredFeatures?: string[];
+};
+
+export type RemoteBridgeConnectResult = {
+  connection: StudioConnectionStatus;
+  device?: RemoteBridgeDevice;
+  compatibility: BridgeCompatibility;
+};
+
+export type RemoteProjectGrantStatus = "granted" | "needs_grant" | "denied";
+
+export type RemoteProjectGrantStatusResult = {
+  projectAccess: RemoteProjectGrantStatus;
+  missingScopes?: Array<"execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose" | "remoteRelay.access">;
+  message?: string;
+};
 
 export type BrowseRootId = string & { readonly __brand: "BrowseRootId" };
 export type BrowseToken = string & { readonly __brand: "BrowseToken" };

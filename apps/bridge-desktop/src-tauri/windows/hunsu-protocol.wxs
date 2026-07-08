@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="HunsuProtocolRegistry" Guid="0E65A73F-90C8-4D7D-93DE-A990B234383E">
+        <RegistryKey Root="HKCU" Key="Software\Classes\hunsu">
+          <RegistryValue Type="string" Name="URL Protocol" Value="" KeyPath="yes" />
+          <RegistryValue Type="string" Value="URL:Hunsu Bridge Protocol" />
+          <RegistryKey Key="DefaultIcon">
+            <RegistryValue Type="string" Value="[INSTALLDIR]Hunsu Bridge.exe,0" />
+          </RegistryKey>
+          <RegistryKey Key="shell\open\command">
+            <RegistryValue Type="string" Value="&quot;[INSTALLDIR]Hunsu Bridge.exe&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

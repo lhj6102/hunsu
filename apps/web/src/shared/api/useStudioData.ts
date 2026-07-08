@@ -80,11 +80,15 @@ const emptyBrowse: FilesystemBrowseResult = {
   ]
 };
 
-export function useRoadmapRegistry(): AsyncState<RoadmapRegistryEntry[]> {
+export function useRoadmapRegistry({ enabled = true }: { enabled?: boolean } = {}): AsyncState<RoadmapRegistryEntry[]> {
   const query = useQuery({
     queryKey: ROADMAP_REGISTRY_QUERY_KEY,
-    queryFn: fetchRoadmapRegistry
+    queryFn: fetchRoadmapRegistry,
+    enabled
   });
+  if (!enabled) {
+    return { data: [], status: "empty" };
+  }
   const data = query.data ?? [];
   if (query.isError) {
     return {

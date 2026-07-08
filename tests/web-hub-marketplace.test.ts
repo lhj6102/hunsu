@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { dirname, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   hubMarketplaceSections,
   hubMarketplacePath,
@@ -13,6 +15,9 @@ import {
   type HubResourceSummary
 } from "../apps/web/src/features/hub/hubMarketplace.ts";
 import { parseStudioRoute, setupPath } from "../apps/web/src/app/routes.ts";
+
+const TEST_ROOT = dirname(fileURLToPath(import.meta.url));
+const WEB_ROOT = resolve(TEST_ROOT, "../apps/web");
 
 test("Hub marketplace model groups Executors, Managers, and independent Skills & Plugins", () => {
   assert.deepEqual(hubMarketplaceSections.map(section => section.label), [
@@ -115,6 +120,28 @@ test("Studio setup route preserves only internal Studio next paths", () => {
   assert.equal(setupPath("https://evil.example/studio"), "/studio/setup?next=%2Fstudio");
 });
 
+test("/hub renders without Bridge, Roadmap Registry fetch, or Setup redirect", async () => {
+  const fetchCalls: string[] = [];
+  const historyReplacements: string[] = [];
+  const browser = installHubBrowserShim({
+    url: "http://localhost/hub",
+    fetchCalls,
+    historyReplacements
+  });
+  const { render, close } = await loadAppRenderModule();
+  try {
+    const html = render();
+    assert.match(html, /Hunsu Hub/);
+    assert.match(html, /Packages/);
+    assert.doesNotMatch(html, /Local Bridge required/);
+    assert.equal(fetchCalls.some(url => url.includes("/api/roadmaps/recent")), false);
+    assert.equal(historyReplacements.some(path => path.startsWith("/studio/setup")), false);
+  } finally {
+    await close();
+    browser.restore();
+  }
+});
+
 
 function packageSummary(kind: HubPackageSummary["kind"], key: string): HubPackageSummary {
   return {
@@ -129,6 +156,162 @@ function packageSummary(kind: HubPackageSummary["kind"], key: string): HubPackag
     sourcePackageKey: key,
     sourcePackageVersion: "1.0.0"
   };
+}
+
+type HubBrowserShimOptions = {
+  url: string;
+  fetchCalls: string[];
+  historyReplacements: string[];
+};
+
+function installHubBrowserShim(options: HubBrowserShimOptions): { restore: () => void } {
+  const previousWindow = globalThis.window;
+  const previousFetch = globalThis.fetch;
+  const previousNavigator = globalThis.navigator;
+  const storage = new Map<string, string>();
+  const location = new URL(options.url);
+  const history = {
+    state: null,
+    pushState: (_state: unknown, _unused: string, path?: string | URL | null) => {
+      if (path) {
+        updateLocation(location, path);
+      }
+    },
+    replaceState: (_state: unknown, _unused: string, path?: string | URL | null) => {
+      if (path) {
+        options.historyReplacements.push(String(path));
+        updateLocation(location, path);
+      }
+    }
+  };
+  const windowValue = {
+    innerWidth: 1200,
+    location,
+    history,
+    localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+      removeItem: (key: string) => storage.delete(key)
+    },
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    setInterval,
+    clearInterval,
+    setTimeout,
+    clearTimeout
+  };
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    writable: true,
+    value: windowValue
+  });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { clipboard: { writeText: () => Promise.resolve() } }
+  });
+  globalThis.fetch = ((input: URL | RequestInfo) => {
+    options.fetchCalls.push(String(input));
+    return Promise.resolve(new Response(JSON.stringify({ error: "unexpected fetch" }), {
+      status: 500,
+      headers: { "content-type": "application/json" }
+    }));
+  }) as typeof fetch;
+
+  return {
+    restore: () => {
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        writable: true,
+        value: previousWindow
+      });
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        writable: true,
+        value: previousNavigator
+      });
+      globalThis.fetch = previousFetch;
+    }
+  };
+}
+
+function updateLocation(location: URL, path: string | URL): void {
+  const next = new URL(String(path), location.origin);
+  location.href = next.href;
+}
+
+async function loadAppRenderModule(): Promise<{ render: () => string; close: () => Promise<void> }> {
+  const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
+  const server = await vite.createServer({
+    root: WEB_ROOT,
+    configFile: false,
+    appType: "custom",
+    logLevel: "silent",
+    resolve: {
+      alias: {
+        "@": resolve(WEB_ROOT, "src")
+      }
+    },
+    define: {
+      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
+    },
+    ssr: {
+      external: ["react", "react-dom", "@tanstack/react-query"]
+    },
+    server: {
+      middlewareMode: true
+    }
+  });
+  try {
+    const react = await importWebDependency("react/index.js") as {
+      default?: { createElement: (...args: unknown[]) => unknown };
+      createElement: (...args: unknown[]) => unknown;
+    };
+    const reactDomServer = await importWebDependency("react-dom/server.node.js") as {
+      renderToString: (element: unknown) => string;
+    };
+    const query = await importWebDependency("@tanstack/react-query/build/modern/index.js") as {
+      QueryClient: new (options?: unknown) => { clear: () => void };
+      QueryClientProvider: unknown;
+    };
+    const app = await server.ssrLoadModule("/src/app/App.tsx") as {
+      App: unknown;
+    };
+    const createElement = react.createElement ?? react.default?.createElement;
+    if (!createElement) {
+      throw new Error("React SSR loader did not expose createElement.");
+    }
+    return {
+      render: () => {
+        const client = new query.QueryClient({
+          defaultOptions: {
+            queries: {
+              retry: false
+            }
+          }
+        });
+        try {
+          return reactDomServer.renderToString(createElement(
+            query.QueryClientProvider,
+            { client },
+            createElement(app.App)
+          ));
+        } finally {
+          client.clear();
+        }
+      },
+      close: () => server.close()
+    };
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+}
+
+async function importWebDependency(path: string): Promise<unknown> {
+  return import(pathToFileURL(resolve(WEB_ROOT, "node_modules", path)).href);
 }
 
 function resourceSummary(resourceKind: HubResourceSummary["resourceKind"], resourceKey: string): HubResourceSummary {
