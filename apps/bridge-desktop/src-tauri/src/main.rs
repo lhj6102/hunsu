@@ -14,6 +14,11 @@ struct FolderSelection {
 }
 
 #[derive(Serialize)]
+struct FileSelection {
+    path: String,
+}
+
+#[derive(Serialize)]
 struct BridgeCommandOutput {
     status: i32,
     stdout: String,
@@ -41,6 +46,31 @@ async fn choose_project_folder(app: tauri::AppHandle) -> Result<Option<FolderSel
                 .map_err(|error| error.to_string())
         })
         .transpose()
+}
+
+#[tauri::command]
+async fn choose_codex_binary(app: tauri::AppHandle) -> Result<Option<FileSelection>, String> {
+    #[cfg(target_os = "windows")]
+    let file = app
+        .dialog()
+        .file()
+        .set_title("Select codex.exe")
+        .add_filter("codex.exe", &["exe"])
+        .blocking_pick_file();
+    #[cfg(not(target_os = "windows"))]
+    let file = app
+        .dialog()
+        .file()
+        .set_title("Select Codex CLI")
+        .blocking_pick_file();
+    file.map(|path| {
+        path.into_path()
+            .map(|path| FileSelection {
+                path: path.to_string_lossy().to_string(),
+            })
+            .map_err(|error| error.to_string())
+    })
+    .transpose()
 }
 
 #[tauri::command]
@@ -289,7 +319,13 @@ fn validate_ui_intent_args(args: &[String]) -> bool {
     match args {
         [command, tab] if command == "ui-intent" => validate_ui_tab_arg(tab).is_ok(),
         [command, tab, detail] if command == "ui-intent" && validate_ui_tab_arg(tab).is_ok() => {
-            matches!((tab.as_str(), detail.as_str()), ("prerequisites", "codex") | ("roadmaps", "add-roadmap"))
+            matches!(
+                (tab.as_str(), detail.as_str()),
+                ("codex", "codex")
+                    | ("prerequisites", "codex")
+                    | ("workspaces", "add-roadmap")
+                    | ("roadmaps", "add-roadmap")
+            )
         }
         _ => false,
     }
@@ -380,7 +416,16 @@ fn validate_ui_tab_arg(value: &str) -> Result<(), String> {
     validate_plain_arg(value)?;
     if matches!(
         value,
-        "overview" | "prerequisites" | "roadmaps" | "connection" | "remote" | "diagnostics" | "settings"
+        "codex"
+            | "workspaces"
+            | "advanced"
+            | "overview"
+            | "prerequisites"
+            | "roadmaps"
+            | "connection"
+            | "remote"
+            | "diagnostics"
+            | "settings"
     ) {
         Ok(())
     } else {
@@ -473,16 +518,17 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
             if let Some(path) = query_value(&query, "path") {
                 vec!["roadmaps".to_string(), "add".to_string(), path]
             } else {
-                vec!["ui-intent".to_string(), "roadmaps".to_string(), "add-roadmap".to_string()]
+                vec!["ui-intent".to_string(), "workspaces".to_string(), "add-roadmap".to_string()]
             }
         }
-        "roadmaps" => vec!["ui-intent".to_string(), "roadmaps".to_string()],
+        "roadmaps" | "workspaces" => vec!["ui-intent".to_string(), "workspaces".to_string()],
+        "codex" => vec!["ui-intent".to_string(), "codex".to_string(), "codex".to_string()],
         "prerequisites" => {
             let decoded_path = path_part.map(percent_decode);
             if !matches!(decoded_path.as_deref(), None | Some("codex")) {
                 return Err("Unsupported hunsu://prerequisites path.".to_string());
             }
-            let mut args = vec!["ui-intent".to_string(), "prerequisites".to_string()];
+            let mut args = vec!["ui-intent".to_string(), "codex".to_string()];
             if decoded_path.as_deref() == Some("codex") {
                 args.push("codex".to_string());
             }
@@ -561,6 +607,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            choose_codex_binary,
             choose_project_folder,
             open_external,
             start_bridge_sidecar,
@@ -600,20 +647,22 @@ mod tests {
         );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://add-roadmap").unwrap(),
-            vec!["ui-intent", "roadmaps", "add-roadmap"]
+            vec!["ui-intent", "workspaces", "add-roadmap"]
         );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://add-roadmap?path=/tmp/example").unwrap(),
             vec!["roadmaps", "add", "/tmp/example"]
         );
-        assert_eq!(bridge_args_for_protocol_url("hunsu://roadmaps").unwrap(), vec!["ui-intent", "roadmaps"]);
+        assert_eq!(bridge_args_for_protocol_url("hunsu://roadmaps").unwrap(), vec!["ui-intent", "workspaces"]);
+        assert_eq!(bridge_args_for_protocol_url("hunsu://workspaces").unwrap(), vec!["ui-intent", "workspaces"]);
+        assert_eq!(bridge_args_for_protocol_url("hunsu://codex").unwrap(), vec!["ui-intent", "codex", "codex"]);
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://prerequisites").unwrap(),
-            vec!["ui-intent", "prerequisites"]
+            vec!["ui-intent", "codex"]
         );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://prerequisites/codex").unwrap(),
-            vec!["ui-intent", "prerequisites", "codex"]
+            vec!["ui-intent", "codex", "codex"]
         );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=roadmap_123").unwrap(),

@@ -23,7 +23,7 @@ import {
 import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts";
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
-import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
+import { backgroundSpawnOptions, BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
 import { createStudioRoadmap, createStudioServer, createStudioState, setRoadmapLifecycle } from "../apps/bridge/src/index.ts";
 
 test("Bridge App parses browser deep links into command arguments", () => {
@@ -45,11 +45,13 @@ test("Bridge App parses browser deep links into command arguments", () => {
     "open-roadmap",
     "roadmap_123"
   ]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap"]), ["ui-intent", "roadmaps", "add-roadmap"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap"]), ["ui-intent", "workspaces", "add-roadmap"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap?path=/tmp/example"]), ["roadmaps", "add", "/tmp/example"]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://roadmaps"]), ["ui-intent", "roadmaps"]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites"]), ["ui-intent", "prerequisites"]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/codex"]), ["ui-intent", "prerequisites", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://roadmaps"]), ["ui-intent", "workspaces"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://workspaces"]), ["ui-intent", "workspaces"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://codex"]), ["ui-intent", "codex", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites"]), ["ui-intent", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/codex"]), ["ui-intent", "codex", "codex"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://activate-roadmap?roadmapId=roadmap_123"]), ["activate-roadmap", "roadmap_123"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://remote-disable"]), ["remote", "disable"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://sign-in"]), ["login", "--gui"]);
@@ -110,15 +112,15 @@ test("Bridge App Roadmap deep links record UI intents for native focus flows", a
   try {
     assert.equal(await main(["hunsu://add-roadmap"]), 0);
     const addRoadmapState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; action?: string } };
-    assert.deepEqual({ tab: addRoadmapState.uiIntent?.tab, action: addRoadmapState.uiIntent?.action }, { tab: "roadmaps", action: "add-roadmap" });
+    assert.deepEqual({ tab: addRoadmapState.uiIntent?.tab, action: addRoadmapState.uiIntent?.action }, { tab: "workspaces", action: "add-roadmap" });
 
     assert.equal(await main(["hunsu://prerequisites/codex"]), 0);
     const codexState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; focus?: string } };
-    assert.deepEqual({ tab: codexState.uiIntent?.tab, focus: codexState.uiIntent?.focus }, { tab: "prerequisites", focus: "codex" });
+    assert.deepEqual({ tab: codexState.uiIntent?.tab, focus: codexState.uiIntent?.focus }, { tab: "codex", focus: "codex" });
 
     assert.equal(await main(["hunsu://activate-roadmap?roadmapId=unknown_roadmap"]), 0);
     const activateState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string } };
-    assert.equal(activateState.uiIntent?.tab, "roadmaps");
+    assert.equal(activateState.uiIntent?.tab, "workspaces");
   } finally {
     console.log = previousLog;
     restoreEnv(previousEnv);
@@ -382,6 +384,38 @@ test("Bridge App Codex ChatGPT login command records failed state when Codex is 
   }
 });
 
+test("Bridge App rejects selected Codex binaries with the wrong executable name", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-path-name-test-"));
+  const wrongBinaryName = process.platform === "win32" ? "not-codex.exe" : "not-codex";
+  const wrongBinary = join(root, wrongBinaryName);
+  const statePath = join(root, "state.json");
+  const logPath = join(root, "bridge-app.log");
+  writeFileSync(wrongBinary, [
+    `#!${process.execPath}`,
+    "process.exit(0);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(wrongBinary, 0o755);
+  const previousEnv = snapshotEnv(["HUNSU_BRIDGE_APP_STATE_PATH", "HUNSU_BRIDGE_APP_LOG_PATH", "PATH"]);
+  const previousError = console.error;
+  const errors: string[] = [];
+  console.error = (message?: unknown) => {
+    errors.push(String(message ?? ""));
+  };
+  try {
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.HUNSU_BRIDGE_APP_LOG_PATH = logPath;
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "path", "set", wrongBinary]), 1);
+    assert.equal(errors.some(line => /Selected Codex binary must be named codex(\.exe)?/.test(line)), true);
+    assert.equal(existsSync(statePath), false);
+  } finally {
+    console.error = previousError;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Bridge App desktop UI clears stale Codex login status after authentication", () => {
   const ui = loadBridgeDesktopUiForTest();
   ui.renderSnapshot({
@@ -428,6 +462,9 @@ test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGP
     }
   });
   assert.match(textForTestElement(ui.elements.get("#codex-card")), /browser unavailable/);
+  const loginActions = testChild(testChild(ui.elements.get("#codex-card"), 0), 1);
+  assert.equal(textForTestElement(loginActions), ["Sign in", "Use device code", "Recheck"].join("\n"));
+  assert.doesNotMatch(textForTestElement(ui.elements.get("#codex-card")), /API Key|Use API Key - Advanced/);
 
   ui.renderSnapshot({
     status: bridgeUiStatusFixture(),
@@ -443,6 +480,188 @@ test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGP
   });
   assert.match(textForTestElement(ui.elements.get("#codex-card")), /Codex login started/);
   assert.match(textForTestElement(ui.elements.get("#codex-card")), /Complete sign-in in your browser, then click Recheck/);
+});
+
+test("Bridge App desktop UI is focused on Codex and Workspaces with secondary advanced surfaces", () => {
+  const html = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/index.html"), "utf8");
+  const nav = html.match(/<nav[\s\S]*?<\/nav>/)?.[0] ?? "";
+  const settingsPanel = html.match(/<section data-panel="settings"[\s\S]*?<\/section>/)?.[0] ?? "";
+  const advancedPanel = html.match(/<section data-panel="advanced"[\s\S]*?<section data-panel="diagnostics"/)?.[0] ?? "";
+  assert.match(nav, /Codex/);
+  assert.match(nav, /Workspaces/);
+  assert.doesNotMatch(nav, /Remote Access/);
+  assert.doesNotMatch(nav, /Diagnostics/);
+  assert.doesNotMatch(nav, /Settings/);
+  assert.doesNotMatch(settingsPanel, /CODEX_HOME|HUNSU_CODEX_APP_SERVER/);
+  assert.match(advancedPanel, /CODEX_HOME/);
+  assert.match(advancedPanel, /HUNSU_CODEX_APP_SERVER_COMMAND/);
+
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: {
+        ready: false,
+        recommendedAction: "select_codex_path",
+        cli: {
+          discovery: {
+            suspectedInstalled: true,
+            candidates: [{ source: "windows_apps_alias", status: "alias" }]
+          }
+        },
+        auth: { state: "unknown" }
+      },
+      tools: {}
+    },
+    managedRoadmaps: [
+      { roadmapId: "roadmap_active", displayName: "my-product", repositoryPath: "/tmp/my-product", lifecycle: "active", health: "ok", codex: { readyForExecute: true }, remoteAccess: { scopes: [] } },
+      { roadmapId: "roadmap_inactive", displayName: "old-prototype", repositoryPath: "/tmp/old-prototype", lifecycle: "inactive", health: "ok", codex: { readyForExecute: true }, remoteAccess: { scopes: [] } }
+    ],
+    projectGrants: []
+  });
+  assert.equal(textForTestElement(ui.elements.get("#codex-summary")), "Needs setup");
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /Select existing Codex/);
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /cannot find a usable codex\.exe/);
+  assert.match(textForTestElement(ui.elements.get("#active-roadmap-list")), /Open Studio/);
+  assert.doesNotMatch(textForTestElement(ui.elements.get("#active-roadmap-list")), /remoteRelay\.access/);
+  assert.match(textForTestElement(ui.elements.get("#inactive-roadmap-list")), /Activate/);
+});
+
+test("Bridge App desktop UI keeps app-server terminology out of visible Codex status", () => {
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: {
+        ready: false,
+        recommendedAction: "recheck",
+        appServer: { available: false, error: "App Server Unavailable: stdio probe failed" },
+        cli: { installed: true, version: "codex 1.2.3" },
+        auth: { state: "unknown" }
+      },
+      tools: {}
+    },
+    managedRoadmaps: [],
+    projectGrants: []
+  });
+
+  assert.equal(textForTestElement(ui.elements.get("#codex-summary")), "Error");
+  const codexCard = ui.elements.get("#codex-card");
+  const codexPrimaryStatus = testChild(testChild(testChild(codexCard, 0), 0), 1);
+  assert.equal(textForTestElement(codexPrimaryStatus), "Error");
+  assert.match(textForTestElement(codexCard), /App server: App Server Unavailable: stdio probe failed/);
+});
+
+test("Bridge App desktop UI hides Open Studio until a workspace is active", async () => {
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      tools: {}
+    },
+    managedRoadmaps: [],
+    projectGrants: []
+  });
+
+  const headerOpenStudio = ui.elements.get("#open-studio");
+  const footerOpenStudio = ui.elements.get("#open-studio-connection");
+  assert.equal(headerOpenStudio?.hidden, true);
+  assert.equal(headerOpenStudio?.disabled, true);
+  assert.equal(footerOpenStudio?.hidden, true);
+  assert.equal(footerOpenStudio?.disabled, true);
+  await headerOpenStudio?.click();
+  await footerOpenStudio?.click();
+  assert.equal(ui.location.href, "");
+
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      tools: {}
+    },
+    managedRoadmaps: [
+      { roadmapId: "roadmap_active", displayName: "my-product", repositoryPath: "/tmp/my-product", lifecycle: "active", health: "ok", codex: { readyForExecute: true }, remoteAccess: { scopes: [] } }
+    ],
+    projectGrants: []
+  });
+  assert.equal(headerOpenStudio?.hidden, false);
+  assert.equal(headerOpenStudio?.disabled, false);
+  assert.equal(footerOpenStudio?.hidden, false);
+  assert.equal(footerOpenStudio?.disabled, false);
+});
+
+test("Bridge App desktop UI labels Add workspace selected-folder actions with explicit outcomes", async () => {
+  const cases = [
+    { kind: "hunsu-roadmap", recommendedAction: "open", expectedLabel: "Activate workspace" },
+    { kind: "git-project", recommendedAction: "port", expectedLabel: "Port into Hunsu" },
+    { kind: "new-project", recommendedAction: "create", expectedLabel: "Create workspace" },
+    { kind: "unsupported", recommendedAction: "explain", expectedLabel: "Explain issue" }
+  ];
+
+  for (const testCase of cases) {
+    const path = `/tmp/${testCase.kind}`;
+    const ui = loadBridgeDesktopUiForTest({
+      invoke: async (command, payload) => {
+        if (command === "choose_project_folder") {
+          return { path };
+        }
+        if (command !== "run_bridge_app_command") {
+          throw new Error(`Unexpected command: ${command}`);
+        }
+        const args = (payload as { input?: { args?: string[] } }).input?.args ?? [];
+        if (args[0] === "snapshot") {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              status: bridgeUiStatusFixture(),
+              prerequisites: {
+                codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+                tools: {}
+              },
+              managedRoadmaps: [],
+              projectGrants: [],
+              logLines: []
+            }),
+            stderr: ""
+          };
+        }
+        if (args[0] === "inspect") {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              project: {
+                kind: testCase.kind,
+                path,
+                recommendedAction: testCase.recommendedAction
+              }
+            }),
+            stderr: ""
+          };
+        }
+        throw new Error(`Unexpected bridge command: ${args.join(" ")}`);
+      }
+    });
+
+    await ui.elements.get("#choose-folder")?.click();
+    assert.equal(ui.elements.get("#selected-project-action")?.textContent, testCase.expectedLabel);
+    assert.match(textForTestElement(ui.elements.get("#selected-project")), new RegExp(path.replaceAll("/", "\\/")));
+  }
+});
+
+test("Bridge App desktop UI footer secondary actions open their panels", async () => {
+  const ui = loadBridgeDesktopUiForTest();
+  for (const tab of ["settings", "diagnostics", "logs", "advanced"]) {
+    await ui.tabElements.get(tab)?.click();
+    assert.equal(ui.panelElements.get(tab)?.hidden, false, `${tab} panel should be visible`);
+    assert.equal(ui.tabElements.get(tab)?.dataset.ariaSelected, "true");
+  }
+});
+
+test("Bridge App background spawn helper hides Windows GUI-started child consoles", () => {
+  assert.equal(backgroundSpawnOptions({ stdio: "ignore" }, "win32").windowsHide, true);
+  assert.equal(backgroundSpawnOptions({ stdio: "ignore", windowsHide: false }, "linux").windowsHide, false);
+  assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src/main.ts"), "utf8"), /stdio: "inherit",\n\s+env: codexProbeEnv\(\),\n\s+windowsHide: false/);
 });
 
 test("Bridge App headless commands persist device, Remote Access, Project Grant, and service state", async () => {
@@ -2331,22 +2550,62 @@ type BridgeUiTestElement = {
   type: string;
   append: (...nodes: unknown[]) => void;
   replaceChildren: (...nodes: unknown[]) => void;
-  addEventListener: () => void;
+  addEventListener: (event: string, listener: () => unknown) => void;
+  click: () => Promise<void>;
   focus: () => void;
   scrollIntoView: () => void;
   setAttribute: (name: string, value: string) => void;
 };
 
-function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => void; elements: Map<string, BridgeUiTestElement> } {
+type BridgeUiInvoke = (command: string, payload?: unknown) => unknown | Promise<unknown>;
+
+function loadBridgeDesktopUiForTest(options: { invoke?: BridgeUiInvoke } = {}): {
+  renderSnapshot: (snapshot: unknown) => void;
+  elements: Map<string, BridgeUiTestElement>;
+  tabElements: Map<string, BridgeUiTestElement>;
+  panelElements: Map<string, BridgeUiTestElement>;
+  location: { href: string };
+} {
   const elements = new Map<string, BridgeUiTestElement>();
+  const tabElements = new Map<string, BridgeUiTestElement>();
+  const panelElements = new Map<string, BridgeUiTestElement>();
+  for (const tab of ["codex", "workspaces", "settings", "diagnostics", "logs", "advanced", "diagnostic-details"]) {
+    const element = createBridgeUiTestElement();
+    element.dataset.tab = tab;
+    tabElements.set(tab, element);
+    elements.set(`[data-tab='${tab}']`, element);
+  }
+  for (const panel of ["codex", "workspaces", "settings", "diagnostics", "logs", "advanced"]) {
+    const element = createBridgeUiTestElement();
+    element.dataset.panel = panel;
+    element.hidden = panel !== "codex" && panel !== "workspaces";
+    panelElements.set(panel, element);
+    elements.set(`[data-panel='${panel}']`, element);
+  }
   const document = {
     querySelector(selector: string) {
+      const panelMatch = selector.match(/^\[data-panel='([^']+)'\]$/);
+      if (panelMatch) {
+        return panelElements.get(panelMatch[1]) ?? null;
+      }
+      const tabMatch = selector.match(/^\[data-tab='([^']+)'\]$/);
+      if (tabMatch) {
+        return tabElements.get(tabMatch[1]) ?? null;
+      }
       if (!elements.has(selector)) {
         elements.set(selector, createBridgeUiTestElement());
       }
       return elements.get(selector);
     },
-    querySelectorAll(_selector: string) {
+    querySelectorAll(selector: string) {
+      if (selector === "nav [data-tab], footer [data-tab]") {
+        return ["codex", "workspaces", "settings", "diagnostics", "logs", "advanced"]
+          .map(tab => tabElements.get(tab))
+          .filter(Boolean);
+      }
+      if (selector === "[data-panel]") {
+        return [...panelElements.values()];
+      }
       return [];
     },
     createElement(_tagName: string) {
@@ -2356,8 +2615,13 @@ function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => 
       return { textContent: value };
     }
   };
-  const window = {
-    __TAURI__: undefined,
+  const window: {
+    __TAURI__?: { core: { invoke: BridgeUiInvoke } };
+    location: { href: string };
+    setTimeout: () => number;
+    setInterval: () => number;
+  } = {
+    __TAURI__: options.invoke ? { core: { invoke: options.invoke } } : undefined,
     location: { href: "" },
     setTimeout: () => 0,
     setInterval: () => 0
@@ -2377,11 +2641,15 @@ function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => 
   runInNewContext(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/app.js"), "utf8"), context);
   return {
     renderSnapshot: (context as unknown as { renderSnapshot: (snapshot: unknown) => void }).renderSnapshot,
-    elements
+    elements,
+    tabElements,
+    panelElements,
+    location: window.location
   };
 }
 
 function createBridgeUiTestElement(): BridgeUiTestElement {
+  const listeners = new Map<string, Array<() => unknown>>();
   return {
     textContent: "",
     className: "",
@@ -2399,7 +2667,17 @@ function createBridgeUiTestElement(): BridgeUiTestElement {
     replaceChildren(...nodes: unknown[]) {
       this.children = nodes;
     },
-    addEventListener() {},
+    addEventListener(event: string, listener: () => unknown) {
+      listeners.set(event, [...listeners.get(event) ?? [], listener]);
+    },
+    async click() {
+      if (this.disabled || this.hidden) {
+        return;
+      }
+      for (const listener of listeners.get("click") ?? []) {
+        await listener();
+      }
+    },
     focus() {},
     scrollIntoView() {},
     setAttribute(name: string, value: string) {
@@ -2419,6 +2697,12 @@ function textForTestElement(element: unknown): string {
     typeof node.textContent === "string" ? node.textContent : "",
     ...(node.children ?? []).map(child => textForTestElement(child))
   ].filter(Boolean).join("\n");
+}
+
+function testChild(element: unknown, index: number): unknown {
+  return element && typeof element === "object"
+    ? (element as { children?: unknown[] }).children?.[index]
+    : undefined;
 }
 
 function bridgeUiStatusFixture() {

@@ -6,7 +6,7 @@ import { homedir, hostname, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isSea } from "node:sea";
 import { fileURLToPath } from "node:url";
-import { BridgeSidecarSupervisor } from "./sidecar-supervisor.ts";
+import { backgroundSpawnOptions, BridgeSidecarSupervisor } from "./sidecar-supervisor.ts";
 import {
   createDefaultCredentialStore,
   createPkceAuthorizationRequest,
@@ -102,7 +102,7 @@ type CodexLoginProcessState = {
 
 type BridgeUiIntent = {
   id: string;
-  tab: "overview" | "prerequisites" | "roadmaps" | "connection" | "remote" | "diagnostics" | "settings";
+  tab: "codex" | "workspaces" | "advanced" | "diagnostics" | "settings" | "overview" | "prerequisites" | "roadmaps" | "connection" | "remote";
   focus?: "codex";
   action?: "add-roadmap";
   createdAt: string;
@@ -633,6 +633,7 @@ async function statusCommand(): Promise<void> {
 
 function codexStatusLabel(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus>>): string {
   if (codex.ready) return "Ready";
+  if (codex.recommendedAction === "select_codex_path") return "Select Codex path";
   if (!codex.cli.installed) return "Missing";
   if (codex.auth.state === "not_authenticated" || codex.auth.state === "expired" || codex.auth.state === "invalid") return "Login required";
   if (codex.usage.rateLimited) return "Rate limited";
@@ -757,9 +758,16 @@ async function codexCommand(parsed: ParsedArgs): Promise<void> {
         throw new Error("Usage: hunsu-bridge codex path set /path/to/codex");
       }
       const resolvedPath = resolve(binaryPath);
+      assertSelectedCodexBinaryName(resolvedPath);
       const status = await getCodexRuntimeStatus({ env: { ...codexProbeEnv(), HUNSU_CODEX_BINARY_PATH: resolvedPath }, force: true });
       if (!status.cli.installed) {
         throw new Error(status.cli.error ?? "Custom Codex path is invalid.");
+      }
+      if (!status.cli.version) {
+        throw new Error("Selected Codex path did not respond to `codex --version`.");
+      }
+      if (!status.appServer.available) {
+        throw new Error(status.appServer.error ?? "Selected Codex path could not start `codex app-server --stdio`.");
       }
       const state = readAppState();
       writeAppState({ ...state, codex: { ...state.codex, binaryPath: resolvedPath } });
@@ -866,29 +874,29 @@ async function roadmapsCommand(parsed: ParsedArgs): Promise<void> {
 function activateRoadmapIntentCommand(parsed: ParsedArgs): void {
   const roadmapId = parsed.rest[0] ?? getFlag(parsed, "roadmap-id");
   if (!roadmapId?.trim()) {
-    writeBridgeUiIntent({ tab: "roadmaps" });
-    console.log("Roadmap ID is required. Showing Roadmaps.");
+    writeBridgeUiIntent({ tab: "workspaces" });
+    console.log("Roadmap ID is required. Showing Workspaces.");
     return;
   }
   try {
     const result = setRoadmapLifecycle({ roadmapId: roadmapId.trim() }, "active", roadmapRegistryOptions());
     console.log(`Activated Roadmap: ${result.roadmap?.displayName ?? roadmapId.trim()}`);
   } catch (_error) {
-    writeBridgeUiIntent({ tab: "roadmaps" });
-    console.log("Roadmap was not registered. Showing Roadmaps.");
+    writeBridgeUiIntent({ tab: "workspaces" });
+    console.log("Roadmap was not registered. Showing Workspaces.");
   }
 }
 
 function uiIntentCommand(parsed: ParsedArgs): void {
-  const tab = parsed.rest[0];
+  const tab = normalizeBridgeUiIntentTab(parsed.rest[0]);
   if (!isBridgeUiIntentTab(tab)) {
-    throw new Error("Usage: hunsu-bridge ui-intent overview|prerequisites|roadmaps|connection|remote|diagnostics|settings [codex|add-roadmap]");
+    throw new Error("Usage: hunsu-bridge ui-intent codex|workspaces|advanced|diagnostics|settings [codex|add-roadmap]");
   }
   const detail = parsed.rest[1];
   writeBridgeUiIntent({
     tab,
-    focus: tab === "prerequisites" && detail === "codex" ? "codex" : undefined,
-    action: tab === "roadmaps" && detail === "add-roadmap" ? "add-roadmap" : undefined
+    focus: tab === "codex" && detail === "codex" ? "codex" : undefined,
+    action: tab === "workspaces" && detail === "add-roadmap" ? "add-roadmap" : undefined
   });
   console.log(`Bridge App intent recorded: ${tab}`);
 }
@@ -905,13 +913,22 @@ function writeBridgeUiIntent(intent: Omit<BridgeUiIntent, "id" | "createdAt">): 
 }
 
 function isBridgeUiIntentTab(value: unknown): value is BridgeUiIntent["tab"] {
-  return value === "overview"
+  return value === "codex"
+    || value === "workspaces"
+    || value === "advanced"
+    || value === "overview"
     || value === "prerequisites"
     || value === "roadmaps"
     || value === "connection"
     || value === "remote"
     || value === "diagnostics"
     || value === "settings";
+}
+
+function normalizeBridgeUiIntentTab(value: unknown): BridgeUiIntent["tab"] | undefined {
+  if (value === "prerequisites") return "codex";
+  if (value === "roadmaps") return "workspaces";
+  return isBridgeUiIntentTab(value) ? value : undefined;
 }
 
 async function buildDiagnostics(): Promise<unknown> {
@@ -1768,6 +1785,7 @@ async function safeCodexDiagnostics(): Promise<unknown> {
     codexAuthState: status.auth.state,
     codexAuthMethod: status.auth.method,
     codexAccessType: status.auth.access,
+    codexDiscovery: status.cli.discovery,
     rateLimitsAvailable: status.usage.rateLimitsAvailable,
     rateLimited: status.usage.rateLimited,
     lastRunUsage: status.usage.lastRunUsage,
@@ -1812,7 +1830,7 @@ async function runCodexDeviceLoginCli(options: { json: boolean; background: bool
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
     env: codexProbeEnv(),
-    windowsHide: false
+    windowsHide: options.background || options.json ? true : false
   });
   const startedAt = new Date().toISOString();
   writeCodexLoginState({ kind: "device", pid: child.pid, startedAt, status: "starting" });
@@ -1916,12 +1934,11 @@ async function runCodexChatGptLoginCli(): Promise<void> {
     throw new Error(codex.cli.error ?? "Codex CLI was not found.");
   }
   try {
-    const child = spawn(binaryPath, args, {
+    const child = spawn(binaryPath, args, backgroundSpawnOptions({
       detached: true,
       stdio: "ignore",
-      env: codexProbeEnv(),
-      windowsHide: false
-    });
+      env: codexProbeEnv()
+    }));
     child.unref();
     writeCodexLoginState({
       kind: "chatgpt",
@@ -2503,6 +2520,17 @@ function parseCodexAuthenticationPreference(value: string | undefined): BridgeCo
   throw new Error(`Unknown Codex authentication preference: ${value}`);
 }
 
+function assertSelectedCodexBinaryName(binaryPath: string, platformName: NodeJS.Platform = process.platform): void {
+  const expected = selectedCodexBinaryName(platformName);
+  if (basename(binaryPath).toLowerCase() !== expected) {
+    throw new Error(`Selected Codex binary must be named ${expected}.`);
+  }
+}
+
+function selectedCodexBinaryName(platformName: NodeJS.Platform): "codex" | "codex.exe" {
+  return platformName === "win32" ? "codex.exe" : "codex";
+}
+
 function defaultDeviceState(): BridgeDeviceState {
   const name = hostname() || "Hunsu Bridge Device";
   return {
@@ -2884,18 +2912,22 @@ export function normalizeBridgeAppArgv(argv: string[]): string[] {
         }
         nextArgs.push("roadmaps", "add", path);
       } else {
-        nextArgs.push("ui-intent", "roadmaps", "add-roadmap");
+        nextArgs.push("ui-intent", "workspaces", "add-roadmap");
       }
       break;
     case "roadmaps":
-      nextArgs.push("ui-intent", "roadmaps");
+    case "workspaces":
+      nextArgs.push("ui-intent", "workspaces");
+      break;
+    case "codex":
+      nextArgs.push("ui-intent", "codex", "codex");
       break;
     case "prerequisites":
       if (pathFromUrl && pathFromUrl !== "codex") {
         nextArgs.push("protocol-error", "Unsupported hunsu://prerequisites path.");
         break;
       }
-      nextArgs.push("ui-intent", "prerequisites");
+      nextArgs.push("ui-intent", "codex");
       if (pathFromUrl === "codex") nextArgs.push("codex");
       break;
     case "activate-roadmap":
@@ -2970,7 +3002,7 @@ Headless:
   hunsu-bridge roadmaps remote enable <roadmapId> [--scopes all|remoteRelay.access,execute.start,artifactAction.run,env.read,hostAlias.expose]
   hunsu-bridge roadmaps remote disable <roadmapId>
   hunsu-bridge roadmaps remove <roadmapId>
-  hunsu-bridge ui-intent <tab> [codex|add-roadmap]
+  hunsu-bridge ui-intent codex|workspaces|advanced|diagnostics|settings [codex|add-roadmap]
   hunsu-bridge projects list
   hunsu-bridge projects recent
   hunsu-bridge projects grant <path> [--scopes all|remoteRelay.access,execute.start,artifactAction.run,env.read,hostAlias.expose]
@@ -2981,6 +3013,8 @@ Deep links:
   hunsu://open
   hunsu://pair?next=/studio
   hunsu://add-roadmap
+  hunsu://codex
+  hunsu://workspaces
   hunsu://roadmaps
   hunsu://prerequisites
   hunsu://prerequisites/codex
@@ -3161,12 +3195,12 @@ function startRemoteAccessProcessIfPossible(parsed: ParsedArgs): boolean {
       ...bridgeNodeExecArgs(),
       process.argv[1] ?? "hunsu-bridge",
       ...args
-    ], {
+    ], backgroundSpawnOptions({
       cwd,
       env: bridgeProcessEnvWithNonce(commandIdentity.nonce),
       detached: true,
       stdio: "ignore"
-    });
+    }));
     child.unref();
     writeStructuredLog({ event: "relay.process.started", pid: child.pid, args });
     writeAppState({

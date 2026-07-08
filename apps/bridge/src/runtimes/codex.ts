@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { currentProcessEnv } from "@hunsu/config";
@@ -7,13 +7,56 @@ import { currentProcessEnv } from "@hunsu/config";
 const execFileAsync = promisify(execFile);
 const DEFAULT_PROBE_TIMEOUT_MS = 3_500;
 const STATUS_CACHE_TTL_MS = 5_000;
+const WINDOWS_CODEX_SELECT_PATH_MESSAGE = [
+  "Codex works in your terminal, but Hunsu Bridge App cannot find it.",
+  "",
+  "This can happen when Windows resolves `codex` through an App Execution Alias or a shell-specific PATH that desktop apps do not inherit.",
+  "",
+  "Select the real codex.exe file or restart Hunsu Bridge App after updating PATH."
+].join("\n");
 
 export type CodexCliStatus = {
   installed: boolean;
   binaryPath?: string;
-  source?: "custom" | "env" | "path" | "unknown";
+  source?: CodexBinarySource;
   version?: string;
   error?: string;
+  discovery?: CodexDiscoveryReport;
+};
+
+export type CodexBinarySource =
+  | "custom"
+  | "env"
+  | "path"
+  | "windows_user_path"
+  | "windows_machine_path"
+  | "where"
+  | "powershell"
+  | "known_install_dir"
+  | "windows_apps_alias"
+  | "unknown";
+
+export type CodexDiscoveryCandidateStatus =
+  | "usable"
+  | "missing"
+  | "invalid"
+  | "alias"
+  | "skipped";
+
+export type CodexDiscoveryCandidate = {
+  source: CodexBinarySource;
+  command?: string;
+  binaryPath?: string;
+  status: CodexDiscoveryCandidateStatus;
+  version?: string;
+  reason?: string;
+};
+
+export type CodexDiscoveryReport = {
+  platform: NodeJS.Platform;
+  candidates: CodexDiscoveryCandidate[];
+  suspectedInstalled: boolean;
+  message?: string;
 };
 
 export type CodexRuntimeStatus = {
@@ -21,10 +64,11 @@ export type CodexRuntimeStatus = {
   cli: {
     installed: boolean;
     binaryPath?: string;
-    source?: "custom" | "env" | "path" | "unknown";
+    source?: CodexBinarySource;
     version?: string;
     installActionAvailable: boolean;
     error?: string;
+    discovery?: CodexDiscoveryReport;
   };
   appServer: {
     available: boolean;
@@ -60,7 +104,7 @@ export type CodexRuntimeStatus = {
     error?: string;
   };
   ready: boolean;
-  recommendedAction: "install_codex" | "login_codex" | "recheck" | "none";
+  recommendedAction: "install_codex" | "select_codex_path" | "login_codex" | "recheck" | "none";
 };
 
 export type CodexAppServerProbeResult =
@@ -81,19 +125,32 @@ export type CodexRuntimeStatusOptions = {
   timeoutMs?: number;
   force?: boolean;
   lastRunUsage?: CodexRuntimeStatus["usage"]["lastRunUsage"];
+  platform?: NodeJS.Platform;
+  windowsUserPath?: string;
+  windowsMachinePath?: string;
+  commandRunner?: CodexDiscoveryCommandRunner;
 };
+
+export type CodexDiscoveryCommandRunner = (
+  command: string,
+  args: string[],
+  options: {
+    env: Record<string, string | undefined>;
+    timeoutMs: number;
+  }
+) => Promise<{ status: number | null; stdout: string; stderr: string }>;
 
 type CodexCommandResolution =
   | {
       kind: "binary";
       installed: true;
       binaryPath: string;
-      source: "custom" | "env" | "path";
+      source: CodexBinarySource;
     }
   | {
       kind: "missing";
       installed: false;
-      source: "custom" | "env" | "path" | "unknown";
+      source: CodexBinarySource;
       binaryPath?: string;
       error: string;
     }
@@ -116,19 +173,69 @@ let cachedStatus: { at: number; key: string; status: CodexRuntimeStatus } | unde
 
 export async function detectCodexBinary(options: CodexRuntimeStatusOptions = {}): Promise<CodexCliStatus> {
   const env = options.env ?? currentProcessEnv();
+  const platform = options.platform ?? process.platform;
+  const discovery: CodexDiscoveryReport = {
+    platform,
+    candidates: [],
+    suspectedInstalled: false
+  };
   const customPath = options.customBinaryPath?.trim() || env.HUNSU_CODEX_BINARY_PATH?.trim();
   if (customPath) {
-    return binaryStatusFromCandidate(customPath, "custom", env);
+    return binaryStatusFromCandidate(customPath, "custom", env, platform, discovery);
   }
   const envCommand = env.HUNSU_CODEX_APP_SERVER_COMMAND?.trim();
   if (envCommand) {
-    return binaryStatusFromCandidate(envCommand, "env", env);
+    const envStatus = binaryStatusFromCandidate(envCommand, "env", env, platform, discovery);
+    if (envStatus.installed || platform !== "win32" || isAbsoluteForPlatform(envCommand, platform) || /\s/.test(envCommand)) {
+      return envStatus;
+    }
   }
-  const pathCandidate = findExecutableOnPath("codex", env);
+  const pathCandidate = findExecutableOnPath("codex", env, platform);
   if (pathCandidate) {
-    return binaryStatusFromCandidate(pathCandidate, "path", env);
+    if (platform === "win32") {
+      const pathStatus = await validateWindowsDiscoveryCandidate(pathCandidate, "path", env, { ...options, env, platform });
+      discovery.candidates.push(pathStatus);
+      if (pathStatus.status === "usable" && pathStatus.binaryPath) {
+        discovery.suspectedInstalled = true;
+        return {
+          installed: true,
+          binaryPath: pathStatus.binaryPath,
+          source: "path",
+          version: pathStatus.version,
+          discovery
+        };
+      }
+      if (pathStatus.status === "alias" || pathStatus.status === "invalid") {
+        discovery.suspectedInstalled = true;
+      }
+    } else {
+      return binaryStatusFromCandidate(pathCandidate, "path", env, platform, discovery);
+    }
   }
-  return { installed: false, source: "unknown", error: "Codex CLI was not found on PATH." };
+  if (platform === "win32") {
+    const windowsStatus = await detectCodexBinaryOnWindows({ ...options, env, platform, discovery });
+    if (windowsStatus) {
+      return windowsStatus;
+    }
+    if (discovery.candidates.some(candidate => candidate.status === "alias" || candidate.status === "invalid")) {
+      discovery.suspectedInstalled = true;
+      discovery.message = WINDOWS_CODEX_SELECT_PATH_MESSAGE;
+      return {
+        installed: false,
+        source: "unknown",
+        error: WINDOWS_CODEX_SELECT_PATH_MESSAGE,
+        discovery
+      };
+    }
+  }
+  return {
+    installed: false,
+    source: "unknown",
+    error: platform === "win32"
+      ? "Codex CLI was not found in Bridge App PATH, Windows PATH, known Codex install directories, or WindowsApps aliases."
+      : "Codex CLI was not found on PATH.",
+    discovery: discovery.candidates.length > 0 ? discovery : undefined
+  };
 }
 
 export async function getCodexVersion(input: { binaryPath: string; timeoutMs?: number }): Promise<string | undefined> {
@@ -224,6 +331,9 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
     customBinaryPath: options.customBinaryPath ?? env.HUNSU_CODEX_BINARY_PATH,
     envCommand: env.HUNSU_CODEX_APP_SERVER_COMMAND,
     path: env.PATH,
+    platform: options.platform ?? process.platform,
+    windowsUserPath: options.windowsUserPath,
+    windowsMachinePath: options.windowsMachinePath,
     lastRunUsage: options.lastRunUsage
   });
   if (!options.force && cachedStatus && cachedStatus.key === cacheKey && Date.now() - cachedStatus.at < STATUS_CACHE_TTL_MS) {
@@ -233,12 +343,12 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
   if (!cli.installed || !cli.binaryPath) {
     const status: CodexRuntimeStatus = {
       runtime: "codex",
-      cli: { installed: false, source: cli.source, installActionAvailable: true, error: cli.error },
+      cli: { installed: false, source: cli.source, installActionAvailable: true, error: cli.error, discovery: cli.discovery },
       appServer: { available: false },
       auth: { state: "unknown", access: "unknown" },
       usage: { rateLimitsAvailable: false, lastRunUsage: options.lastRunUsage },
       ready: false,
-      recommendedAction: "install_codex"
+      recommendedAction: cli.discovery?.suspectedInstalled ? "select_codex_path" : "install_codex"
     };
     cachedStatus = { at: Date.now(), key: cacheKey, status };
     return status;
@@ -250,7 +360,7 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
   if (!appServer.available) {
     const status: CodexRuntimeStatus = {
       runtime: "codex",
-      cli: { installed: true, binaryPath: cli.binaryPath, source: cli.source, version, installActionAvailable: false, error: cli.error },
+      cli: { installed: true, binaryPath: cli.binaryPath, source: cli.source, version, installActionAvailable: false, error: cli.error, discovery: cli.discovery },
       appServer,
       auth: { state: "unknown", access: "unknown" },
       usage: { rateLimitsAvailable: false, lastRunUsage: options.lastRunUsage },
@@ -278,7 +388,7 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
   const ready = auth.state === "authenticated" && usage.rateLimited !== true;
   const status: CodexRuntimeStatus = {
     runtime: "codex",
-    cli: { installed: true, binaryPath: cli.binaryPath, source: cli.source, version, installActionAvailable: false, error: cli.error },
+    cli: { installed: true, binaryPath: cli.binaryPath, source: cli.source, version, installActionAvailable: false, error: cli.error, discovery: cli.discovery },
     appServer,
     auth,
     usage,
@@ -291,22 +401,22 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
 
 export function codexRuntimePreflightError(status: CodexRuntimeStatus): ExecutePreflightError | undefined {
   if (!status.cli.installed) {
-    return preflight("CODEX_CLI_MISSING", "Codex CLI is not installed or was not found.", [
-      { type: "install_codex", label: "Install Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+    return preflight("CODEX_CLI_MISSING", CODEX_SETUP_REQUIRED_MESSAGE, [
+      { type: "install_codex", label: "Open Codex setup" },
+      { type: "open_prerequisites", label: "Open Codex setup" }
     ]);
   }
   if (!status.appServer.available) {
-    return preflight("CODEX_APP_SERVER_UNAVAILABLE", status.appServer.error ?? "Codex app-server is unavailable.", [
-      { type: "codex_recheck", label: "Recheck Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+    return preflight("CODEX_APP_SERVER_UNAVAILABLE", CODEX_TEMPORARILY_UNAVAILABLE_MESSAGE, [
+      { type: "open_prerequisites", label: "Open Codex setup" },
+      { type: "codex_recheck", label: "Recheck Codex" }
     ]);
   }
   if (status.auth.state === "not_authenticated") {
     return preflight("CODEX_LOGIN_REQUIRED", "Codex login is required before Execute can start.", [
       { type: "codex_login_chatgpt", label: "Sign in with ChatGPT" },
       { type: "codex_login_device", label: "Use Device Code" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+      { type: "open_prerequisites", label: "Open Codex setup" }
     ]);
   }
   if (status.auth.state === "expired") {
@@ -322,20 +432,23 @@ export function codexRuntimePreflightError(status: CodexRuntimeStatus): ExecuteP
     ]);
   }
   if (status.auth.state !== "authenticated") {
-    return preflight("CODEX_RUNTIME_UNKNOWN", status.auth.error ?? "Codex runtime readiness could not be confirmed.", [
-      { type: "codex_recheck", label: "Recheck Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+    return preflight("CODEX_RUNTIME_UNKNOWN", CODEX_SETUP_REQUIRED_MESSAGE, [
+      { type: "open_prerequisites", label: "Open Codex setup" },
+      { type: "codex_recheck", label: "Recheck Codex" }
     ]);
   }
   if (status.usage.rateLimited) {
     const reset = status.usage.rateLimitSummary?.resetAt ? ` Reset: ${status.usage.rateLimitSummary.resetAt}.` : "";
     return preflight("CODEX_RATE_LIMITED", `Codex access is temporarily unavailable because it is rate limited.${reset}`, [
       { type: "codex_recheck", label: "Recheck Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+      { type: "open_prerequisites", label: "Open Codex setup" }
     ]);
   }
   return undefined;
 }
+
+const CODEX_SETUP_REQUIRED_MESSAGE = "Codex setup required. Open Codex setup in Hunsu Bridge App before starting Execute.";
+const CODEX_TEMPORARILY_UNAVAILABLE_MESSAGE = "Codex is temporarily unavailable. Open Codex setup in Hunsu Bridge App and recheck before starting Execute.";
 
 export type ExecutePreflightError = {
   area: "codex";
@@ -385,20 +498,288 @@ function preflight(error: Extract<ExecutePreflightError, { area: "codex" }>["err
   return { area: "codex", error, message, runtime: "codex", actions: [{ type: "open_bridge_app", label: "Open Bridge App", href: "hunsu://open" }, ...actions] };
 }
 
-function binaryStatusFromCandidate(candidate: string, source: CodexCliStatus["source"], env: Record<string, string | undefined>): CodexCliStatus {
-  const resolution = resolveCodexCommand(candidate, source, env);
+async function detectCodexBinaryOnWindows(options: CodexRuntimeStatusOptions & {
+  env: Record<string, string | undefined>;
+  platform: NodeJS.Platform;
+  discovery: CodexDiscoveryReport;
+}): Promise<CodexCliStatus | undefined> {
+  const env = options.env;
+  const userPath = options.windowsUserPath ?? await readWindowsRegistryPath("user", env, options);
+  const machinePath = options.windowsMachinePath ?? await readWindowsRegistryPath("machine", env, options);
+  const candidates: Array<{ source: CodexBinarySource; command: string }> = [
+    ...pathCandidates("windows_user_path", userPath, env, options.platform),
+    ...pathCandidates("windows_machine_path", machinePath, env, options.platform),
+    ...await commandDiscoveryCandidates("where", "where.exe", ["codex"], env, options),
+    ...await commandDiscoveryCandidates("powershell", "powershell.exe", [
+      "-NoProfile",
+      "-Command",
+      "(Get-Command codex -All | Select-Object -ExpandProperty Source) -join [Environment]::NewLine"
+    ], env, options),
+    ...knownWindowsCodexInstallCandidates(env),
+    ...windowsAppsAliasCandidates(env)
+  ];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const key = `${candidate.source}:${candidate.command.toLowerCase()}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const status = await validateWindowsDiscoveryCandidate(candidate.command, candidate.source, env, options);
+    options.discovery.candidates.push(status);
+    if (status.status === "usable" && status.binaryPath) {
+      options.discovery.suspectedInstalled = true;
+      return {
+        installed: true,
+        binaryPath: status.binaryPath,
+        source: candidate.source,
+        version: status.version,
+        discovery: options.discovery
+      };
+    }
+    if (status.status === "alias" || status.status === "invalid") {
+      options.discovery.suspectedInstalled = true;
+    }
+  }
+  if (options.discovery.suspectedInstalled) {
+    options.discovery.message = WINDOWS_CODEX_SELECT_PATH_MESSAGE;
+  }
+  return undefined;
+}
+
+function pathCandidates(
+  source: CodexBinarySource,
+  pathValue: string | undefined,
+  env: Record<string, string | undefined>,
+  platform: NodeJS.Platform
+): Array<{ source: CodexBinarySource; command: string }> {
+  if (!pathValue?.trim()) {
+    return [];
+  }
+  const pathEnv = { ...env, PATH: pathValue };
+  const candidate = findExecutableOnPath("codex", pathEnv, platform);
+  return candidate ? [{ source, command: candidate }] : [];
+}
+
+async function commandDiscoveryCandidates(
+  source: CodexBinarySource,
+  command: string,
+  args: string[],
+  env: Record<string, string | undefined>,
+  options: CodexRuntimeStatusOptions
+): Promise<Array<{ source: CodexBinarySource; command: string }>> {
+  const result = await runDiscoveryCommand(command, args, env, options);
+  if (result.status !== 0) {
+    return [];
+  }
+  return result.stdout
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(candidate => ({ source, command: candidate }));
+}
+
+async function readWindowsRegistryPath(
+  scope: "user" | "machine",
+  env: Record<string, string | undefined>,
+  options: CodexRuntimeStatusOptions
+): Promise<string | undefined> {
+  const key = scope === "user"
+    ? "HKCU\\Environment"
+    : "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+  const result = await runDiscoveryCommand("reg.exe", ["query", key, "/v", "Path"], env, options);
+  if (result.status !== 0) {
+    return undefined;
+  }
+  const pathLine = result.stdout
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(line => /^Path\s+REG_/i.test(line));
+  if (!pathLine) {
+    return undefined;
+  }
+  const match = pathLine.match(/^Path\s+REG_\S+\s+(.+)$/i);
+  return match?.[1] ? expandWindowsEnvVars(match[1], env) : undefined;
+}
+
+async function runDiscoveryCommand(
+  command: string,
+  args: string[],
+  env: Record<string, string | undefined>,
+  options: CodexRuntimeStatusOptions
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  if (options.commandRunner) {
+    return options.commandRunner(command, args, {
+      env,
+      timeoutMs: options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
+    });
+  }
+  try {
+    const { stdout, stderr } = await execFileAsync(command, args, {
+      env,
+      encoding: "utf8",
+      timeout: options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
+      windowsHide: true,
+      maxBuffer: 256 * 1024
+    });
+    return { status: 0, stdout, stderr };
+  } catch (error) {
+    const processError = error as NodeJS.ErrnoException & { stdout?: string | Buffer; stderr?: string | Buffer; code?: number | string | null };
+    return {
+      status: typeof processError.code === "number" ? processError.code : null,
+      stdout: processError.stdout ? String(processError.stdout) : "",
+      stderr: processError.stderr ? String(processError.stderr) : errorMessage(error)
+    };
+  }
+}
+
+async function validateWindowsDiscoveryCandidate(
+  candidate: string,
+  source: CodexBinarySource,
+  env: Record<string, string | undefined>,
+  options: CodexRuntimeStatusOptions
+): Promise<CodexDiscoveryCandidate> {
+  const resolution = resolveCodexCommand(candidate, source, env, options.platform ?? "win32");
   if (resolution.kind !== "binary") {
+    return {
+      source,
+      command: candidate,
+      binaryPath: resolution.kind === "missing" ? resolution.binaryPath : undefined,
+      status: "missing",
+      reason: resolution.error
+    };
+  }
+  const version = await getCodexVersion({ binaryPath: resolution.binaryPath, timeoutMs: options.timeoutMs });
+  const isAlias = source === "windows_apps_alias" || isWindowsAppsAliasPath(resolution.binaryPath, env);
+  if (!version) {
+    return {
+      source,
+      command: candidate,
+      binaryPath: resolution.binaryPath,
+      status: isAlias ? "alias" : "invalid",
+      reason: "codex --version failed."
+    };
+  }
+  const appServer = await probeCodexAppServer({ binaryPath: resolution.binaryPath, timeoutMs: options.timeoutMs });
+  if (!appServer.available) {
+    return {
+      source,
+      command: candidate,
+      binaryPath: resolution.binaryPath,
+      status: isAlias ? "alias" : "invalid",
+      version,
+      reason: appServer.error
+    };
+  }
+  return {
+    source,
+    command: candidate,
+    binaryPath: resolution.binaryPath,
+    status: "usable",
+    version
+  };
+}
+
+function knownWindowsCodexInstallCandidates(env: Record<string, string | undefined>): Array<{ source: CodexBinarySource; command: string }> {
+  const localAppData = env.LOCALAPPDATA?.trim();
+  if (!localAppData) {
+    return [];
+  }
+  const binRoot = join(localAppData, "OpenAI", "Codex", "bin");
+  const candidates: string[] = [];
+  const direct = join(binRoot, "codex.exe");
+  if (existsSync(direct)) {
+    candidates.push(direct);
+  }
+  try {
+    for (const entry of readdirSync(binRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const candidate = join(binRoot, entry.name, "codex.exe");
+      if (existsSync(candidate)) {
+        candidates.push(candidate);
+      }
+    }
+  } catch (_error) {
+    // The known install root is optional.
+  }
+  return candidates.sort().map(command => ({ source: "known_install_dir", command }));
+}
+
+function windowsAppsAliasCandidates(env: Record<string, string | undefined>): Array<{ source: CodexBinarySource; command: string }> {
+  const localAppData = env.LOCALAPPDATA?.trim();
+  if (!localAppData) {
+    return [];
+  }
+  const alias = join(localAppData, "Microsoft", "WindowsApps", "codex.exe");
+  return existsSync(alias) ? [{ source: "windows_apps_alias", command: alias }] : [];
+}
+
+function isWindowsAppsAliasPath(candidate: string, env: Record<string, string | undefined>): boolean {
+  const normalizedCandidate = normalizeWindowsPath(candidate);
+  const localAppData = env.LOCALAPPDATA?.trim();
+  if (localAppData) {
+    const expected = normalizeWindowsPath(join(localAppData, "Microsoft", "WindowsApps", "codex.exe"));
+    if (normalizedCandidate === expected) {
+      return true;
+    }
+  }
+  return /(?:^|\/)microsoft\/windowsapps\/codex\.exe$/i.test(normalizedCandidate);
+}
+
+function normalizeWindowsPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function expandWindowsEnvVars(value: string, env: Record<string, string | undefined>): string {
+  return value.replace(/%([^%]+)%/g, (match, key: string) => env[key] ?? env[key.toUpperCase()] ?? env[key.toLowerCase()] ?? match);
+}
+
+function binaryStatusFromCandidate(
+  candidate: string,
+  source: CodexCliStatus["source"],
+  env: Record<string, string | undefined>,
+  platform = process.platform,
+  discovery?: CodexDiscoveryReport
+): CodexCliStatus {
+  const resolution = resolveCodexCommand(candidate, source, env, platform);
+  if (resolution.kind !== "binary") {
+    discovery?.candidates.push({
+      source: resolution.source,
+      command: candidate,
+      binaryPath: resolution.kind === "missing" ? resolution.binaryPath : undefined,
+      status: "missing",
+      reason: resolution.error
+    });
     return {
       installed: false,
       source: resolution.source,
       binaryPath: resolution.kind === "missing" ? resolution.binaryPath : undefined,
-      error: resolution.error
+      error: resolution.error,
+      discovery: discovery && discovery.candidates.length > 0 ? discovery : undefined
     };
   }
-  return { installed: true, binaryPath: resolution.binaryPath, source: resolution.source };
+  discovery?.candidates.push({
+    source: resolution.source,
+    command: candidate,
+    binaryPath: resolution.binaryPath,
+    status: "usable"
+  });
+  return {
+    installed: true,
+    binaryPath: resolution.binaryPath,
+    source: resolution.source,
+    discovery: discovery && discovery.candidates.length > 0 ? discovery : undefined
+  };
 }
 
-function resolveCodexCommand(candidate: string, source: CodexCliStatus["source"], env: Record<string, string | undefined>): CodexCommandResolution {
+function resolveCodexCommand(
+  candidate: string,
+  source: CodexCliStatus["source"],
+  env: Record<string, string | undefined>,
+  platform = process.platform
+): CodexCommandResolution {
   const trimmed = candidate.trim();
   if (!trimmed) {
     return { kind: "missing", installed: false, source: source ?? "unknown", error: "Codex command is empty." };
@@ -411,14 +792,14 @@ function resolveCodexCommand(candidate: string, source: CodexCliStatus["source"]
       error: "HUNSU_CODEX_APP_SERVER_COMMAND must be a binary path or command name without arguments. Put arguments in HUNSU_CODEX_APP_SERVER_ARGS."
     };
   }
-  const binaryPath = isAbsolute(trimmed) ? trimmed : findExecutableOnPath(trimmed, env);
+  const binaryPath = isAbsoluteForPlatform(trimmed, platform) ? trimmed : findExecutableOnPath(trimmed, env, platform);
   if (!binaryPath) {
     return {
       kind: "missing",
       installed: false,
       source: source ?? "unknown",
-      binaryPath: isAbsolute(trimmed) ? trimmed : undefined,
-      error: isAbsolute(trimmed) ? "Configured Codex path does not exist." : `Codex command was not found on PATH: ${trimmed}`
+      binaryPath: isAbsoluteForPlatform(trimmed, platform) ? trimmed : undefined,
+      error: isAbsoluteForPlatform(trimmed, platform) ? "Configured Codex path does not exist." : `Codex command was not found on PATH: ${trimmed}`
     };
   }
   try {
@@ -426,7 +807,7 @@ function resolveCodexCommand(candidate: string, source: CodexCliStatus["source"]
     if (!stat.isFile()) {
       return { kind: "missing", installed: false, binaryPath, source: source ?? "unknown", error: "Configured Codex path is not a file." };
     }
-    if (process.platform !== "win32") {
+    if (platform !== "win32") {
       accessSync(binaryPath, constants.X_OK);
     }
     return { kind: "binary", installed: true, binaryPath, source: source === "unknown" || source === undefined ? "path" : source };
@@ -435,23 +816,40 @@ function resolveCodexCommand(candidate: string, source: CodexCliStatus["source"]
   }
 }
 
-function findExecutableOnPath(command: string, env: Record<string, string | undefined>): string | undefined {
-  if (isAbsolute(command)) {
+function findExecutableOnPath(command: string, env: Record<string, string | undefined>, platform = process.platform): string | undefined {
+  if (isAbsoluteForPlatform(command, platform)) {
     return existsSync(command) ? command : undefined;
   }
   const path = env.PATH ?? "";
-  const extensions = process.platform === "win32"
-    ? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const extensions = platform === "win32"
+    ? uniqueExtensions(["", ...(env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")])
     : [""];
-  for (const directory of path.split(delimiter).filter(Boolean)) {
+  for (const directory of path.split(pathDelimiter).filter(Boolean)) {
     for (const extension of extensions) {
-      const candidate = join(directory, process.platform === "win32" && !command.toUpperCase().endsWith(extension.toUpperCase()) ? `${command}${extension}` : command);
+      const candidate = join(directory, platform === "win32" && extension && !command.toUpperCase().endsWith(extension.toUpperCase()) ? `${command}${extension}` : command);
       if (existsSync(candidate)) {
         return candidate;
       }
     }
   }
   return undefined;
+}
+
+function uniqueExtensions(extensions: string[]): string[] {
+  const result: string[] = [];
+  for (const extension of extensions.flatMap(value => [value, value.toLowerCase()])) {
+    if (!result.includes(extension)) {
+      result.push(extension);
+    }
+  }
+  return result;
+}
+
+function isAbsoluteForPlatform(value: string, platform: NodeJS.Platform): boolean {
+  return platform === "win32"
+    ? isAbsolute(value) || /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith("\\\\")
+    : isAbsolute(value);
 }
 
 class ProbeClient {

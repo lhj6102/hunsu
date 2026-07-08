@@ -24,6 +24,7 @@ import {
   applyStudioPort,
   bridgePairingSessionState,
   browseFilesystem,
+  bridgeBackgroundSpawnOptions,
   bridgeVersionInfo,
   completeStudioMoveFromExecuteCompletion,
   completeStudioMove,
@@ -237,22 +238,31 @@ test("Bridge Execute preflight separates Roadmap readiness from Codex readiness"
   assert.equal(inactiveResponse.body.area, "roadmap");
   assert.equal(inactiveResponse.body.error, "ROADMAP_INACTIVE");
   assert.equal(inactiveResponse.body.runtime, undefined);
+  assert.equal(inactiveResponse.body.message, "This workspace is inactive. Activate it in Hunsu Bridge App before starting Execute.");
+  assert.doesNotMatch(inactiveResponse.body.message, /[Rr]oadmap/);
   assert.deepEqual(inactiveResponse.body.actions.map((action: { type: string }) => action.type), ["open_bridge_app", "open_roadmaps", "activate_roadmap"]);
-  assert.match(inactiveResponse.body.actions.find((action: { type: string; href?: string }) => action.type === "activate_roadmap")?.href ?? "", /^hunsu:\/\/activate-roadmap\?roadmapId=/);
+  const activateAction = inactiveResponse.body.actions.find((action: { type: string; href?: string; label?: string }) => action.type === "activate_roadmap");
+  assert.equal(activateAction?.label, "Activate workspace");
+  assert.match(activateAction?.href ?? "", /^hunsu:\/\/activate-roadmap\?roadmapId=/);
+  assert.equal(inactiveResponse.body.actions.find((action: { type: string; label?: string }) => action.type === "open_roadmaps")?.label, "Open Workspaces");
 
   const unhealthyServer = createStudioServer({ cwd: repoUnhealthyPlainGit, state, persist: true, roadmapRegistryPath: registryPath });
   const unhealthyResponse = await requestStudioServerJson(unhealthyServer, "POST", "/api/runs/start", body);
   assert.equal(unhealthyResponse.status, 409);
   assert.equal(unhealthyResponse.body.area, "roadmap");
   assert.equal(unhealthyResponse.body.error, "ROADMAP_UNHEALTHY");
-  assert.equal(unhealthyResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://roadmaps"), true);
+  assert.equal(unhealthyResponse.body.message, "This workspace is not healthy. Repair it in Hunsu Bridge App before starting Execute.");
+  assert.doesNotMatch(unhealthyResponse.body.message, /[Rr]oadmap/);
+  assert.equal(unhealthyResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://workspaces"), true);
 
   const missingServer = createStudioServer({ cwd: repoMissing, state, persist: true, roadmapRegistryPath: registryPath });
   const missingResponse = await requestStudioServerJson(missingServer, "POST", "/api/runs/start", body);
   assert.equal(missingResponse.status, 409);
   assert.equal(missingResponse.body.area, "roadmap");
   assert.equal(missingResponse.body.error, "ROADMAP_MISSING");
-  assert.equal(missingResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://roadmaps"), true);
+  assert.equal(missingResponse.body.message, "This workspace is missing from the active registry or its project path cannot be found. Repair or activate it in Hunsu Bridge App before starting Execute.");
+  assert.doesNotMatch(missingResponse.body.message, /[Rr]oadmap/);
+  assert.equal(missingResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://workspaces"), true);
 });
 
 test("Bridge Codex runtime status detects missing and custom Codex CLI without reading credentials", async () => {
@@ -280,7 +290,10 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
   try {
     const missing = await getCodexRuntimeStatus({ env: { PATH: join(root, "missing") }, force: true });
     assert.equal(missing.cli.installed, false);
-    assert.equal(codexRuntimePreflightError(missing)?.error, "CODEX_CLI_MISSING");
+    const missingPreflight = codexRuntimePreflightError(missing);
+    assert.equal(missingPreflight?.error, "CODEX_CLI_MISSING");
+    assert.equal(missingPreflight?.message, "Codex setup required. Open Codex setup in Hunsu Bridge App before starting Execute.");
+    assert.doesNotMatch(missingPreflight?.message ?? "", /CLI|app-server|codex\.exe/i);
 
     const missingEnvCommand = await getCodexRuntimeStatus({ env: { PATH: join(root, "missing"), HUNSU_CODEX_APP_SERVER_COMMAND: "codex" }, force: true });
     assert.equal(missingEnvCommand.cli.installed, false);
@@ -352,6 +365,115 @@ test("Bridge Codex device auth output parser extracts verification URL and user 
   });
 });
 
+test("Bridge runtime background spawn helper hides Windows API-started Codex login children", () => {
+  assert.equal(bridgeBackgroundSpawnOptions({ stdio: "ignore" }, "win32").windowsHide, true);
+  assert.equal(bridgeBackgroundSpawnOptions({ stdio: "ignore", windowsHide: false }, "linux").windowsHide, false);
+
+  const source = readFileSync(join(process.cwd(), "apps/bridge/src/index.ts"), "utf8");
+  const start = source.indexOf("async function spawnCodexAction");
+  const end = source.indexOf("async function waitForCodexLoginInitialState");
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const codexLoginRegion = source.slice(start, end);
+  assert.doesNotMatch(codexLoginRegion, /windowsHide:\s*false/);
+  assert.equal((codexLoginRegion.match(/bridgeBackgroundSpawnOptions/g) ?? []).length, 3);
+});
+
+test("Bridge Codex Windows discovery finds real binaries and treats WindowsApps aliases as path-selection prompts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-windows-discovery-test-"));
+  const processPathDir = join(root, "process-path");
+  const userPathDir = join(root, "user-path");
+  const localAppData = join(root, "local-app-data");
+  const knownInstallDir = join(localAppData, "OpenAI", "Codex", "bin", "1.2.3");
+  const windowsAppsDir = join(localAppData, "Microsoft", "WindowsApps");
+  mkdirSync(processPathDir, { recursive: true });
+  mkdirSync(userPathDir, { recursive: true });
+  mkdirSync(knownInstallDir, { recursive: true });
+  mkdirSync(windowsAppsDir, { recursive: true });
+  const processPathCodex = join(processPathDir, "codex.exe");
+  const userPathCodex = join(userPathDir, "codex.exe");
+  const knownCodex = join(knownInstallDir, "codex.exe");
+  const aliasCodex = join(windowsAppsDir, "codex.exe");
+  for (const codexPath of [processPathCodex, userPathCodex, knownCodex]) {
+    writeFileSync(codexPath, fakeCodexExecutable("codex 1.2.3"), "utf8");
+    chmodSync(codexPath, 0o755);
+  }
+  writeFileSync(aliasCodex, [
+    `#!${process.execPath}`,
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex alias 0.0.0'); process.exit(0); }",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(aliasCodex, 0o755);
+  try {
+    const baseEnv = { PATH: "", PATHEXT: ".exe", LOCALAPPDATA: localAppData };
+
+    const fromProcessPath = await getCodexRuntimeStatus({
+      env: { ...baseEnv, PATH: processPathDir },
+      platform: "win32",
+      force: true,
+      timeoutMs: 500
+    });
+    assert.equal(fromProcessPath.ready, true);
+    assert.equal(fromProcessPath.cli.source, "path");
+
+    const fromUserPath = await getCodexRuntimeStatus({
+      env: baseEnv,
+      platform: "win32",
+      windowsUserPath: userPathDir,
+      force: true,
+      timeoutMs: 500
+    });
+    assert.equal(fromUserPath.ready, true);
+    assert.equal(fromUserPath.cli.source, "windows_user_path");
+
+    rmSync(userPathCodex, { force: true });
+    const fromKnownInstallDir = await getCodexRuntimeStatus({
+      env: baseEnv,
+      platform: "win32",
+      force: true,
+      timeoutMs: 500
+    });
+    assert.equal(fromKnownInstallDir.ready, true);
+    assert.equal(fromKnownInstallDir.cli.source, "known_install_dir");
+
+    rmSync(knownCodex, { force: true });
+    const aliasFromProcessPath = await getCodexRuntimeStatus({
+      env: { ...baseEnv, PATH: windowsAppsDir },
+      platform: "win32",
+      force: true,
+      timeoutMs: 500
+    });
+    assert.equal(aliasFromProcessPath.cli.installed, false);
+    assert.equal(aliasFromProcessPath.recommendedAction, "select_codex_path");
+    assert.equal(aliasFromProcessPath.cli.discovery?.candidates.some(candidate => candidate.source === "path" && candidate.status === "alias"), true);
+
+    const aliasOnly = await getCodexRuntimeStatus({
+      env: baseEnv,
+      platform: "win32",
+      force: true,
+      timeoutMs: 500
+    });
+    assert.equal(aliasOnly.cli.installed, false);
+    assert.equal(aliasOnly.recommendedAction, "select_codex_path");
+    assert.equal(aliasOnly.cli.discovery?.suspectedInstalled, true);
+    assert.equal(aliasOnly.cli.discovery?.candidates.some(candidate => candidate.source === "windows_apps_alias" && candidate.status === "alias"), true);
+
+    rmSync(aliasCodex, { force: true });
+    const missing = await getCodexRuntimeStatus({
+      env: baseEnv,
+      platform: "win32",
+      force: true,
+      timeoutMs: 500
+    });
+    assert.equal(missing.cli.installed, false);
+    assert.equal(missing.recommendedAction, "install_codex");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Bridge Codex app-server probe handles immediate responses and invalid JSON safely", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-probe-race-test-"));
   const immediateCodex = join(root, "codex");
@@ -389,7 +511,11 @@ test("Bridge Codex app-server probe handles immediate responses and invalid JSON
     const invalid = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: invalidJsonCodex }, force: true, timeoutMs: 500 });
     assert.equal(invalid.appServer.available, false);
     assert.match(invalid.appServer.error ?? "", /Invalid Codex app-server JSON-RPC line/);
-    assert.equal(codexRuntimePreflightError(invalid)?.error, "CODEX_APP_SERVER_UNAVAILABLE");
+    const preflight = codexRuntimePreflightError(invalid);
+    assert.equal(preflight?.error, "CODEX_APP_SERVER_UNAVAILABLE");
+    assert.equal(preflight?.message, "Codex is temporarily unavailable. Open Codex setup in Hunsu Bridge App and recheck before starting Execute.");
+    assert.doesNotMatch(preflight?.message ?? "", /app-server|Invalid Codex|JSON-RPC|secret raw probe text/i);
+    assert.equal(preflight?.actions.some(action => action.label === "Open Codex setup"), true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -630,7 +756,10 @@ test("Bridge runtime Codex device login tracker captures later output and failur
     assert.equal(started.status, 202);
     assert.equal(started.body.state, "pending");
 
-    await delay(1200);
+    await waitForEventually(async () => {
+      const prerequisites = await requestStudioServerJson(server, "GET", "/api/prerequisites");
+      return prerequisites.body.codexLogin?.status === "device_code" && prerequisites.body.codexLogin?.userCode === "HUNSU-LATE";
+    }, 600);
     const prerequisites = await requestStudioServerJson(server, "GET", "/api/prerequisites");
     assert.equal(prerequisites.body.codexLogin.status, "device_code");
     assert.equal(prerequisites.body.codexLogin.userCode, "HUNSU-LATE");
@@ -4459,14 +4588,14 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   assert.equal(predicate(), true);
 }
 
-async function waitForEventually(predicate: () => boolean): Promise<void> {
-  for (let attempts = 0; attempts < 100; attempts += 1) {
-    if (predicate()) {
+async function waitForEventually(predicate: () => boolean | Promise<boolean>, maxAttempts = 100): Promise<void> {
+  for (let attempts = 0; attempts < maxAttempts; attempts += 1) {
+    if (await predicate()) {
       return;
     }
     await delay(10);
   }
-  assert.equal(predicate(), true);
+  assert.equal(await predicate(), true);
 }
 
 function jsonBytes(value: unknown): number {
@@ -4715,6 +4844,24 @@ async function withSubscribeStreamTimeout<T>(
 
 function formatSubscribeStreamTimeline(timeline: SubscribeStreamTimeline): string {
   return JSON.stringify(timeline.entries, null, 2);
+}
+
+function fakeCodexExecutable(version: string): string {
+  return [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    `if (args.includes('--version')) { console.log(${JSON.stringify(version)}); process.exit(0); }`,
+    "if (args[0] !== 'app-server') process.exit(2);",
+    "const rl = readline.createInterface({ input: process.stdin });",
+    "rl.on('line', line => {",
+    "  const msg = JSON.parse(line);",
+    "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+    "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "});",
+    ""
+  ].join("\n");
 }
 
 class FakeRunner implements Runner {

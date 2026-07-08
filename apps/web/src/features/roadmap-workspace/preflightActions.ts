@@ -8,13 +8,13 @@ export function bridgeActionHref(action: ExecutePreflightAction): string {
     case "codex_login_device":
     case "codex_recheck":
     case "open_prerequisites":
-      return "hunsu://prerequisites/codex";
+      return "hunsu://codex";
     case "open_roadmaps":
-      return "hunsu://roadmaps";
+      return "hunsu://workspaces";
     case "activate_roadmap":
       return action.roadmapId
         ? `hunsu://activate-roadmap?roadmapId=${encodeURIComponent(action.roadmapId)}`
-        : "hunsu://roadmaps";
+        : "hunsu://workspaces";
     case "open_bridge_app":
     default:
       return "hunsu://open";

@@ -341,8 +341,8 @@ export function RoadmapWorkspacePreflightActions({ preflight, open = openBridgeL
 
 function fallbackPreflightActions(preflight: ExecutePreflightError | undefined): ExecutePreflightAction[] {
   return preflight?.area === "roadmap"
-    ? [{ type: "open_roadmaps", label: "Open Roadmaps" }]
-    : [{ type: "open_prerequisites", label: "Open Prerequisites" }];
+    ? [{ type: "open_roadmaps", label: "Open Workspaces" }]
+    : [{ type: "open_prerequisites", label: "Open Codex setup" }];
 }
 
 function primaryAction(action: ExecutePreflightAction): boolean {
