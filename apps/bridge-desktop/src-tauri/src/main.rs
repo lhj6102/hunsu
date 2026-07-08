@@ -29,9 +29,15 @@ async fn choose_project_folder(app: tauri::AppHandle) -> Result<Option<FolderSel
         .file()
         .set_title("Choose a folder for Hunsu Bridge")
         .blocking_pick_folder();
-    Ok(folder.map(|path| FolderSelection {
-        path: path.to_string_lossy().to_string(),
-    }))
+    folder
+        .map(|path| {
+            path.into_path()
+                .map(|path| FolderSelection {
+                    path: path.to_string_lossy().to_string(),
+                })
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
 }
 
 #[tauri::command]
