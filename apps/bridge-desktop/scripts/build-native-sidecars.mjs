@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { gunzipSync, inflateRawSync } from "node:zlib";
 import * as esbuild from "esbuild";
 import { currentProcessEnv, resolveBridgeSidecarPackagingConfig, unwrapConfigResult } from "@hunsu/config";
@@ -443,7 +443,12 @@ function readRequiredArg(argv, index, flag) {
   return value;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isCurrentScriptEntrypoint() {
+  const entrypoint = process.argv[1];
+  return Boolean(entrypoint) && import.meta.url === pathToFileURL(resolve(entrypoint)).href;
+}
+
+if (isCurrentScriptEntrypoint()) {
   runCli(process.argv.slice(2)).catch(error => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
