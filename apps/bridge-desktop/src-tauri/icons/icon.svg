@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Hunsu app icon">
+  <defs>
+    <filter id="soft-shadow" x="-18%" y="-24%" width="136%" height="158%">
+      <feDropShadow dx="0" dy="28" stdDeviation="32" flood-color="#15202b" flood-opacity="0.16"/>
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#15202b" flood-opacity="0.08"/>
+    </filter>
+  </defs>
+  <g filter="url(#soft-shadow)">
+    <path
+      d="M128 310C128 251.458 175.458 204 234 204H790C848.542 204 896 251.458 896 310V598C896 656.542 848.542 704 790 704H432L323 781C299.655 797.499 268 780.805 268 752.22V704H234C175.458 704 128 656.542 128 598V310Z"
+      fill="#ffffff"
+      fill-opacity="0.96"
+      stroke="#d7e3ec"
+      stroke-width="22"
+      stroke-linejoin="round"/>
+    <path
+      d="M184 313C184 284.833 206.833 262 235 262H789C817.167 262 840 284.833 840 313V329H184V313Z"
+      fill="#ffffff"
+      opacity="0.64"/>
+  </g>
+  <text
+    x="213"
+    y="552"
+    fill="#1f2933"
+    font-family="'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans CJK KR', 'Pretendard', 'WenQuanYi Zen Hei', sans-serif"
+    font-size="230"
+    font-weight="900"
+    letter-spacing="-11">훈수</text>
+  <circle cx="760" cy="481" r="100" fill="#0a84ff"/>
+  <path
+    d="M760 533V430M717 474L760 431L803 474"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="38"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+</svg>
