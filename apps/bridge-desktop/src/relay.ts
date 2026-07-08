@@ -127,7 +127,7 @@ export type RelayOutboundClientOptions = {
   relayUrl: string;
   accessToken?: string;
   device: RemoteBridgeDevice;
-  projectGrants: ProjectGrant[];
+  projectGrants: ProjectGrant[] | (() => ProjectGrant[]);
   bridgeApiUrl?: string;
   bridgeAuthToken?: string;
   websocketFactory?: (url: string) => RelayWebSocket;
@@ -250,6 +250,11 @@ export class RelayOutboundClient {
     return this.statusValue;
   }
 
+  updateProjectGrants(projectGrants: ProjectGrant[]): void {
+    this.options.projectGrants = projectGrants;
+    this.sendDeviceRegistration();
+  }
+
   start(): RelayConnectionStatus {
     this.stopping = false;
     if (this.socket || this.reconnectTimer) {
@@ -283,11 +288,7 @@ export class RelayOutboundClient {
     const onOpen = () => {
       this.reconnectAttempt = 0;
       this.statusValue = { status: "connected", relayUrl: this.options.relayUrl, connectedAt: new Date().toISOString() };
-      this.send({
-        type: "device.register",
-        device: { ...this.options.device, status: "online", lastSeenAt: new Date().toISOString() },
-        projectGrants: this.options.projectGrants
-      });
+      this.sendDeviceRegistration();
       this.sendHeartbeat();
       this.startHeartbeatTimer();
     };
@@ -374,10 +375,11 @@ export class RelayOutboundClient {
     if (!envelope) {
       return;
     }
+    const projectGrants = this.currentProjectGrants();
     const decision = evaluateRelayCommand({
       device: envelope.command.deviceId === this.options.device.deviceId ? this.options.device : undefined,
       command: envelope.command,
-      projectGrants: this.options.projectGrants,
+      projectGrants,
       requestUserId: envelope.userId
     });
     if (!decision.ok) {
@@ -398,6 +400,7 @@ export class RelayOutboundClient {
           bridgeApiUrl: this.options.bridgeApiUrl,
           bridgeAuthToken: this.options.bridgeAuthToken,
           command: envelope.command,
+          projectGrants,
           fetchImpl: this.options.fetchImpl,
           onEvent: event => this.send({
             type: "command.stream.event",
@@ -410,9 +413,23 @@ export class RelayOutboundClient {
       bridgeApiUrl: this.options.bridgeApiUrl,
       bridgeAuthToken: this.options.bridgeAuthToken,
       command: envelope.command,
+      projectGrants,
       fetchImpl: this.options.fetchImpl
     });
     this.send({ type: "command.result", commandId: envelope.commandId, result });
+  }
+
+  private currentProjectGrants(): ProjectGrant[] {
+    const source = this.options.projectGrants;
+    return typeof source === "function" ? source() : source;
+  }
+
+  private sendDeviceRegistration(): void {
+    this.send({
+      type: "device.register",
+      device: { ...this.options.device, status: "online", lastSeenAt: new Date().toISOString() },
+      projectGrants: this.currentProjectGrants()
+    });
   }
 
   private send(message: RelayClientMessage): void {
@@ -461,17 +478,15 @@ export function evaluateRelayCommand(input: {
   if (input.device.status !== "online") {
     return { ok: false, reason: "device_offline", message: "Bridge device is offline." };
   }
-  const requiredScopes = input.command.requestedScopes?.length
-    ? input.command.requestedScopes
-    : scopesForRelayCommand(input.command.command);
+  const requiredScopes = requiredScopesForRelayCommand(input.command);
   if (requiredScopes.length === 0) {
     return { ok: true, scopes: [] };
   }
-  const projectPath = input.command.projectPath ? resolve(input.command.projectPath) : undefined;
+  const projectPath = input.command.projectPath ? normalizeLocalPath(input.command.projectPath) : undefined;
   if (!projectPath) {
     return { ok: false, reason: "project_grant_denied", message: "Relay command requires an explicit project path." };
   }
-  const grant = input.projectGrants.find(candidate => resolve(candidate.path) === projectPath);
+  const grant = input.projectGrants.find(candidate => normalizeLocalPath(candidate.path) === projectPath);
   if (!grant) {
     return { ok: false, reason: "project_grant_denied", message: "Project Grant is required for this Relay command." };
   }
@@ -482,10 +497,18 @@ export function evaluateRelayCommand(input: {
   return { ok: true, scopes: requiredScopes };
 }
 
+function requiredScopesForRelayCommand(command: RelayCommand): BridgeCommandScope[] {
+  return uniqueRelayScopes([
+    ...scopesForRelayCommand(command.command),
+    ...(command.requestedScopes ?? [])
+  ]);
+}
+
 export async function forwardRelayCommand(input: {
   bridgeApiUrl: string;
   bridgeAuthToken?: string;
   command: RelayCommand;
+  projectGrants?: ProjectGrant[];
   fetchImpl?: typeof fetch;
 }): Promise<RelayCommandForwardResult> {
   const request = relayHttpRequestForCommand(input.command);
@@ -496,7 +519,7 @@ export async function forwardRelayCommand(input: {
     return { ok: false, error: `Relay command must be forwarded as a stream: ${input.command.command}` };
   }
   const fetcher = input.fetchImpl ?? fetch;
-  const validation = await validateRelayCommandRoadmapGrant({
+  const validation = await validateRelayCommandProjectGrant({
     bridgeApiUrl: input.bridgeApiUrl,
     bridgeAuthToken: input.bridgeAuthToken,
     command: input.command,
@@ -523,13 +546,18 @@ export async function forwardRelayCommand(input: {
   if (!response.ok) {
     return { ok: false, status: response.status, error: typeof body === "object" && body !== null && "error" in body ? String((body as { error?: unknown }).error) : `Bridge API returned ${response.status}` };
   }
-  return { ok: true, status: response.status, body };
+  return {
+    ok: true,
+    status: response.status,
+    body: sanitizeRelayResponseBody(body, input.command, input.projectGrants ?? [])
+  };
 }
 
 export async function forwardRelayCommandStream(input: {
   bridgeApiUrl: string;
   bridgeAuthToken?: string;
   command: RelayCommand;
+  projectGrants?: ProjectGrant[];
   fetchImpl?: typeof fetch;
   onEvent: (event: RelayStreamEvent) => void;
 }): Promise<RelayCommandForwardResult> {
@@ -541,7 +569,7 @@ export async function forwardRelayCommandStream(input: {
     return { ok: false, error: `Relay command is not an event stream: ${input.command.command}` };
   }
   const fetcher = input.fetchImpl ?? fetch;
-  const validation = await validateRelayCommandRoadmapGrant({
+  const validation = await validateRelayCommandProjectGrant({
     bridgeApiUrl: input.bridgeApiUrl,
     bridgeAuthToken: input.bridgeAuthToken,
     command: input.command,
@@ -571,22 +599,28 @@ export async function forwardRelayCommandStream(input: {
   return { ok: true, status: response.status };
 }
 
-async function validateRelayCommandRoadmapGrant(input: {
+async function validateRelayCommandProjectGrant(input: {
   bridgeApiUrl: string;
   bridgeAuthToken?: string;
   command: RelayCommand;
   fetchImpl: typeof fetch;
 }): Promise<{ ok: true } | RelayCommandForwardResult> {
-  if (!requiresRoadmapProjectValidation(input.command.command)) {
+  if (!requiresProjectPathGrantValidation(input.command.command)) {
     return { ok: true };
-  }
-  const roadmapId = relayCommandRoadmapId(input.command);
-  if (!roadmapId) {
-    return { ok: false, status: 403, error: "Remote command requires a roadmapId for Project Grant validation." };
   }
   const projectPath = input.command.projectPath?.trim();
   if (!projectPath) {
     return { ok: false, status: 403, error: "Remote command requires a projectPath for Project Grant validation." };
+  }
+  const payloadPathValidation = validateRelayCommandPayloadProjectPath(input.command, projectPath);
+  if (!payloadPathValidation.ok) {
+    return payloadPathValidation;
+  }
+  const roadmapId = relayCommandRoadmapId(input.command);
+  if (!roadmapId) {
+    return requiresRoadmapProjectValidation(input.command.command)
+      ? { ok: false, status: 403, error: "Remote command requires a roadmapId for Project Grant validation." }
+      : { ok: true };
   }
   const headers: Record<string, string> = {};
   if (input.bridgeAuthToken) {
@@ -611,6 +645,102 @@ async function validateRelayCommandRoadmapGrant(input: {
   return { ok: true };
 }
 
+function validateRelayCommandPayloadProjectPath(
+  command: RelayCommand,
+  projectPath: string
+): { ok: true } | RelayCommandForwardResult {
+  const projectPathFields = relayCommandProjectPathPayloadFields(command.command);
+  if (projectPathFields.length === 0) {
+    return { ok: true };
+  }
+  const payload = objectPayload(command.payload);
+  if (!payload) {
+    return { ok: true };
+  }
+  const normalizedProjectPath = normalizeLocalPath(projectPath);
+  for (const field of projectPathFields) {
+    const value = stringPayloadField(payload, field);
+    if (value && normalizeLocalPath(value) !== normalizedProjectPath) {
+      return { ok: false, status: 403, error: `Remote command payload ${field} does not match the granted project path.` };
+    }
+  }
+  return { ok: true };
+}
+
+function relayCommandProjectPathPayloadFields(command: RelayCommandName): Array<"path" | "cwd"> {
+  switch (command) {
+    case "roadmap.open":
+    case "roadmap.port.inspect":
+    case "roadmap.port.apply":
+    case "roadmap.create":
+      return ["path", "cwd"];
+    case "roadmap.registry.remove":
+      return ["path", "cwd"];
+    default:
+      return [];
+  }
+}
+
+function sanitizeRelayResponseBody(body: unknown, command: RelayCommand, projectGrants: ProjectGrant[]): unknown {
+  if (command.command === "connection.status") {
+    return redactConnectionStatusBody(body, command, projectGrants);
+  }
+  if (command.command === "roadmap.registry.list") {
+    return filterRemoteRoadmapRegistryBody(body, projectGrants);
+  }
+  return body;
+}
+
+function redactConnectionStatusBody(body: unknown, command: RelayCommand, projectGrants: ProjectGrant[]): unknown {
+  const value = objectPayload(body);
+  if (!value) {
+    return body;
+  }
+  const project = objectPayload(value.project);
+  if (!project || typeof project.repositoryPath !== "string") {
+    return body;
+  }
+  if (projectPathIsGranted(project.repositoryPath, command.projectPath, projectGrants)) {
+    return body;
+  }
+  const nextProject = { ...project };
+  delete nextProject.repositoryPath;
+  return {
+    ...value,
+    project: nextProject
+  };
+}
+
+function filterRemoteRoadmapRegistryBody(body: unknown, projectGrants: ProjectGrant[]): unknown {
+  const value = objectPayload(body);
+  if (!value || !Array.isArray(value.roadmaps)) {
+    return body;
+  }
+  return {
+    ...value,
+    roadmaps: value.roadmaps
+      .filter(item => {
+        const roadmap = objectPayload(item);
+        return typeof roadmap?.repositoryPath === "string" && projectPathIsGranted(roadmap.repositoryPath, undefined, projectGrants);
+      })
+      .map(item => {
+        const roadmap = objectPayload(item)!;
+        return { ...roadmap };
+      })
+  };
+}
+
+function projectPathIsGranted(path: string, requestedPath: string | undefined, projectGrants: ProjectGrant[]): boolean {
+  const normalizedPath = normalizeLocalPath(path);
+  if (requestedPath && normalizeLocalPath(requestedPath) !== normalizedPath) {
+    return false;
+  }
+  return projectGrants.some(grant =>
+    normalizeLocalPath(grant.path) === normalizedPath
+    && grant.scopes.includes("remoteRelay.access")
+  );
+}
+
 export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequest | undefined {
   const payload = objectPayload(command.payload);
   const roadmapId = stringPayloadField(payload, "roadmapId");
@@ -629,15 +759,15 @@ export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequ
     case "roadmap.registry.list":
       return { method: "GET", path: "/api/roadmaps/recent" };
     case "roadmap.registry.remove":
-      return { method: "POST", path: "/api/roadmaps/recent/remove", body: command.payload ?? { path: command.projectPath } };
+      return { method: "POST", path: "/api/roadmaps/recent/remove", body: relayRegistryRemoveBody(command) };
     case "roadmap.open":
-      return { method: "POST", path: "/api/roadmaps/open", body: command.payload ?? { path: command.projectPath } };
+      return { method: "POST", path: "/api/roadmaps/open", body: relayProjectPathBody(command) };
     case "roadmap.port.inspect":
-      return { method: "POST", path: "/api/roadmaps/port/inspect", body: command.payload ?? { path: command.projectPath } };
+      return { method: "POST", path: "/api/roadmaps/port/inspect", body: relayProjectPathBody(command) };
     case "roadmap.port.apply":
-      return { method: "POST", path: "/api/roadmaps/port/apply", body: command.payload ?? { path: command.projectPath } };
+      return { method: "POST", path: "/api/roadmaps/port/apply", body: relayProjectPathBody(command) };
     case "roadmap.create":
-      return { method: "POST", path: "/api/roadmaps/create", body: command.payload ?? { path: command.projectPath } };
+      return { method: "POST", path: "/api/roadmaps/create", body: relayProjectPathBody(command) };
     case "roadmap.board":
       return { method: "GET", path: path("/board") };
     case "roadmap.worktree":
@@ -747,6 +877,24 @@ export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequ
   }
 }
 
+function relayProjectPathBody(command: RelayCommand): Record<string, unknown> {
+  const payload = objectPayload(command.payload);
+  const { path: _path, cwd: _cwd, browseToken: _browseToken, ...rest } = payload ?? {};
+  return {
+    ...rest,
+    path: command.projectPath
+  };
+}
+
+function relayRegistryRemoveBody(command: RelayCommand): Record<string, unknown> {
+  const payload = objectPayload(command.payload);
+  const roadmapId = stringPayloadField(payload, "roadmapId");
+  if (roadmapId) {
+    return { roadmapId };
+  }
+  return { path: command.projectPath };
+}
+
 export class LocalDevRelayService {
   private readonly sessions = new Map<string, RelayServiceSession>();
   private readonly devices = new Map<string, RemoteBridgeDevice>();
@@ -843,8 +991,6 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "roadmap.worktree":
     case "roadmap.skills":
     case "roadmap.commands":
-    case "artifactAction.list":
-    case "artifactAction.runs":
     case "moveFile.tree":
     case "moveFile.blob":
     case "moveFile.diff":
@@ -863,9 +1009,12 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "agentSession.events":
     case "live.events":
       return ["remoteRelay.access"];
+    case "artifactAction.list":
+    case "artifactAction.runs":
+      return ["env.read", "hostAlias.expose", "remoteRelay.access"];
     case "artifactAction.start":
     case "artifactAction.stop":
-      return ["artifactAction.run", "remoteRelay.access"];
+      return ["artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"];
     case "roadmap.open":
     case "roadmap.port.inspect":
     case "roadmap.port.apply":
@@ -877,6 +1026,10 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "roadmap.registry.list":
       return [];
   }
+}
+
+function uniqueRelayScopes(scopes: BridgeCommandScope[]): BridgeCommandScope[] {
+  return [...new Set(scopes)];
 }
 
 async function readSseStream(body: ReadableStream<Uint8Array>, onEvent: (event: RelayStreamEvent) => void): Promise<void> {
@@ -958,6 +1111,15 @@ function requiresRoadmapProjectValidation(command: RelayCommandName): boolean {
     || command === "agentSession.get"
     || command === "agentSession.events"
     || command === "live.events";
+}
+
+function requiresProjectPathGrantValidation(command: RelayCommandName): boolean {
+  return requiresRoadmapProjectValidation(command)
+    || command === "roadmap.registry.remove"
+    || command === "roadmap.open"
+    || command === "roadmap.port.inspect"
+    || command === "roadmap.port.apply"
+    || command === "roadmap.create";
 }
 
 function relayCommandRoadmapId(command: RelayCommand): string | undefined {

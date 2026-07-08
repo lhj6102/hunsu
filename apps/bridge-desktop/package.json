@@ -12,7 +12,8 @@
     "bridge-app": "node --conditions=development src/main.ts",
     "desktop:dev": "pnpm run typecheck && pnpm exec tauri dev",
     "desktop:build": "pnpm exec tauri build",
-    "build": "tsc -p tsconfig.build.json && node --conditions=development scripts/build-native-sidecars.mjs",
+    "build": "pnpm run build:ui && tsc -p tsconfig.build.json && node --conditions=development scripts/build-native-sidecars.mjs",
+    "build:ui": "node scripts/build-ui.mjs",
     "sidecars:build": "node --conditions=development scripts/build-native-sidecars.mjs",
     "sidecars:prepare": "node --conditions=development scripts/prepare-sidecars.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"

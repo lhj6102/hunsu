@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { bridgeApiHttpUrl, bridgeApiRequestHeaders, hasBridgeApiAuthToken } from "@/shared/api/bridgeApiBase";
+import { postRemoteBridgeConnect } from "@/shared/api/bridgeClient";
+import { bridgeApiHttpUrl, bridgeApiRequestHeaders, clearRemoteBridgeSession, currentRemoteBridgeSession, hasBridgeApiAuthToken } from "@/shared/api/bridgeApiBase";
 import type { BridgeVersionInfo, StudioConnectionStatus } from "@/shared/api/bridgeTypes";
 
 export type BridgeConnectionState =
@@ -7,6 +8,15 @@ export type BridgeConnectionState =
   | { status: "checking"; tokenPresent: boolean }
   | { status: "online"; tokenPresent: boolean; connection?: StudioConnectionStatus; version?: BridgeVersionInfo }
   | { status: "offline"; tokenPresent: boolean; error?: string };
+
+export type RemoteBridgeSessionState =
+  | { status: "idle"; sessionPresent: boolean }
+  | { status: "remote_checking"; sessionPresent: true }
+  | { status: "remote_connected"; sessionPresent: true; connection: StudioConnectionStatus }
+  | { status: "remote_offline"; sessionPresent: true; error?: string; connection?: StudioConnectionStatus }
+  | { status: "remote_expired"; sessionPresent: false; error?: string; connection?: StudioConnectionStatus }
+  | { status: "remote_account_mismatch"; sessionPresent: false; error?: string; connection?: StudioConnectionStatus }
+  | { status: "remote_project_grant_needed"; sessionPresent: true; error?: string; connection?: StudioConnectionStatus };
 
 export function useBridgeConnection({
   enabled = true,
@@ -72,6 +82,49 @@ export function useBridgeConnection({
   return state;
 }
 
+export function useVerifiedRemoteBridgeSession({ enabled = true }: { enabled?: boolean } = {}): RemoteBridgeSessionState {
+  const [state, setState] = useState<RemoteBridgeSessionState>(() => {
+    const session = currentRemoteBridgeSession();
+    return enabled && session ? { status: "remote_checking", sessionPresent: true } : { status: "idle", sessionPresent: Boolean(session) };
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    const session = currentRemoteBridgeSession();
+    if (!enabled || !session) {
+      setState({ status: "idle", sessionPresent: Boolean(session) });
+      return () => {
+        cancelled = true;
+      };
+    }
+    setState({ status: "remote_checking", sessionPresent: true });
+    postRemoteBridgeConnect({
+      deviceId: session.deviceId,
+      webUserId: session.webUserId,
+      projectPath: session.projectPath
+    })
+      .then(result => {
+        if (cancelled) return;
+        setState(remoteBridgeSessionStateFromConnection(result.connection));
+      })
+      .catch(error => {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : "Remote Bridge session could not be verified.";
+        if (looksLikeExpiredRemoteSession(message)) {
+          clearRemoteBridgeSession();
+          setState({ status: "remote_expired", sessionPresent: false, error: message });
+          return;
+        }
+        setState({ status: "remote_offline", sessionPresent: true, error: message });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled]);
+
+  return state;
+}
+
 export async function checkBridgeHealth(timeoutMs = 1200): Promise<{ ok: true; version?: BridgeVersionInfo } | { ok: false; error: string }> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -114,6 +167,28 @@ export async function fetchConnectionStatus(timeoutMs = 1200): Promise<StudioCon
   }
 }
 
+function remoteBridgeSessionStateFromConnection(connection: StudioConnectionStatus): RemoteBridgeSessionState {
+  if (connection.auth === "account_mismatch") {
+    clearRemoteBridgeSession();
+    return { status: "remote_account_mismatch", sessionPresent: false, error: connection.error, connection };
+  }
+  if (connection.auth === "expired" || connection.auth === "missing_token" || connection.auth === "invalid") {
+    clearRemoteBridgeSession();
+    return { status: "remote_expired", sessionPresent: false, error: connection.error, connection };
+  }
+  if (connection.projectAccess === "needs_grant" || connection.projectAccess === "denied") {
+    return { status: "remote_project_grant_needed", sessionPresent: true, error: connection.error, connection };
+  }
+  if (connection.mode === "remote" && connection.health === "connected" && connection.compatibility?.compatible !== false) {
+    return { status: "remote_connected", sessionPresent: true, connection };
+  }
+  return { status: "remote_offline", sessionPresent: true, error: connection.error, connection };
+}
+
+function looksLikeExpiredRemoteSession(message: string): boolean {
+  return /expired|invalid_token|unauthorized|401/i.test(message);
+}
+
 class BridgeConnectionStatusError extends Error {
   constructor(readonly status: number, readonly code: string | undefined, message: string) {
     super(message);
@@ -127,7 +202,9 @@ function connectionStatusFromError(error: unknown, version: BridgeVersionInfo | 
   }
   const auth = error.code === "pairing_token_expired" || error.code === "pairing_token_revoked"
     ? "expired"
-    : error.code === "pairing_token_missing" || error.code === "pairing_token_invalid"
+    : error.code === "pairing_token_invalid"
+      ? "invalid"
+      : error.code === "pairing_token_missing"
       ? "missing_token"
       : "unknown";
   return {

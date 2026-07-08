@@ -484,19 +484,23 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
       throw new ResponseError("Relay device user does not match the authenticated session.", 403);
     }
     const existing = devices.get(deviceId);
-    const projectGrants = parseProjectGrants(object?.projectGrants ?? candidate.projectGrants);
+    const explicitProjectGrants = bodyProjectGrantsValue(object, candidate);
+    const projectGrants = explicitProjectGrants === undefined
+      ? existing?.projectGrants ?? []
+      : parseProjectGrants(explicitProjectGrants);
     const nowIso = new Date(now()).toISOString();
+    const connectedDevice = options.connected || connected.has(deviceId);
     const device: StoredRelayDevice = {
       deviceId,
       deviceName,
       userId,
       registeredAt: existing?.registeredAt ?? nowIso,
-      lastSeenAt: options.connected ? nowIso : existing?.lastSeenAt,
-      status: options.connected ? "online" : "offline",
+      lastSeenAt: connectedDevice ? nowIso : existing?.lastSeenAt,
+      status: connectedDevice ? "online" : "offline",
       bridgeVersion: optionalString(candidate.bridgeVersion),
       bridgeAppVersion: optionalString(candidate.bridgeAppVersion),
       protocolVersion: optionalString(candidate.protocolVersion),
-      projectGrants: projectGrants.length > 0 ? projectGrants : existing?.projectGrants ?? []
+      projectGrants
     };
     devices.set(deviceId, device);
     return device;
@@ -608,9 +612,7 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
     if (input.device.status !== "online") {
       return { ok: false, reason: "device_offline", message: "Bridge device is offline." };
     }
-    const requiredScopes = input.command.requestedScopes?.length
-      ? input.command.requestedScopes
-      : scopesForRelayCommand(input.command.command);
+    const requiredScopes = requiredScopesForRelayCommand(input.command);
     if (requiredScopes.length === 0) {
       return { ok: true, scopes: [] };
     }
@@ -618,7 +620,8 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
     if (!projectPath) {
       return { ok: false, reason: "project_grant_denied", message: "Relay command requires an explicit project path." };
     }
-    const grant = input.device.projectGrants.find(candidate => candidate.path === projectPath);
+    const normalizedProjectPath = normalizeRelayProjectPath(projectPath);
+    const grant = input.device.projectGrants.find(candidate => normalizeRelayProjectPath(candidate.path) === normalizedProjectPath);
     if (!grant) {
       return { ok: false, reason: "project_grant_denied", message: "Project Grant is required for this Relay command." };
     }
@@ -729,8 +732,6 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "roadmap.worktree":
     case "roadmap.skills":
     case "roadmap.commands":
-    case "artifactAction.list":
-    case "artifactAction.runs":
     case "moveFile.tree":
     case "moveFile.blob":
     case "moveFile.diff":
@@ -749,9 +750,12 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "agentSession.events":
     case "live.events":
       return ["remoteRelay.access"];
+    case "artifactAction.list":
+    case "artifactAction.runs":
+      return ["env.read", "hostAlias.expose", "remoteRelay.access"];
     case "artifactAction.start":
     case "artifactAction.stop":
-      return ["artifactAction.run", "remoteRelay.access"];
+      return ["artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"];
     case "roadmap.open":
     case "roadmap.port.inspect":
     case "roadmap.port.apply":
@@ -763,6 +767,17 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "roadmap.registry.list":
       return [];
   }
+}
+
+function requiredScopesForRelayCommand(command: RelayCommand): BridgeCommandScope[] {
+  return uniqueRelayScopes([
+    ...scopesForRelayCommand(command.command),
+    ...(command.requestedScopes ?? [])
+  ]);
+}
+
+function uniqueRelayScopes(scopes: BridgeCommandScope[]): BridgeCommandScope[] {
+  return [...new Set(scopes)];
 }
 
 function readState(path: string): RelayStateFile {
@@ -811,6 +826,23 @@ function parseRelayCommand(value: unknown): RelayCommand | undefined {
   };
 }
 
+function bodyProjectGrantsValue(
+  object: Record<string, unknown> | undefined,
+  candidate: Record<string, unknown> | undefined
+): unknown {
+  if (hasOwnJsonField(object, "projectGrants")) {
+    return object.projectGrants;
+  }
+  if (hasOwnJsonField(candidate, "projectGrants")) {
+    return candidate.projectGrants;
+  }
+  return undefined;
+}
+
+function hasOwnJsonField(object: Record<string, unknown> | undefined, field: string): object is Record<string, unknown> {
+  return Boolean(object && Object.prototype.hasOwnProperty.call(object, field));
+}
+
 function parseProjectGrants(value: unknown): ProjectGrant[] {
   if (!Array.isArray(value)) {
     return [];
@@ -822,7 +854,7 @@ function parseProjectGrants(value: unknown): ProjectGrant[] {
       && Array.isArray(object.scopes)
       && object.scopes.every(isBridgeCommandScope);
   }).map(grant => ({
-    path: grant.path,
+    path: normalizeRelayProjectPath(grant.path),
     grantedAt: grant.grantedAt,
     scopes: [...grant.scopes]
   }));

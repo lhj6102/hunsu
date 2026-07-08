@@ -1447,6 +1447,37 @@ test("Bridge pairing sessions expire and can be revoked without exposing protect
   assert.equal(revoked.body.code, "pairing_token_revoked");
 });
 
+test("Bridge shutdown control endpoint requires control token", async () => {
+  const server = createStudioServer({
+    cwd: "/repo",
+    persist: false,
+    runner: new FakeRunner(),
+    security: {
+      controlToken: "control-token",
+      authToken: "browser-token",
+      allowedOrigins: ["https://studio.example.test"]
+    }
+  });
+
+  const rejected = await requestStudioServerJson(server, "POST", "/api/bridge/control/shutdown", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      "x-hunsu-bridge-control-token": "wrong-token"
+    }
+  });
+  assert.equal(rejected.status, 401);
+  assert.equal(rejected.body.code, "bridge_control_token_invalid");
+
+  const accepted = await requestStudioServerJson(server, "POST", "/api/bridge/control/shutdown", undefined, {
+    headers: {
+      origin: "https://studio.example.test",
+      "x-hunsu-bridge-control-token": "control-token"
+    }
+  });
+  assert.equal(accepted.status, 202);
+  assert.equal(accepted.body.shuttingDown, true);
+});
+
 test("Bridge version compatibility reports update and feature requirements", () => {
   const current = bridgeVersionInfo();
   assert.deepEqual(evaluateBridgeCompatibility(current, {

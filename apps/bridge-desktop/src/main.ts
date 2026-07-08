@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, hostname, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isSea } from "node:sea";
@@ -57,7 +58,11 @@ type BridgeAppState = {
   schema: "hunsu.bridge-app-state.v1";
   supervisorPid?: number;
   pid?: number;
+  supervisorProcess?: BridgeProcessRuntimeMetadata;
+  bridgeProcess?: BridgeProcessRuntimeMetadata;
   bridgeApiUrl?: string;
+  processNonce?: string;
+  commandIdentity?: BridgeProcessCommandIdentity;
   authToken?: string;
   controlToken?: string;
   pairing?: BridgePairingSession;
@@ -97,6 +102,27 @@ type BridgeServiceState = {
   updatedAt?: string;
 };
 
+type BridgeProcessCommandIdentity = {
+  kind: "start" | "supervise" | "daemon" | "remote-attach";
+  executable: string;
+  argv: string[];
+  nonce: string;
+};
+
+type BridgeProcessRuntimeMetadata = {
+  pid: number;
+  processNonce?: string;
+  commandIdentity: BridgeProcessCommandIdentity;
+  startMetadata?: BridgeProcessStartMetadata;
+  recordedAt: string;
+};
+
+type BridgeProcessStartMetadata = {
+  platform: NodeJS.Platform;
+  source: "proc-stat" | "ps-lstart";
+  value: string;
+};
+
 type BridgeAppSnapshot = {
   schema: "hunsu.bridge-app-snapshot.v1";
   status: {
@@ -111,6 +137,7 @@ type BridgeAppSnapshot = {
     startedAt?: string;
     healthError?: string;
   };
+  projectGrants: ProjectGrant[];
   recentProjects: ReturnType<typeof listRoadmapRegistry>;
   diagnostics: unknown;
   logLines: string[];
@@ -121,8 +148,12 @@ const DEFAULT_CREDENTIAL_PATH = join(homedir(), ".config", "hunsu", "bridge-cred
 const DEFAULT_RELAY_REGISTRY_PATH = join(homedir(), ".config", "hunsu", "relay-devices.json");
 const DEFAULT_APP_LOG_PATH = join(homedir(), ".cache", "hunsu", "bridge-app.log");
 const DEFAULT_SYSTEMD_USER_UNIT_PATH = join(homedir(), ".config", "systemd", "user", "hunsu-bridge.service");
-const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "hostAlias.expose"];
+const DEFAULT_LAUNCHD_USER_PLIST_PATH = join(homedir(), "Library", "LaunchAgents", "app.hunsu.bridge.plist");
+const PROJECT_GRANT_SCOPE_VALUES = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"] as const satisfies readonly BridgeCommandScope[];
+const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose"];
 const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
+const BRIDGE_STARTING_GRACE_MS = 15_000;
+const BRIDGE_PROCESS_NONCE_ENV = "HUNSU_BRIDGE_PROCESS_NONCE";
 
 async function main(argv = process.argv.slice(2)): Promise<number> {
   const parsed = parseArgs(normalizeBridgeAppArgv(argv));
@@ -193,8 +224,10 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
         await authDevServerCommand(parsed);
         return 0;
       case "projects":
-        projectsCommand(parsed);
+        await projectsCommand(parsed);
         return 0;
+      case "protocol-error":
+        throw new Error(parsed.rest[0] ?? "Unsupported hunsu:// URL.");
       case "help":
         printHelp();
         return 0;
@@ -212,9 +245,13 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
 async function supervisedStartCommand(parsed: ParsedArgs): Promise<void> {
   const supervisor = createBridgeAppSidecarSupervisor(parsed);
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
+  const commandIdentity = currentBridgeProcessCommandIdentity("start");
   writeAppState({
     ...readAppState(),
     supervisorPid: process.pid,
+    supervisorProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
+    processNonce: commandIdentity.nonce,
+    commandIdentity,
     cwd,
     webUrl: getFlag(parsed, "web-url"),
     startedAt: new Date().toISOString()
@@ -475,37 +512,54 @@ async function statusCommand(): Promise<void> {
 
 async function stopCommand(): Promise<void> {
   const state = readAppState();
-  const targetPid = state.supervisorPid ?? state.pid;
-  if (!targetPid) {
+  const controlStop = await stopBridgeThroughControlEndpoint(state);
+  if (controlStop.ok) {
+    for (const targetPid of uniqueNumberList([state.supervisorPid, state.pid])) {
+      const verification = verifyManagedBridgePid(targetPid, state);
+      if (verification.ok) {
+        try {
+          process.kill(targetPid, "SIGTERM");
+        } catch (error) {
+          writeStructuredLog({
+            event: "bridge.stop.post-control-signal-failed",
+            pid: targetPid,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+    }
+    writeAppState(clearBridgeProcessRuntimeState(readAppState()));
+    console.log("Hunsu Bridge stopped.");
+    return;
+  }
+  const targetPids = uniqueNumberList([state.supervisorPid, state.pid]);
+  if (targetPids.length === 0) {
     console.log("Hunsu Bridge is not managed by this Bridge App process.");
     return;
   }
   let stopped = false;
   let stopError: unknown;
-  try {
-    process.kill(targetPid, "SIGTERM");
-    stopped = true;
-  } catch (error) {
-    stopError = error;
-    if (state.supervisorPid && state.pid && state.pid !== targetPid) {
-      try {
-        process.kill(state.pid, "SIGTERM");
-        stopped = true;
-      } catch (fallbackError) {
-        stopError = fallbackError;
-      }
+  let verifiedAny = false;
+  for (const targetPid of targetPids) {
+    const verification = verifyManagedBridgePid(targetPid, state);
+    if (!verification.ok) {
+      writeStructuredLog({ event: "bridge.stop.pid-verification-failed", pid: targetPid, reason: verification.reason });
+      continue;
+    }
+    verifiedAny = true;
+    try {
+      process.kill(targetPid, "SIGTERM");
+      stopped = true;
+      break;
+    } catch (error) {
+      stopError = error;
     }
   }
-  writeAppState({
-    ...state,
-    supervisorPid: undefined,
-    pid: undefined,
-    bridgeApiUrl: undefined,
-    authToken: undefined,
-    controlToken: undefined,
-    pairing: undefined,
-    startedAt: undefined
-  });
+  writeAppState(clearBridgeProcessRuntimeState(state));
+  if (!verifiedAny) {
+    console.log("Removed stale Hunsu Bridge process state. No PID was terminated.");
+    return;
+  }
   if (!stopped) {
     throw new Error(stopError instanceof Error ? stopError.message : "Unable to stop Hunsu Bridge.");
   }
@@ -545,6 +599,7 @@ async function buildDiagnostics(): Promise<unknown> {
       credentialsPresent: credentialStore.read() !== undefined,
       remoteAccess: state.remoteAccess,
       projectGrantCount: state.projectGrants.length,
+      projectGrants: snapshotProjectGrants(state.projectGrants),
       service: state.service
     },
     bridge: {
@@ -817,9 +872,16 @@ function serviceCommand(parsed: ParsedArgs): void {
   }
   if (subcommand === "install") {
     const service = installServiceArtifact(parsed);
+    if (!service.installed) {
+      console.log(`Dry run: Hunsu Bridge service artifact for ${service.manager} was not installed.`);
+      if (service.unitPath) {
+        console.log(`Target: ${service.unitPath}`);
+      }
+      return;
+    }
     writeAppState({
       ...state,
-      service: { ...service, installed: true, updatedAt: new Date().toISOString() }
+      service: { ...service, updatedAt: new Date().toISOString() }
     });
     console.log(`Installed Hunsu Bridge service artifact for ${service.manager}.`);
     if (service.unitPath) {
@@ -855,18 +917,23 @@ function protocolCommand(parsed: ParsedArgs): void {
 
 async function superviseCommand(parsed: ParsedArgs): Promise<void> {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
+  const daemonNonce = newBridgeProcessNonce();
   const supervisor = new BridgeSidecarSupervisor({
     command: process.execPath,
     args: [...bridgeNodeExecArgs(), process.argv[1] ?? "hunsu-bridge", "daemon", "--cwd", cwd, "--no-open"],
     cwd,
-    env: currentProcessEnv(),
+    env: bridgeProcessEnvWithNonce(daemonNonce),
     logPath: appLogPath(),
     restartLimit: Number(getFlag(parsed, "restart-limit") ?? 3),
     restartDelayMs: 750
   });
+  const commandIdentity = currentBridgeProcessCommandIdentity("supervise");
   writeAppState({
     ...readAppState(),
     supervisorPid: process.pid,
+    supervisorProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
+    processNonce: commandIdentity.nonce,
+    commandIdentity,
     cwd,
     webUrl: getFlag(parsed, "web-url"),
     startedAt: new Date().toISOString()
@@ -883,9 +950,20 @@ async function superviseCommand(parsed: ParsedArgs): Promise<void> {
   }
 }
 
-function projectsCommand(parsed: ParsedArgs): void {
+async function projectsCommand(parsed: ParsedArgs): Promise<void> {
   const subcommand = parsed.rest[0] ?? "list";
   if (subcommand === "list") {
+    const grants = readAppState().projectGrants;
+    if (grants.length === 0) {
+      console.log("No Project Grants.");
+      return;
+    }
+    for (const grant of grants) {
+      console.log(`${grant.path}\t${grant.scopes.join(",")}\t${grant.grantedAt}`);
+    }
+    return;
+  }
+  if (subcommand === "recent") {
     for (const project of listRoadmapRegistry(roadmapRegistryOptions())) {
       console.log(`${project.displayName}\t${project.health}\t${project.repositoryPath}`);
     }
@@ -909,36 +987,69 @@ function projectsCommand(parsed: ParsedArgs): void {
     console.log(result.removed ? "Removed from recent Roadmaps." : "No matching recent Roadmap was found.");
     return;
   }
-  const targetPath = parsed.rest[1] ? resolve(parsed.rest[1]) : undefined;
+  const targetPath = parsed.rest[1] ? normalizeGrantPath(parsed.rest[1]) : undefined;
   if (!targetPath) {
     throw new Error("Project path is required.");
   }
   const state = readAppState();
   if (subcommand === "grant") {
-    const scopes = state.remoteAccess !== "off"
-      ? uniqueScopeList([...DEFAULT_PROJECT_GRANT_SCOPES, "remoteRelay.access"])
-      : [...DEFAULT_PROJECT_GRANT_SCOPES];
+    const scopes = projectGrantScopesForCommand(parsed, state);
     const grant: ProjectGrant = {
       path: targetPath,
       grantedAt: new Date().toISOString(),
       scopes
     };
-    writeAppState({
+    const nextState = {
       ...state,
       projectGrants: [grant, ...state.projectGrants.filter(item => item.path !== targetPath)]
-    });
+    };
+    writeAppState(nextState);
+    await publishProjectGrantsToRelay(nextState);
     console.log(`Granted project access: ${targetPath}`);
     return;
   }
   if (subcommand === "revoke") {
-    writeAppState({
+    const nextState = {
       ...state,
       projectGrants: state.projectGrants.filter(item => item.path !== targetPath)
-    });
+    };
+    writeAppState(nextState);
+    await publishProjectGrantsToRelay(nextState);
     console.log(`Revoked project access: ${targetPath}`);
     return;
   }
   throw new Error(`Unknown projects command: ${subcommand}`);
+}
+
+async function publishProjectGrantsToRelay(state: BridgeAppState): Promise<void> {
+  if (state.account?.status !== "signed-in") {
+    return;
+  }
+  const credentials = createDefaultCredentialStore({ path: credentialPath() }).read();
+  const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
+  if (!credentials || !relayConfig.relayApiUrl) {
+    return;
+  }
+  try {
+    await registerRelayDevice({
+      relayApiUrl: relayConfig.relayApiUrl,
+      accessToken: credentials.accessToken,
+      device: {
+        deviceId: state.device.id,
+        deviceName: state.device.name,
+        userId: state.account.userId,
+        registeredAt: new Date().toISOString(),
+        status: "offline",
+        bridgeVersion: bridgeVersionInfo().bridgeVersion,
+        bridgeAppVersion: HUNSU_BRIDGE_APP_VERSION,
+        protocolVersion: bridgeVersionInfo().protocolVersion
+      },
+      projectGrants: state.projectGrants
+    });
+    writeStructuredLog({ event: "relay.project-grants.published", relayApiUrl: relayConfig.relayApiUrl, deviceId: state.device.id, projectGrantCount: state.projectGrants.length });
+  } catch (error) {
+    writeStructuredLog({ event: "relay.project-grants.publish-failed", error: error instanceof Error ? error.message : String(error) });
+  }
 }
 
 function looksLikeProjectPath(value: string): boolean {
@@ -947,6 +1058,48 @@ function looksLikeProjectPath(value: string): boolean {
     || value.startsWith("~")
     || value.includes("\\")
     || value.includes("/");
+}
+
+function normalizeGrantPath(path: string): string {
+  const resolved = resolve(path);
+  try {
+    return realpathSync(resolved);
+  } catch (_error) {
+    return resolved;
+  }
+}
+
+function projectGrantScopesForCommand(parsed: ParsedArgs, state: BridgeAppState): BridgeCommandScope[] {
+  const explicitScopes = parseExplicitProjectGrantScopes(parsed);
+  if (explicitScopes.length > 0) {
+    return explicitScopes;
+  }
+  return state.remoteAccess !== "off"
+    ? uniqueScopeList([...DEFAULT_PROJECT_GRANT_SCOPES, "remoteRelay.access"])
+    : [...DEFAULT_PROJECT_GRANT_SCOPES];
+}
+
+function parseExplicitProjectGrantScopes(parsed: ParsedArgs): BridgeCommandScope[] {
+  const raw = getFlag(parsed, "scope") ?? getFlag(parsed, "scopes");
+  if (!raw) {
+    return [];
+  }
+  const values = raw.split(",").map(value => value.trim()).filter(Boolean);
+  if (values.includes("all")) {
+    return [...PROJECT_GRANT_SCOPE_VALUES];
+  }
+  const scopes: BridgeCommandScope[] = [];
+  for (const value of values) {
+    if (!isProjectGrantScope(value)) {
+      throw new Error(`Unknown Project Grant scope: ${value}`);
+    }
+    scopes.push(value);
+  }
+  return uniqueScopeList(scopes);
+}
+
+function isProjectGrantScope(value: unknown): value is BridgeCommandScope {
+  return typeof value === "string" && (PROJECT_GRANT_SCOPE_VALUES as readonly string[]).includes(value);
 }
 
 function printAppStatus(handle: BridgeRuntimeHandle): void {
@@ -1025,28 +1178,50 @@ function formatProjectKind(kind: ProjectInspection["kind"]): string {
   }
 }
 
-async function readBridgeHealth(): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> {
-  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig(currentProcessEnv(), { cwd: process.cwd() }));
-  try {
-    const response = await fetch(new URL("/health", endpointUrl(runtimeConfig.bridgeApi)));
-    if (!response.ok) {
-      return { ok: false, error: `Bridge returned ${response.status}` };
+async function readBridgeHealth(state = readAppState()): Promise<
+  | { ok: true; body: unknown; bridgeApiUrl: string }
+  | { ok: false; error: string; attemptedUrls: string[] }
+> {
+  const configuredUrl = configuredBridgeApiUrl();
+  const attemptedUrls = uniqueStringList([
+    state.bridgeApiUrl,
+    configuredUrl
+  ].filter((value): value is string => Boolean(value?.trim())));
+  for (const bridgeApiUrl of attemptedUrls) {
+    try {
+      const response = await fetch(new URL("/health", bridgeApiUrl));
+      if (!response.ok) {
+        continue;
+      }
+      const body = await response.json().catch(() => undefined);
+      if (!isHunsuBridgeHealthBody(body)) {
+        continue;
+      }
+      return { ok: true, body, bridgeApiUrl };
+    } catch (_error) {
+      continue;
     }
-    return { ok: true, body: await response.json() };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : "Bridge is not reachable" };
   }
+  return {
+    ok: false,
+    error: attemptedUrls.length > 0 ? `Bridge is not reachable at ${attemptedUrls.join(", ")}` : "Bridge API endpoint is not configured.",
+    attemptedUrls
+  };
+}
+
+function isHunsuBridgeHealthBody(body: unknown): body is { ok: true; service: "hunsu-bridge" } {
+  return typeof body === "object"
+    && body !== null
+    && (body as { ok?: unknown }).ok === true
+    && (body as { service?: unknown }).service === "hunsu-bridge";
 }
 
 async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
-  const state = readAppState();
-  const health = await readBridgeHealth();
+  let state = readAppState();
+  const health = await readBridgeHealth(state);
+  state = reconcileBridgeProcessState(state, health);
   const account = state.account?.status === "signed-in" ? `Signed in as ${state.account.email ?? state.account.userId}` : "Signed out";
-  const localBridge = health.ok
-    ? "connected"
-    : state.pid || state.supervisorPid
-      ? "starting"
-      : "not-running";
+  const localBridge = localBridgeStatusFromState(state, health);
   return {
     schema: "hunsu.bridge-app-snapshot.v1",
     status: {
@@ -1057,22 +1232,315 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
       service: state.service,
       supervisorPid: state.supervisorPid,
       pid: state.pid,
-      bridgeApiUrl: state.bridgeApiUrl,
+      bridgeApiUrl: health.ok ? health.bridgeApiUrl : state.bridgeApiUrl,
       startedAt: state.startedAt,
       healthError: health.ok ? undefined : health.error
     },
+    projectGrants: snapshotProjectGrants(state.projectGrants),
     recentProjects: listRoadmapRegistry(roadmapRegistryOptions()).slice(0, 12),
     diagnostics: await buildDiagnostics(),
     logLines: readLogTail(appLogPath(), 80)
   };
 }
 
+function snapshotProjectGrants(projectGrants: ProjectGrant[]): ProjectGrant[] {
+  return projectGrants.map(grant => ({
+    path: grant.path,
+    grantedAt: grant.grantedAt,
+    scopes: [...grant.scopes]
+  }));
+}
+
+function configuredBridgeApiUrl(): string | undefined {
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig(currentProcessEnv(), { cwd: process.cwd() }));
+    return endpointUrl(runtimeConfig.bridgeApi);
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function reconcileBridgeProcessState(
+  state: BridgeAppState,
+  health: Awaited<ReturnType<typeof readBridgeHealth>>
+): BridgeAppState {
+  const pids = uniqueNumberList([state.supervisorPid, state.pid]);
+  if (pids.length === 0) {
+    return state;
+  }
+  const anyAlive = pids.some(pid => processIsAlive(pid));
+  const staleUrl = health.ok && state.bridgeApiUrl ? normalizeUrl(health.bridgeApiUrl) !== normalizeUrl(state.bridgeApiUrl) : false;
+  if (!anyAlive || staleUrl) {
+    const next = clearBridgeProcessRuntimeState(state);
+    writeAppState(next);
+    writeStructuredLog({
+      event: "bridge.state.stale-cleared",
+      reason: !anyAlive ? "process-dead" : "bridge-url-changed",
+      pids,
+      previousBridgeApiUrl: state.bridgeApiUrl,
+      healthBridgeApiUrl: health.ok ? health.bridgeApiUrl : undefined
+    });
+    return next;
+  }
+  return state;
+}
+
+function localBridgeStatusFromState(
+  state: BridgeAppState,
+  health: Awaited<ReturnType<typeof readBridgeHealth>>
+): BridgeAppSnapshot["status"]["localBridge"] {
+  if (health.ok) {
+    return "connected";
+  }
+  const pids = uniqueNumberList([state.supervisorPid, state.pid]);
+  if (pids.length === 0 || pids.every(pid => !processIsAlive(pid))) {
+    return "not-running";
+  }
+  const startedAtMs = state.startedAt ? Date.parse(state.startedAt) : Number.NaN;
+  if (Number.isFinite(startedAtMs) && Date.now() - startedAtMs <= BRIDGE_STARTING_GRACE_MS) {
+    return "starting";
+  }
+  return "error";
+}
+
+async function stopBridgeThroughControlEndpoint(state: BridgeAppState): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!state.bridgeApiUrl || !state.controlToken) {
+    return { ok: false, error: "No Bridge control endpoint is known." };
+  }
+  try {
+    const response = await fetch(new URL("/api/bridge/control/shutdown", state.bridgeApiUrl), {
+      method: "POST",
+      headers: {
+        "x-hunsu-bridge-control-token": state.controlToken
+      }
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
+      return { ok: false, error: body?.error ?? `Bridge shutdown returned HTTP ${response.status}.` };
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Unable to reach Bridge control endpoint." };
+  }
+}
+
+function clearBridgeProcessRuntimeState(state: BridgeAppState): BridgeAppState {
+  return {
+    ...state,
+    supervisorPid: undefined,
+    pid: undefined,
+    supervisorProcess: undefined,
+    bridgeProcess: undefined,
+    bridgeApiUrl: undefined,
+    processNonce: undefined,
+    commandIdentity: undefined,
+    authToken: undefined,
+    controlToken: undefined,
+    pairing: undefined,
+    startedAt: undefined
+  };
+}
+
+function verifyManagedBridgePid(pid: number, state: BridgeAppState): { ok: true } | { ok: false; reason: string } {
+  if (!processIsAlive(pid)) {
+    return { ok: false, reason: "process_not_alive" };
+  }
+  const metadata = storedProcessMetadataForPid(pid, state);
+  if (!metadata?.startMetadata) {
+    return { ok: false, reason: "process_metadata_unavailable" };
+  }
+  const currentStartMetadata = processStartMetadata(pid);
+  if (!currentStartMetadata || !sameProcessStartMetadata(metadata.startMetadata, currentStartMetadata)) {
+    return { ok: false, reason: "process_start_metadata_mismatch" };
+  }
+  if (metadata.processNonce) {
+    const currentNonce = processEnvironmentValue(pid, BRIDGE_PROCESS_NONCE_ENV);
+    if (currentNonce !== metadata.processNonce) {
+      return { ok: false, reason: currentNonce ? "process_nonce_mismatch" : "process_nonce_unavailable" };
+    }
+  }
+  const commandLine = processCommandLine(pid);
+  if (!commandLine) {
+    return { ok: false, reason: "process_command_unavailable" };
+  }
+  const expectedKinds: BridgeProcessCommandIdentity["kind"][] = [metadata.commandIdentity.kind];
+  if (!commandLineLooksLikeBridgeApp(commandLine, expectedKinds)) {
+    return { ok: false, reason: "process_command_mismatch" };
+  }
+  return { ok: true };
+}
+
+function storedProcessMetadataForPid(pid: number, state: BridgeAppState): BridgeProcessRuntimeMetadata | undefined {
+  if (state.supervisorPid === pid && state.supervisorProcess?.pid === pid) {
+    return state.supervisorProcess;
+  }
+  if (state.pid === pid && state.bridgeProcess?.pid === pid) {
+    return state.bridgeProcess;
+  }
+  return undefined;
+}
+
+function bridgeProcessRuntimeMetadata(pid: number, commandIdentity: BridgeProcessCommandIdentity): BridgeProcessRuntimeMetadata {
+  const verifiableNonce = processNonceCanBeVerified() && processEnvironmentValue(pid, BRIDGE_PROCESS_NONCE_ENV) === commandIdentity.nonce
+    ? commandIdentity.nonce
+    : undefined;
+  return {
+    pid,
+    processNonce: verifiableNonce,
+    commandIdentity,
+    startMetadata: processStartMetadata(pid),
+    recordedAt: new Date().toISOString()
+  };
+}
+
+function processNonceCanBeVerified(): boolean {
+  return process.platform === "linux";
+}
+
+function newBridgeProcessNonce(): string {
+  return `bridge_process_${randomBytes(12).toString("base64url")}`;
+}
+
+function bridgeProcessEnvWithNonce(nonce: string): NodeJS.ProcessEnv {
+  return {
+    ...currentProcessEnv(),
+    [BRIDGE_PROCESS_NONCE_ENV]: nonce
+  };
+}
+
+function processEnvironmentValue(pid: number, key: string): string | undefined {
+  if (process.platform !== "linux") {
+    return undefined;
+  }
+  try {
+    const entries = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+    const prefix = `${key}=`;
+    return entries.find(entry => entry.startsWith(prefix))?.slice(prefix.length);
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function processStartMetadata(pid: number): BridgeProcessStartMetadata | undefined {
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const endCommandIndex = stat.lastIndexOf(") ");
+      if (endCommandIndex >= 0) {
+        const fieldsFromState = stat.slice(endCommandIndex + 2).trim().split(/\s+/);
+        const startTicks = fieldsFromState[19];
+        if (startTicks) {
+          return { platform: process.platform, source: "proc-stat", value: startTicks };
+        }
+      }
+    } catch (_error) {
+      // Fall back to ps below.
+    }
+  }
+  try {
+    const startedAt = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    return startedAt ? { platform: process.platform, source: "ps-lstart", value: startedAt } : undefined;
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function sameProcessStartMetadata(left: BridgeProcessStartMetadata, right: BridgeProcessStartMetadata): boolean {
+  return left.platform === right.platform
+    && left.source === right.source
+    && left.value === right.value;
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function processCommandLine(pid: number): string | undefined {
+  if (process.platform === "linux") {
+    try {
+      const commandLine = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+      if (commandLine) {
+        return commandLine;
+      }
+    } catch (_error) {
+      // Fall back to ps below.
+    }
+  }
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function commandLineLooksLikeBridgeApp(commandLine: string, expectedKinds: BridgeProcessCommandIdentity["kind"][]): boolean {
+  const normalized = commandLine.toLowerCase();
+  const hasBridgeExecutable = normalized.includes("hunsu-bridge")
+    || normalized.includes("bridge-desktop")
+    || normalized.includes("/src/main.ts")
+    || normalized.includes("\\src\\main.ts");
+  const hasExpectedCommand = expectedKinds.some(expectedKind =>
+    normalized.includes(expectedKind)
+    || (expectedKind === "remote-attach" && (normalized.includes("remote attach") || normalized.includes("daemon")))
+  );
+  return hasBridgeExecutable && hasExpectedCommand;
+}
+
+function currentBridgeProcessCommandIdentity(kind: BridgeProcessCommandIdentity["kind"]): BridgeProcessCommandIdentity {
+  const inheritedNonce = currentProcessEnv()[BRIDGE_PROCESS_NONCE_ENV]?.trim() || undefined;
+  return bridgeProcessCommandIdentityForSpawn(kind, [process.execPath, ...bridgeNodeExecArgs(), process.argv[1] ?? "hunsu-bridge", ...process.argv.slice(2)], inheritedNonce);
+}
+
+function bridgeProcessCommandIdentityForSpawn(kind: BridgeProcessCommandIdentity["kind"], argv: string[], nonce = newBridgeProcessNonce()): BridgeProcessCommandIdentity {
+  return {
+    kind,
+    executable: argv[0] ?? process.execPath,
+    argv,
+    nonce
+  };
+}
+
+function uniqueNumberList(values: Array<number | undefined>): number[] {
+  return [...new Set(values.filter((value): value is number => value !== undefined && Number.isInteger(value) && value > 0))];
+}
+
+function uniqueStringList(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function normalizeUrl(value: string): string {
+  try {
+    return new URL(value).toString();
+  } catch (_error) {
+    return value;
+  }
+}
+
 function rememberRunningBridge(handle: BridgeRuntimeHandle, cwd: string, webUrl: string | undefined): void {
   const state = readAppState();
+  const commandIdentity = currentBridgeProcessCommandIdentity("daemon");
   writeAppState({
     ...state,
     pid: process.pid,
+    bridgeProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
     bridgeApiUrl: handle.bridgeApiUrl,
+    processNonce: commandIdentity.nonce,
+    commandIdentity,
     authToken: handle.authToken,
     controlToken: handle.controlToken,
     pairing: handle.pairing,
@@ -1089,7 +1557,12 @@ function clearSupervisorProcessState(): void {
   if (state.supervisorPid === process.pid) {
     writeAppState({
       ...state,
-      supervisorPid: undefined
+      supervisorPid: undefined,
+      supervisorProcess: undefined,
+      ...(state.pid ? {} : {
+        processNonce: undefined,
+        commandIdentity: undefined
+      })
     });
     writeStructuredLog({ event: "bridge.supervisor.stopped", pid: process.pid });
   }
@@ -1101,7 +1574,10 @@ function clearManagedProcessState(): void {
     writeAppState({
       ...state,
       pid: undefined,
+      bridgeProcess: undefined,
       bridgeApiUrl: undefined,
+      processNonce: undefined,
+      commandIdentity: undefined,
       authToken: undefined,
       controlToken: undefined,
       pairing: undefined,
@@ -1175,14 +1651,50 @@ function defaultServiceManager(): BridgeServiceState["manager"] {
 
 function installServiceArtifact(parsed: ParsedArgs): BridgeServiceState {
   const manager = defaultServiceManager();
+  const dryRun = hasFlag(parsed, "dry-run");
   if (manager === "systemd-user") {
     const unitPath = currentProcessEnv().HUNSU_BRIDGE_SERVICE_UNIT_PATH?.trim() || DEFAULT_SYSTEMD_USER_UNIT_PATH;
     const cwd = resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd());
+    const text = systemdUserUnitText(cwd);
+    if (dryRun) {
+      console.log(`Dry run: would write Hunsu Bridge systemd user service artifact to ${unitPath}.`);
+      console.log(text);
+      return { installed: false, manager, unitPath };
+    }
     mkdirSync(dirname(unitPath), { recursive: true });
-    writeFileSync(unitPath, systemdUserUnitText(cwd), "utf8");
+    writeFileSync(unitPath, text, "utf8");
     writeStructuredLog({ event: "service.installed", manager, unitPath, cwd });
     console.log("Run `systemctl --user daemon-reload` if your desktop session does not pick up the new unit automatically.");
     return { installed: true, manager, unitPath };
+  }
+  if (manager === "launchd-user") {
+    const unitPath = currentProcessEnv().HUNSU_BRIDGE_SERVICE_UNIT_PATH?.trim() || DEFAULT_LAUNCHD_USER_PLIST_PATH;
+    const cwd = resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd());
+    const text = launchdUserPlistText(cwd);
+    if (dryRun) {
+      console.log(`Dry run: would write Hunsu Bridge launchd user service artifact to ${unitPath}.`);
+      console.log(text);
+      return { installed: false, manager, unitPath };
+    }
+    mkdirSync(dirname(unitPath), { recursive: true });
+    writeFileSync(unitPath, text, "utf8");
+    writeStructuredLog({ event: "service.installed", manager, unitPath, cwd });
+    console.log("Run `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/app.hunsu.bridge.plist` after reviewing the service artifact.");
+    return { installed: true, manager, unitPath };
+  }
+  if (manager === "windows-service") {
+    const command = windowsServiceInstallCommand(resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd()));
+    if (dryRun) {
+      console.log("Dry run: would use the following Hunsu Bridge Windows service command.");
+    }
+    console.log(command);
+    writeStructuredLog({ event: "service.install-intent", manager, command });
+    return { installed: !dryRun, manager };
+  }
+  if (dryRun) {
+    console.log(`Dry run: no automatic service artifact is available for ${manager}.`);
+    writeStructuredLog({ event: "service.install-intent.dry-run", manager });
+    return { installed: false, manager };
   }
   writeStructuredLog({ event: "service.install-intent", manager });
   return { installed: true, manager };
@@ -1220,11 +1732,11 @@ function systemdUserUnitText(cwd: string): string {
     "",
     "[Service]",
     "Type=simple",
-    `WorkingDirectory=${cwd}`,
-    `ExecStart=${process.execPath} ${command} supervise --cwd ${cwd}`,
+    `WorkingDirectory=${systemdQuote(cwd)}`,
+    `ExecStart=${systemdQuote(process.execPath)} ${systemdQuote(command)} supervise --cwd ${systemdQuote(cwd)}`,
     "Restart=on-failure",
     "RestartSec=2",
-    "Environment=HUNSU_BRIDGE_HEADLESS=1",
+    `Environment=${systemdQuote("HUNSU_BRIDGE_HEADLESS=1")}`,
     "",
     "[Install]",
     "WantedBy=default.target",
@@ -1232,8 +1744,71 @@ function systemdUserUnitText(cwd: string): string {
   ].join("\n");
 }
 
+function launchdUserPlistText(cwd: string): string {
+  const command = process.argv[1] ? resolve(process.argv[1]) : "hunsu-bridge";
+  return [
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
+    "<plist version=\"1.0\">",
+    "<dict>",
+    "  <key>Label</key>",
+    "  <string>app.hunsu.bridge</string>",
+    "  <key>ProgramArguments</key>",
+    "  <array>",
+    `    <string>${xmlEscape(process.execPath)}</string>`,
+    `    <string>${xmlEscape(command)}</string>`,
+    "    <string>supervise</string>",
+    "    <string>--cwd</string>",
+    `    <string>${xmlEscape(cwd)}</string>`,
+    "  </array>",
+    "  <key>WorkingDirectory</key>",
+    `  <string>${xmlEscape(cwd)}</string>`,
+    "  <key>EnvironmentVariables</key>",
+    "  <dict>",
+    "    <key>HUNSU_BRIDGE_HEADLESS</key>",
+    "    <string>1</string>",
+    "  </dict>",
+    "  <key>KeepAlive</key>",
+    "  <true/>",
+    "</dict>",
+    "</plist>",
+    ""
+  ].join("\n");
+}
+
+function windowsServiceInstallCommand(cwd: string): string {
+  const command = process.argv[1] ? resolve(process.argv[1]) : "hunsu-bridge";
+  return [
+    "Use the Hunsu Bridge installer-managed Windows service when available.",
+    "Manual fallback:",
+    `  ${windowsCommandQuote(process.execPath)} ${windowsCommandQuote(command)} supervise --cwd ${windowsCommandQuote(cwd)}`
+  ].join("\n");
+}
+
+function systemdQuote(value: string): string {
+  return `"${value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, "\\\"")
+    .replace(/%/g, "%%")
+    .replace(/\n/g, "\\n")}"`;
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function windowsCommandQuote(value: string): string {
+  return `"${value.replace(/"/g, "\\\"")}"`;
+}
+
 function createBridgeAppSidecarSupervisor(parsed: ParsedArgs): BridgeSidecarSupervisor {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
+  const daemonNonce = newBridgeProcessNonce();
   return new BridgeSidecarSupervisor({
     command: process.execPath,
     args: [
@@ -1247,7 +1822,7 @@ function createBridgeAppSidecarSupervisor(parsed: ParsedArgs): BridgeSidecarSupe
       ...(hasFlag(parsed, "no-open") ? ["--no-open"] : [])
     ],
     cwd,
-    env: currentProcessEnv(),
+    env: bridgeProcessEnvWithNonce(daemonNonce),
     logPath: appLogPath(),
     restartLimit: Number(getFlag(parsed, "restart-limit") ?? 3),
     restartDelayMs: 750
@@ -1425,7 +2000,7 @@ export function normalizeBridgeAppArgv(argv: string[]): string[] {
       nextArgs.push("logout");
       break;
     default:
-      nextArgs.push("status");
+      nextArgs.push("protocol-error", `Unsupported hunsu:// command: ${action || "(empty)"}`);
       break;
   }
   return [...nextArgs, ...rest];
@@ -1466,7 +2041,8 @@ Headless:
   hunsu-bridge service install|start|stop|status
   hunsu-bridge auth-dev-server
   hunsu-bridge projects list
-  hunsu-bridge projects grant <path>
+  hunsu-bridge projects recent
+  hunsu-bridge projects grant <path> [--scopes all|remoteRelay.access,execute.start,artifactAction.run,env.read,hostAlias.expose]
   hunsu-bridge projects revoke <path>
   hunsu-bridge projects remove --roadmap-id <id>
 
@@ -1574,7 +2150,7 @@ function startRelayIfConfigured(handle: Pick<BridgeRuntimeHandle, "bridgeApiUrl"
     relayUrl,
     accessToken: credentials.accessToken,
     device,
-    projectGrants: state.projectGrants,
+    projectGrants: () => readAppState().projectGrants,
     bridgeApiUrl: handle.bridgeApiUrl,
     bridgeAuthToken: handle.authToken
   });
@@ -1634,13 +2210,19 @@ function startRemoteAccessProcessIfPossible(parsed: ParsedArgs): boolean {
         ...(getFlag(parsed, "web-url") ? ["--web-url", getFlag(parsed, "web-url") as string] : [])
       ];
   try {
+    const commandIdentity = bridgeProcessCommandIdentityForSpawn("remote-attach", [
+      process.execPath,
+      ...bridgeNodeExecArgs(),
+      process.argv[1] ?? "hunsu-bridge",
+      ...args
+    ]);
     const child = spawn(process.execPath, [
       ...bridgeNodeExecArgs(),
       process.argv[1] ?? "hunsu-bridge",
       ...args
     ], {
       cwd,
-      env: currentProcessEnv(),
+      env: bridgeProcessEnvWithNonce(commandIdentity.nonce),
       detached: true,
       stdio: "ignore"
     });
@@ -1649,6 +2231,9 @@ function startRemoteAccessProcessIfPossible(parsed: ParsedArgs): boolean {
     writeAppState({
       ...readAppState(),
       pid: child.pid,
+      bridgeProcess: child.pid ? bridgeProcessRuntimeMetadata(child.pid, commandIdentity) : undefined,
+      processNonce: commandIdentity.nonce,
+      commandIdentity,
       cwd,
       remoteAccess: "registered-offline"
     });

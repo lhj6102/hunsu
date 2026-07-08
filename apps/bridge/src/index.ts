@@ -791,7 +791,7 @@ export type StudioConnectionStatus = {
   mode: "none" | "local" | "remote";
   transport: "direct" | "relay" | "unreachable";
   health: "checking" | "connected" | "disconnected" | "error";
-  auth: "paired" | "missing_token" | "expired" | "account_mismatch" | "unknown";
+  auth: "paired" | "missing_token" | "expired" | "invalid" | "account_mismatch" | "unknown";
   projectAccess: "granted" | "needs_grant" | "denied" | "not_applicable";
   bridge?: {
     id?: string;
@@ -1966,7 +1966,8 @@ function isPublicBridgeRequest(url: URL): boolean {
 
 function isBridgeControlRequest(pathname: string): boolean {
   return pathname === "/api/bridge/pairing/rotate"
-    || pathname === "/api/bridge/pairing/revoke";
+    || pathname === "/api/bridge/pairing/revoke"
+    || pathname === "/api/bridge/control/shutdown";
 }
 
 function validateBridgeControlToken(request: IncomingMessage, security: StudioServerSecurity): StudioRequestSecurity {
@@ -2516,7 +2517,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
   const actionRunner = options.actionRunner;
   const security = createStudioServerSecurity(options.security, runtimeConfig);
 
-  return createServer(async (request, response) => {
+  const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
       const pathname = url.pathname;
@@ -2549,6 +2550,19 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         }
         if (request.method !== "POST") {
           sendJson(response, 405, { error: "method_not_allowed" });
+          return;
+        }
+        if (pathname === "/api/bridge/control/shutdown") {
+          sendJson(response, 202, { shuttingDown: true });
+          setTimeout(() => {
+            try {
+              server.close();
+            } catch (error) {
+              if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING")) {
+                throw error;
+              }
+            }
+          }, 0);
           return;
         }
         if (pathname === "/api/bridge/pairing/revoke") {
@@ -2887,19 +2901,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
 
-      if (request.method === "POST" && request.url === "/api/executes/stop") {
-        const body = await readJson<StudioRunActionRequest>(request);
-        sendJson(response, 202, await stopStudioRun(body, state, { cwd: repositoryPath, persist, runner }));
-        return;
-      }
-
       if (request.method === "POST" && request.url === "/api/runs/complete-move") {
-        const body = await readJson<StudioMoveCompletionRequest>(request);
-        sendJson(response, 202, await completeStudioMove(body, state, { cwd: repositoryPath, persist }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/executes/complete-move") {
         const body = await readJson<StudioMoveCompletionRequest>(request);
         sendJson(response, 202, await completeStudioMove(body, state, { cwd: repositoryPath, persist }));
         return;
@@ -2929,6 +2931,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       sendJson(response, 400, { error: message });
     }
   });
+  return server;
 }
 
 type RoadmapApiRoute = {

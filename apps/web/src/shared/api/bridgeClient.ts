@@ -7,6 +7,7 @@ import {
   bridgeApiRequestHeaders,
   currentRelayAccessToken,
   currentRemoteBridgeSession,
+  hasBridgeApiAuthToken,
   hasDirectRelaySession,
   relayApiHttpUrl,
   relayApiRequestHeaders,
@@ -50,13 +51,14 @@ import type {
   StudioSkillSummary,
   WorktreeStatus
 } from "@/shared/api/bridgeTypes";
+import { isUsableRemoteStudioConnectionStatus } from "@/shared/api/studioConnectionStatus";
 
 const SERVER_URL = BRIDGE_API_BASE_URL;
 
 async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge API request"): Promise<T> {
   const method = init?.method?.toUpperCase() ?? "GET";
   const body = parseRequestBody(init?.body);
-  const remoteCommand = remoteBridgeCommandForRequest(path, method, body, currentRemoteBridgeSession());
+  const remoteCommand = remoteBridgeCommandForRequest(path, method, body, currentRoutableRemoteBridgeSession());
   if (remoteCommand) {
     return requestRemoteJson<T>(remoteCommand, label);
   }
@@ -181,7 +183,7 @@ export async function fetchRemoteBridgeDevices(): Promise<RemoteBridgeDeviceList
 export async function postRemoteBridgeConnect(input: RemoteBridgeConnectRequest): Promise<RemoteBridgeConnectResult> {
   if (hasDirectRelaySession()) {
     const result = await connectRemoteBridgeThroughRelay(input);
-    if (result.device && result.connection.mode === "remote" && result.connection.health === "connected") {
+    if (shouldStoreRemoteBridgeSession(result)) {
       storeRemoteBridgeSession({
         deviceId: result.device.deviceId,
         projectPath: input.projectPath,
@@ -192,7 +194,7 @@ export async function postRemoteBridgeConnect(input: RemoteBridgeConnectRequest)
     return result;
   }
   const result = await postJson<RemoteBridgeConnectResult>("/api/remote/connect", input, "Remote Bridge connect");
-  if (result.device && result.connection.mode === "remote" && result.connection.health === "connected") {
+  if (shouldStoreRemoteBridgeSession(result)) {
     storeRemoteBridgeSession({
       deviceId: result.device.deviceId,
       projectPath: input.projectPath,
@@ -200,6 +202,12 @@ export async function postRemoteBridgeConnect(input: RemoteBridgeConnectRequest)
     });
   }
   return result;
+}
+
+function shouldStoreRemoteBridgeSession(result: RemoteBridgeConnectResult): result is RemoteBridgeConnectResult & { device: NonNullable<RemoteBridgeConnectResult["device"]> } {
+  return Boolean(result.device)
+    && result.compatibility.compatible
+    && isUsableRemoteStudioConnectionStatus(result.connection);
 }
 
 export function fetchBoard(roadmapId: string): Promise<BoardProjection> {
@@ -315,7 +323,7 @@ export function postActionRunStop(roadmapId: string, runId: string): Promise<Act
 }
 
 export function subscribeRunEvents(roadmapId: string, onEvent: (event: StudioLiveEvent) => void, onError: () => void): () => void {
-  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, "/runs/events"), "GET", undefined, currentRemoteBridgeSession());
+  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, "/runs/events"), "GET", undefined, currentRoutableRemoteBridgeSession());
   if (remoteCommand) {
     return subscribeRemoteCommand(remoteCommand, onEvent, onError);
   }
@@ -341,7 +349,7 @@ export function subscribeRunEvents(roadmapId: string, onEvent: (event: StudioLiv
 }
 
 export function subscribeAgentSessionEvents(roadmapId: string, sessionId: string, onEvent: (event: AgentSessionEvent) => void, onError: () => void): () => void {
-  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, `/agent-sessions/${encodeURIComponent(sessionId)}/events`), "GET", undefined, currentRemoteBridgeSession());
+  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, `/agent-sessions/${encodeURIComponent(sessionId)}/events`), "GET", undefined, currentRoutableRemoteBridgeSession());
   if (remoteCommand) {
     return subscribeRemoteCommand(remoteCommand, onEvent, onError);
   }
@@ -641,6 +649,10 @@ function remoteBridgeCommandEventUrl(command: RemoteBridgeCommandRequest): strin
     url.searchParams.set("hunsuRelayToken", relayToken);
   }
   return BRIDGE_API_BASE_URL ? url.toString() : `${url.pathname}${url.search}`;
+}
+
+function currentRoutableRemoteBridgeSession(): RemoteBridgeSession | undefined {
+  return hasBridgeApiAuthToken() ? undefined : currentRemoteBridgeSession();
 }
 
 function parseRequestBody(body: BodyInit | null | undefined): unknown {

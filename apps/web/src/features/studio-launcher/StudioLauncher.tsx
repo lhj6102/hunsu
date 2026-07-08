@@ -35,6 +35,7 @@ export function StudioLauncher({
   const queryClient = useQueryClient();
   const [message, setMessage] = useState<string | undefined>();
   const [busyAction, setBusyAction] = useState<"open" | "create" | "repair" | "remove" | undefined>();
+  const [advancedOpen, setAdvancedOpen] = useState(Boolean(initialPath));
 
   const finderItems = useMemo<FinderItem[]>(() => {
     const items: FinderItem[] = [
@@ -178,48 +179,56 @@ export function StudioLauncher({
           </section>
         ) : null}
 
-        <div className="apple-glass-strong mt-8 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] p-4">
-          <div className="flex shrink-0 flex-col gap-3 md:flex-row md:items-center">
-            <div className="relative min-w-0 flex-1">
-              <Search className="pointer-events-none absolute left-4 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                aria-label="Repository path"
-                className="pl-11"
-                value={path}
-                onChange={event => {
-                  setPath(event.target.value);
-                  setRootId(undefined);
-                }}
-                placeholder="/path/to/project"
-              />
-            </div>
-          </div>
-          {message ? <p className="mt-3 shrink-0 text-[13px] leading-5 text-muted-foreground">{message}</p> : null}
+        {message ? <p className="mt-4 shrink-0 text-[13px] leading-5 text-muted-foreground">{message}</p> : null}
 
-          <ScrollArea className="mt-4 min-h-0 flex-1">
-            <div className="grid divide-y divide-[color:var(--border)]">
-              {browser.status === "connecting" ? <FinderSkeleton /> : null}
-              {finderItems.map(item => (
-                <FinderRow
-                  key={item.id}
-                  item={item}
-                  busy={busyAction !== undefined}
-                  onChoosePath={(nextPath, nextRootId) => {
-                    setPath(nextPath);
-                    setRootId(nextRootId);
+        <details
+          className="mt-6 shrink-0 rounded-[18px] border border-[color:var(--apple-hairline)] bg-white/46 px-4 py-3"
+          open={advancedOpen}
+          onToggle={event => setAdvancedOpen(event.currentTarget.open)}
+        >
+          <summary className="cursor-pointer text-[13px] font-semibold text-[color:var(--apple-ink)]">Advanced</summary>
+          <div className="mt-4 flex max-h-[min(520px,calc(100vh-300px))] min-h-[280px] flex-col overflow-hidden rounded-[16px] border border-[color:var(--apple-hairline)] bg-white/42 p-4">
+            <div className="flex shrink-0 flex-col gap-3 md:flex-row md:items-center">
+              <div className="relative min-w-0 flex-1">
+                <Search className="pointer-events-none absolute left-4 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  aria-label="Repository path"
+                  className="pl-11"
+                  value={path}
+                  onChange={event => {
+                    setPath(event.target.value);
+                    setRootId(undefined);
                   }}
-                  onCreate={createRoadmap}
-                  onOpen={openRoadmap}
+                  placeholder="/path/to/project"
                 />
-              ))}
-              {browser.status !== "connecting" && finderItems.length === 1 ? (
-                <div className="px-3 py-5 text-[13px] leading-5 text-muted-foreground">
-                  No folders found for this path.
-                </div>
-              ) : null}
+              </div>
             </div>
-          </ScrollArea>
-        </div>
+
+            <ScrollArea className="mt-4 min-h-0 flex-1">
+              <div className="grid divide-y divide-[color:var(--border)]">
+                {browser.status === "connecting" ? <FinderSkeleton /> : null}
+                {finderItems.map(item => (
+                  <FinderRow
+                    key={item.id}
+                    item={item}
+                    busy={busyAction !== undefined}
+                    onChoosePath={(nextPath, nextRootId) => {
+                      setPath(nextPath);
+                      setRootId(nextRootId);
+                    }}
+                    onCreate={createRoadmap}
+                    onOpen={openRoadmap}
+                  />
+                ))}
+                {browser.status !== "connecting" && finderItems.length === 1 ? (
+                  <div className="px-3 py-5 text-[13px] leading-5 text-muted-foreground">
+                    No folders found for this path.
+                  </div>
+                ) : null}
+              </div>
+            </ScrollArea>
+          </div>
+        </details>
       </section>
     </main>
   );

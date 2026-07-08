@@ -46,7 +46,8 @@ Studio opens in the browser
 The Bridge App starts Hunsu Bridge on `127.0.0.1`, creates a temporary pairing
 session, opens Studio, and keeps local repository access on your machine. Login
 is optional for local use; signing in enables Remote Bridge access through
-authenticated Relay commands.
+authenticated Relay commands. Remote Registry and connection-status responses
+redact local filesystem paths until the matching Project Grant exists.
 
 Advanced developer fallback:
 
@@ -60,6 +61,7 @@ Headless Linux/devbox path:
 hunsu-bridge login
 hunsu-bridge remote status
 hunsu-bridge projects grant /path/to/project
+hunsu-bridge projects list
 hunsu-bridge start --remote
 ```
 

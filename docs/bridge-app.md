@@ -62,8 +62,9 @@ Hunsu Bridge App owns local runtime supervision:
 `apps/bridge-desktop` contains the product desktop layer:
 
 - a Tauri shell scaffold under `src-tauri/`
-- a small desktop status window under `dist-ui/` that polls live status,
-  recent projects, selected-folder inspection, diagnostics, and logs
+- a small desktop status window maintained from `src-ui/` and built into
+  `dist-ui/` for packaging; it polls live status, recent projects,
+  selected-folder inspection, diagnostics, and logs
 - a native folder picker command for macOS, Windows, and Linux GUI
 - `hunsu://` protocol registration through macOS `Info.plist`, a Windows WiX
   registry fragment, and a Linux user-level `.desktop`/`xdg-mime` handler
@@ -88,6 +89,11 @@ user's `PATH`.
 `desktop:build` requires Rust/Cargo plus platform Tauri dependencies. The
 TypeScript sidecar/headless package can be built and tested without those native
 toolchains.
+
+The Tauri shell ships with an explicit CSP. Browser JavaScript is loaded from a
+bundled app script, and native command invocation is allowlisted to known Bridge
+App commands. Unsupported `hunsu://` commands are rejected instead of being
+passed to the sidecar.
 
 Studio remains the main product UI for Roadmaps, Execute, Hunsu Drafts,
 Artifact Actions, and Hub.
@@ -187,6 +193,7 @@ hunsu-bridge remote enable
 hunsu-bridge remote disable
 hunsu-bridge remote devices
 hunsu-bridge remote check execute.start /path/to/project
+hunsu-bridge projects list
 hunsu-bridge projects grant /path/to/project
 hunsu-bridge projects revoke /path/to/project
 ```
@@ -239,7 +246,30 @@ Project Grant and command-scope checks pass.
 
 Relay checks Web session, device access, device online state, Project Grant,
 and command scope. Bridge checks Relay session, granted project path, allowed
-command scope, and Roadmap-to-path mapping.
+command scope, and Roadmap-to-path mapping. Remote `connection.status` and
+Roadmap Registry results do not expose local repository paths unless the
+requested project is granted.
+
+## Process Status, Stop, And Services
+
+Bridge App status checks the stored managed `bridgeApiUrl` before falling back
+to the configured default endpoint. It records process metadata when Bridge is
+started, checks PID liveness, and clears stale runtime process fields while
+keeping account, device, and Project Grant state.
+
+`hunsu-bridge stop` tries the Bridge control endpoint first:
+
+```text
+POST /api/bridge/control/shutdown
+```
+
+The endpoint requires the Bridge control token. PID termination is only a
+fallback after the stored process still appears alive and its command line
+matches a Hunsu Bridge App sidecar/supervisor process.
+
+Headless service artifacts are generated per platform. Linux systemd user units
+quote paths, percent signs, and environment values; macOS emits a launchd plist
+artifact; Windows remains installer-managed with a documented manual fallback.
 
 ## Native And Manual QA Matrix
 

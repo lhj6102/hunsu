@@ -71,10 +71,10 @@ test("Relay service authenticates device flow, registers WebSocket devices, and 
     const deniedGrantStatus = await relayJson(`${urls.apiUrl}/v1/project-grants/status`, token.access_token, {
       deviceId: "device_123",
       projectPath: "/tmp/hunsu-project",
-      requestedScopes: ["artifactAction.run", "remoteRelay.access"]
+      requestedScopes: ["artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"]
     }) as { projectAccess: string; missingScopes?: string[] };
     assert.equal(deniedGrantStatus.projectAccess, "denied");
-    assert.deepEqual(deniedGrantStatus.missingScopes, ["artifactAction.run"]);
+    assert.deepEqual(deniedGrantStatus.missingScopes, ["artifactAction.run", "env.read", "hostAlias.expose"]);
 
     const offline = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
       deviceId: "device_123",
@@ -141,6 +141,64 @@ test("Relay service authenticates device flow, registers WebSocket devices, and 
       payload: { roadmapId: "roadmap_123" }
     }, 202) as { ok: true; body: { routed: string } };
     assert.equal(board.body.routed, "roadmap.board");
+
+    socket.send(JSON.stringify({
+      type: "device.register",
+      device: {
+        deviceId: "device_123",
+        deviceName: "relay-devbox",
+        userId: token.user_id,
+        registeredAt: new Date().toISOString(),
+        status: "online",
+        bridgeVersion: "0.1.2",
+        protocolVersion: "local-bridge-v1"
+      },
+      projectGrants: [{
+        path: "/tmp/hunsu-project",
+        grantedAt: new Date().toISOString(),
+        scopes: ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"]
+      }]
+    }));
+    await delay(30);
+
+    const routedArtifact = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
+      deviceId: "device_123",
+      command: "artifactAction.start",
+      projectPath: "/tmp/hunsu-project",
+      requestedScopes: ["remoteRelay.access"],
+      payload: { roadmapId: "roadmap_123", actionId: "host-web" }
+    }, 202) as { ok: true; body: { routed: string } };
+    assert.equal(routedArtifact.body.routed, "artifactAction.start");
+
+    socket.send(JSON.stringify({
+      type: "device.register",
+      device: {
+        deviceId: "device_123",
+        deviceName: "relay-devbox",
+        userId: token.user_id,
+        registeredAt: new Date().toISOString(),
+        status: "online",
+        bridgeVersion: "0.1.2",
+        protocolVersion: "local-bridge-v1"
+      },
+      projectGrants: []
+    }));
+    await delay(30);
+
+    const revokedStatus = await relayJson(`${urls.apiUrl}/v1/project-grants/status`, token.access_token, {
+      deviceId: "device_123",
+      projectPath: "/tmp/hunsu-project",
+      requestedScopes: ["remoteRelay.access"]
+    }) as { projectAccess: string };
+    assert.equal(revokedStatus.projectAccess, "needs_grant");
+
+    const revokedCommand = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
+      deviceId: "device_123",
+      command: "execute.start",
+      projectPath: "/tmp/hunsu-project",
+      payload: { roadmapId: "roadmap_123" }
+    }, 403) as { ok: false; reason: string };
+    assert.equal(revokedCommand.reason, "project_grant_denied");
 
     socket.close();
   } finally {

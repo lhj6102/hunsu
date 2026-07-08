@@ -235,6 +235,7 @@ export function connectionCardLabel(connection: BridgeConnectionState): string {
   if (status?.warnings.includes("version_mismatch")) return "Bridge update needed";
   if (status?.auth === "account_mismatch") return "Account mismatch";
   if (status?.auth === "expired") return "Session expired";
+  if (status?.auth === "invalid") return "Pairing needed";
   if (status?.projectAccess === "denied") return "Project access denied";
   if (status?.projectAccess === "needs_grant") return "Project access needed";
   if (status?.health === "error") return "Bridge error";
@@ -268,6 +269,7 @@ function problemMessage(connection: BridgeConnectionState): string {
   if (status?.warnings.includes("origin_not_allowed")) return "Bridge is running, but this Studio origin is not allowed.";
   if (compatibilityMessage) return compatibilityMessage;
   if (status?.warnings.includes("version_mismatch")) return "Bridge version is too old for this Studio session.";
+  if (status?.auth === "invalid") return "Bridge rejected this browser pairing token. Pair Studio again from the Bridge App.";
   if (status?.projectAccess === "denied") return "Bridge is connected, but the selected Project Grant does not allow this access.";
   if (status?.projectAccess === "needs_grant") return "Bridge is connected, but this project still needs a Project Grant.";
   if (status?.transport === "relay" && status.health !== "connected") return "Remote Bridge is offline or Relay is unavailable.";

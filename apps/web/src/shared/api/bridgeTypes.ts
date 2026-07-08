@@ -494,7 +494,7 @@ export type StudioConnectionStatus = {
   mode: "none" | "local" | "remote";
   transport: "direct" | "relay" | "unreachable";
   health: "checking" | "connected" | "disconnected" | "error";
-  auth: "paired" | "missing_token" | "expired" | "account_mismatch" | "unknown";
+  auth: "paired" | "missing_token" | "expired" | "invalid" | "account_mismatch" | "unknown";
   projectAccess: "granted" | "needs_grant" | "denied" | "not_applicable";
   bridge?: {
     id?: string;

@@ -14,15 +14,16 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/shar
 type AppleAppShellProps = {
   active: "studio" | "hub";
   currentRoadmapId?: string;
+  connectionOverride?: BridgeConnectionState;
   children: ReactNode;
 };
 
-export function AppleAppShell({ active, currentRoadmapId, children }: AppleAppShellProps) {
+export function AppleAppShell({ active, currentRoadmapId, connectionOverride, children }: AppleAppShellProps) {
   const [collapsed, setCollapsed] = useState(() => window.innerWidth < 900);
   const [connectionCenterOpen, setConnectionCenterOpen] = useState(false);
   const [remoteConnection, setRemoteConnection] = useState<StudioConnectionStatus | undefined>();
-  const registry = useRoadmapRegistry();
-  const bridgeConnection = useBridgeConnection({ enabled: true, intervalMs: 2500 });
+  const registry = useRoadmapRegistry({ enabled: active === "studio" });
+  const bridgeConnection = useBridgeConnection({ enabled: active === "studio" && !connectionOverride, intervalMs: 2500 });
   const effectiveBridgeConnection = useMemo<BridgeConnectionState>(() => remoteConnection
     ? {
         status: "online",
@@ -30,7 +31,7 @@ export function AppleAppShell({ active, currentRoadmapId, children }: AppleAppSh
         connection: remoteConnection,
         version: remoteConnection.version
       }
-    : bridgeConnection, [bridgeConnection, remoteConnection]);
+    : connectionOverride ?? bridgeConnection, [bridgeConnection, connectionOverride, remoteConnection]);
   const showRoadmaps = active === "studio";
   const recentRoadmaps = useMemo(
     () => [...registry.data].sort(compareRoadmapRecency),

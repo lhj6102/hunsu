@@ -159,21 +159,131 @@ test("Web remote Bridge client lists, connects, and routes commands directly thr
   }
 });
 
-test("Studio Bridge-backed routes render when only a Relay-backed Remote Bridge session is stored", async () => {
+test("Studio Bridge-backed routes require a verified Remote Bridge session", async () => {
   const { module, close } = await loadAppModule();
   try {
     for (const routePath of ["/studio", "/studio/roadmaps/roadmap_123"]) {
-      const input = {
+      const staleInput = {
         routeNeedsBridge: true,
         hasLocalBridgeSession: false,
         hasRemoteBridgeSession: true,
+        hasVerifiedRemoteBridgeSession: false,
         bridgeStatus: "offline" as const
       };
-      assert.equal(module.shouldRedirectBridgeBackedStudioRoute(input), false, `${routePath} should not redirect to setup`);
-      assert.equal(module.shouldRenderBridgeBackedSetup(input), false, `${routePath} should render the Studio route`);
+      assert.equal(module.shouldRedirectBridgeBackedStudioRoute(staleInput), true, `${routePath} should redirect stale remote sessions to setup`);
+      assert.equal(module.shouldRenderBridgeBackedSetup(staleInput), true, `${routePath} should render setup for stale remote sessions`);
+
+      const verifiedInput = {
+        ...staleInput,
+        hasVerifiedRemoteBridgeSession: true
+      };
+      assert.equal(module.shouldRedirectBridgeBackedStudioRoute(verifiedInput), false, `${routePath} should not redirect verified remote sessions`);
+      assert.equal(module.shouldRenderBridgeBackedSetup(verifiedInput), false, `${routePath} should render verified remote sessions`);
     }
   } finally {
     await close();
+  }
+});
+
+test("Studio Bridge-backed routes require a usable local Bridge pairing", async () => {
+  const { module, close } = await loadAppModule();
+  try {
+    const pairedInput = {
+      routeNeedsBridge: true,
+      hasLocalBridgeSession: true,
+      hasVerifiedRemoteBridgeSession: false,
+      bridgeStatus: "online" as const,
+      bridgeConnection: studioConnectionStatus()
+    };
+    assert.equal(module.shouldRedirectBridgeBackedStudioRoute(pairedInput), false);
+    assert.equal(module.shouldRenderBridgeBackedSetup(pairedInput), false);
+
+    for (const auth of ["expired", "invalid", "missing_token"] as const) {
+      const rejectedInput = {
+        ...pairedInput,
+        bridgeConnection: studioConnectionStatus({ auth, health: "error", error: `Pairing ${auth}` })
+      };
+      assert.equal(module.shouldRedirectBridgeBackedStudioRoute(rejectedInput), true, `${auth} local pairing should redirect to setup`);
+      assert.equal(module.shouldRenderBridgeBackedSetup(rejectedInput), true, `${auth} local pairing should render setup`);
+    }
+
+    const incompatibleInput = {
+      ...pairedInput,
+      bridgeConnection: studioConnectionStatus({
+        compatibility: { compatible: false, reason: "bridge_update_needed", message: "Bridge is too old." },
+        warnings: ["version_mismatch"]
+      })
+    };
+    assert.equal(module.shouldRedirectBridgeBackedStudioRoute(incompatibleInput), true);
+    assert.equal(module.shouldRenderBridgeBackedSetup(incompatibleInput), true);
+  } finally {
+    await close();
+  }
+});
+
+test("Web remote Bridge client stores a session only after a usable connection", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>();
+  const responses = [
+    remoteConnectResult({ auth: "account_mismatch", account: { webUserId: "web@example.test", bridgeUserId: "bridge@example.test", sameUser: false } }),
+    remoteConnectResult({ projectAccess: "needs_grant" }),
+    remoteConnectResult({
+      compatibility: { compatible: false, reason: "bridge_app_update_needed", message: "Bridge App is too old." },
+      warnings: ["version_mismatch"]
+    }),
+    remoteConnectResult({ projectAccess: "granted" })
+  ];
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    assert.equal(requestUrl.pathname, "/api/remote/connect");
+    const response = responses.shift();
+    assert.ok(response);
+    return new Response(JSON.stringify(response), { status: 202, headers: { "content-type": "application/json" } });
+  };
+
+  const { module, close } = await loadBridgeClientModule();
+  try {
+    await module.postRemoteBridgeConnect({ deviceId: "device_1", webUserId: "web@example.test", projectPath: "/tmp/hunsu-project" });
+    assert.equal(storage.has("hunsu.remoteBridgeSession"), false);
+
+    await module.postRemoteBridgeConnect({ deviceId: "device_1", webUserId: "web@example.test", projectPath: "/tmp/hunsu-project" });
+    assert.equal(storage.has("hunsu.remoteBridgeSession"), false);
+
+    await module.postRemoteBridgeConnect({ deviceId: "device_1", webUserId: "web@example.test", projectPath: "/tmp/hunsu-project" });
+    assert.equal(storage.has("hunsu.remoteBridgeSession"), false);
+
+    await module.postRemoteBridgeConnect({ deviceId: "device_1", webUserId: "web@example.test", projectPath: "/tmp/hunsu-project" });
+    const stored = JSON.parse(storage.get("hunsu.remoteBridgeSession") ?? "{}") as { deviceId?: string; projectPath?: string; webUserId?: string };
+    assert.deepEqual(stored, {
+      deviceId: "device_1",
+      projectPath: "/tmp/hunsu-project",
+      webUserId: "web@example.test",
+      relayAccessToken: ""
+    });
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
   }
 });
 
@@ -294,7 +404,110 @@ test("Web Roadmap workspace APIs route through Relay with no local Bridge token"
   }
 });
 
-function onlineConnection(overrides: Partial<StudioConnectionStatus>): BridgeConnectionState {
+test("Web Roadmap workspace APIs prefer local Bridge when local and remote sessions both exist", async () => {
+  const fetches: Array<{ method: string; pathname: string; authorization?: string }> = [];
+  const eventSourceUrls: string[] = [];
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const globalWithEventSource = globalThis as unknown as { EventSource?: typeof EventSource };
+  const previousEventSource = globalWithEventSource.EventSource;
+  const storage = new Map<string, string>([
+    ["hunsu.bridgeApiToken", "local-token"],
+    ["hunsu.remoteBridgeSession", JSON.stringify({
+      deviceId: "device_1",
+      projectPath: "/tmp/hunsu-project",
+      relayAccessToken: "relay-token"
+    })]
+  ]);
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio/roadmaps/roadmap_123",
+      origin: "https://studio.example.test"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url, init) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    fetches.push({
+      method: init?.method ?? "GET",
+      pathname: requestUrl.pathname,
+      authorization: new Headers(init?.headers).get("authorization") ?? undefined
+    });
+    assert.equal(requestUrl.origin, "https://studio.example.test");
+    if (requestUrl.pathname === "/api/roadmaps/roadmap_123/board") {
+      return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (requestUrl.pathname === "/api/roadmaps/roadmap_123/runs") {
+      return new Response(JSON.stringify({ runs: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ error: `Unexpected request: ${requestUrl}` }), { status: 500, headers: { "content-type": "application/json" } });
+  };
+  class TestEventSource {
+    onerror: ((event: Event) => void) | null = null;
+
+    constructor(url: string | URL) {
+      eventSourceUrls.push(String(url));
+    }
+
+    addEventListener() {}
+    removeEventListener() {}
+    close() {}
+  }
+  globalWithEventSource.EventSource = TestEventSource as unknown as typeof EventSource;
+
+  const { module, close } = await loadBridgeClientModule();
+  try {
+    await module.fetchBoard("roadmap_123");
+    await module.fetchRuns("roadmap_123");
+    const unsubscribeRunEvents = module.subscribeRunEvents("roadmap_123", () => {}, () => {});
+    const unsubscribeAgentEvents = module.subscribeAgentSessionEvents("roadmap_123", "agent_1", () => {}, () => {});
+    unsubscribeRunEvents();
+    unsubscribeAgentEvents();
+
+    assert.deepEqual(fetches, [
+      { method: "GET", pathname: "/api/roadmaps/roadmap_123/board", authorization: "Bearer local-token" },
+      { method: "GET", pathname: "/api/roadmaps/roadmap_123/runs", authorization: "Bearer local-token" }
+    ]);
+    assert.equal(fetches.some(call => call.pathname === "/v1/commands" || call.pathname.startsWith("/api/remote/")), false);
+
+    assert.equal(eventSourceUrls.length, 2);
+    const runEventsUrl = new URL(eventSourceUrls[0] ?? "", "https://studio.example.test");
+    assert.equal(runEventsUrl.pathname, "/api/roadmaps/roadmap_123/runs/events");
+    assert.equal(runEventsUrl.searchParams.get("hunsuBridgeToken"), "local-token");
+    assert.equal(runEventsUrl.searchParams.has("command"), false);
+    assert.equal(runEventsUrl.searchParams.has("hunsuRelayToken"), false);
+
+    const agentEventsUrl = new URL(eventSourceUrls[1] ?? "", "https://studio.example.test");
+    assert.equal(agentEventsUrl.pathname, "/api/roadmaps/roadmap_123/agent-sessions/agent_1/events");
+    assert.equal(agentEventsUrl.searchParams.get("hunsuBridgeToken"), "local-token");
+    assert.equal(agentEventsUrl.searchParams.has("command"), false);
+    assert.equal(agentEventsUrl.searchParams.has("hunsuRelayToken"), false);
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+    if (previousEventSource) {
+      globalWithEventSource.EventSource = previousEventSource;
+    } else {
+      delete globalWithEventSource.EventSource;
+    }
+  }
+});
+
+function studioConnectionStatus(overrides: Partial<StudioConnectionStatus> = {}): StudioConnectionStatus {
   const connection: StudioConnectionStatus = {
     mode: "local",
     transport: "direct",
@@ -319,11 +532,57 @@ function onlineConnection(overrides: Partial<StudioConnectionStatus>): BridgeCon
     compatibility: { compatible: true },
     ...overrides
   };
+  return connection;
+}
+
+function onlineConnection(overrides: Partial<StudioConnectionStatus>): BridgeConnectionState {
+  const connection = studioConnectionStatus(overrides);
   return {
     status: "online",
     tokenPresent: true,
     connection,
     version: connection.version
+  };
+}
+
+function remoteConnectResult(overrides: Partial<StudioConnectionStatus>) {
+  const compatibility = overrides.compatibility ?? { compatible: true as const };
+  return {
+    device: {
+      deviceId: "device_1",
+      deviceName: "devbox",
+      userId: "bridge@example.test",
+      registeredAt: "2026-07-08T00:00:00.000Z",
+      lastSeenAt: "2026-07-08T00:01:00.000Z",
+      status: "online" as const,
+      bridgeVersion: "0.1.2",
+      bridgeAppVersion: "0.1.0",
+      protocolVersion: "local-bridge-v1"
+    },
+    compatibility,
+    connection: studioConnectionStatus({
+      mode: "remote",
+      transport: "relay",
+      auth: "paired",
+      projectAccess: "granted",
+      bridge: {
+        id: "device_1",
+        name: "devbox",
+        version: "0.1.2",
+        protocolVersion: "local-bridge-v1",
+        lastSeenAt: "2026-07-08T00:01:00.000Z"
+      },
+      endpoint: {
+        relayLabel: "Hunsu Relay"
+      },
+      account: {
+        webUserId: "web@example.test",
+        bridgeUserId: "web@example.test",
+        sameUser: true
+      },
+      compatibility,
+      ...overrides
+    })
   };
 }
 
@@ -410,14 +669,18 @@ async function loadAppModule(): Promise<{
     shouldRedirectBridgeBackedStudioRoute: (input: {
       routeNeedsBridge: boolean;
       hasLocalBridgeSession: boolean;
-      hasRemoteBridgeSession: boolean;
-      bridgeStatus: "checking" | "online" | "offline";
+      hasRemoteBridgeSession?: boolean;
+      hasVerifiedRemoteBridgeSession?: boolean;
+      bridgeStatus: "idle" | "checking" | "online" | "offline";
+      bridgeConnection?: StudioConnectionStatus;
     }) => boolean;
     shouldRenderBridgeBackedSetup: (input: {
       routeNeedsBridge: boolean;
       hasLocalBridgeSession: boolean;
-      hasRemoteBridgeSession: boolean;
-      bridgeStatus: "checking" | "online" | "offline";
+      hasRemoteBridgeSession?: boolean;
+      hasVerifiedRemoteBridgeSession?: boolean;
+      bridgeStatus: "idle" | "checking" | "online" | "offline";
+      bridgeConnection?: StudioConnectionStatus;
     }) => boolean;
   };
   close: () => Promise<void>;
@@ -489,6 +752,8 @@ async function loadBridgeClientModule(): Promise<{
     fetchHunsuDraftDiffArtifact: (roadmapId: string, draftSessionId: string, diffArtifactId: string) => Promise<unknown>;
     postHunsuDraftApprove: (roadmapId: string, draftSessionId: string, diffArtifactId: string, teamName: string) => Promise<unknown>;
     postHunsuDraftDiscard: (roadmapId: string, draftSessionId: string) => Promise<unknown>;
+    subscribeRunEvents: (roadmapId: string, onEvent: (event: unknown) => void, onError: () => void) => () => void;
+    subscribeAgentSessionEvents: (roadmapId: string, sessionId: string, onEvent: (event: unknown) => void, onError: () => void) => () => void;
   };
   close: () => Promise<void>;
 }> {
