@@ -1,16 +1,18 @@
 import { useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { BridgeRequestError, fetchHunsuDraftDiffArtifact, postArtifactActionRun, postHunsuDraftApprove, postHunsuDraftDiscard, postHunsuDraftMessage, postHunsuDraftStart, postRunAction } from "@/shared/api/bridgeClient";
-import type { ExecutePreflightError, StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
+import type { ExecutePreflightAction, ExecutePreflightError, StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
 import { useRoadmapWorkspace } from "@/shared/api/useStudioData";
 import { Button } from "@/shared/ui/button";
 import type { RoadmapActionModel, RoadmapDetailPanel, RoadmapSelection } from "@/shared/domain/roadmapViewModel";
 import { NodeDetailPanel } from "@/features/inspector/NodeDetailPanel";
 import { RoadmapGraph } from "@/features/roadmap-graph/RoadmapGraph";
+import { bridgeActionHref } from "./preflightActions.js";
 
 type ExecuteActionState = {
   status: "idle" | "starting" | "started" | "error";
   message?: string;
+  preflight?: ExecutePreflightError;
 };
 
 type HunsuDraftActionState = {
@@ -139,7 +141,8 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
       const preflight = executePreflightError(nextError);
       setExecuteAction({
         status: "error",
-        message: preflight?.message ?? (nextError instanceof Error ? nextError.message : "Execute start failed.")
+        message: preflight?.message ?? (nextError instanceof Error ? nextError.message : "Execute start failed."),
+        preflight
       });
     }
   }
@@ -249,9 +252,7 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
         <div className="pointer-events-none absolute left-5 right-5 top-[92px] z-30 flex justify-center">
           <div className="apple-glass pointer-events-auto flex max-w-[720px] flex-wrap items-center justify-center gap-3 rounded-[14px] px-4 py-3 text-center">
             <p className="text-[13px] font-medium leading-5 text-[color:var(--apple-ink)]">{executeAction.message}</p>
-            <Button type="button" size="sm" variant="outline" onClick={() => openBridgeLink("hunsu://prerequisites/codex")}>
-              Open Prerequisites
-            </Button>
+            <RoadmapWorkspacePreflightActions preflight={executeAction.preflight} />
           </div>
         </div>
       ) : null}
@@ -315,9 +316,40 @@ function executePreflightError(error: unknown): ExecutePreflightError | undefine
     return undefined;
   }
   const body = error.body as Partial<ExecutePreflightError>;
-  return body.runtime === "codex" && typeof body.error === "string" && typeof body.message === "string"
+  return (body.area === "codex" || body.area === "roadmap") && typeof body.error === "string" && typeof body.message === "string"
     ? body as ExecutePreflightError
     : undefined;
+}
+
+export function RoadmapWorkspacePreflightActions({ preflight, open = openBridgeLink }: { preflight: ExecutePreflightError | undefined; open?: (href: string) => void }) {
+  return (
+    <>
+      {(preflight?.actions ?? fallbackPreflightActions(preflight)).map(action => (
+        <Button
+          key={`${action.type}:${action.href ?? action.roadmapId ?? ""}`}
+          type="button"
+          size="sm"
+          variant={primaryAction(action) ? "default" : "outline"}
+          onClick={() => open(bridgeActionHref(action))}
+        >
+          {action.label}
+        </Button>
+      ))}
+    </>
+  );
+}
+
+function fallbackPreflightActions(preflight: ExecutePreflightError | undefined): ExecutePreflightAction[] {
+  return preflight?.area === "roadmap"
+    ? [{ type: "open_roadmaps", label: "Open Roadmaps" }]
+    : [{ type: "open_prerequisites", label: "Open Prerequisites" }];
+}
+
+function primaryAction(action: ExecutePreflightAction): boolean {
+  return action.type === "install_codex"
+    || action.type === "codex_login_chatgpt"
+    || action.type === "open_roadmaps"
+    || action.type === "activate_roadmap";
 }
 
 function openBridgeLink(url: string): void {

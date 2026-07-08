@@ -53,6 +53,7 @@ import {
   pauseStudioRun,
   planStudioArtifactActionRun,
   parseCodexDeviceAuthOutput,
+  sanitizeDiagnostics,
   readMoveFileBlob,
   readMoveDiff,
   readMoveFileTree,
@@ -201,15 +202,71 @@ test("Bridge Roadmap registry exposes active Roadmaps by default and keeps manag
   assert.equal(managed.find(entry => entry.roadmapId === third.roadmap.roadmapId)?.lifecycle, "missing");
 });
 
+test("Bridge Execute preflight separates Roadmap readiness from Codex readiness", async () => {
+  const parent = createRepo();
+  const repoActive = join(parent, "roadmap-active");
+  const repoInactive = join(parent, "roadmap-inactive");
+  const repoUnhealthy = join(parent, "roadmap-unhealthy");
+  const repoUnhealthyPlainGit = join(parent, "roadmap-unhealthy-plain-git");
+  const repoMissing = join(parent, "roadmap-missing");
+  const registryPath = join(parent, "roadmaps.json");
+  const state = createStudioState();
+  const active = createStudioRoadmap({ path: repoActive, title: "roadmap-active" }, state, { persist: true, roadmapRegistryPath: registryPath });
+  const inactive = createStudioRoadmap({ path: repoInactive, title: "roadmap-inactive" }, state, { persist: true, roadmapRegistryPath: registryPath });
+  const unhealthy = createStudioRoadmap({ path: repoUnhealthy, title: "roadmap-unhealthy" }, state, { persist: true, roadmapRegistryPath: registryPath });
+  createStudioRoadmap({ path: repoMissing, title: "roadmap-missing" }, state, { persist: true, roadmapRegistryPath: registryPath });
+  setRoadmapLifecycle({ roadmapId: inactive.roadmap.roadmapId }, "inactive", { roadmapRegistryPath: registryPath });
+  mkdirSync(repoUnhealthyPlainGit, { recursive: true });
+  run("git", ["init"], repoUnhealthyPlainGit);
+  const registry = JSON.parse(readFileSync(registryPath, "utf8")) as { roadmaps: Array<{ roadmapId: string; repositoryPath: string }> };
+  const unhealthyEntry = registry.roadmaps.find(entry => entry.roadmapId === unhealthy.roadmap.roadmapId);
+  if (unhealthyEntry) {
+    unhealthyEntry.repositoryPath = repoUnhealthyPlainGit;
+  }
+  writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
+  rmSync(repoMissing, { recursive: true, force: true });
+
+  const body = {
+    requestId: String(active.board.requests[0].id),
+    lineId: String(active.board.lines[0].id),
+    selectedDestinationIds: [String(active.board.destinations[0].id)]
+  };
+  const inactiveServer = createStudioServer({ cwd: inactive.repository.root, state, persist: true, roadmapRegistryPath: registryPath });
+  const inactiveResponse = await requestStudioServerJson(inactiveServer, "POST", "/api/runs/start", body);
+  assert.equal(inactiveResponse.status, 409);
+  assert.equal(inactiveResponse.body.area, "roadmap");
+  assert.equal(inactiveResponse.body.error, "ROADMAP_INACTIVE");
+  assert.equal(inactiveResponse.body.runtime, undefined);
+  assert.deepEqual(inactiveResponse.body.actions.map((action: { type: string }) => action.type), ["open_bridge_app", "open_roadmaps", "activate_roadmap"]);
+  assert.match(inactiveResponse.body.actions.find((action: { type: string; href?: string }) => action.type === "activate_roadmap")?.href ?? "", /^hunsu:\/\/activate-roadmap\?roadmapId=/);
+
+  const unhealthyServer = createStudioServer({ cwd: repoUnhealthyPlainGit, state, persist: true, roadmapRegistryPath: registryPath });
+  const unhealthyResponse = await requestStudioServerJson(unhealthyServer, "POST", "/api/runs/start", body);
+  assert.equal(unhealthyResponse.status, 409);
+  assert.equal(unhealthyResponse.body.area, "roadmap");
+  assert.equal(unhealthyResponse.body.error, "ROADMAP_UNHEALTHY");
+  assert.equal(unhealthyResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://roadmaps"), true);
+
+  const missingServer = createStudioServer({ cwd: repoMissing, state, persist: true, roadmapRegistryPath: registryPath });
+  const missingResponse = await requestStudioServerJson(missingServer, "POST", "/api/runs/start", body);
+  assert.equal(missingResponse.status, 409);
+  assert.equal(missingResponse.body.area, "roadmap");
+  assert.equal(missingResponse.body.error, "ROADMAP_MISSING");
+  assert.equal(missingResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://roadmaps"), true);
+});
+
 test("Bridge Codex runtime status detects missing and custom Codex CLI without reading credentials", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-runtime-test-"));
   const fakeCodex = join(root, "codex");
+  const countFile = join(root, "app-server-count.txt");
   writeFileSync(fakeCodex, [
     "#!/usr/bin/env node",
     "const readline = require('node:readline');",
+    "const fs = require('node:fs');",
     "const args = process.argv.slice(2);",
     "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
     "if (args[0] !== 'app-server') process.exit(2);",
+    `fs.appendFileSync(${JSON.stringify(countFile)}, 'app-server\\n');`,
     "const rl = readline.createInterface({ input: process.stdin });",
     "rl.on('line', line => {",
     "  const msg = JSON.parse(line);",
@@ -224,6 +281,27 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
     const missing = await getCodexRuntimeStatus({ env: { PATH: join(root, "missing") }, force: true });
     assert.equal(missing.cli.installed, false);
     assert.equal(codexRuntimePreflightError(missing)?.error, "CODEX_CLI_MISSING");
+
+    const missingEnvCommand = await getCodexRuntimeStatus({ env: { PATH: join(root, "missing"), HUNSU_CODEX_APP_SERVER_COMMAND: "codex" }, force: true });
+    assert.equal(missingEnvCommand.cli.installed, false);
+    assert.equal(codexRuntimePreflightError(missingEnvCommand)?.error, "CODEX_CLI_MISSING");
+
+    const unsupportedEnvCommand = await getCodexRuntimeStatus({ env: { PATH: root, HUNSU_CODEX_APP_SERVER_COMMAND: "codex app-server" }, force: true });
+    assert.equal(unsupportedEnvCommand.cli.installed, false);
+    assert.match(unsupportedEnvCommand.cli.error ?? "", /without arguments/);
+
+    const absoluteMissing = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: join(root, "does-not-exist") }, force: true });
+    assert.equal(absoluteMissing.cli.installed, false);
+    assert.equal(codexRuntimePreflightError(absoluteMissing)?.error, "CODEX_CLI_MISSING");
+
+    const pathReady = await getCodexRuntimeStatus({ env: { PATH: root }, force: true });
+    assert.equal(pathReady.cli.installed, true);
+    assert.equal(pathReady.cli.source, "path");
+
+    rmSync(countFile, { force: true });
+    const counted = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: fakeCodex }, force: true });
+    assert.equal(counted.ready, true);
+    assert.equal(readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 1);
 
     const ready = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: fakeCodex }, force: true });
     assert.equal(ready.cli.installed, true);
@@ -274,6 +352,97 @@ test("Bridge Codex device auth output parser extracts verification URL and user 
   });
 });
 
+test("Bridge Codex app-server probe handles immediate responses and invalid JSON safely", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-probe-race-test-"));
+  const immediateCodex = join(root, "codex");
+  const invalidJsonCodex = join(root, "codex-invalid-json");
+  writeFileSync(immediateCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 9.9.9'); process.exit(0); }",
+    "if (args[0] !== 'app-server') process.exit(2);",
+    "const rl = readline.createInterface({ input: process.stdin });",
+    "rl.on('line', line => {",
+    "  const msg = JSON.parse(line);",
+    "  if (msg.method === 'initialize') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }) + '\\n');",
+    "  else if (msg.method === 'account/read') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt' } }) + '\\n');",
+    "  else if (msg.method === 'account/rateLimits/read') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available' } }) + '\\n');",
+    "});",
+    ""
+  ].join("\n"), "utf8");
+  writeFileSync(invalidJsonCodex, [
+    `#!${process.execPath}`,
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 9.9.9'); process.exit(0); }",
+    "if (args[0] !== 'app-server') process.exit(2);",
+    "process.stdout.write('{not-json}\\n');",
+    "setTimeout(() => {}, 1000);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(immediateCodex, 0o755);
+  chmodSync(invalidJsonCodex, 0o755);
+  try {
+    const ready = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: immediateCodex }, force: true, timeoutMs: 500 });
+    assert.equal(ready.ready, true);
+
+    const invalid = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: invalidJsonCodex }, force: true, timeoutMs: 500 });
+    assert.equal(invalid.appServer.available, false);
+    assert.match(invalid.appServer.error ?? "", /Invalid Codex app-server JSON-RPC line/);
+    assert.equal(codexRuntimePreflightError(invalid)?.error, "CODEX_APP_SERVER_UNAVAILABLE");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge Codex runtime preflight maps auth failures without leaking provider payload secrets", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-auth-preflight-test-"));
+  const authFailureCodex = join(root, "codex");
+  writeFileSync(authFailureCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] !== 'app-server') process.exit(2);",
+    "const rl = readline.createInterface({ input: process.stdin });",
+    "rl.on('line', line => {",
+    "  const msg = JSON.parse(line);",
+    "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { message: 'not authenticated: Bearer secret-token-value' } }));",
+    "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available' } }));",
+    "});",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(authFailureCodex, 0o755);
+  try {
+    const status = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: authFailureCodex }, force: true });
+    assert.equal(status.auth.state, "not_authenticated");
+    const preflight = codexRuntimePreflightError(status);
+    assert.equal(preflight?.area, "codex");
+    assert.equal(preflight?.error, "CODEX_LOGIN_REQUIRED");
+    assert.match(status.auth.error ?? "", /Bearer \[redacted\]/);
+
+    const diagnostics = sanitizeDiagnostics({
+      OPENAI_API_KEY: "sk-secretsecretsecret",
+      nested: {
+        CODEX_ACCESS_TOKEN: "codex-token",
+        authorization: "Bearer token-secret",
+        text: "read ~/.codex/auth.json with apiKey=abc refreshToken=def accessToken=ghi Authorization=Bearer nope"
+      }
+    });
+    assert.deepEqual(diagnostics, {
+      OPENAI_API_KEY: "[redacted]",
+      nested: {
+        CODEX_ACCESS_TOKEN: "[redacted]",
+        authorization: "[redacted]",
+        text: "read [redacted] with apiKey=[redacted] refreshToken=[redacted] accessToken=[redacted] Authorization=[redacted]"
+      }
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Bridge runtime Codex device login endpoint returns device-code details", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-device-login-test-"));
   const fakeCodex = join(root, "codex");
@@ -303,6 +472,132 @@ test("Bridge runtime Codex device login endpoint returns device-code details", a
     assert.equal(response.body.verificationUriComplete, "https://auth.openai.com/activate?user_code=HUNSU-1234");
     assert.equal(response.body.userCode, "HUNSU-1234");
     assert.deepEqual(response.body.args, ["login", "--device-auth"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge runtime Codex device login endpoint preserves code details when later exit fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-device-login-code-then-fail-test-"));
+  const fakeCodex = join(root, "codex");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login' && args[1] === '--device-auth') {",
+    "  console.log('Open https://auth.openai.com/activate?user_code=HUNSU-FAIL');",
+    "  console.log('Code: HUNSU-FAIL');",
+    "  console.error('device auth failed after code');",
+    "  process.exit(7);",
+    "}",
+    "if (args[0] === 'app-server') return;",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: fakeCodex
+    }, { cwd: root }));
+    const state = createStudioState();
+    const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
+    const response = await requestStudioServerJson(server, "POST", "/api/runtimes/codex/login/device");
+
+    assert.equal(response.status, 202);
+    assert.equal(response.body.state, "failed");
+    assert.equal(response.body.verificationUriComplete, "https://auth.openai.com/activate?user_code=HUNSU-FAIL");
+    assert.equal(response.body.userCode, "HUNSU-FAIL");
+    assert.match(response.body.error, /status 7/);
+    assert.match(response.body.lastOutput, /device auth failed after code/);
+    assert.equal(state.codexLogin?.status, "failed");
+    assert.equal(state.codexLogin?.userCode, "HUNSU-FAIL");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge runtime Codex device login tracker captures later output and failures", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-device-login-tracker-test-"));
+  const fakeCodex = join(root, "codex");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login' && args[1] === '--device-auth') {",
+    "  setTimeout(() => {",
+    "    console.log('Open https://auth.openai.com/activate?user_code=HUNSU-LATE');",
+    "    console.log('Code: HUNSU-LATE');",
+    "    setTimeout(() => process.exit(0), 50);",
+    "  }, 3300);",
+    "  return;",
+    "}",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32001, message: 'Not authenticated' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Unavailable' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: fakeCodex
+    }, { cwd: root }));
+    const state = createStudioState();
+    const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
+    const started = await requestStudioServerJson(server, "POST", "/api/runtimes/codex/login/device");
+    assert.equal(started.status, 202);
+    assert.equal(started.body.state, "pending");
+
+    await delay(700);
+    const prerequisites = await requestStudioServerJson(server, "GET", "/api/prerequisites");
+    assert.equal(prerequisites.body.codexLogin.status, "device_code");
+    assert.equal(prerequisites.body.codexLogin.userCode, "HUNSU-LATE");
+    assert.equal(prerequisites.body.runtimes.codex.codexLogin.userCode, "HUNSU-LATE");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge runtime Codex device login endpoint leaves actionable failure state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-device-login-failure-test-"));
+  const fakeCodex = join(root, "codex");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login' && args[1] === '--device-auth') {",
+    "  console.error('device auth failed: browser unavailable');",
+    "  process.exit(7);",
+    "}",
+    "if (args[0] === 'app-server') return;",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: fakeCodex
+    }, { cwd: root }));
+    const state = createStudioState();
+    const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
+    const response = await requestStudioServerJson(server, "POST", "/api/runtimes/codex/login/device");
+
+    assert.equal(response.status, 202);
+    assert.equal(response.body.state, "failed");
+    assert.match(response.body.error, /status 7/);
+    assert.match(response.body.lastOutput, /browser unavailable/);
+    assert.equal(state.codexLogin?.status, "failed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1691,7 +1986,9 @@ test("Bridge version compatibility reports update and feature requirements", () 
 test("Bridge server default Codex runner uses resolved app-server config", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-config-"));
   const scriptPath = join(root, "fake-codex-app-server.mjs");
+  const evidencePath = join(root, "fake-codex-evidence.json");
   writeFileSync(scriptPath, `import { createInterface } from "node:readline";
+import { writeFileSync } from "node:fs";
 
 let requestCount = 0;
 const rl = createInterface({ input: process.stdin });
@@ -1704,6 +2001,9 @@ rl.on("line", line => {
   const result = message.method === "initialize"
     ? { argv: process.argv.slice(2), env: process.env.HUNSU_FAKE_CODEX_ENV ?? null }
     : { ok: true };
+  if (message.method === "initialize") {
+    writeFileSync(${JSON.stringify(evidencePath)}, JSON.stringify(result));
+  }
   process.stdout.write(JSON.stringify({ id: message.id, result }) + "\\n");
   if (requestCount >= 3) {
     setTimeout(() => process.exit(0), 10);
@@ -1723,8 +2023,10 @@ rl.on("line", line => {
 
   assert.equal(response.status, 200);
   assert.equal(response.body.available, true);
-  assert.deepEqual(response.body.initialized.argv, ["configured-arg"]);
-  assert.equal(response.body.initialized.env, "configured-env");
+  assert.equal(response.body.initialized, true);
+  const evidence = JSON.parse(readFileSync(evidencePath, "utf8")) as { argv?: string[]; env?: string };
+  assert.deepEqual(evidence.argv, ["configured-arg"]);
+  assert.equal(evidence.env, "configured-env");
 });
 
 test("Bridge server uses resolved runtime config for Roadmap registry path", async () => {

@@ -80,11 +80,24 @@ type BridgeAppState = {
   account?: BridgeAccountState;
   pendingAuth?: BridgePendingAuthState;
   codex?: BridgeCodexSettings;
+  codexLogin?: CodexLoginProcessState;
   device: BridgeDeviceState;
   remoteAccess: "off" | "on" | "registered-offline" | "unavailable";
   projectGrants: ProjectGrant[];
   uiIntent?: BridgeUiIntent;
   service: BridgeServiceState;
+};
+
+type CodexLoginProcessState = {
+  kind: "chatgpt" | "device";
+  pid?: number;
+  startedAt: string;
+  status: "starting" | "device_code" | "pending" | "completed" | "failed";
+  verificationUri?: string;
+  verificationUriComplete?: string;
+  userCode?: string;
+  lastOutput?: string;
+  error?: string;
 };
 
 type BridgeUiIntent = {
@@ -154,6 +167,11 @@ type BridgeProcessStartMetadata = {
   value: string;
 };
 
+type CodexDeviceLoginOutcome =
+  | { kind: "exit"; code: number | null; signal: NodeJS.Signals | null }
+  | { kind: "error"; error: Error }
+  | { kind: "timeout" };
+
 type BridgeAppSnapshot = {
   schema: "hunsu.bridge-app-snapshot.v1";
   status: {
@@ -187,6 +205,7 @@ type BridgeAppSnapshot = {
       HUNSU_CODEX_APP_SERVER_ARGS?: string;
     };
   };
+  codexLogin?: CodexLoginProcessState;
   diagnostics: unknown;
   logLines: string[];
   uiIntent?: BridgeUiIntent;
@@ -217,6 +236,9 @@ const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "ar
 const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
 const BRIDGE_STARTING_GRACE_MS = 15_000;
 const BRIDGE_PROCESS_NONCE_ENV = "HUNSU_BRIDGE_PROCESS_NONCE";
+const CODEX_DEVICE_LOGIN_STARTUP_GRACE_MS = 3_000;
+const CODEX_DEVICE_LOGIN_JSON_TIMEOUT_MS = 10_000;
+const CODEX_DEVICE_LOGIN_BACKGROUND_LIFECYCLE_TIMEOUT_MS = 15 * 60_000;
 
 async function main(argv = process.argv.slice(2)): Promise<number> {
   const parsed = parseArgs(normalizeBridgeAppArgv(argv));
@@ -575,10 +597,31 @@ async function statusCommand(): Promise<void> {
   console.log(`  Device: ${snapshot.status.device.name}${snapshot.status.device.registered ? " (registered)" : ""}`);
   console.log(`  Service: ${snapshot.status.service.installed ? `Installed (${snapshot.status.service.manager})` : "Not installed"}`);
   console.log("");
-  console.log("Projects:");
-  for (const project of snapshot.recentProjects.slice(0, 8)) {
-    console.log(`  ${project.displayName} (${project.health === "ok" ? "Roadmap" : "Missing"})`);
-    console.log(`    ${project.repositoryPath}`);
+  console.log("Prerequisites:");
+  console.log(`  Codex: ${codexStatusLabel(snapshot.prerequisites.codex)}`);
+  console.log(`  Git: ${snapshot.prerequisites.tools.git.installed ? "Ready" : "Missing"}`);
+  console.log(`  Node: ${snapshot.prerequisites.tools.node.installed ? "Ready" : "Missing"}`);
+  console.log("");
+  const activeRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle === "active");
+  const inactiveRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle !== "active");
+  console.log("Active Roadmaps:");
+  for (const roadmap of activeRoadmaps) {
+    console.log(`  ${roadmap.displayName}`);
+    console.log(`    ${roadmap.repositoryPath}`);
+    console.log(`    Codex: ${roadmap.codex.readyForExecute ? "Ready" : "Not Ready"}`);
+    console.log(`    Remote Access: ${roadmap.remoteAccess.enabled ? "On" : "Off"}`);
+  }
+  if (activeRoadmaps.length === 0) {
+    console.log("  None");
+  }
+  console.log("");
+  console.log("Inactive Roadmaps:");
+  for (const roadmap of inactiveRoadmaps) {
+    console.log(`  ${roadmap.displayName}`);
+    console.log(`    ${roadmap.repositoryPath}`);
+  }
+  if (inactiveRoadmaps.length === 0) {
+    console.log("  None");
   }
   console.log("");
   console.log("Actions:");
@@ -586,6 +629,14 @@ async function statusCommand(): Promise<void> {
   console.log("  Start Bridge");
   console.log("  Stop Bridge");
   console.log("  Copy Diagnostics");
+}
+
+function codexStatusLabel(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus>>): string {
+  if (codex.ready) return "Ready";
+  if (!codex.cli.installed) return "Missing";
+  if (codex.auth.state === "not_authenticated" || codex.auth.state === "expired" || codex.auth.state === "invalid") return "Login required";
+  if (codex.usage.rateLimited) return "Rate limited";
+  return "Not Ready";
 }
 
 async function stopCommand(): Promise<void> {
@@ -669,6 +720,7 @@ async function codexCommand(parsed: ParsedArgs): Promise<void> {
   const action = parsed.rest[0] ?? "status";
   if (action === "status" || action === "recheck") {
     const codex = await getCodexRuntimeStatus({ env: codexProbeEnv(), force: true });
+    reconcileCodexLoginFromStatus(codex);
     if (hasFlag(parsed, "json")) {
       console.log(JSON.stringify(codex, null, 2));
       return;
@@ -684,7 +736,7 @@ async function codexCommand(parsed: ParsedArgs): Promise<void> {
   }
   if (action === "login") {
     if (hasFlag(parsed, "device")) {
-      await runCodexDeviceLoginCli(hasFlag(parsed, "json"));
+      await runCodexDeviceLoginCli({ json: hasFlag(parsed, "json"), background: hasFlag(parsed, "background") });
       return;
     }
     runCodexCli(["login"]);
@@ -736,7 +788,7 @@ async function codexCommand(parsed: ParsedArgs): Promise<void> {
       return;
     }
   }
-  throw new Error("Usage: hunsu-bridge codex status|install|login [--device]|recheck|logout|path set <path>|path reset|settings set [--install-channel stable|latest|manual] [--auth-preference chatgpt|api_key|device_code]");
+  throw new Error("Usage: hunsu-bridge codex status|install|login [--device] [--background]|recheck|logout|path set <path>|path reset|settings set [--install-channel stable|latest|manual] [--auth-preference chatgpt|api_key|device_code]");
 }
 
 async function roadmapsCommand(parsed: ParsedArgs): Promise<void> {
@@ -1611,6 +1663,7 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
   const account = state.account?.status === "signed-in" ? `Signed in as ${state.account.email ?? state.account.userId}` : "Signed out";
   const localBridge = localBridgeStatusFromState(state, health);
   const codex = await getCodexRuntimeStatus({ env: codexProbeEnv() });
+  state = reconcileCodexLoginFromStatus(codex);
   return {
     schema: "hunsu.bridge-app-snapshot.v1",
     status: {
@@ -1638,6 +1691,7 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
       }
     },
     codexSettings: snapshotCodexSettings(state),
+    codexLogin: state.codexLogin,
     diagnostics: await buildDiagnostics(),
     logLines: readLogTail(appLogPath(), 80),
     uiIntent: state.uiIntent
@@ -1718,56 +1772,119 @@ async function safeCodexDiagnostics(): Promise<unknown> {
   };
 }
 
-async function runCodexDeviceLoginCli(json: boolean): Promise<void> {
+async function runCodexDeviceLoginCli(options: { json: boolean; background: boolean }): Promise<void> {
   const args = ["login", "--device-auth"];
   const codex = await getCodexRuntimeStatus({ env: codexProbeEnv(), force: true });
   const binaryPath = codex.cli.binaryPath;
   if (!binaryPath || !codex.cli.installed) {
     throw new Error(codex.cli.error ?? "Codex CLI was not found.");
   }
+  if (!options.json && !options.background) {
+    const startedAt = new Date().toISOString();
+    writeCodexLoginState({ kind: "device", startedAt, status: "starting" });
+    const child = spawnSync(binaryPath, args, {
+      stdio: "inherit",
+      env: codexProbeEnv(),
+      windowsHide: false
+    });
+    if (child.status === 0) {
+      writeCodexLoginState({ kind: "device", startedAt, status: "completed" });
+      return;
+    }
+    writeCodexLoginState({
+      kind: "device",
+      startedAt,
+      status: "failed",
+      error: child.error?.message ?? `Codex device login exited with status ${child.status ?? child.signal ?? "unknown"}.`
+    });
+    if (child.status && child.status !== 0) {
+      process.exitCode = child.status;
+      return;
+    }
+    if (child.error) throw child.error;
+    return;
+  }
+
   const child = spawn(binaryPath, args, {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
     env: codexProbeEnv(),
     windowsHide: false
   });
+  const startedAt = new Date().toISOString();
+  writeCodexLoginState({ kind: "device", pid: child.pid, startedAt, status: "starting" });
   let output = "";
+  let finalized = false;
   const append = (chunk: Buffer | string) => {
+    if (finalized) {
+      return;
+    }
     output = `${output}${chunk.toString()}`.slice(-64 * 1024);
+    const details = parseCodexDeviceAuthOutput(output);
+    writeCodexLoginState({
+      kind: "device",
+      pid: child.pid,
+      startedAt,
+      status: details.verificationUri || details.userCode ? "device_code" : "pending",
+      ...details,
+      lastOutput: output.trim().slice(-4096)
+    });
+  };
+  const startupTimer = setTimeout(() => {
+    const state = readAppState().codexLogin;
+    if (state?.startedAt === startedAt && state.status === "starting") {
+      writeCodexLoginState({ ...state, status: "pending" });
+    }
+  }, CODEX_DEVICE_LOGIN_STARTUP_GRACE_MS);
+  const finalize = (outcome: CodexDeviceLoginOutcome) => {
+    finalized = true;
+    clearTimeout(startupTimer);
+    const details = parseCodexDeviceAuthOutput(output);
+    const failed = outcome.kind === "error" || outcome.kind === "timeout" || outcome.code !== 0;
+    writeCodexLoginState({
+      kind: "device",
+      pid: child.pid,
+      startedAt,
+      status: failed ? "failed" : details.verificationUri || details.userCode ? "device_code" : "completed",
+      ...details,
+      lastOutput: output.trim().slice(-4096),
+      error: codexDeviceLoginError(outcome, output)
+    });
   };
   child.stdout?.on("data", append);
   child.stderr?.on("data", append);
-  const outcome = await Promise.race([
-    new Promise<{ kind: "exit"; code: number | null; signal: NodeJS.Signals | null }>(resolve => {
-      child.once("close", (code, signal) => resolve({ kind: "exit", code, signal }));
-    }),
-    new Promise<{ kind: "error"; error: Error }>(resolve => {
-      child.once("error", error => resolve({ kind: "error", error }));
-    }),
-    delayMs(3_000).then(() => ({ kind: "timeout" as const }))
-  ]);
-  const details = parseCodexDeviceAuthOutput(output);
+  const outcome = await waitForCodexDeviceLoginOutcome(
+    child,
+    options.background ? CODEX_DEVICE_LOGIN_BACKGROUND_LIFECYCLE_TIMEOUT_MS : CODEX_DEVICE_LOGIN_JSON_TIMEOUT_MS
+  );
   if (outcome.kind === "timeout") {
-    child.stdout?.destroy();
-    child.stderr?.destroy();
-    child.unref();
+    child.kill();
   }
-  const failed = outcome.kind === "error" || (outcome.kind === "exit" && outcome.code !== 0);
+  finalize(outcome);
+  const processState = readAppState().codexLogin ?? { kind: "device", pid: child.pid, startedAt, status: "pending" };
   const result = {
     started: outcome.kind !== "error",
     command: binaryPath,
     args,
-    state: details.verificationUri || details.userCode ? "device_code" : failed ? "failed" : "pending",
-    ...details,
-    message: details.verificationUri || details.userCode
-      ? "Codex device login started. Complete authorization in your browser."
+    state: processState.status,
+    verificationUri: processState.verificationUri,
+    verificationUriComplete: processState.verificationUriComplete,
+    userCode: processState.userCode,
+    lastOutput: processState.lastOutput,
+    error: processState.error,
+    message: processState.status === "failed"
+      ? processState.error ?? "Codex device login failed."
       : outcome.kind === "error"
         ? outcome.error.message
-        : failed
+        : outcome.kind === "exit" && outcome.code !== 0
           ? `Codex device login exited with status ${outcome.code ?? outcome.signal ?? "unknown"}.`
-          : "Codex device login started, but no device code has been emitted yet."
+          : processState.verificationUri || processState.userCode
+            ? "Codex device login started. Complete authorization in your browser."
+          : processState.status === "completed"
+            ? "Codex device login completed."
+            : "Codex device login started, but no device code has been emitted yet."
   };
-  if (json) {
+  if (options.json) {
     console.log(JSON.stringify(result, null, 2));
     return;
   }
@@ -1778,6 +1895,73 @@ async function runCodexDeviceLoginCli(json: boolean): Promise<void> {
   if (result.userCode) {
     console.log(`Code: ${result.userCode}`);
   }
+}
+
+function waitForCodexDeviceLoginOutcome(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<CodexDeviceLoginOutcome> {
+  return new Promise(resolve => {
+    let settled = false;
+    let timer: NodeJS.Timeout;
+    const finish = (outcome: CodexDeviceLoginOutcome) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      child.off("close", onClose);
+      child.off("error", onError);
+      resolve(outcome);
+    };
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => finish({ kind: "exit", code, signal });
+    const onError = (error: Error) => finish({ kind: "error", error });
+    timer = setTimeout(() => finish({ kind: "timeout" }), timeoutMs);
+    child.once("close", onClose);
+    child.once("error", onError);
+  });
+}
+
+function codexDeviceLoginError(outcome: CodexDeviceLoginOutcome, output: string): string | undefined {
+  const lastOutput = lastNonEmptyLine(output);
+  if (outcome.kind === "error") {
+    return lastOutput ? `${outcome.error.message}: ${lastOutput}` : outcome.error.message;
+  }
+  if (outcome.kind === "timeout") {
+    return lastOutput
+      ? `Codex device login timed out while waiting for Codex to finish: ${lastOutput}`
+      : "Codex device login timed out while waiting for Codex to finish.";
+  }
+  if (outcome.code === 0) {
+    return undefined;
+  }
+  const status = outcome.code ?? outcome.signal ?? "unknown";
+  return lastOutput
+    ? `Codex device login exited with status ${status}: ${lastOutput}`
+    : `Codex device login exited with status ${status}.`;
+}
+
+function lastNonEmptyLine(output: string): string | undefined {
+  return output
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .at(-1);
+}
+
+function writeCodexLoginState(codexLogin: CodexLoginProcessState): void {
+  const state = readAppState();
+  writeAppState({ ...state, codexLogin });
+}
+
+function reconcileCodexLoginFromStatus(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus>>): BridgeAppState {
+  const state = readAppState();
+  if (!state.codexLogin) {
+    return state;
+  }
+  if (codex.auth.state === "authenticated") {
+    const next = { ...state, codexLogin: undefined };
+    writeAppState(next);
+    return next;
+  }
+  return state;
 }
 
 function runCodexCli(args: string[]): void {
@@ -2638,12 +2822,20 @@ export function normalizeBridgeAppArgv(argv: string[]): string[] {
       }
       break;
     case "open-roadmap":
-      nextArgs.push("open-roadmap");
-      if (url.searchParams.has("roadmapId")) nextArgs.push("--roadmap-id", url.searchParams.get("roadmapId") ?? "");
+      if (!url.searchParams.get("roadmapId")) {
+        nextArgs.push("protocol-error", "hunsu://open-roadmap requires roadmapId.");
+        break;
+      }
+      nextArgs.push("open-roadmap", url.searchParams.get("roadmapId") ?? "");
       break;
     case "add-roadmap":
       if (url.searchParams.has("path")) {
-        nextArgs.push("roadmaps", "add", url.searchParams.get("path") ?? "");
+        const path = url.searchParams.get("path") ?? "";
+        if (!path) {
+          nextArgs.push("protocol-error", "hunsu://add-roadmap path is empty.");
+          break;
+        }
+        nextArgs.push("roadmaps", "add", path);
       } else {
         nextArgs.push("ui-intent", "roadmaps", "add-roadmap");
       }
@@ -2652,12 +2844,19 @@ export function normalizeBridgeAppArgv(argv: string[]): string[] {
       nextArgs.push("ui-intent", "roadmaps");
       break;
     case "prerequisites":
+      if (pathFromUrl && pathFromUrl !== "codex") {
+        nextArgs.push("protocol-error", "Unsupported hunsu://prerequisites path.");
+        break;
+      }
       nextArgs.push("ui-intent", "prerequisites");
       if (pathFromUrl === "codex") nextArgs.push("codex");
       break;
     case "activate-roadmap":
-      nextArgs.push("activate-roadmap");
-      if (url.searchParams.has("roadmapId")) nextArgs.push(url.searchParams.get("roadmapId") ?? "");
+      if (!url.searchParams.get("roadmapId")) {
+        nextArgs.push("protocol-error", "hunsu://activate-roadmap requires roadmapId.");
+        break;
+      }
+      nextArgs.push("activate-roadmap", url.searchParams.get("roadmapId") ?? "");
       break;
     case "remote-disable":
       nextArgs.push("remote", "disable");

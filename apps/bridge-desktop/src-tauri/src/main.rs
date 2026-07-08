@@ -118,14 +118,31 @@ fn validate_external_url(value: &str) -> Result<(), String> {
     if value.len() > 4096 || value.contains('\0') {
         return Err("External URL is invalid.".to_string());
     }
-    let allowed = value.starts_with("https://")
-        || value.starts_with("http://")
-        || value.starts_with("hunsu://");
-    if allowed {
+    if value.starts_with("hunsu://")
+        || value.starts_with("https://hunsu.app/")
+        || value.starts_with("https://chatgpt.com/codex")
+        || is_allowed_loopback_url(value)
+    {
         Ok(())
     } else {
-        Err("External URL scheme is not allowed.".to_string())
+        Err("External URL is not allowlisted.".to_string())
     }
+}
+
+fn is_allowed_loopback_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host_port, _path)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return false;
+    };
+    if !matches!(host, "127.0.0.1" | "localhost") {
+        return false;
+    }
+    !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
@@ -202,12 +219,15 @@ fn validate_codex_args(args: &[String]) -> bool {
     match args {
         [command, subcommand] if command == "codex" && matches!(subcommand.as_str(), "status" | "install" | "recheck" | "logout") => true,
         [command, subcommand] if command == "codex" && subcommand == "login" => true,
-        [command, subcommand, flag] if command == "codex" && subcommand == "login" && flag == "--device" => true,
+        [command, subcommand, flag] if command == "codex" && subcommand == "login" && matches!(flag.as_str(), "--device" | "--background") => true,
         [command, subcommand, first_flag, second_flag]
             if command == "codex"
                 && subcommand == "login"
-                && ((first_flag == "--device" && second_flag == "--json")
-                    || (first_flag == "--json" && second_flag == "--device")) => true,
+                && valid_codex_login_flags(&[first_flag.as_str(), second_flag.as_str()]) => true,
+        [command, subcommand, first_flag, second_flag, third_flag]
+            if command == "codex"
+                && subcommand == "login"
+                && valid_codex_login_flags(&[first_flag.as_str(), second_flag.as_str(), third_flag.as_str()]) => true,
         [command, subcommand, action] if command == "codex" && subcommand == "path" && action == "reset" => true,
         [command, subcommand, action, path] if command == "codex" && subcommand == "path" && action == "set" => {
             validate_path_arg(path).is_ok()
@@ -217,6 +237,21 @@ fn validate_codex_args(args: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+fn valid_codex_login_flags(flags: &[&str]) -> bool {
+    let mut saw_device = false;
+    let mut saw_json = false;
+    let mut saw_background = false;
+    for flag in flags {
+        match *flag {
+            "--device" if !saw_device => saw_device = true,
+            "--json" if !saw_json => saw_json = true,
+            "--background" if !saw_background => saw_background = true,
+            _ => return false,
+        }
+    }
+    saw_device || saw_background
 }
 
 fn validate_codex_settings_set_args(args: &[String]) -> bool {
@@ -443,18 +478,20 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
         }
         "roadmaps" => vec!["ui-intent".to_string(), "roadmaps".to_string()],
         "prerequisites" => {
+            let decoded_path = path_part.map(percent_decode);
+            if !matches!(decoded_path.as_deref(), None | Some("codex")) {
+                return Err("Unsupported hunsu://prerequisites path.".to_string());
+            }
             let mut args = vec!["ui-intent".to_string(), "prerequisites".to_string()];
-            if path_part.map(percent_decode).as_deref() == Some("codex") {
+            if decoded_path.as_deref() == Some("codex") {
                 args.push("codex".to_string());
             }
             args
         }
         "activate-roadmap" => {
-            let mut args = vec!["activate-roadmap".to_string()];
-            if let Some(roadmap_id) = query_value(&query, "roadmapId") {
-                args.push(roadmap_id);
-            }
-            args
+            let roadmap_id = query_value(&query, "roadmapId")
+                .ok_or_else(|| "hunsu://activate-roadmap requires roadmapId.".to_string())?;
+            vec!["activate-roadmap".to_string(), roadmap_id]
         }
         "sign-in" => vec!["login".to_string(), "--gui".to_string()],
         "sign-out" => vec!["logout".to_string()],
@@ -532,4 +569,77 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hunsu Bridge");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_url_allowlist_rejects_arbitrary_web_origins() {
+        assert!(validate_external_url("hunsu://roadmaps").is_ok());
+        assert!(validate_external_url("https://hunsu.app/download/bridge").is_ok());
+        assert!(validate_external_url("https://chatgpt.com/codex/login").is_ok());
+        assert!(validate_external_url("http://127.0.0.1:5173/studio").is_ok());
+        assert!(validate_external_url("http://localhost:5173/studio").is_ok());
+        assert!(validate_external_url("https://evil.example/studio").is_err());
+        assert!(validate_external_url("http://example.test:5173/studio").is_err());
+    }
+
+    #[test]
+    fn protocol_urls_and_sidecar_commands_are_allowlisted() {
+        assert_eq!(bridge_args_for_protocol_url("hunsu://open").unwrap(), vec!["status"]);
+        assert_eq!(bridge_args_for_protocol_url("hunsu://pair").unwrap(), vec!["pair"]);
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://pair?next=/studio/roadmaps/roadmap_123").unwrap(),
+            vec!["pair", "--next", "/studio/roadmaps/roadmap_123"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://pair?code=abc123&state=state123").unwrap(),
+            vec!["auth-callback", "--code", "abc123", "--state", "state123"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://add-roadmap").unwrap(),
+            vec!["ui-intent", "roadmaps", "add-roadmap"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://add-roadmap?path=/tmp/example").unwrap(),
+            vec!["roadmaps", "add", "/tmp/example"]
+        );
+        assert_eq!(bridge_args_for_protocol_url("hunsu://roadmaps").unwrap(), vec!["ui-intent", "roadmaps"]);
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://prerequisites").unwrap(),
+            vec!["ui-intent", "prerequisites"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://prerequisites/codex").unwrap(),
+            vec!["ui-intent", "prerequisites", "codex"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=roadmap_123").unwrap(),
+            vec!["activate-roadmap", "roadmap_123"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://open-roadmap?roadmapId=roadmap_123").unwrap(),
+            vec!["open-roadmap", "roadmap_123"]
+        );
+        assert_eq!(bridge_args_for_protocol_url("hunsu://sign-in").unwrap(), vec!["login", "--gui"]);
+        assert_eq!(bridge_args_for_protocol_url("hunsu://sign-out").unwrap(), vec!["logout"]);
+        assert_eq!(bridge_args_for_protocol_url("hunsu://remote-disable").unwrap(), vec!["remote", "disable"]);
+        assert!(bridge_args_for_protocol_url("hunsu://delete-everything").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://prerequisites/other").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://open-roadmap").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://activate-roadmap").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=bad/id").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://open-project?path=%00tmp").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://add-roadmap?path=").is_err());
+    }
+
+    #[test]
+    fn codex_sidecar_commands_cannot_pass_arbitrary_arguments() {
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into()]).is_ok());
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--background".into()]).is_ok());
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--danger".into()]).is_err());
+        assert!(validate_bridge_command_args(&["codex".into(), "exec".into(), "rm -rf /".into()]).is_err());
+    }
 }

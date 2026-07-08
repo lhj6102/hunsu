@@ -98,6 +98,7 @@ function renderSnapshot(snapshot) {
     diagnostics: snapshot.diagnostics,
     logs: snapshot.logLines
   }, null, 2);
+  latestCodexDeviceLoginResult = snapshot.codexLogin ?? latestCodexDeviceLoginResult;
   renderCodexCard(codex);
   renderToolCards(snapshot.prerequisites?.tools);
   activeRoadmapList.replaceChildren(...roadmapRows(activeRoadmaps, "active", snapshot.projectGrants ?? []));
@@ -328,10 +329,10 @@ async function startCodexDeviceLogin() {
   };
   renderCodexCard(latestSnapshot?.prerequisites?.codex);
   try {
-    const stdout = await run(["codex", "login", "--device", "--json"]);
-    latestCodexDeviceLoginResult = parseJsonResult(stdout) ?? {
+    await spawn(["codex", "login", "--device", "--background"]);
+    latestCodexDeviceLoginResult = {
       state: "pending",
-      message: stdout.trim() || "Codex device login started."
+      message: "Codex device login started."
     };
   } catch (error) {
     latestCodexDeviceLoginResult = {
@@ -340,7 +341,13 @@ async function startCodexDeviceLogin() {
     };
   }
   renderCodexCard(latestSnapshot?.prerequisites?.codex);
-  await refresh();
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await delay(750);
+    await refresh();
+    if (latestCodexDeviceLoginResult?.state === "device_code" || latestCodexDeviceLoginResult?.state === "failed") {
+      break;
+    }
+  }
 }
 
 function codexDeviceLoginStatus() {
@@ -350,14 +357,17 @@ function codexDeviceLoginStatus() {
   if (!result) {
     return container;
   }
+  const failed = result.state === "failed" || result.status === "failed";
   const lines = [
-    result.message,
+    failed ? result.message || "Codex device login failed. Start device login again or run Recheck after completing sign-in." : result.message,
+    failed && result.error ? `Error: ${result.error}` : undefined,
     result.verificationUriComplete || result.verificationUri ? `Verification URL: ${result.verificationUriComplete || result.verificationUri}` : undefined,
     result.userCode ? `Code: ${result.userCode}` : undefined,
-    result.state ? `Status: ${formatDeviceLoginState(result.state)}` : undefined
+    result.state ? `Status: ${formatDeviceLoginState(result.state)}` : undefined,
+    failed && result.lastOutput ? `Last output: ${result.lastOutput}` : undefined
   ].filter(Boolean);
   container.textContent = lines.join("\n");
-  if (result.state === "failed") {
+  if (failed) {
     container.className = "message status-error";
   }
   return container;
@@ -369,6 +379,10 @@ function parseJsonResult(value) {
   } catch (_error) {
     return undefined;
   }
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function formatDeviceLoginState(state) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,7 @@ import type { StudioConnectionStatus } from "../apps/web/src/shared/api/bridgeTy
 
 const TEST_ROOT = dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = resolve(TEST_ROOT, "../apps/web");
+const require = createRequire(import.meta.url);
 
 test("Connection Center card labels cover required Studio connection states", async () => {
   const { module, close } = await loadConnectionModule();
@@ -61,6 +63,47 @@ test("Connection Center card labels cover required Studio connection states", as
       compatibility: { compatible: false, reason: "bridge_app_update_needed", message: "Bridge App is too old." },
       warnings: ["version_mismatch"]
     })), "Remote Relay requires newer Bridge App");
+  } finally {
+    await close();
+  }
+});
+
+test("Roadmap workspace preflight actions map to Bridge App destinations", async () => {
+  const { module, close } = await loadPreflightActionsModule();
+  try {
+    assert.equal(module.bridgeActionHref({ type: "install_codex", label: "Install Codex" }), "hunsu://prerequisites/codex");
+    assert.equal(module.bridgeActionHref({ type: "codex_login_device", label: "Use Device Code" }), "hunsu://prerequisites/codex");
+    assert.equal(module.bridgeActionHref({ type: "open_roadmaps", label: "Open Roadmaps" }), "hunsu://roadmaps");
+    assert.equal(module.bridgeActionHref({ type: "activate_roadmap", label: "Activate Roadmap", roadmapId: "roadmap 123" }), "hunsu://activate-roadmap?roadmapId=roadmap%20123");
+    assert.equal(module.bridgeActionHref({ type: "open_bridge_app", label: "Open Bridge App" }), "hunsu://open");
+    assert.equal(module.bridgeActionHref({ type: "open_roadmaps", label: "Server href", href: "hunsu://roadmaps" }), "hunsu://roadmaps");
+  } finally {
+    await close();
+  }
+});
+
+test("Roadmap workspace renders multiple server-provided preflight actions", async () => {
+  const { module, close } = await loadRoadmapWorkspaceModule();
+  try {
+    const react = require("../apps/web/node_modules/react") as { createElement: (type: unknown, props: unknown) => unknown };
+    const reactDomServer = require("../apps/web/node_modules/react-dom/server.node.js") as { renderToString: (element: unknown) => string };
+    const html = reactDomServer.renderToString(react.createElement(module.RoadmapWorkspacePreflightActions, {
+      preflight: {
+        area: "roadmap",
+        error: "ROADMAP_INACTIVE",
+        message: "This Roadmap is inactive.",
+        roadmapId: "roadmap_123",
+        lifecycle: "inactive",
+        actions: [
+          { type: "open_roadmaps", label: "Open Roadmaps", href: "hunsu://roadmaps" },
+          { type: "activate_roadmap", label: "Activate Roadmap", href: "hunsu://activate-roadmap?roadmapId=roadmap_123" }
+        ]
+      },
+      open: () => undefined
+    }));
+
+    assert.match(html, /Open Roadmaps/);
+    assert.match(html, /Activate Roadmap/);
   } finally {
     await close();
   }
@@ -654,6 +697,79 @@ async function loadConnectionModule(): Promise<{
   let module: { connectionCardLabel: (connection: BridgeConnectionState) => string };
   try {
     module = await server.ssrLoadModule("/src/features/connection/ConnectionCenter.tsx") as typeof module;
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+  return {
+    module,
+    close: () => server.close()
+  };
+}
+
+async function loadPreflightActionsModule(): Promise<{
+  module: {
+    bridgeActionHref: (action: {
+      type: "install_codex" | "codex_login_chatgpt" | "codex_login_device" | "codex_recheck" | "open_bridge_app" | "open_prerequisites" | "open_roadmaps" | "activate_roadmap";
+      label: string;
+      href?: string;
+      roadmapId?: string;
+    }) => string;
+  };
+  close: () => Promise<void>;
+}> {
+  const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
+  const server = await vite.createServer({
+    root: WEB_ROOT,
+    logLevel: "silent",
+    server: { middlewareMode: true },
+    appType: "custom",
+    resolve: {
+      alias: {
+        "@": resolve(WEB_ROOT, "src")
+      }
+    }
+  });
+  let module: Awaited<ReturnType<typeof loadPreflightActionsModule>>["module"];
+  try {
+    module = await server.ssrLoadModule("/src/features/roadmap-workspace/preflightActions.ts") as typeof module;
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+  return {
+    module,
+    close: () => server.close()
+  };
+}
+
+async function loadRoadmapWorkspaceModule(): Promise<{
+  module: {
+    RoadmapWorkspacePreflightActions: (props: unknown) => unknown;
+  };
+  close: () => Promise<void>;
+}> {
+  const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
+  const server = await vite.createServer({
+    root: WEB_ROOT,
+    configFile: false,
+    logLevel: "silent",
+    server: { middlewareMode: true },
+    appType: "custom",
+    resolve: {
+      alias: {
+        "@": resolve(WEB_ROOT, "src")
+      }
+    },
+    define: {
+      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
+    }
+  });
+  let module: Awaited<ReturnType<typeof loadRoadmapWorkspaceModule>>["module"];
+  try {
+    module = await server.ssrLoadModule("/src/features/roadmap-workspace/RoadmapWorkspace.tsx") as typeof module;
   } catch (error) {
     await server.close();
     throw error;

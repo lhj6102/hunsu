@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 
@@ -81,6 +81,27 @@ export type CodexRuntimeStatusOptions = {
   force?: boolean;
   lastRunUsage?: CodexRuntimeStatus["usage"]["lastRunUsage"];
 };
+
+type CodexCommandResolution =
+  | {
+      kind: "binary";
+      installed: true;
+      binaryPath: string;
+      source: "custom" | "env" | "path";
+    }
+  | {
+      kind: "missing";
+      installed: false;
+      source: "custom" | "env" | "path" | "unknown";
+      binaryPath?: string;
+      error: string;
+    }
+  | {
+      kind: "unsupported_command_string";
+      installed: false;
+      source: "env";
+      error: string;
+    };
 
 type JsonRpcMessage = {
   id?: number;
@@ -171,6 +192,31 @@ export async function readCodexRateLimits(input: { binaryPath: string; timeoutMs
   }
 }
 
+export async function probeCodexRuntimeWithAppServer(input: {
+  binaryPath: string;
+  timeoutMs?: number;
+}): Promise<{
+  appServer: CodexRuntimeStatus["appServer"];
+  account?: CodexAccountProbeResult;
+  rateLimits?: CodexRateLimitProbeResult;
+}> {
+  const client = new ProbeClient(input.binaryPath, input.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
+  try {
+    const initialized = await client.initialize();
+    const account = await client.readAccount();
+    const rateLimits = await client.readRateLimits();
+    return {
+      appServer: { available: true, initialized: sanitizeAppServerPayload(initialized) },
+      account,
+      rateLimits
+    };
+  } catch (error) {
+    return { appServer: { available: false, error: errorMessage(error) } };
+  } finally {
+    client.close();
+  }
+}
+
 export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions = {}): Promise<CodexRuntimeStatus> {
   const env = options.env ?? process.env;
   const cacheKey = JSON.stringify({
@@ -198,7 +244,8 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
   }
 
   const version = await getCodexVersion({ binaryPath: cli.binaryPath, timeoutMs: options.timeoutMs });
-  const appServer = await probeCodexAppServer({ binaryPath: cli.binaryPath, timeoutMs: options.timeoutMs });
+  const probe = await probeCodexRuntimeWithAppServer({ binaryPath: cli.binaryPath, timeoutMs: options.timeoutMs });
+  const appServer = probe.appServer;
   if (!appServer.available) {
     const status: CodexRuntimeStatus = {
       runtime: "codex",
@@ -213,8 +260,8 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
     return status;
   }
 
-  const account = await readCodexAccount({ binaryPath: cli.binaryPath, timeoutMs: options.timeoutMs });
-  const rateLimits = await readCodexRateLimits({ binaryPath: cli.binaryPath, timeoutMs: options.timeoutMs });
+  const account = probe.account ?? { ok: false, authState: "unknown" as const, error: "Codex account probe did not return a result." };
+  const rateLimits = probe.rateLimits ?? { ok: false, error: "Codex rate limit probe did not return a result." };
   const auth = account.ok
     ? accountStatus(account.account)
     : { state: account.authState, access: "unknown" as const, error: account.error };
@@ -290,13 +337,33 @@ export function codexRuntimePreflightError(status: CodexRuntimeStatus): ExecuteP
 }
 
 export type ExecutePreflightError = {
+  area: "codex";
   error: "CODEX_CLI_MISSING" | "CODEX_LOGIN_REQUIRED" | "CODEX_AUTH_EXPIRED" | "CODEX_APP_SERVER_UNAVAILABLE" | "CODEX_RATE_LIMITED" | "CODEX_RUNTIME_UNKNOWN";
   message: string;
   runtime: "codex";
-  actions: Array<{
-    type: "install_codex" | "codex_login_chatgpt" | "codex_login_device" | "codex_recheck" | "open_bridge_app" | "open_prerequisites";
-    label: string;
-  }>;
+  actions: ExecutePreflightAction[];
+} | {
+  area: "roadmap";
+  error: "ROADMAP_INACTIVE" | "ROADMAP_MISSING" | "ROADMAP_NEEDS_UPGRADE" | "ROADMAP_UNHEALTHY";
+  message: string;
+  roadmapId?: string;
+  lifecycle?: "inactive" | "missing" | "needs_upgrade" | "error";
+  actions: ExecutePreflightAction[];
+};
+
+export type ExecutePreflightAction = {
+  type:
+    | "install_codex"
+    | "codex_login_chatgpt"
+    | "codex_login_device"
+    | "codex_recheck"
+    | "open_bridge_app"
+    | "open_prerequisites"
+    | "open_roadmaps"
+    | "activate_roadmap";
+  label: string;
+  href?: string;
+  roadmapId?: string;
 };
 
 export function sanitizeDiagnostics(value: unknown): unknown {
@@ -313,22 +380,57 @@ export function sanitizeDiagnostics(value: unknown): unknown {
   return result;
 }
 
-function preflight(error: ExecutePreflightError["error"], message: string, actions: ExecutePreflightError["actions"]): ExecutePreflightError {
-  return { error, message, runtime: "codex", actions: [{ type: "open_bridge_app", label: "Open Bridge App" }, ...actions] };
+function preflight(error: Extract<ExecutePreflightError, { area: "codex" }>["error"], message: string, actions: ExecutePreflightAction[]): ExecutePreflightError {
+  return { area: "codex", error, message, runtime: "codex", actions: [{ type: "open_bridge_app", label: "Open Bridge App", href: "hunsu://open" }, ...actions] };
 }
 
 function binaryStatusFromCandidate(candidate: string, source: CodexCliStatus["source"], env: Record<string, string | undefined>): CodexCliStatus {
-  const binaryPath = isAbsolute(candidate) ? candidate : findExecutableOnPath(candidate, env) ?? candidate;
+  const resolution = resolveCodexCommand(candidate, source, env);
+  if (resolution.kind !== "binary") {
+    return {
+      installed: false,
+      source: resolution.source,
+      binaryPath: resolution.kind === "missing" ? resolution.binaryPath : undefined,
+      error: resolution.error
+    };
+  }
+  return { installed: true, binaryPath: resolution.binaryPath, source: resolution.source };
+}
+
+function resolveCodexCommand(candidate: string, source: CodexCliStatus["source"], env: Record<string, string | undefined>): CodexCommandResolution {
+  const trimmed = candidate.trim();
+  if (!trimmed) {
+    return { kind: "missing", installed: false, source: source ?? "unknown", error: "Codex command is empty." };
+  }
+  if (source === "env" && /\s/.test(trimmed)) {
+    return {
+      kind: "unsupported_command_string",
+      installed: false,
+      source: "env",
+      error: "HUNSU_CODEX_APP_SERVER_COMMAND must be a binary path or command name without arguments. Put arguments in HUNSU_CODEX_APP_SERVER_ARGS."
+    };
+  }
+  const binaryPath = isAbsolute(trimmed) ? trimmed : findExecutableOnPath(trimmed, env);
+  if (!binaryPath) {
+    return {
+      kind: "missing",
+      installed: false,
+      source: source ?? "unknown",
+      binaryPath: isAbsolute(trimmed) ? trimmed : undefined,
+      error: isAbsolute(trimmed) ? "Configured Codex path does not exist." : `Codex command was not found on PATH: ${trimmed}`
+    };
+  }
   try {
-    if (isAbsolute(binaryPath)) {
-      const stat = statSync(binaryPath);
-      if (!stat.isFile()) {
-        return { installed: false, binaryPath, source, error: "Configured Codex path is not a file." };
-      }
+    const stat = statSync(binaryPath);
+    if (!stat.isFile()) {
+      return { kind: "missing", installed: false, binaryPath, source: source ?? "unknown", error: "Configured Codex path is not a file." };
     }
-    return { installed: true, binaryPath, source };
+    if (process.platform !== "win32") {
+      accessSync(binaryPath, constants.X_OK);
+    }
+    return { kind: "binary", installed: true, binaryPath, source: source === "unknown" || source === undefined ? "path" : source };
   } catch (error) {
-    return { installed: false, binaryPath, source, error: errorMessage(error) };
+    return { kind: "missing", installed: false, binaryPath, source: source ?? "unknown", error: errorMessage(error) };
   }
 }
 
@@ -376,14 +478,47 @@ class ProbeClient {
   request(method: string, params?: unknown): Promise<unknown> {
     const id = this.nextId;
     this.nextId += 1;
-    this.write({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Codex app-server probe timed out: ${method}`));
       }, this.timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.write({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
+  }
+
+  async initialize(): Promise<unknown> {
+    const initialized = await this.request("initialize", {
+      clientInfo: { name: "hunsu-bridge", title: "Hunsu Bridge", version: "0.1.0" }
+    });
+    this.notify("initialized", {});
+    return initialized;
+  }
+
+  async readAccount(): Promise<CodexAccountProbeResult> {
+    try {
+      const account = await this.request("account/read", { refreshToken: false });
+      return { ok: true, account: sanitizeAppServerPayload(account) };
+    } catch (error) {
+      const message = errorMessage(error);
+      return { ok: false, authState: authStateFromError(message), error: message };
+    }
+  }
+
+  async readRateLimits(): Promise<CodexRateLimitProbeResult> {
+    try {
+      const rateLimits = await this.request("account/rateLimits/read");
+      return { ok: true, rateLimits: sanitizeAppServerPayload(rateLimits) };
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
   }
 
   notify(method: string, params?: unknown): void {
@@ -407,7 +542,13 @@ class ProbeClient {
       this.buffer = this.buffer.slice(newline + 1);
       newline = this.buffer.indexOf("\n");
       if (!line) continue;
-      const message = JSON.parse(line) as JsonRpcMessage;
+      let message: JsonRpcMessage;
+      try {
+        message = JSON.parse(line) as JsonRpcMessage;
+      } catch (error) {
+        this.rejectAll(new Error(`Invalid Codex app-server JSON-RPC line: ${errorMessage(error)}`));
+        continue;
+      }
       if (message.id === undefined || typeof message.id !== "number") {
         continue;
       }
@@ -536,8 +677,11 @@ function isSecretKey(key: string): boolean {
 function redactSecretText(value: string): string {
   return value
     .replace(/sk-[A-Za-z0-9_-]{10,}/g, "[redacted]")
-    .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[redacted]")
-    .replace(/(OPENAI_API_KEY|CODEX_ACCESS_TOKEN)=\S+/g, "$1=[redacted]");
+    .replace(/(OPENAI_API_KEY|CODEX_ACCESS_TOKEN)=\S+/g, "$1=[redacted]")
+    .replace(/~\/\.codex\/auth\.json/g, "[redacted]")
+    .replace(/("(?:apiKey|refreshToken|accessToken|authorization)"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
+    .replace(/\b(apiKey|refreshToken|accessToken|authorization)=(?:Bearer\s+)?\S+/gi, "$1=[redacted]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[redacted]");
 }
 
 function errorMessage(error: unknown): string {

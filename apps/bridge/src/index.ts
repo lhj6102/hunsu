@@ -586,6 +586,7 @@ export type StudioServerState = {
   filesystemCapabilities: Record<string, FilesystemBrowseCapability>;
   liveSubscribers: Set<StudioLiveSubscriber>;
   agentSessionSubscribers: Set<AgentSessionSubscriber>;
+  codexLogin?: CodexLoginProcessState;
 };
 
 export type StudioServerSecurityOptions = {
@@ -700,6 +701,7 @@ export type PrerequisiteStatus = {
   runtimes: {
     codex: CodexRuntimeStatus;
   };
+  codexLogin?: CodexLoginProcessState;
   tools: {
     git?: ToolStatus;
     node?: ToolStatus;
@@ -2173,9 +2175,12 @@ function createConfiguredRunner(runtimeConfig: BridgeRuntimeConfig): Runner {
     return new DeterministicLocalTestRunner();
   }
   const codexBinaryPath = runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH?.trim();
+  const command = codexBinaryPath && runtimeConfig.codexAppServer.command === "codex"
+    ? codexBinaryPath
+    : runtimeConfig.codexAppServer.command;
   return createDefaultCodexRunner({
     clientOptions: {
-      command: codexBinaryPath || runtimeConfig.codexAppServer.command,
+      command,
       args: runtimeConfig.codexAppServer.args,
       environment: runtimeConfig.codexAppServer.environment
     },
@@ -2184,6 +2189,9 @@ function createConfiguredRunner(runtimeConfig: BridgeRuntimeConfig): Runner {
 }
 
 async function prerequisiteStatus(env: Record<string, string | undefined>, state?: StudioServerState): Promise<PrerequisiteStatus> {
+  const codex = state
+    ? await codexRuntimeStatusForResponse(env, state, { lastRunUsage: latestCodexRunUsage(state) })
+    : await getCodexRuntimeStatus({ env });
   return {
     bridge: {
       connected: true,
@@ -2191,8 +2199,9 @@ async function prerequisiteStatus(env: Record<string, string | undefined>, state
       protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION
     },
     runtimes: {
-      codex: await getCodexRuntimeStatus({ env, lastRunUsage: state ? latestCodexRunUsage(state) : undefined })
+      codex
     },
+    ...(state?.codexLogin ? { codexLogin: state.codexLogin } : {}),
     tools: {
       git: await toolStatus("git", ["--version"]),
       node: await toolStatus(process.execPath, ["--version"])
@@ -2343,12 +2352,36 @@ type CodexActionStartResult = {
   message?: string;
 };
 
-type CodexDeviceLoginResult = CodexActionStartResult & {
-  state?: "device_code" | "pending" | "failed";
+export type CodexLoginProcessState = {
+  kind: "chatgpt" | "device";
+  pid?: number;
+  startedAt: string;
+  status: "starting" | "device_code" | "pending" | "completed" | "failed";
   verificationUri?: string;
   verificationUriComplete?: string;
   userCode?: string;
+  lastOutput?: string;
+  error?: string;
 };
+
+type CodexDeviceLoginResult = CodexActionStartResult & {
+  state?: CodexLoginProcessState["status"];
+  status?: CodexLoginProcessState["status"];
+  verificationUri?: string;
+  verificationUriComplete?: string;
+  userCode?: string;
+  lastOutput?: string;
+  error?: string;
+};
+
+type TrackedCodexLoginProcess = {
+  child: ReturnType<typeof spawn>;
+  startedAt: string;
+  output: string;
+  cleared: boolean;
+};
+
+const codexLoginTrackers = new WeakMap<StudioServerState, TrackedCodexLoginProcess>();
 
 async function spawnCodexAction(args: string[], env: Record<string, string | undefined>): Promise<CodexActionStartResult> {
   const cli = await detectCodexBinary({ env });
@@ -2365,11 +2398,21 @@ async function spawnCodexAction(args: string[], env: Record<string, string | und
   return { started: true, command: cli.binaryPath, args };
 }
 
-async function spawnCodexDeviceLogin(env: Record<string, string | undefined>, timeoutMs = 3_000): Promise<CodexDeviceLoginResult> {
+async function spawnCodexDeviceLogin(state: StudioServerState, env: Record<string, string | undefined>, timeoutMs = 3_000): Promise<CodexDeviceLoginResult> {
   const args = ["login", "--device-auth"];
+  const existing = codexLoginTrackers.get(state);
+  if (existing && !existing.cleared) {
+    return codexDeviceLoginResult(existing.child.spawnfile, args, state.codexLogin);
+  }
   const cli = await detectCodexBinary({ env });
   if (!cli.installed || !cli.binaryPath) {
-    return { started: false, args, state: "failed", message: cli.error ?? "Codex CLI was not found." };
+    const failed = updateCodexLoginState(state, {
+      kind: "device",
+      startedAt: new Date().toISOString(),
+      status: "failed",
+      error: cli.error ?? "Codex CLI was not found."
+    });
+    return codexDeviceLoginResult(undefined, args, failed, false);
   }
 
   const child = spawn(cli.binaryPath, args, {
@@ -2378,57 +2421,132 @@ async function spawnCodexDeviceLogin(env: Record<string, string | undefined>, ti
     env: { ...process.env, ...env },
     windowsHide: false
   });
-  let output = "";
+  const tracker: TrackedCodexLoginProcess = {
+    child,
+    startedAt: new Date().toISOString(),
+    output: "",
+    cleared: false
+  };
+  codexLoginTrackers.set(state, tracker);
+  updateCodexLoginState(state, {
+    kind: "device",
+    pid: child.pid,
+    startedAt: tracker.startedAt,
+    status: "starting"
+  });
   const append = (chunk: Buffer | string) => {
-    output = `${output}${chunk.toString()}`.slice(-64 * 1024);
+    if (tracker.cleared) {
+      return;
+    }
+    tracker.output = `${tracker.output}${chunk.toString()}`.slice(-64 * 1024);
+    const details = parseCodexDeviceAuthOutput(tracker.output);
+    updateCodexLoginState(state, {
+      kind: "device",
+      pid: child.pid,
+      startedAt: tracker.startedAt,
+      status: details.verificationUri || details.userCode ? "device_code" : "pending",
+      ...details,
+      lastOutput: tracker.output.trim().slice(-4096)
+    });
   };
   child.stdout?.on("data", append);
   child.stderr?.on("data", append);
-
-  const outcome = await Promise.race([
-    new Promise<{ kind: "exit"; code: number | null; signal: NodeJS.Signals | null }>(resolve => {
-      child.once("close", (code, signal) => resolve({ kind: "exit", code, signal }));
-    }),
-    new Promise<{ kind: "error"; error: Error }>(resolve => {
-      child.once("error", error => resolve({ kind: "error", error }));
-    }),
-    sleep(timeoutMs).then(() => ({ kind: "timeout" as const }))
-  ]);
-  const details = parseCodexDeviceAuthOutput(output);
-
-  if (outcome.kind === "timeout") {
-    child.stdout?.destroy();
-    child.stderr?.destroy();
-    child.unref();
-    return {
-      started: true,
-      command: cli.binaryPath,
-      args,
-      state: details.verificationUri || details.userCode ? "device_code" : "pending",
+  child.once("error", error => {
+    if (tracker.cleared) {
+      return;
+    }
+    updateCodexLoginState(state, {
+      kind: "device",
+      pid: child.pid,
+      startedAt: tracker.startedAt,
+      status: "failed",
+      error: error.message,
+      lastOutput: tracker.output.trim().slice(-4096)
+    });
+    codexLoginTrackers.delete(state);
+  });
+  child.once("close", (code, signal) => {
+    if (tracker.cleared) {
+      return;
+    }
+    const details = parseCodexDeviceAuthOutput(tracker.output);
+    const failed = code !== 0;
+    updateCodexLoginState(state, {
+      kind: "device",
+      pid: child.pid,
+      startedAt: tracker.startedAt,
+      status: failed ? "failed" : details.verificationUri || details.userCode ? "device_code" : "completed",
       ...details,
-      message: details.verificationUri || details.userCode
-        ? "Codex device login started. Complete authorization in your browser."
-        : "Codex device login started, but no device code has been emitted yet."
-    };
-  }
+      lastOutput: tracker.output.trim().slice(-4096),
+      error: failed ? `Codex device login exited with status ${code ?? signal ?? "unknown"}.` : undefined
+    });
+    codexLoginTrackers.delete(state);
+  });
 
-  if (outcome.kind === "error") {
-    return { started: false, command: cli.binaryPath, args, state: "failed", message: outcome.error.message };
-  }
+  await waitForCodexLoginInitialState(state, timeoutMs);
+  return codexDeviceLoginResult(cli.binaryPath, args, state.codexLogin);
+}
 
-  const failed = outcome.code !== 0;
+async function waitForCodexLoginInitialState(state: StudioServerState, timeoutMs: number): Promise<void> {
+  const startedAt = state.codexLogin?.startedAt;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const codexLogin = state.codexLogin;
+    const status = codexLogin && codexLogin.startedAt === startedAt ? codexLogin.status : undefined;
+    if (status === "device_code" || status === "failed" || status === "completed") {
+      return;
+    }
+    await sleep(50);
+  }
+  const tracker = codexLoginTrackers.get(state);
+  if (tracker && !tracker.cleared && state.codexLogin?.startedAt === tracker.startedAt && state.codexLogin.status === "starting") {
+    updateCodexLoginState(state, { ...state.codexLogin, status: "pending" });
+  }
+}
+
+function codexDeviceLoginResult(command: string | undefined, args: string[], state: CodexLoginProcessState | undefined, started = true): CodexDeviceLoginResult {
+  const status = state?.status ?? "pending";
   return {
-    started: true,
-    command: cli.binaryPath,
+    started,
+    command,
     args,
-    state: details.verificationUri || details.userCode ? "device_code" : failed ? "failed" : "pending",
-    ...details,
-    message: details.verificationUri || details.userCode
-      ? "Codex device login started. Complete authorization in your browser."
-      : failed
-        ? `Codex device login exited with status ${outcome.code ?? outcome.signal ?? "unknown"}.`
+    state: status,
+    status,
+    verificationUri: state?.verificationUri,
+    verificationUriComplete: state?.verificationUriComplete,
+    userCode: state?.userCode,
+    lastOutput: state?.lastOutput,
+    error: state?.error,
+    message: status === "failed"
+      ? state?.error ?? "Codex device login failed."
+      : state?.verificationUri || state?.userCode
+        ? "Codex device login started. Complete authorization in your browser."
+        : status === "completed"
+          ? "Codex device login completed."
         : "Codex device login started."
   };
+}
+
+function updateCodexLoginState(state: StudioServerState, codexLogin: CodexLoginProcessState): CodexLoginProcessState {
+  state.codexLogin = codexLogin;
+  return codexLogin;
+}
+
+function clearCodexLoginState(state: StudioServerState): void {
+  const tracker = codexLoginTrackers.get(state);
+  if (tracker) {
+    tracker.cleared = true;
+    codexLoginTrackers.delete(state);
+  }
+  state.codexLogin = undefined;
+}
+
+async function codexRuntimeStatusForResponse(env: Record<string, string | undefined>, state: StudioServerState, options: { force?: boolean; lastRunUsage?: CodexRuntimeStatus["usage"]["lastRunUsage"] } = {}): Promise<CodexRuntimeStatus & { codexLogin?: CodexLoginProcessState }> {
+  const status = await getCodexRuntimeStatus({ env, force: options.force, lastRunUsage: options.lastRunUsage });
+  if (status.auth.state === "authenticated" && state.codexLogin) {
+    clearCodexLoginState(state);
+  }
+  return state.codexLogin ? { ...status, codexLogin: state.codexLogin } : status;
 }
 
 export function parseCodexDeviceAuthOutput(output: string): Pick<CodexDeviceLoginResult, "verificationUri" | "verificationUriComplete" | "userCode"> {
@@ -2982,12 +3100,12 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       }
 
       if (request.method === "GET" && pathname === "/api/runtimes/codex/status") {
-        sendJson(response, 200, await getCodexRuntimeStatus({ env: runtimeConfig.processEnv }));
+        sendJson(response, 200, await codexRuntimeStatusForResponse(runtimeConfig.processEnv, state));
         return;
       }
 
       if (request.method === "POST" && pathname === "/api/runtimes/codex/recheck") {
-        sendJson(response, 202, await getCodexRuntimeStatus({ env: runtimeConfig.processEnv, force: true }));
+        sendJson(response, 202, await codexRuntimeStatusForResponse(runtimeConfig.processEnv, state, { force: true }));
         return;
       }
 
@@ -3002,7 +3120,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       }
 
       if (request.method === "POST" && pathname === "/api/runtimes/codex/login/device") {
-        sendJson(response, 202, await spawnCodexDeviceLogin(runtimeConfig.processEnv));
+        sendJson(response, 202, await spawnCodexDeviceLogin(state, runtimeConfig.processEnv));
         return;
       }
 
@@ -7374,15 +7492,40 @@ function repositoryActivePreflight(repositoryPath: string, roadmapRegistryPath: 
 
 function roadmapInactivePreflight(lifecycle: RoadmapRegistryEntry["lifecycle"] | undefined, roadmapId: string | undefined): ExecutePreflightError {
   const state = lifecycle ?? "missing";
+  const encodedRoadmapId = roadmapId ? encodeURIComponent(roadmapId) : undefined;
   return {
-    error: "CODEX_RUNTIME_UNKNOWN",
+    area: "roadmap",
+    error: roadmapPreflightError(state),
     message: roadmapInactiveMessage(state, roadmapId),
-    runtime: "codex",
+    roadmapId,
+    lifecycle: roadmapPreflightLifecycle(state),
     actions: [
-      { type: "open_bridge_app", label: "Open Bridge App" },
-      { type: "open_prerequisites", label: "Open Roadmaps" }
+      { type: "open_bridge_app", label: "Open Bridge App", href: "hunsu://open" },
+      { type: "open_roadmaps", label: "Open Roadmaps", href: "hunsu://roadmaps" },
+      ...(encodedRoadmapId && state === "inactive"
+        ? [{ type: "activate_roadmap" as const, label: "Activate Roadmap", href: `hunsu://activate-roadmap?roadmapId=${encodedRoadmapId}`, roadmapId }]
+        : [])
     ]
   };
+}
+
+function roadmapPreflightError(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing"): Extract<ExecutePreflightError, { area: "roadmap" }>["error"] {
+  switch (lifecycle) {
+    case "inactive":
+      return "ROADMAP_INACTIVE";
+    case "needs_upgrade":
+      return "ROADMAP_NEEDS_UPGRADE";
+    case "error":
+      return "ROADMAP_UNHEALTHY";
+    case "missing":
+    case "active":
+    default:
+      return "ROADMAP_MISSING";
+  }
+}
+
+function roadmapPreflightLifecycle(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing"): Extract<ExecutePreflightError, { area: "roadmap" }>["lifecycle"] {
+  return lifecycle === "active" ? "missing" : lifecycle;
 }
 
 function roadmapInactiveMessage(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing", roadmapId: string | undefined): string {
