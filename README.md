@@ -31,14 +31,14 @@ Hunsu exists for that human layer.
 Prerequisites:
 
 - Git
-- Codex installed and authenticated when you want to run agent Executes
+- Codex CLI installed and authenticated when you want to run agent Executes
 
 Recommended local-first path:
 
 ```text
 Install Hunsu Bridge App
 Open the app
-Choose or create a project
+Add and activate a Roadmap
 Hunsu Bridge starts locally
 Studio opens in the browser
 ```
@@ -48,6 +48,12 @@ session, opens Studio, and keeps local repository access on your machine. Login
 is optional for local use; signing in enables Remote Bridge access through
 authenticated Relay commands. Remote Registry and connection-status responses
 redact local filesystem paths until the matching Project Grant exists.
+
+Codex is an external prerequisite runtime. Hunsu does not bundle Codex, read
+Codex credential files, store OpenAI API keys, or transmit Codex tokens. Bridge
+App checks Codex readiness, can open Codex login flows, and can show the
+official install command, but Execute remains disabled until the local Codex CLI,
+Codex app-server, and Codex authentication are ready.
 
 Advanced developer fallback:
 
@@ -59,6 +65,11 @@ Headless Linux/devbox path:
 
 ```sh
 hunsu-bridge login
+hunsu-bridge prerequisites status
+hunsu-bridge codex status
+hunsu-bridge codex login --device
+hunsu-bridge roadmaps add /path/to/project
+hunsu-bridge roadmaps activate <roadmapId>
 hunsu-bridge remote status
 hunsu-bridge projects grant /path/to/project
 hunsu-bridge projects list
@@ -89,6 +100,10 @@ Studio recovery links use the Bridge App protocol surface:
 ```text
 hunsu://open
 hunsu://pair?next=/studio
+hunsu://add-roadmap
+hunsu://roadmaps
+hunsu://prerequisites/codex
+hunsu://activate-roadmap?roadmapId=<id>
 hunsu://open-project?path=/path/to/project
 hunsu://open-roadmap?roadmapId=<id>
 hunsu://sign-in
@@ -284,9 +299,25 @@ MOVE-scoped checks from depending on hardcoded ports.
   `19673`.
 - `HUNSU_ROADMAP_REGISTRY_PATH`, `HUNSU_ROUTE_WORKTREE_ROOT`, and
   `HUNSU_ACTION_WORKTREE_ROOT` control Bridge runtime paths.
-- `HUNSU_CODEX_APP_SERVER_COMMAND`, `HUNSU_CODEX_APP_SERVER_ARGS`, and
+- `HUNSU_CODEX_BINARY_PATH`, `HUNSU_CODEX_APP_SERVER_COMMAND`,
+  `HUNSU_CODEX_APP_SERVER_ARGS`, and
   `HUNSU_CODEX_*` thread option variables are resolved by `@hunsu/config`
   before Bridge constructs the Codex runner.
+
+Troubleshooting:
+
+- Codex CLI not found: open Bridge App Prerequisites, install Codex, or set a
+  custom Codex path.
+- Codex login required or expired: run `hunsu-bridge codex login` or use the
+  Bridge App Codex card.
+- Codex app-server unavailable: run `hunsu-bridge codex recheck` and verify
+  `codex app-server --stdio` works in your shell.
+- Codex rate limited: wait for Codex access to recover; Hunsu shows only safe
+  rate-limit summaries when Codex provides them.
+- Roadmap inactive or missing: activate, repair, or remove it from Bridge App
+  Roadmaps. Studio shows Active Roadmaps only.
+- Project Grant missing: grant the project path before Remote Access Execute or
+  Artifact Action commands.
 
 ## Docs
 

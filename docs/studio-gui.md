@@ -60,16 +60,15 @@ It should feel closer to a VS Code start page than to a Roadmap workspace.
 
 Launcher responsibilities:
 
-- recent Roadmap list from the local Roadmap Registry
-- open existing Roadmap
-- port Git project
-- create Roadmap in a new folder
-- show missing-path or unhealthy Roadmap states
-- remove stale local registry entries
-- explain when a selected folder is not a Git repository or not initialized for
-  Hunsu
+- active Roadmap list from the local Bridge Roadmap Registry
+- open active Roadmaps
+- send Add Roadmap to Bridge App through `hunsu://add-roadmap`
+- show an empty state when no active Roadmaps are exposed by Bridge
+- keep manual path entry as an Advanced fallback
 
-The launcher can display many Roadmaps. It does not show the MOVE graph.
+The launcher can display many active Roadmaps. It does not show inactive
+Roadmaps by default and does not show the MOVE graph. Add, activate,
+deactivate, repair, and remove are Bridge App responsibilities.
 
 ## Roadmap View Shell
 

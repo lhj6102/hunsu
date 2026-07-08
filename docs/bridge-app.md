@@ -48,7 +48,11 @@ Hunsu Bridge App owns local runtime supervision:
 - start, stop, restart, and report local Bridge health
 - open Studio with a fresh pairing token
 - handle `hunsu://` browser handoff links
+- show Overview, Prerequisites, Roadmaps, Connection, Remote Access,
+  Diagnostics, and Settings navigation
+- check Codex CLI readiness without reading Codex credential files
 - inspect selected folders through Project Finder
+- add, activate, deactivate, and remove managed Roadmaps
 - open existing Hunsu Roadmaps
 - port Git projects into Hunsu
 - create Roadmaps in new folders
@@ -98,6 +102,34 @@ passed to the sidecar.
 Studio remains the main product UI for Roadmaps, Execute, Hunsu Drafts,
 Artifact Actions, and Hub.
 
+## Prerequisites
+
+Codex is an external prerequisite runtime. Bridge App starts and remains useful
+when Codex is missing: local Bridge pairing, Project Finder, Roadmap activation,
+Hub, and non-Execute Studio flows still work.
+
+Codex resolution order is:
+
+1. saved custom `HUNSU_CODEX_BINARY_PATH`
+2. `HUNSU_CODEX_APP_SERVER_COMMAND`
+3. `codex` on `PATH`
+4. missing
+
+Bridge App may run `codex --version`, `codex app-server --stdio`, and Codex
+app-server account/rate-limit requests. It must not read `~/.codex/auth.json`,
+token files, OpenAI API keys, or credential stores directly. Diagnostics include
+safe readiness fields such as installed/version/source/app-server/auth/access
+state, and redact token-like values.
+
+Codex UI states:
+
+- Install Required: show Install Codex, Use Existing Installation, Copy Install
+  Command, and Recheck.
+- Login Required: show Sign in with ChatGPT, Use Device Code, API key advanced,
+  and Recheck.
+- Ready: show auth method/access where safely detectable.
+- Error: show Recheck and diagnostics without credential material.
+
 ## Project Finder
 
 Project Finder classifies selected folders as:
@@ -110,6 +142,16 @@ Project Finder classifies selected folders as:
 
 Inspection is a Bridge API primitive so the Bridge App, Studio, and headless
 commands can share classification rules.
+
+## Active Roadmaps
+
+Bridge App manages Roadmaps through Add Roadmap, Activate Roadmap, Deactivate
+Roadmap, and Remove Roadmap. Remove only deletes the Bridge registry entry; it
+does not delete local files.
+
+Studio consumes active Roadmaps from Bridge by default. Inactive Roadmaps remain
+visible in Bridge App Roadmaps but are hidden from Studio navigation and are not
+Remote Access candidates until activated again.
 
 ## Connection Center
 

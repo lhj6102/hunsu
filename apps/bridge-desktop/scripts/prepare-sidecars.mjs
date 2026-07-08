@@ -49,7 +49,8 @@ export function validateNativeSidecarArtifact(path) {
 export function prepareNativeSidecars(options = {}) {
   const packagingConfig = unwrapConfigResult(resolveBridgeSidecarPackagingConfig(currentProcessEnv()));
   const nativeDir = resolve(options.nativeDir ?? packagingConfig.nativeSidecarDir ?? defaultNativeDir);
-  mkdirSync(dist, { recursive: true });
+  const outputDir = resolve(options.distDir ?? dist);
+  mkdirSync(outputDir, { recursive: true });
   const manifest = {
     schema: "hunsu.bridge-sidecars.v1",
     source: nativeDir,
@@ -59,7 +60,7 @@ export function prepareNativeSidecars(options = {}) {
   for (const target of sidecarTargets) {
     const artifactName = sidecarArtifactNameForTarget(target);
     const source = resolve(nativeDir, artifactName);
-    const destination = resolve(dist, artifactName);
+    const destination = resolve(outputDir, artifactName);
     validateNativeSidecarArtifact(source);
     copyFileSync(source, destination);
     if (target.extension === "") {
@@ -74,8 +75,8 @@ export function prepareNativeSidecars(options = {}) {
 
   const currentTarget = sidecarTargets.find(target => target.platform === process.platform && target.arch === process.arch);
   if (currentTarget) {
-    const source = resolve(dist, sidecarArtifactNameForTarget(currentTarget));
-    const destination = resolve(dist, genericSidecarNameForPlatform());
+    const source = resolve(outputDir, sidecarArtifactNameForTarget(currentTarget));
+    const destination = resolve(outputDir, genericSidecarNameForPlatform());
     copyFileSync(source, destination);
     if (currentTarget.extension === "") {
       chmodSync(destination, 0o755);
@@ -86,7 +87,7 @@ export function prepareNativeSidecars(options = {}) {
     };
   }
 
-  writeFileSync(resolve(dist, "sidecar-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  writeFileSync(resolve(outputDir, "sidecar-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   return manifest;
 }
 
@@ -130,8 +131,13 @@ function runCli(argv) {
   if (nativeDirArgIndex >= 0 && !nativeDir) {
     throw new Error("Usage: prepare-sidecars.mjs --native-dir <directory>");
   }
-  const manifest = prepareNativeSidecars({ nativeDir });
-  console.log(`Prepared ${manifest.artifacts.length} native Hunsu Bridge sidecar artifacts in ${dist}.`);
+  const distDirArgIndex = argv.indexOf("--dist-dir");
+  const distDir = distDirArgIndex >= 0 ? argv[distDirArgIndex + 1] : undefined;
+  if (distDirArgIndex >= 0 && !distDir) {
+    throw new Error("Usage: prepare-sidecars.mjs --dist-dir <directory>");
+  }
+  const manifest = prepareNativeSidecars({ nativeDir, distDir });
+  console.log(`Prepared ${manifest.artifacts.length} native Hunsu Bridge sidecar artifacts in ${resolve(distDir ?? dist)}.`);
 }
 
 function isCurrentScriptEntrypoint() {

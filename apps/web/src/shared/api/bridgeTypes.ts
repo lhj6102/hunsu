@@ -424,11 +424,52 @@ export type RoadmapRegistryEntry = {
   roadmapId: string;
   displayName: string;
   repositoryPath: string;
+  kind?: "hunsu-roadmap" | "git-project" | "new-project";
+  lifecycle?: "active" | "inactive" | "missing" | "needs_upgrade" | "error";
+  localAccess?: { enabled: boolean };
+  remoteAccess?: {
+    enabled: boolean;
+    scopes: Array<"remoteRelay.access" | "execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose">;
+  };
+  codex?: {
+    readyForExecute: boolean;
+    lastCheckedAt?: string;
+  };
   lastOpenedAt: string;
   lastKnownBranch?: string;
   health: "ok" | "missing" | "missing-runtime" | "needs-upgrade" | "git-dirty" | "unknown";
   type?: "roadmap" | "git-project" | "missing";
   primaryAction?: "open" | "port" | "repair" | "remove";
+};
+
+export type ExecutePreflightAction = {
+  type:
+    | "install_codex"
+    | "codex_login_chatgpt"
+    | "codex_login_device"
+    | "codex_recheck"
+    | "open_bridge_app"
+    | "open_prerequisites"
+    | "open_roadmaps"
+    | "activate_roadmap";
+  label: string;
+  href?: string;
+  roadmapId?: string;
+};
+
+export type ExecutePreflightError = {
+  area: "codex";
+  error: "CODEX_CLI_MISSING" | "CODEX_LOGIN_REQUIRED" | "CODEX_AUTH_EXPIRED" | "CODEX_APP_SERVER_UNAVAILABLE" | "CODEX_RATE_LIMITED" | "CODEX_RUNTIME_UNKNOWN";
+  message: string;
+  runtime: "codex";
+  actions: ExecutePreflightAction[];
+} | {
+  area: "roadmap";
+  error: "ROADMAP_INACTIVE" | "ROADMAP_MISSING" | "ROADMAP_NEEDS_UPGRADE" | "ROADMAP_UNHEALTHY";
+  message: string;
+  roadmapId?: string;
+  lifecycle?: "inactive" | "missing" | "needs_upgrade" | "error";
+  actions: ExecutePreflightAction[];
 };
 
 export type RoadmapListResult = { roadmaps: RoadmapRegistryEntry[] };

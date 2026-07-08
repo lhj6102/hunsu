@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { runInNewContext } from "node:vm";
 import {
   createDeviceAuthorizationRequest,
   createPkceAuthorizationRequest,
@@ -23,7 +24,7 @@ import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
-import { createStudioRoadmap, createStudioServer, createStudioState } from "../apps/bridge/src/index.ts";
+import { createStudioRoadmap, createStudioServer, createStudioState, setRoadmapLifecycle } from "../apps/bridge/src/index.ts";
 
 test("Bridge App parses browser deep links into command arguments", () => {
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open"]), ["status"]);
@@ -42,15 +43,32 @@ test("Bridge App parses browser deep links into command arguments", () => {
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open-project?path=/tmp/example"]), ["open-project", "/tmp/example"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open-roadmap?roadmapId=roadmap_123"]), [
     "open-roadmap",
-    "--roadmap-id",
     "roadmap_123"
   ]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap"]), ["ui-intent", "roadmaps", "add-roadmap"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap?path=/tmp/example"]), ["roadmaps", "add", "/tmp/example"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://roadmaps"]), ["ui-intent", "roadmaps"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites"]), ["ui-intent", "prerequisites"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/codex"]), ["ui-intent", "prerequisites", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://activate-roadmap?roadmapId=roadmap_123"]), ["activate-roadmap", "roadmap_123"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://remote-disable"]), ["remote", "disable"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://sign-in"]), ["login", "--gui"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://sign-out"]), ["logout"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://delete-everything"]), [
     "protocol-error",
     "Unsupported hunsu:// command: delete-everything"
+  ]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/other"]), [
+    "protocol-error",
+    "Unsupported hunsu://prerequisites path."
+  ]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open-roadmap"]), [
+    "protocol-error",
+    "hunsu://open-roadmap requires roadmapId."
+  ]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://activate-roadmap"]), [
+    "protocol-error",
+    "hunsu://activate-roadmap requires roadmapId."
   ]);
 });
 
@@ -72,6 +90,359 @@ test("Bridge App rejects unsupported browser deep links", async () => {
     else process.env.HUNSU_BRIDGE_APP_LOG_PATH = previousLogPath;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Bridge App Roadmap deep links record UI intents for native focus flows", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-deeplink-intent-test-"));
+  const statePath = join(root, "state.json");
+  const roadmapRegistryPath = join(root, "roadmaps.json");
+  const logPath = join(root, "bridge-app.log");
+  const previousEnv = snapshotEnv([
+    "HUNSU_BRIDGE_APP_STATE_PATH",
+    "HUNSU_ROADMAP_REGISTRY_PATH",
+    "HUNSU_BRIDGE_APP_LOG_PATH"
+  ]);
+  const previousLog = console.log;
+  console.log = () => undefined;
+  process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+  process.env.HUNSU_ROADMAP_REGISTRY_PATH = roadmapRegistryPath;
+  process.env.HUNSU_BRIDGE_APP_LOG_PATH = logPath;
+  try {
+    assert.equal(await main(["hunsu://add-roadmap"]), 0);
+    const addRoadmapState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; action?: string } };
+    assert.deepEqual({ tab: addRoadmapState.uiIntent?.tab, action: addRoadmapState.uiIntent?.action }, { tab: "roadmaps", action: "add-roadmap" });
+
+    assert.equal(await main(["hunsu://prerequisites/codex"]), 0);
+    const codexState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; focus?: string } };
+    assert.deepEqual({ tab: codexState.uiIntent?.tab, focus: codexState.uiIntent?.focus }, { tab: "prerequisites", focus: "codex" });
+
+    assert.equal(await main(["hunsu://activate-roadmap?roadmapId=unknown_roadmap"]), 0);
+    const activateState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string } };
+    assert.equal(activateState.uiIntent?.tab, "roadmaps");
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex device login command returns verification details for UI display", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-device-ui-test-"));
+  const fakeCodex = join(root, "codex");
+  const statePath = join(root, "state.json");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login' && args[1] === '--device-auth') {",
+    "  console.log('Open https://auth.openai.com/activate?user_code=HUNSU-5678');",
+    "  console.log('Code: HUNSU-5678');",
+    "  process.exit(0);",
+    "}",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  const previousEnv = snapshotEnv(["HUNSU_CODEX_BINARY_PATH", "HUNSU_BRIDGE_APP_STATE_PATH", "PATH"]);
+  const previousLog = console.log;
+  const logs: string[] = [];
+  console.log = (message?: unknown) => {
+    logs.push(String(message ?? ""));
+  };
+  try {
+    process.env.HUNSU_CODEX_BINARY_PATH = fakeCodex;
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "login", "--device", "--json"]), 0);
+    const result = JSON.parse(logs.at(-1) ?? "{}") as {
+      state?: string;
+      verificationUriComplete?: string;
+      userCode?: string;
+      args?: string[];
+    };
+    assert.equal(result.state, "device_code");
+    assert.equal(result.verificationUriComplete, "https://auth.openai.com/activate?user_code=HUNSU-5678");
+    assert.equal(result.userCode, "HUNSU-5678");
+    assert.deepEqual(result.args, ["login", "--device-auth"]);
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: { status?: string; userCode?: string } };
+    assert.equal(state.codexLogin?.status, "device_code");
+    assert.equal(state.codexLogin?.userCode, "HUNSU-5678");
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex device login JSON preserves code details when later exit fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-device-code-then-fail-test-"));
+  const fakeCodex = join(root, "codex");
+  const statePath = join(root, "state.json");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login' && args[1] === '--device-auth') {",
+    "  console.log('Open https://auth.openai.com/activate?user_code=HUNSU-FAIL');",
+    "  console.log('Code: HUNSU-FAIL');",
+    "  console.error('device auth failed after code');",
+    "  process.exit(7);",
+    "}",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  const previousEnv = snapshotEnv(["HUNSU_CODEX_BINARY_PATH", "HUNSU_BRIDGE_APP_STATE_PATH", "PATH"]);
+  const previousLog = console.log;
+  const logs: string[] = [];
+  console.log = (message?: unknown) => {
+    logs.push(String(message ?? ""));
+  };
+  try {
+    process.env.HUNSU_CODEX_BINARY_PATH = fakeCodex;
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "login", "--device", "--json"]), 0);
+    const result = JSON.parse(logs.at(-1) ?? "{}") as {
+      state?: string;
+      verificationUriComplete?: string;
+      userCode?: string;
+      error?: string;
+      lastOutput?: string;
+    };
+    assert.equal(result.state, "failed");
+    assert.equal(result.verificationUriComplete, "https://auth.openai.com/activate?user_code=HUNSU-FAIL");
+    assert.equal(result.userCode, "HUNSU-FAIL");
+    assert.match(result.error ?? "", /status 7/);
+    assert.match(result.lastOutput ?? "", /device auth failed after code/);
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: { status?: string; userCode?: string } };
+    assert.equal(state.codexLogin?.status, "failed");
+    assert.equal(state.codexLogin?.userCode, "HUNSU-FAIL");
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex device background login persists delayed failure after device code", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-device-background-fail-test-"));
+  const fakeCodex = join(root, "codex");
+  const statePath = join(root, "state.json");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login' && args[1] === '--device-auth') {",
+    "  console.log('Open https://auth.openai.com/activate?user_code=HUNSU-LATE');",
+    "  console.log('Code: HUNSU-LATE');",
+    "  setTimeout(() => {",
+    "    console.error('device auth failed after background delay');",
+    "    process.exit(7);",
+    "  }, 3400);",
+    "  return;",
+    "}",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  const previousEnv = snapshotEnv(["HUNSU_CODEX_BINARY_PATH", "HUNSU_BRIDGE_APP_STATE_PATH", "PATH"]);
+  const previousLog = console.log;
+  console.log = () => {};
+  try {
+    process.env.HUNSU_CODEX_BINARY_PATH = fakeCodex;
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "login", "--device", "--background"]), 0);
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+      codexLogin?: {
+        status?: string;
+        verificationUri?: string;
+        verificationUriComplete?: string;
+        userCode?: string;
+        error?: string;
+        lastOutput?: string;
+      };
+    };
+    assert.equal(state.codexLogin?.status, "failed");
+    assert.equal(state.codexLogin?.verificationUri, "https://auth.openai.com/activate?user_code=HUNSU-LATE");
+    assert.equal(state.codexLogin?.verificationUriComplete, "https://auth.openai.com/activate?user_code=HUNSU-LATE");
+    assert.equal(state.codexLogin?.userCode, "HUNSU-LATE");
+    assert.match(state.codexLogin?.error ?? "", /status 7/);
+    assert.match(state.codexLogin?.error ?? "", /device auth failed after background delay/);
+    assert.match(state.codexLogin?.lastOutput ?? "", /HUNSU-LATE/);
+    assert.match(state.codexLogin?.lastOutput ?? "", /device auth failed after background delay/);
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex ChatGPT login command records pending state and recheck clears authenticated state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-chatgpt-login-test-"));
+  const fakeCodex = join(root, "codex");
+  const statePath = join(root, "state.json");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login') { process.exit(0); }",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  const previousEnv = snapshotEnv(["HUNSU_CODEX_BINARY_PATH", "HUNSU_BRIDGE_APP_STATE_PATH", "PATH"]);
+  const previousLog = console.log;
+  console.log = () => {};
+  try {
+    process.env.HUNSU_CODEX_BINARY_PATH = fakeCodex;
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "login"]), 0);
+    const pendingState = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: { kind?: string; status?: string; lastOutput?: string } };
+    assert.equal(pendingState.codexLogin?.kind, "chatgpt");
+    assert.equal(pendingState.codexLogin?.status, "pending");
+    assert.match(pendingState.codexLogin?.lastOutput ?? "", /Complete sign-in/);
+
+    assert.equal(await main(["codex", "recheck"]), 0);
+    const recheckedState = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: unknown };
+    assert.equal(recheckedState.codexLogin, undefined);
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex ChatGPT login command records failed state when Codex is missing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-chatgpt-login-fail-test-"));
+  const statePath = join(root, "state.json");
+  const previousEnv = snapshotEnv(["HUNSU_CODEX_BINARY_PATH", "HUNSU_BRIDGE_APP_STATE_PATH", "HUNSU_BRIDGE_APP_LOG_PATH", "PATH"]);
+  const previousError = console.error;
+  console.error = () => {};
+  try {
+    process.env.HUNSU_CODEX_BINARY_PATH = join(root, "missing-codex");
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.HUNSU_BRIDGE_APP_LOG_PATH = join(root, "bridge-app.log");
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "login"]), 1);
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: { kind?: string; status?: string; error?: string } };
+    assert.equal(state.codexLogin?.kind, "chatgpt");
+    assert.equal(state.codexLogin?.status, "failed");
+    assert.match(state.codexLogin?.error ?? "", /not found|missing|no such file/i);
+  } finally {
+    console.error = previousError;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App desktop UI clears stale Codex login status after authentication", () => {
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "device",
+      status: "device_code",
+      state: "device_code",
+      message: "Codex device login started.",
+      verificationUriComplete: "https://auth.openai.com/activate?user_code=HUNSU-UI",
+      userCode: "HUNSU-UI"
+    },
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "login_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /HUNSU-UI/);
+
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      tools: {}
+    }
+  });
+  assert.doesNotMatch(textForTestElement(ui.elements.get("#codex-card")), /HUNSU-UI/);
+});
+
+test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGPT pending state", () => {
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "device",
+      status: "failed",
+      state: "failed",
+      message: "Codex device login failed.",
+      error: "browser unavailable"
+    },
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "login_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /browser unavailable/);
+
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "chatgpt",
+      status: "pending",
+      lastOutput: "Browser login started. Complete sign-in, then click Recheck."
+    },
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "login_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /Codex login started/);
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /Complete sign-in in your browser, then click Recheck/);
 });
 
 test("Bridge App headless commands persist device, Remote Access, Project Grant, and service state", async () => {
@@ -155,6 +526,10 @@ test("Bridge App headless commands persist device, Remote Access, Project Grant,
       assert.match(readFileSync(serviceUnitPath, "utf8"), /ExecStart=.*supervise --cwd/);
     }
     assert.equal(logs.some(line => line.includes("Remote Access: Registered but offline")), true);
+    assert.equal(logs.some(line => line.includes("Prerequisites:")), true);
+    assert.equal(logs.some(line => line.includes("Active Roadmaps:")), true);
+    assert.equal(logs.some(line => line.includes("Inactive Roadmaps:")), true);
+    assert.equal(logs.some(line => line.includes("Projects:")), false);
     assert.equal(existsSync(credentialPath), true);
     if (process.platform !== "win32") {
       assert.equal(statSync(credentialPath).mode & 0o077, 0);
@@ -321,6 +696,164 @@ test("Bridge App Project Grant revoke publishes an empty grant list to Relay", a
     await new Promise<void>((resolve, reject) => {
       relay.close(error => error ? reject(error) : resolve());
     });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App publishes only active managed Roadmap grants to Relay", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-active-grants-relay-test-"));
+  const statePath = join(root, "state.json");
+  const credentialPath = join(root, "credentials.json");
+  const logPath = join(root, "bridge-app.log");
+  const roadmapRegistryPath = join(root, "roadmaps.json");
+  const activePath = join(root, "active-project");
+  const inactivePath = join(root, "inactive-project");
+  const state = createStudioState();
+  const active = createStudioRoadmap({ path: activePath, title: "Active Roadmap" }, state, { persist: true, roadmapRegistryPath });
+  const inactive = createStudioRoadmap({ path: inactivePath, title: "Inactive Roadmap" }, state, { persist: true, roadmapRegistryPath });
+  setRoadmapLifecycle({ roadmapId: inactive.roadmap.roadmapId }, "inactive", { roadmapRegistryPath });
+  let relayRequest: { body?: any } | undefined;
+  const relay = createHttpServer(async (request, response) => {
+    if (request.method === "POST" && request.url === "/v1/devices") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) {
+        chunks.push(Buffer.from(chunk));
+      }
+      relayRequest = { body: JSON.parse(Buffer.concat(chunks).toString("utf8")) };
+      response.writeHead(202, { "content-type": "application/json" });
+      response.end(JSON.stringify({ device: relayRequest.body.device }));
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "not_found" }));
+  });
+  const previousEnv = snapshotEnv([
+    "HUNSU_BRIDGE_APP_STATE_PATH",
+    "HUNSU_BRIDGE_CREDENTIAL_PATH",
+    "HUNSU_BRIDGE_APP_LOG_PATH",
+    "HUNSU_BRIDGE_CREDENTIAL_BACKEND",
+    "HUNSU_ROADMAP_REGISTRY_PATH",
+    "HUNSU_RELAY_PUBLIC_API_URL"
+  ]);
+  const previousLog = console.log;
+  console.log = () => undefined;
+  await new Promise<void>((resolve, reject) => {
+    relay.once("error", reject);
+    relay.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = relay.address();
+  assert.ok(address && typeof address === "object");
+
+  try {
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.HUNSU_BRIDGE_CREDENTIAL_PATH = credentialPath;
+    process.env.HUNSU_BRIDGE_APP_LOG_PATH = logPath;
+    process.env.HUNSU_BRIDGE_CREDENTIAL_BACKEND = "secure-file";
+    process.env.HUNSU_ROADMAP_REGISTRY_PATH = roadmapRegistryPath;
+    process.env.HUNSU_RELAY_PUBLIC_API_URL = `http://127.0.0.1:${address.port}`;
+    writeFileSync(statePath, JSON.stringify({
+      schema: "hunsu.bridge-app-state.v1",
+      account: { status: "signed-in", userId: "user_123", email: "user@example.test" },
+      device: { id: "device_123", name: "devbox", registered: true },
+      remoteAccess: "on",
+      projectGrants: [
+        { path: activePath, grantedAt: new Date().toISOString(), scopes: ["execute.start", "remoteRelay.access"] },
+        { path: inactivePath, grantedAt: new Date().toISOString(), scopes: ["execute.start", "remoteRelay.access"] },
+        { path: join(root, "unmanaged-project"), grantedAt: new Date().toISOString(), scopes: ["execute.start", "remoteRelay.access"] }
+      ],
+      service: { installed: false, manager: "systemd-user" }
+    }), "utf8");
+    new FileCredentialStore(credentialPath).write({
+      schema: "hunsu.bridge-credentials.v1",
+      accessToken: "access_123",
+      userId: "user_123",
+      email: "user@example.test",
+      deviceId: "device_123",
+      deviceName: "devbox",
+      savedAt: new Date().toISOString()
+    });
+
+    assert.equal(await main(["remote", "enable"]), 0);
+    const published = relayRequest?.body?.projectGrants as ProjectGrant[] | undefined;
+    assert.deepEqual(published?.map(grant => grant.path), [activePath]);
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    await new Promise<void>((resolve, reject) => {
+      relay.close(error => error ? reject(error) : resolve());
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Roadmaps CLI manages per-Roadmap Remote Access state and scopes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-roadmap-remote-test-"));
+  const statePath = join(root, "state.json");
+  const roadmapRegistryPath = join(root, "roadmaps.json");
+  const logPath = join(root, "bridge-app.log");
+  const activePath = join(root, "active-project");
+  const inactivePath = join(root, "inactive-project");
+  const state = createStudioState();
+  const active = createStudioRoadmap({ path: activePath, title: "Active Roadmap" }, state, { persist: true, roadmapRegistryPath });
+  const inactive = createStudioRoadmap({ path: inactivePath, title: "Inactive Roadmap" }, state, { persist: true, roadmapRegistryPath });
+  setRoadmapLifecycle({ roadmapId: inactive.roadmap.roadmapId }, "inactive", { roadmapRegistryPath });
+  const previousEnv = snapshotEnv([
+    "HUNSU_BRIDGE_APP_STATE_PATH",
+    "HUNSU_BRIDGE_APP_LOG_PATH",
+    "HUNSU_ROADMAP_REGISTRY_PATH",
+    "HUNSU_CODEX_BINARY_PATH"
+  ]);
+  const logs: string[] = [];
+  const errors: string[] = [];
+  const previousLog = console.log;
+  const previousError = console.error;
+  console.log = (message?: unknown) => {
+    logs.push(String(message ?? ""));
+  };
+  console.error = (message?: unknown) => {
+    errors.push(String(message ?? ""));
+  };
+  try {
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.HUNSU_BRIDGE_APP_LOG_PATH = logPath;
+    process.env.HUNSU_ROADMAP_REGISTRY_PATH = roadmapRegistryPath;
+    process.env.HUNSU_CODEX_BINARY_PATH = join(root, "missing-codex");
+
+    assert.equal(await main(["roadmaps", "remote", "enable", active.roadmap.roadmapId, "--scopes", "remoteRelay.access,execute.start"]), 0);
+    const enabledState = JSON.parse(readFileSync(statePath, "utf8")) as { projectGrants?: ProjectGrant[] };
+    assert.deepEqual(enabledState.projectGrants?.[0], {
+      path: activePath,
+      grantedAt: enabledState.projectGrants?.[0]?.grantedAt,
+      scopes: ["remoteRelay.access", "execute.start"]
+    });
+
+    logs.length = 0;
+    assert.equal(await main(["roadmaps", "list", "--json"]), 0);
+    const listed = JSON.parse(logs.at(-1) ?? "{}") as {
+      roadmaps?: Array<{
+        roadmapId: string;
+        codex?: { readyForExecute?: boolean };
+        remoteAccess?: { enabled?: boolean; available?: boolean; scopeState?: Record<string, boolean> };
+      }>;
+    };
+    const activeRow = listed.roadmaps?.find(roadmap => roadmap.roadmapId === active.roadmap.roadmapId);
+    const inactiveRow = listed.roadmaps?.find(roadmap => roadmap.roadmapId === inactive.roadmap.roadmapId);
+    assert.equal(activeRow?.codex?.readyForExecute, false);
+    assert.equal(activeRow?.remoteAccess?.enabled, true);
+    assert.equal(activeRow?.remoteAccess?.scopeState?.["remoteRelay.access"], true);
+    assert.equal(activeRow?.remoteAccess?.scopeState?.["execute.start"], true);
+    assert.equal(inactiveRow?.remoteAccess?.available, false);
+
+    assert.equal(await main(["roadmaps", "remote", "enable", inactive.roadmap.roadmapId]), 1);
+    assert.match(errors.at(-1) ?? "", /Inactive Roadmap cannot be exposed/);
+
+    assert.equal(await main(["roadmaps", "remote", "disable", active.roadmap.roadmapId]), 0);
+    const disabledState = JSON.parse(readFileSync(statePath, "utf8")) as { projectGrants?: ProjectGrant[] };
+    assert.deepEqual(disabledState.projectGrants?.[0]?.scopes, ["execute.start"]);
+  } finally {
+    console.log = previousLog;
+    console.error = previousError;
+    restoreEnv(previousEnv);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -715,6 +1248,15 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
     command: { deviceId: device.deviceId, command: "execute.start", projectPath: "/tmp/hunsu-project" },
     projectGrants: [grant]
   }).ok, true);
+  assert.deepEqual(evaluateRelayCommand({
+    device,
+    command: { deviceId: device.deviceId, command: "execute.start", projectPath: "/tmp/hunsu-project" },
+    projectGrants: [{ ...grant, active: false }]
+  }), {
+    ok: false,
+    reason: "project_grant_denied",
+    message: "Project Grant is required for this Relay command."
+  });
   assert.equal(evaluateRelayCommand({
     device: { ...device, status: "offline" },
     command: { deviceId: device.deviceId, command: "execute.start", projectPath: "/tmp/hunsu-project" },
@@ -1580,6 +2122,7 @@ test("built current-platform Bridge sidecar status matches the Node bundle", {
 });
 
 test("Bridge App protocol plan and sidecar supervisor expose native desktop foundations", async () => {
+  await delay(1_000);
   const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-sidecar-test-"));
   const logPath = join(root, "sidecar.log");
   const sidecarDistSnapshot = snapshotSidecarDist();
@@ -1642,6 +2185,7 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.equal(accepted.status, 0, accepted.stderr);
 
     const nativeDir = join(root, "native-sidecars");
+    const preparedDist = join(root, "prepared-dist");
     mkdirSync(nativeDir);
     const sidecarArtifacts = [
       ["hunsu-bridge-sidecar-x86_64-apple-darwin", "mach-o"],
@@ -1658,10 +2202,12 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
       "--conditions=development",
       "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
       "--native-dir",
-      nativeDir
+      nativeDir,
+      "--dist-dir",
+      preparedDist
     ], { cwd: process.cwd(), encoding: "utf8" });
     assert.equal(prepared.status, 0, prepared.stderr);
-    const sidecarManifest = JSON.parse(readFileSync(join(process.cwd(), "apps/bridge-desktop/dist/sidecar-manifest.json"), "utf8")) as {
+    const sidecarManifest = JSON.parse(readFileSync(join(preparedDist, "sidecar-manifest.json"), "utf8")) as {
       artifacts: Array<{ target: string; file: string; kind: string }>;
       currentPlatform?: { file: string };
     };
@@ -1669,7 +2215,7 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.deepEqual(sidecarManifest.artifacts.map(artifact => artifact.kind), sidecarArtifacts.map(() => "native-executable"));
     assert.equal(sidecarManifest.artifacts.some(artifact => artifact.file.endsWith(".cmd")), false);
     if (sidecarManifest.currentPlatform) {
-      assert.equal(existsSync(join(process.cwd(), "apps/bridge-desktop/dist", sidecarManifest.currentPlatform.file)), true);
+      assert.equal(existsSync(join(preparedDist, sidecarManifest.currentPlatform.file)), true);
     }
 
     const bundleOnly = spawnSync("pnpm", [
@@ -1728,12 +2274,32 @@ function restoreSidecarDist(snapshot: Map<string, Buffer | undefined>): void {
     if (content === undefined) {
       rmSync(path, { force: true });
     } else {
-      writeFileSync(path, content);
+      writeFileSyncRetry(path, content);
       if (!path.endsWith(".exe") && path.includes("hunsu-bridge-sidecar")) {
         chmodSync(path, 0o755);
       }
     }
   }
+}
+
+function writeFileSyncRetry(path: string, content: Buffer): void {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const tempPath = `${path}.restore-${process.pid}-${attempt}`;
+    try {
+      writeFileSync(tempPath, content);
+      renameSync(tempPath, path);
+      return;
+    } catch (error) {
+      rmSync(tempPath, { force: true });
+      lastError = error;
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ETXTBSY") {
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function fakeNativeExecutable(kind: "elf" | "mach-o" | "pe"): Buffer {
@@ -1750,6 +2316,119 @@ function fakeNativeExecutable(kind: "elf" | "mach-o" | "pe"): Buffer {
       break;
   }
   return buffer;
+}
+
+type BridgeUiTestElement = {
+  textContent: string;
+  className: string;
+  children: unknown[];
+  dataset: Record<string, string>;
+  value: string;
+  checked: boolean;
+  disabled: boolean;
+  hidden: boolean;
+  title: string;
+  type: string;
+  append: (...nodes: unknown[]) => void;
+  replaceChildren: (...nodes: unknown[]) => void;
+  addEventListener: () => void;
+  focus: () => void;
+  scrollIntoView: () => void;
+  setAttribute: (name: string, value: string) => void;
+};
+
+function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => void; elements: Map<string, BridgeUiTestElement> } {
+  const elements = new Map<string, BridgeUiTestElement>();
+  const document = {
+    querySelector(selector: string) {
+      if (!elements.has(selector)) {
+        elements.set(selector, createBridgeUiTestElement());
+      }
+      return elements.get(selector);
+    },
+    querySelectorAll(_selector: string) {
+      return [];
+    },
+    createElement(_tagName: string) {
+      return createBridgeUiTestElement();
+    },
+    createTextNode(value: string) {
+      return { textContent: value };
+    }
+  };
+  const window = {
+    __TAURI__: undefined,
+    location: { href: "" },
+    setTimeout: () => 0,
+    setInterval: () => 0
+  };
+  const context = {
+    window,
+    document,
+    navigator: { clipboard: { writeText: () => Promise.resolve() } },
+    console,
+    Promise,
+    JSON,
+    Date,
+    String,
+    setTimeout: () => 0,
+    clearTimeout: () => undefined
+  };
+  runInNewContext(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/app.js"), "utf8"), context);
+  return {
+    renderSnapshot: (context as unknown as { renderSnapshot: (snapshot: unknown) => void }).renderSnapshot,
+    elements
+  };
+}
+
+function createBridgeUiTestElement(): BridgeUiTestElement {
+  return {
+    textContent: "",
+    className: "",
+    children: [],
+    dataset: {},
+    value: "",
+    checked: false,
+    disabled: false,
+    hidden: false,
+    title: "",
+    type: "",
+    append(...nodes: unknown[]) {
+      this.children.push(...nodes);
+    },
+    replaceChildren(...nodes: unknown[]) {
+      this.children = nodes;
+    },
+    addEventListener() {},
+    focus() {},
+    scrollIntoView() {},
+    setAttribute(name: string, value: string) {
+      if (name === "aria-selected") {
+        this.dataset.ariaSelected = value;
+      }
+    }
+  };
+}
+
+function textForTestElement(element: unknown): string {
+  if (!element || typeof element !== "object") {
+    return "";
+  }
+  const node = element as { textContent?: unknown; children?: unknown[] };
+  return [
+    typeof node.textContent === "string" ? node.textContent : "",
+    ...(node.children ?? []).map(child => textForTestElement(child))
+  ].filter(Boolean).join("\n");
+}
+
+function bridgeUiStatusFixture() {
+  return {
+    localBridge: "connected",
+    account: "Signed out",
+    remoteAccess: "Off",
+    device: { name: "Test Device", registered: false },
+    service: { installed: false, manager: "manual" }
+  };
 }
 
 test("Bridge App sidecar supervisor cancels crash restart when stopped intentionally", async () => {

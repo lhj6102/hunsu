@@ -2,17 +2,33 @@ const invoke = window.__TAURI__?.core?.invoke;
 const diagnostics = document.querySelector("#diagnostics");
 const statusEls = {
   localBridge: document.querySelector("#local-bridge"),
+  codexSummary: document.querySelector("#codex-summary"),
+  activeRoadmaps: document.querySelector("#active-roadmaps"),
   account: document.querySelector("#account"),
   remoteAccess: document.querySelector("#remote-access"),
   device: document.querySelector("#device"),
   service: document.querySelector("#service")
 };
-const recentProjects = document.querySelector("#recent-projects");
+const activeRoadmapList = document.querySelector("#active-roadmap-list");
+const inactiveRoadmapList = document.querySelector("#inactive-roadmap-list");
+const codexCard = document.querySelector("#codex-card");
+const gitCard = document.querySelector("#git-card");
+const nodeCard = document.querySelector("#node-card");
+const remoteRoadmapList = document.querySelector("#remote-roadmap-list");
 const projectGrants = document.querySelector("#project-grants");
 const selectedProject = document.querySelector("#selected-project");
 const selectedProjectAction = document.querySelector("#selected-project-action");
+const codexBinaryPath = document.querySelector("#codex-binary-path");
+const codexInstallChannel = document.querySelector("#codex-install-channel");
+const codexAuthPreference = document.querySelector("#codex-auth-preference");
+const codexEnvHome = document.querySelector("#codex-env-home");
+const codexEnvCommand = document.querySelector("#codex-env-command");
+const codexEnvArgs = document.querySelector("#codex-env-args");
 let latestSnapshot = undefined;
 let selectedInspection = undefined;
+let lastHandledUiIntentId = undefined;
+let latestCodexDeviceLoginResult = undefined;
+const projectGrantScopes = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"];
 
 async function open(url) {
   if (invoke) await invoke("open_external", { url });
@@ -41,6 +57,7 @@ async function refresh() {
     const stdout = await run(["snapshot"]);
     latestSnapshot = JSON.parse(stdout);
     renderSnapshot(latestSnapshot);
+    await handleUiIntent(latestSnapshot.uiIntent);
   } catch (error) {
     statusEls.localBridge.textContent = "Error";
     statusEls.localBridge.className = "status-error";
@@ -48,10 +65,31 @@ async function refresh() {
   }
 }
 
+async function handleUiIntent(intent) {
+  if (!intent?.id || intent.id === lastHandledUiIntentId) {
+    return;
+  }
+  lastHandledUiIntentId = intent.id;
+  selectTab(intent.tab);
+  if (intent.focus === "codex") {
+    codexCard?.scrollIntoView({ block: "start" });
+  }
+  if (intent.action === "add-roadmap") {
+    await chooseProjectFolder();
+  }
+}
+
 function renderSnapshot(snapshot) {
   const status = snapshot.status;
   statusEls.localBridge.textContent = labelLocalBridge(status.localBridge);
   statusEls.localBridge.className = status.localBridge === "connected" ? "status-connected" : status.localBridge === "error" ? "status-error" : "status-warning";
+  const codex = snapshot.prerequisites?.codex;
+  statusEls.codexSummary.textContent = codexSummary(codex);
+  statusEls.codexSummary.className = codex?.ready ? "status-connected" : codex?.recommendedAction === "install_codex" || codex?.recommendedAction === "login_codex" ? "status-warning" : "status-error";
+  const managed = snapshot.managedRoadmaps ?? snapshot.recentProjects ?? [];
+  const activeRoadmaps = managed.filter(project => project.lifecycle === "active");
+  const inactiveRoadmaps = managed.filter(project => project.lifecycle !== "active");
+  statusEls.activeRoadmaps.textContent = `${activeRoadmaps.length} active`;
   statusEls.account.textContent = status.account;
   statusEls.remoteAccess.textContent = status.remoteAccess;
   statusEls.device.textContent = `${status.device.name}${status.device.registered ? " (registered)" : ""}`;
@@ -60,11 +98,31 @@ function renderSnapshot(snapshot) {
     diagnostics: snapshot.diagnostics,
     logs: snapshot.logLines
   }, null, 2);
-  recentProjects.replaceChildren(...snapshot.recentProjects.map(projectRow));
+  if (snapshot.codexLogin) {
+    latestCodexDeviceLoginResult = snapshot.codexLogin;
+  } else if (codex?.ready || codex?.auth?.state === "authenticated") {
+    latestCodexDeviceLoginResult = undefined;
+  }
+  renderCodexCard(codex);
+  renderToolCards(snapshot.prerequisites?.tools);
+  activeRoadmapList.replaceChildren(...roadmapRows(activeRoadmaps, "active", snapshot.projectGrants ?? []));
+  inactiveRoadmapList.replaceChildren(...roadmapRows(inactiveRoadmaps, "inactive", snapshot.projectGrants ?? []));
+  remoteRoadmapList.replaceChildren(...roadmapRows(managed, "remote", snapshot.projectGrants ?? []));
   projectGrants.replaceChildren(...projectGrantRows(snapshot.projectGrants ?? []));
+  renderCodexSettings(snapshot.codexSettings, snapshot.diagnostics?.app?.codex);
 }
 
-function projectRow(project) {
+function roadmapRows(projects, lifecycle, grants) {
+  if (!projects.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-row";
+    empty.textContent = lifecycle === "active" ? "No active Roadmaps." : lifecycle === "remote" ? "No managed Roadmaps." : "No inactive Roadmaps.";
+    return [empty];
+  }
+  return projects.map(project => projectRow(project, grants));
+}
+
+function projectRow(project, grants = []) {
   const row = document.createElement("div");
   row.className = "project-row";
   const body = document.createElement("div");
@@ -73,13 +131,20 @@ function projectRow(project) {
   title.textContent = project.displayName;
   const meta = document.createElement("div");
   meta.className = "project-meta";
+  const grant = project.projectGrant ?? grantForProject(project, grants);
+  const remote = remoteAccessState(project, grant);
   meta.textContent = [
+    `Local: ${project.lifecycle === "active" ? "Active" : "Inactive"}`,
+    `Codex: ${project.codex?.readyForExecute ? "Ready" : "Not Ready"}`,
+    `Remote: ${remote.label}`,
     project.health,
     project.lastKnownBranch,
     project.lastOpenedAt ? new Date(project.lastOpenedAt).toLocaleString() : undefined,
     project.repositoryPath
   ].filter(Boolean).join(" · ");
-  body.append(title, meta);
+  body.append(title, meta, scopeControls(project, grant, remote));
+  const buttons = document.createElement("div");
+  buttons.className = "actions";
   const button = document.createElement("button");
   const action = project.primaryAction || (project.health === "ok" ? "open" : "remove");
   button.textContent = actionLabel(action);
@@ -93,8 +158,343 @@ function projectRow(project) {
     }
     await refresh();
   });
-  row.append(body, button);
+  buttons.append(button);
+  const lifecycleButton = document.createElement("button");
+  lifecycleButton.textContent = project.lifecycle === "inactive" ? "Activate" : "Deactivate";
+  lifecycleButton.addEventListener("click", async () => {
+    await run(["roadmaps", project.lifecycle === "inactive" ? "activate" : "deactivate", project.roadmapId]);
+    await refresh();
+  });
+  buttons.append(lifecycleButton);
+  const remoteButton = document.createElement("button");
+  remoteButton.textContent = remote.enabled ? "Disable Remote Access" : "Enable Remote Access";
+  remoteButton.disabled = !remote.available;
+  remoteButton.title = remote.available ? remoteButton.textContent : remote.reason;
+  remoteButton.className = remote.enabled ? "" : remote.available ? "primary" : "";
+  remoteButton.addEventListener("click", async () => {
+    await run(["roadmaps", "remote", remote.enabled ? "disable" : "enable", project.roadmapId]);
+    await refresh();
+  });
+  buttons.append(remoteButton);
+  const removeButton = document.createElement("button");
+  removeButton.textContent = "Remove";
+  removeButton.addEventListener("click", async () => {
+    await run(["roadmaps", "remove", project.roadmapId]);
+    await refresh();
+  });
+  buttons.append(removeButton);
+  row.append(body, buttons);
   return row;
+}
+
+function grantForProject(project, grants) {
+  return grants.find(grant => normalizePath(grant.path) === normalizePath(project.repositoryPath));
+}
+
+function remoteAccessState(project, grant) {
+  const available = project.lifecycle === "active";
+  const scopes = scopesForProject(project, grant);
+  const enabled = available && scopes.includes("remoteRelay.access") && grant?.active !== false;
+  const reason = available ? undefined : project.remoteAccess?.reason ?? "Inactive Roadmaps are not exposed over Relay.";
+  return {
+    available,
+    enabled,
+    reason,
+    label: enabled ? "On" : available ? "Off" : "Unavailable"
+  };
+}
+
+function scopesForProject(project, grant) {
+  return grant?.scopes ?? project.remoteAccess?.scopes ?? [];
+}
+
+function scopeControls(project, grant, remote) {
+  const scopes = scopesForProject(project, grant);
+  const checks = document.createElement("div");
+  checks.className = "scope-checks";
+  for (const scope of projectGrantScopes) {
+    const item = document.createElement("label");
+    const enabled = scopes.includes(scope);
+    const scopeManageable = remote.available && (remote.enabled || scope === "remoteRelay.access");
+    item.className = enabled ? "scope-on" : "scope-off";
+    item.title = scopeManageable ? scope : remote.available ? "Enable Remote Access before changing this scope." : remote.reason;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = enabled;
+    input.disabled = !scopeManageable;
+    input.addEventListener("change", async () => {
+      await setRoadmapScope(project, grant, scope, input.checked);
+    });
+    item.append(input, document.createTextNode(scope));
+    checks.append(item);
+  }
+  return checks;
+}
+
+async function setRoadmapScope(project, grant, scope, enabled) {
+  const currentScopes = new Set(scopesForProject(project, grant));
+  if (enabled) currentScopes.add(scope);
+  else currentScopes.delete(scope);
+  if (scope === "remoteRelay.access" && !enabled) {
+    await run(["roadmaps", "remote", "disable", project.roadmapId]);
+    await refresh();
+    return;
+  }
+  currentScopes.add("remoteRelay.access");
+  const scopes = projectGrantScopes.filter(candidate => currentScopes.has(candidate));
+  await run(["roadmaps", "remote", "enable", project.roadmapId, "--scopes", scopes.join(",")]);
+  await refresh();
+}
+
+function normalizePath(path) {
+  return String(path ?? "").replace(/\/+$/, "");
+}
+
+function renderCodexCard(codex) {
+  codexCard.replaceChildren();
+  const row = document.createElement("div");
+  row.className = "project-row";
+  const body = document.createElement("div");
+  const title = document.createElement("div");
+  title.className = "project-title";
+  title.textContent = "Codex CLI";
+  const meta = document.createElement("div");
+  meta.className = "project-meta";
+  meta.textContent = [
+    codexSummary(codex),
+    codex?.cli?.version,
+    codex?.cli?.source ? `Source: ${codex.cli.source}` : undefined,
+    codex?.auth?.access ? `Access: ${formatCodexAccess(codex)}` : undefined,
+    codex?.usage?.rateLimitSummary ? `Rate limits: ${formatRateLimit(codex)}` : undefined,
+    codex?.usage?.lastRunUsage ? `Last run: ${formatUsage(codex.usage.lastRunUsage)}` : undefined,
+    codex?.cli?.binaryPath
+  ].filter(Boolean).join(" · ");
+  body.append(title, meta, codexDeviceLoginStatus());
+  const buttons = document.createElement("div");
+  buttons.className = "actions";
+  const recheck = document.createElement("button");
+  recheck.textContent = "Recheck";
+  recheck.addEventListener("click", async () => {
+    await run(["codex", "recheck"]);
+    await refresh();
+  });
+  buttons.append(recheck);
+  if (codex?.recommendedAction === "install_codex") {
+    const install = document.createElement("button");
+    install.className = "primary";
+    install.textContent = "Install Codex";
+    install.addEventListener("click", async () => {
+      diagnostics.textContent = await run(["codex", "install"]);
+    });
+    buttons.append(install);
+    const existing = document.createElement("button");
+    existing.textContent = "Use Existing Installation";
+    existing.addEventListener("click", () => {
+      document.querySelector("[data-tab='settings']")?.click();
+      codexBinaryPath.focus();
+    });
+    buttons.append(existing);
+    const copy = document.createElement("button");
+    copy.textContent = "Copy Install Command";
+    copy.addEventListener("click", async () => {
+      await navigator.clipboard.writeText("curl -fsSL https://chatgpt.com/codex/install.sh | sh");
+    });
+    buttons.append(copy);
+  }
+  if (codex?.recommendedAction === "login_codex") {
+    const login = document.createElement("button");
+    login.className = "primary";
+    login.textContent = "Sign in with ChatGPT";
+    login.addEventListener("click", startCodexChatGptLogin);
+    buttons.append(login);
+    const device = document.createElement("button");
+    device.textContent = "Use Device Code";
+    device.addEventListener("click", startCodexDeviceLogin);
+    buttons.append(device);
+    const apiKey = document.createElement("button");
+    apiKey.textContent = "Use API Key - Advanced";
+    apiKey.addEventListener("click", startCodexChatGptLogin);
+    buttons.append(apiKey);
+  }
+  if (codex?.recommendedAction !== "login_codex") {
+    const apiKey = document.createElement("button");
+    apiKey.textContent = "Use API Key - Advanced";
+    apiKey.addEventListener("click", startCodexChatGptLogin);
+    buttons.append(apiKey);
+  }
+  row.append(body, buttons);
+  codexCard.append(row);
+}
+
+async function startCodexChatGptLogin() {
+  latestCodexDeviceLoginResult = {
+    kind: "chatgpt",
+    status: "pending",
+    message: "Codex login started.",
+    lastOutput: "Browser login started. Complete sign-in, then click Recheck."
+  };
+  renderCodexCard(latestSnapshot?.prerequisites?.codex);
+  try {
+    await spawn(["codex", "login"]);
+  } catch (error) {
+    latestCodexDeviceLoginResult = {
+      kind: "chatgpt",
+      status: "failed",
+      message: "Codex login failed to start.",
+      error: String(error)
+    };
+  }
+  await refresh();
+}
+
+async function startCodexDeviceLogin() {
+  latestCodexDeviceLoginResult = {
+    state: "pending",
+    message: "Starting Codex device login..."
+  };
+  renderCodexCard(latestSnapshot?.prerequisites?.codex);
+  try {
+    await spawn(["codex", "login", "--device", "--background"]);
+    latestCodexDeviceLoginResult = {
+      state: "pending",
+      message: "Codex device login started."
+    };
+  } catch (error) {
+    latestCodexDeviceLoginResult = {
+      state: "failed",
+      message: String(error)
+    };
+  }
+  renderCodexCard(latestSnapshot?.prerequisites?.codex);
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await delay(750);
+    await refresh();
+    if (latestCodexDeviceLoginResult?.state === "device_code" || latestCodexDeviceLoginResult?.state === "failed") {
+      break;
+    }
+  }
+}
+
+function codexDeviceLoginStatus() {
+  const result = latestCodexDeviceLoginResult;
+  const container = document.createElement("div");
+  if (!result) {
+    return container;
+  }
+  container.className = "message";
+  if (result.kind === "chatgpt") {
+    const failed = result.status === "failed" || result.state === "failed";
+    const lines = [
+      failed ? result.message || "Codex login failed to start." : "Codex login started.",
+      failed ? result.error : "Complete sign-in in your browser, then click Recheck."
+    ].filter(Boolean);
+    container.textContent = lines.join("\n");
+    if (failed) {
+      container.className = "message status-error";
+    }
+    return container;
+  }
+  const failed = result.state === "failed" || result.status === "failed";
+  const lines = [
+    failed ? result.message || "Codex device login failed. Start device login again or run Recheck after completing sign-in." : result.message,
+    failed && result.error ? `Error: ${result.error}` : undefined,
+    result.verificationUriComplete || result.verificationUri ? `Verification URL: ${result.verificationUriComplete || result.verificationUri}` : undefined,
+    result.userCode ? `Code: ${result.userCode}` : undefined,
+    result.state ? `Status: ${formatDeviceLoginState(result.state)}` : undefined,
+    failed && result.lastOutput ? `Last output: ${result.lastOutput}` : undefined
+  ].filter(Boolean);
+  container.textContent = lines.join("\n");
+  if (failed) {
+    container.className = "message status-error";
+  }
+  return container;
+}
+
+function parseJsonResult(value) {
+  try {
+    return JSON.parse(value);
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function formatDeviceLoginState(state) {
+  if (state === "device_code") return "Waiting for authorization";
+  if (state === "pending") return "Pending";
+  if (state === "failed") return "Failed";
+  return state;
+}
+
+function renderToolCards(tools) {
+  gitCard.replaceChildren(toolRow("Git", tools?.git));
+  nodeCard.replaceChildren(
+    toolRow("Node", tools?.node),
+    toolRow("Package manager", tools?.packageManager)
+  );
+}
+
+function toolRow(titleText, tool) {
+  const row = document.createElement("div");
+  row.className = "project-row";
+  const body = document.createElement("div");
+  const title = document.createElement("div");
+  title.className = "project-title";
+  title.textContent = titleText;
+  const meta = document.createElement("div");
+  meta.className = "project-meta";
+  meta.textContent = [
+    tool?.installed ? "Installed" : "Missing",
+    tool?.version,
+    tool?.binaryPath,
+    tool?.error
+  ].filter(Boolean).join(" · ");
+  body.append(title, meta);
+  row.append(body);
+  return row;
+}
+
+function codexSummary(codex) {
+  if (!codex) return "Unknown";
+  if (codex.usage?.rateLimited) return "Rate Limited";
+  if (codex.ready) return "Ready";
+  if (codex.recommendedAction === "install_codex") return "Install Required";
+  if (codex.recommendedAction === "login_codex") return "Login Required";
+  if (!codex.appServer?.available) return "App Server Unavailable";
+  return "Error";
+}
+
+function formatCodexAccess(codex) {
+  if (codex?.usage?.rateLimited) return "Temporarily unavailable";
+  if (codex?.auth?.access === "subscription") return "Subscription";
+  if (codex?.auth?.access === "usage_based") return "Usage-based";
+  return "Unknown";
+}
+
+function formatRateLimit(codex) {
+  const summary = codex?.usage?.rateLimitSummary;
+  if (!summary) return codex?.usage?.rateLimitsAvailable ? "Available" : "Unavailable";
+  return [
+    summary.label,
+    summary.remainingLabel,
+    summary.resetAt ? `Reset ${summary.resetAt}` : undefined
+  ].filter(Boolean).join(", ");
+}
+
+function formatUsage(usage) {
+  return `input ${usage.inputTokens}, cached ${usage.cachedInputTokens}, output ${usage.outputTokens}, reasoning ${usage.reasoningTokens}`;
+}
+
+function renderCodexSettings(settings, legacyCodexSettings) {
+  codexBinaryPath.value = settings?.binaryPath ?? legacyCodexSettings?.binaryPath ?? "";
+  codexInstallChannel.value = settings?.installChannel ?? "stable";
+  codexAuthPreference.value = settings?.authenticationPreference ?? "chatgpt";
+  codexEnvHome.value = settings?.environment?.CODEX_HOME ?? "";
+  codexEnvCommand.value = settings?.environment?.HUNSU_CODEX_APP_SERVER_COMMAND ?? "";
+  codexEnvArgs.value = settings?.environment?.HUNSU_CODEX_APP_SERVER_ARGS ?? "";
 }
 
 function projectGrantRows(grants) {
@@ -215,8 +615,8 @@ async function runSelectedAction() {
 
 document.querySelector("#refresh").addEventListener("click", refresh);
 document.querySelector("#open-studio").addEventListener("click", () => spawn(["pair"]));
+document.querySelector("#open-studio-connection").addEventListener("click", () => spawn(["pair"]));
 selectedProjectAction.addEventListener("click", runSelectedAction);
-document.querySelector("#sign-in").addEventListener("click", () => spawn(["login", "--gui"]));
 document.querySelector("#enable-remote").addEventListener("click", async () => {
   await run(["remote", "enable"]);
   await refresh();
@@ -237,16 +637,56 @@ document.querySelector("#stop-bridge").addEventListener("click", async () => {
   await run(["stop"]);
   await refresh();
 });
-document.querySelector("#choose-folder").addEventListener("click", async () => {
+async function chooseProjectFolder() {
   if (!invoke) return;
   const folder = await invoke("choose_project_folder");
   if (folder?.path) {
     await inspectSelectedFolder(folder.path);
   }
-});
+}
+
+document.querySelector("#choose-folder").addEventListener("click", chooseProjectFolder);
 document.querySelector("#copy-diagnostics").addEventListener("click", async () => {
   await navigator.clipboard.writeText(diagnostics.textContent || "{}");
 });
+document.querySelector("#save-codex-path").addEventListener("click", async () => {
+  const value = codexBinaryPath.value.trim();
+  if (value) await run(["codex", "path", "set", value]);
+  else await run(["codex", "path", "reset"]);
+  await refresh();
+});
+document.querySelector("#save-codex-settings").addEventListener("click", async () => {
+  await run([
+    "codex",
+    "settings",
+    "set",
+    "--install-channel",
+    codexInstallChannel.value,
+    "--auth-preference",
+    codexAuthPreference.value
+  ]);
+  await refresh();
+});
+document.querySelector("#reset-codex-path").addEventListener("click", async () => {
+  await run(["codex", "path", "reset"]);
+  await refresh();
+});
+
+for (const tab of document.querySelectorAll("nav [data-tab]")) {
+  tab.addEventListener("click", () => {
+    selectTab(tab.dataset.tab);
+  });
+}
+
+function selectTab(tabName) {
+  if (!tabName) return;
+  for (const candidate of document.querySelectorAll("nav [data-tab]")) {
+    candidate.setAttribute("aria-selected", String(candidate.dataset.tab === tabName));
+  }
+  for (const panel of document.querySelectorAll("[data-panel]")) {
+    panel.hidden = panel.dataset.panel !== tabName;
+  }
+}
 
 void refresh();
 window.setInterval(refresh, 3000);

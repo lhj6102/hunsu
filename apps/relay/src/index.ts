@@ -58,6 +58,7 @@ export type ProjectGrant = {
   path: string;
   grantedAt: string;
   scopes: BridgeCommandScope[];
+  active?: boolean;
 };
 
 export type RemoteBridgeDevice = {
@@ -621,7 +622,7 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
       return { ok: false, reason: "project_grant_denied", message: "Relay command requires an explicit project path." };
     }
     const normalizedProjectPath = normalizeRelayProjectPath(projectPath);
-    const grant = input.device.projectGrants.find(candidate => normalizeRelayProjectPath(candidate.path) === normalizedProjectPath);
+    const grant = input.device.projectGrants.find(candidate => candidate.active !== false && normalizeRelayProjectPath(candidate.path) === normalizedProjectPath);
     if (!grant) {
       return { ok: false, reason: "project_grant_denied", message: "Project Grant is required for this Relay command." };
     }
@@ -650,7 +651,7 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
       return { projectAccess: "denied", message: "Remote Bridge device is not registered for this account." };
     }
     const normalizedProjectPath = normalizeRelayProjectPath(projectPath);
-    const grant = device.projectGrants.find(candidate => normalizeRelayProjectPath(candidate.path) === normalizedProjectPath);
+    const grant = device.projectGrants.find(candidate => candidate.active !== false && normalizeRelayProjectPath(candidate.path) === normalizedProjectPath);
     if (!grant) {
       return { projectAccess: "needs_grant", message: "Project Grant is required for this Remote Bridge." };
     }
@@ -856,7 +857,8 @@ function parseProjectGrants(value: unknown): ProjectGrant[] {
   }).map(grant => ({
     path: normalizeRelayProjectPath(grant.path),
     grantedAt: grant.grantedAt,
-    scopes: [...grant.scopes]
+    scopes: [...grant.scopes],
+    active: grant.active === false ? false : undefined
   }));
 }
 

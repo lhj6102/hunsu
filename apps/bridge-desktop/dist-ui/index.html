@@ -37,6 +37,19 @@
         background: rgba(255, 255, 255, 0.82);
         padding: 16px;
       }
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 18px;
+      }
+      nav button[aria-selected="true"] {
+        border-color: #1f6feb;
+        background: #eaf2ff;
+      }
+      section[hidden] {
+        display: none;
+      }
       h2 {
         margin: 0 0 12px;
         font-size: 14px;
@@ -61,6 +74,10 @@
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
       }
       button {
         min-height: 36px;
@@ -87,6 +104,15 @@
         padding: 12px;
         font-size: 12px;
         line-height: 1.5;
+      }
+      input,
+      select {
+        min-height: 34px;
+        border: 1px solid #ccd5e0;
+        border-radius: 8px;
+        padding: 0 10px;
+        font: inherit;
+        font-size: 13px;
       }
       .grid {
         display: grid;
@@ -120,6 +146,29 @@
         font-size: 12px;
         line-height: 1.45;
       }
+      .message {
+        white-space: pre-line;
+      }
+      .scope-checks {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        margin-top: 8px;
+        color: #667085;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .scope-checks label {
+        align-items: center;
+        display: inline-flex;
+        gap: 4px;
+      }
+      .scope-on {
+        color: #138a4f;
+      }
+      .scope-off {
+        color: #667085;
+      }
       .status-connected {
         color: #138a4f;
       }
@@ -141,11 +190,25 @@
         </div>
       </header>
 
-      <section>
-        <h2>Status</h2>
+      <nav aria-label="Bridge sections">
+        <button data-tab="overview" aria-selected="true">Overview</button>
+        <button data-tab="prerequisites">Prerequisites</button>
+        <button data-tab="roadmaps">Roadmaps</button>
+        <button data-tab="connection">Connection</button>
+        <button data-tab="remote">Remote Access</button>
+        <button data-tab="diagnostics">Diagnostics</button>
+        <button data-tab="settings">Settings</button>
+      </nav>
+
+      <section data-panel="overview">
+        <h2>Overview</h2>
         <dl>
           <dt>Local Bridge</dt>
           <dd id="local-bridge">Not Running</dd>
+          <dt>Codex</dt>
+          <dd id="codex-summary">Unknown</dd>
+          <dt>Active Roadmaps</dt>
+          <dd id="active-roadmaps">0 active</dd>
           <dt>Account</dt>
           <dd id="account">Signed out</dd>
           <dt>Remote Access</dt>
@@ -157,37 +220,98 @@
         </dl>
       </section>
 
-      <section>
-        <h2>Projects</h2>
+      <section data-panel="prerequisites" hidden>
+        <h2>Prerequisites</h2>
+        <div id="codex-card" class="grid"></div>
+        <h2 style="margin-top: 18px;">Git</h2>
+        <div id="git-card" class="grid"></div>
+        <h2 style="margin-top: 18px;">Node / Package Manager</h2>
+        <div id="node-card" class="grid"></div>
+      </section>
+
+      <section data-panel="roadmaps" hidden>
+        <h2>Roadmaps</h2>
         <div class="actions">
-          <button id="choose-folder" class="primary">Choose Folder</button>
+          <button id="choose-folder" class="primary">Add Roadmap</button>
           <button id="selected-project-action" disabled>Select a Folder</button>
         </div>
         <div id="selected-project" class="message">No folder selected.</div>
-        <div id="recent-projects" class="grid" style="margin-top: 14px;"></div>
+        <h2 style="margin-top: 18px;">Active Roadmaps</h2>
+        <div id="active-roadmap-list" class="grid"></div>
+        <h2 style="margin-top: 18px;">Inactive Roadmaps</h2>
+        <div id="inactive-roadmap-list" class="grid"></div>
       </section>
 
-      <section>
-        <h2>Project Grants</h2>
-        <div id="project-grants" class="grid"></div>
-      </section>
-
-      <section>
-        <h2>Actions</h2>
+      <section data-panel="connection" hidden>
+        <h2>Connection</h2>
         <div class="actions">
           <button id="start-bridge">Start Bridge</button>
           <button id="stop-bridge">Stop Bridge</button>
-          <button id="copy-diagnostics">Copy Diagnostics</button>
-          <button id="sign-in">Sign In</button>
-          <button id="enable-remote">Enable Remote Access</button>
-          <button id="disable-remote">Disable Remote Access</button>
+          <button id="open-studio-connection">Open Studio</button>
           <button id="install-protocol">Install hunsu:// Handler</button>
         </div>
       </section>
 
-      <section>
+      <section data-panel="remote" hidden>
+        <h2>Active Roadmap Remote Access</h2>
+        <div id="remote-roadmap-list" class="grid"></div>
+        <h2 style="margin-top: 18px;">Project Grants</h2>
+        <div id="project-grants" class="grid"></div>
+        <div class="actions">
+          <button id="enable-remote">Enable Remote Access</button>
+          <button id="disable-remote">Disable Remote Access</button>
+        </div>
+      </section>
+
+      <section data-panel="diagnostics" hidden>
         <h2>Diagnostics</h2>
+        <div class="actions">
+          <button id="copy-diagnostics">Copy Diagnostics</button>
+        </div>
         <pre id="diagnostics">{}</pre>
+      </section>
+
+      <section data-panel="settings" hidden>
+        <h2>Settings</h2>
+        <div class="grid">
+          <label>
+            <span class="project-meta">Codex binary path</span>
+            <input id="codex-binary-path" placeholder="Auto-detect from PATH" />
+          </label>
+          <label>
+            <span class="project-meta">Install channel</span>
+            <select id="codex-install-channel">
+              <option value="stable">Stable</option>
+              <option value="latest">Latest</option>
+              <option value="manual">Manual</option>
+            </select>
+          </label>
+          <label>
+            <span class="project-meta">Authentication preference</span>
+            <select id="codex-auth-preference">
+              <option value="chatgpt">ChatGPT</option>
+              <option value="device_code">Device code</option>
+              <option value="api_key">API key</option>
+            </select>
+          </label>
+          <label>
+            <span class="project-meta">CODEX_HOME</span>
+            <input id="codex-env-home" readonly />
+          </label>
+          <label>
+            <span class="project-meta">HUNSU_CODEX_APP_SERVER_COMMAND</span>
+            <input id="codex-env-command" readonly />
+          </label>
+          <label>
+            <span class="project-meta">HUNSU_CODEX_APP_SERVER_ARGS</span>
+            <input id="codex-env-args" readonly />
+          </label>
+          <div class="actions">
+            <button id="save-codex-path" class="primary">Save Codex Path</button>
+            <button id="save-codex-settings">Save Codex Settings</button>
+            <button id="reset-codex-path">Reset to Auto-Detect</button>
+          </div>
+        </div>
       </section>
     </main>
     <script type="module" src="./app.js"></script>

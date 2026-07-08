@@ -1,16 +1,18 @@
 import { useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { fetchHunsuDraftDiffArtifact, postArtifactActionRun, postHunsuDraftApprove, postHunsuDraftDiscard, postHunsuDraftMessage, postHunsuDraftStart, postRunAction } from "@/shared/api/bridgeClient";
-import type { StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
+import { BridgeRequestError, fetchHunsuDraftDiffArtifact, postArtifactActionRun, postHunsuDraftApprove, postHunsuDraftDiscard, postHunsuDraftMessage, postHunsuDraftStart, postRunAction } from "@/shared/api/bridgeClient";
+import type { ExecutePreflightAction, ExecutePreflightError, StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
 import { useRoadmapWorkspace } from "@/shared/api/useStudioData";
 import { Button } from "@/shared/ui/button";
 import type { RoadmapActionModel, RoadmapDetailPanel, RoadmapSelection } from "@/shared/domain/roadmapViewModel";
 import { NodeDetailPanel } from "@/features/inspector/NodeDetailPanel";
 import { RoadmapGraph } from "@/features/roadmap-graph/RoadmapGraph";
+import { bridgeActionHref } from "./preflightActions.js";
 
 type ExecuteActionState = {
   status: "idle" | "starting" | "started" | "error";
   message?: string;
+  preflight?: ExecutePreflightError;
 };
 
 type HunsuDraftActionState = {
@@ -136,9 +138,11 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
       setExecuteAction({ status: "started", message: "Execute started. Waiting for live run events." });
       refresh();
     } catch (nextError) {
+      const preflight = executePreflightError(nextError);
       setExecuteAction({
         status: "error",
-        message: nextError instanceof Error ? nextError.message : "Execute start failed."
+        message: preflight?.message ?? (nextError instanceof Error ? nextError.message : "Execute start failed."),
+        preflight
       });
     }
   }
@@ -244,6 +248,14 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
           </p>
         </div>
       </div>
+      {executeAction.status === "error" && executeAction.message ? (
+        <div className="pointer-events-none absolute left-5 right-5 top-[92px] z-30 flex justify-center">
+          <div className="apple-glass pointer-events-auto flex max-w-[720px] flex-wrap items-center justify-center gap-3 rounded-[14px] px-4 py-3 text-center">
+            <p className="text-[13px] font-medium leading-5 text-[color:var(--apple-ink)]">{executeAction.message}</p>
+            <RoadmapWorkspacePreflightActions preflight={executeAction.preflight} />
+          </div>
+        </div>
+      ) : null}
       <RoadmapGraph
         model={model.graph}
         selection={model.selection.selection}
@@ -297,6 +309,51 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
+}
+
+function executePreflightError(error: unknown): ExecutePreflightError | undefined {
+  if (!(error instanceof BridgeRequestError) || typeof error.body !== "object" || error.body === null) {
+    return undefined;
+  }
+  const body = error.body as Partial<ExecutePreflightError>;
+  return (body.area === "codex" || body.area === "roadmap") && typeof body.error === "string" && typeof body.message === "string"
+    ? body as ExecutePreflightError
+    : undefined;
+}
+
+export function RoadmapWorkspacePreflightActions({ preflight, open = openBridgeLink }: { preflight: ExecutePreflightError | undefined; open?: (href: string) => void }) {
+  return (
+    <>
+      {(preflight?.actions ?? fallbackPreflightActions(preflight)).map(action => (
+        <Button
+          key={`${action.type}:${action.href ?? action.roadmapId ?? ""}`}
+          type="button"
+          size="sm"
+          variant={primaryAction(action) ? "default" : "outline"}
+          onClick={() => open(bridgeActionHref(action))}
+        >
+          {action.label}
+        </Button>
+      ))}
+    </>
+  );
+}
+
+function fallbackPreflightActions(preflight: ExecutePreflightError | undefined): ExecutePreflightAction[] {
+  return preflight?.area === "roadmap"
+    ? [{ type: "open_roadmaps", label: "Open Roadmaps" }]
+    : [{ type: "open_prerequisites", label: "Open Prerequisites" }];
+}
+
+function primaryAction(action: ExecutePreflightAction): boolean {
+  return action.type === "install_codex"
+    || action.type === "codex_login_chatgpt"
+    || action.type === "open_roadmaps"
+    || action.type === "activate_roadmap";
+}
+
+function openBridgeLink(url: string): void {
+  window.location.href = url;
 }
 
 function hunsuDraftDiffArtifactKey(draftSessionId: string, diffArtifactId: string): string {
