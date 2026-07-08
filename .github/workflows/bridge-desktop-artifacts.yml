@@ -1,0 +1,138 @@
+name: Bridge Desktop Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Desktop target to build
+        type: choice
+        required: true
+        default: windows
+        options:
+          - windows
+          - macos-arm64
+          - macos-intel
+          - all
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    name: Select desktop targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build matrix
+        id: matrix
+        shell: bash
+        run: |
+          case "${{ inputs.platform }}" in
+            windows)
+              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"}]}'
+              ;;
+            macos-arm64)
+              matrix='{"include":[{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"}]}'
+              ;;
+            macos-intel)
+              matrix='{"include":[{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"}]}'
+              ;;
+            all)
+              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"},{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"}]}'
+              ;;
+            *)
+              echo "Unsupported platform: ${{ inputs.platform }}" >&2
+              exit 1
+              ;;
+          esac
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: select
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.select.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+
+      - name: Enable pnpm
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.30.2 --activate
+          node --version
+          pnpm --version
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop bundle
+        run: pnpm --filter @hunsu/bridge-desktop desktop:build
+
+      - name: Verify sidecar artifact
+        shell: bash
+        run: test -f "${{ matrix.sidecar }}"
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+          import { join, relative } from "node:path";
+
+          const bundleDir = "apps/bridge-desktop/src-tauri/target/release/bundle";
+          if (!existsSync(bundleDir)) {
+            throw new Error(`Missing bundle directory: ${bundleDir}`);
+          }
+
+          function walk(directory) {
+            const files = [];
+            for (const entry of readdirSync(directory)) {
+              const path = join(directory, entry);
+              const stat = statSync(path);
+              if (stat.isDirectory()) {
+                files.push(...walk(path));
+              } else if (stat.isFile() && !path.endsWith("SHA256SUMS.txt")) {
+                files.push(path);
+              }
+            }
+            return files;
+          }
+
+          const lines = walk(bundleDir)
+            .sort()
+            .map(path => {
+              const hash = createHash("sha256").update(readFileSync(path)).digest("hex");
+              const name = relative(bundleDir, path).split("\\").join("/");
+              return `${hash}  ${name}`;
+            });
+          writeFileSync(join(bundleDir, "SHA256SUMS.txt"), `${lines.join("\n")}\n`);
+          NODE
+
+      - name: List bundle outputs
+        shell: bash
+        run: find apps/bridge-desktop/src-tauri/target/release/bundle -maxdepth 4 -type f -print
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: apps/bridge-desktop/src-tauri/target/release/bundle/**/*
+          if-no-files-found: error
+          retention-days: 14

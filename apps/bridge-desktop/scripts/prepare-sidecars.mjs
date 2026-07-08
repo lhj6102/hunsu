@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { currentProcessEnv, resolveBridgeSidecarPackagingConfig, unwrapConfigResult } from "@hunsu/config";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -134,7 +134,12 @@ function runCli(argv) {
   console.log(`Prepared ${manifest.artifacts.length} native Hunsu Bridge sidecar artifacts in ${dist}.`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isCurrentScriptEntrypoint() {
+  const entrypoint = process.argv[1];
+  return Boolean(entrypoint) && import.meta.url === pathToFileURL(resolve(entrypoint)).href;
+}
+
+if (isCurrentScriptEntrypoint()) {
   try {
     runCli(process.argv.slice(2));
   } catch (error) {

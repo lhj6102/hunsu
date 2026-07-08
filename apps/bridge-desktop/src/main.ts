@@ -5,6 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writ
 import { homedir, hostname, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isSea } from "node:sea";
+import { fileURLToPath } from "node:url";
 import { BridgeSidecarSupervisor } from "./sidecar-supervisor.ts";
 import {
   createDefaultCredentialStore,
@@ -2061,7 +2062,11 @@ if (isBridgeAppEntrypoint()) {
 }
 
 function isBridgeAppEntrypoint(): boolean {
-  return isSea() || import.meta.url === `file://${process.argv[1]}`;
+  if (isSea()) {
+    return true;
+  }
+  const entrypoint = process.argv[1];
+  return Boolean(entrypoint) && resolve(fileURLToPath(import.meta.url)) === resolve(entrypoint);
 }
 
 function studioWebUrlForNext(webUrl: string | undefined, next: string): string {
