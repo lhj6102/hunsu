@@ -53,6 +53,7 @@ export type ProjectGrant = {
   path: string;
   grantedAt: string;
   scopes: BridgeCommandScope[];
+  active?: boolean;
 };
 
 export type RemoteBridgeDevice = {
@@ -486,7 +487,7 @@ export function evaluateRelayCommand(input: {
   if (!projectPath) {
     return { ok: false, reason: "project_grant_denied", message: "Relay command requires an explicit project path." };
   }
-  const grant = input.projectGrants.find(candidate => normalizeLocalPath(candidate.path) === projectPath);
+  const grant = input.projectGrants.find(candidate => candidate.active !== false && normalizeLocalPath(candidate.path) === projectPath);
   if (!grant) {
     return { ok: false, reason: "project_grant_denied", message: "Project Grant is required for this Relay command." };
   }

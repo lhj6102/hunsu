@@ -138,6 +138,11 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
     let command = args[0].as_str();
     let allowed = match command {
         "snapshot" | "status" | "stop" | "diagnostics" | "choose-folder" | "logout" => args.len() == 1,
+        "prerequisites" => args.len() == 2 && args[1] == "status",
+        "ui-intent" => validate_ui_intent_args(args),
+        "activate-roadmap" => {
+            args.len() == 1 || (args.len() == 2 && validate_identifier_arg(&args[1]).is_ok())
+        },
         "pair" => {
             args.len() == 1
                 || (args.len() == 3 && args[1] == "--next" && validate_next_arg(&args[2]).is_ok())
@@ -151,6 +156,8 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
         }
         "open-roadmap" => args.len() == 2 && validate_identifier_arg(&args[1]).is_ok(),
         "projects" => validate_projects_args(args),
+        "roadmaps" => validate_roadmaps_args(args),
+        "codex" => validate_codex_args(args),
         "auth-callback" => validate_auth_callback_args(args),
         _ => false,
     };
@@ -158,6 +165,98 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("Bridge command is not allowed: {}", command))
+    }
+}
+
+fn validate_roadmaps_args(args: &[String]) -> bool {
+    match args {
+        [command, subcommand] if command == "roadmaps" && subcommand == "list" => true,
+        [command, subcommand, path] if command == "roadmaps" && subcommand == "add" => {
+            validate_path_arg(path).is_ok()
+        }
+        [command, subcommand, roadmap_id]
+            if command == "roadmaps" && matches!(subcommand.as_str(), "activate" | "deactivate" | "remove") =>
+        {
+            validate_identifier_arg(roadmap_id).is_ok()
+        }
+        [command, subcommand, mode, roadmap_id]
+            if command == "roadmaps"
+                && subcommand == "remote"
+                && matches!(mode.as_str(), "enable" | "disable") =>
+        {
+            validate_identifier_arg(roadmap_id).is_ok()
+        }
+        [command, subcommand, mode, roadmap_id, flag, scopes]
+            if command == "roadmaps"
+                && subcommand == "remote"
+                && mode == "enable"
+                && matches!(flag.as_str(), "--scope" | "--scopes") =>
+        {
+            validate_identifier_arg(roadmap_id).is_ok() && validate_project_grant_scopes_arg(scopes).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn validate_codex_args(args: &[String]) -> bool {
+    match args {
+        [command, subcommand] if command == "codex" && matches!(subcommand.as_str(), "status" | "install" | "recheck" | "logout") => true,
+        [command, subcommand] if command == "codex" && subcommand == "login" => true,
+        [command, subcommand, flag] if command == "codex" && subcommand == "login" && flag == "--device" => true,
+        [command, subcommand, first_flag, second_flag]
+            if command == "codex"
+                && subcommand == "login"
+                && ((first_flag == "--device" && second_flag == "--json")
+                    || (first_flag == "--json" && second_flag == "--device")) => true,
+        [command, subcommand, action] if command == "codex" && subcommand == "path" && action == "reset" => true,
+        [command, subcommand, action, path] if command == "codex" && subcommand == "path" && action == "set" => {
+            validate_path_arg(path).is_ok()
+        }
+        [command, subcommand, action, ..] if command == "codex" && subcommand == "settings" && action == "set" => {
+            validate_codex_settings_set_args(args)
+        }
+        _ => false,
+    }
+}
+
+fn validate_codex_settings_set_args(args: &[String]) -> bool {
+    if args.len() < 3 || args[0] != "codex" || args[1] != "settings" || args[2] != "set" {
+        return false;
+    }
+    let mut index = 3;
+    let mut saw_install_channel = false;
+    let mut saw_auth_preference = false;
+    while index < args.len() {
+        if index + 1 >= args.len() {
+            return false;
+        }
+        match args[index].as_str() {
+            "--install-channel" if !saw_install_channel => {
+                if !matches!(args[index + 1].as_str(), "stable" | "latest" | "manual") {
+                    return false;
+                }
+                saw_install_channel = true;
+            }
+            "--auth-preference" if !saw_auth_preference => {
+                if !matches!(args[index + 1].as_str(), "chatgpt" | "api_key" | "device_code") {
+                    return false;
+                }
+                saw_auth_preference = true;
+            }
+            _ => return false,
+        }
+        index += 2;
+    }
+    true
+}
+
+fn validate_ui_intent_args(args: &[String]) -> bool {
+    match args {
+        [command, tab] if command == "ui-intent" => validate_ui_tab_arg(tab).is_ok(),
+        [command, tab, detail] if command == "ui-intent" && validate_ui_tab_arg(tab).is_ok() => {
+            matches!((tab.as_str(), detail.as_str()), ("prerequisites", "codex") | ("roadmaps", "add-roadmap"))
+        }
+        _ => false,
     }
 }
 
@@ -215,6 +314,42 @@ fn validate_identifier_arg(value: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("Identifier argument contains unsupported characters.".to_string())
+    }
+}
+
+fn validate_project_grant_scopes_arg(value: &str) -> Result<(), String> {
+    validate_plain_arg(value)?;
+    if value == "all" {
+        return Ok(());
+    }
+    let allowed = [
+        "execute.start",
+        "artifactAction.run",
+        "env.read",
+        "hostAlias.expose",
+        "remoteRelay.access",
+    ];
+    let scopes: Vec<&str> = value.split(',').collect();
+    if scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|scope| scope.is_empty() || !allowed.contains(scope))
+    {
+        Err("Project Grant scopes contain unsupported values.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_ui_tab_arg(value: &str) -> Result<(), String> {
+    validate_plain_arg(value)?;
+    if matches!(
+        value,
+        "overview" | "prerequisites" | "roadmaps" | "connection" | "remote" | "diagnostics" | "settings"
+    ) {
+        Ok(())
+    } else {
+        Err("Bridge App tab is not supported.".to_string())
     }
 }
 
@@ -298,6 +433,28 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
             let roadmap_id = query_value(&query, "roadmapId")
                 .ok_or_else(|| "hunsu://open-roadmap requires roadmapId.".to_string())?;
             vec!["open-roadmap".to_string(), roadmap_id]
+        }
+        "add-roadmap" => {
+            if let Some(path) = query_value(&query, "path") {
+                vec!["roadmaps".to_string(), "add".to_string(), path]
+            } else {
+                vec!["ui-intent".to_string(), "roadmaps".to_string(), "add-roadmap".to_string()]
+            }
+        }
+        "roadmaps" => vec!["ui-intent".to_string(), "roadmaps".to_string()],
+        "prerequisites" => {
+            let mut args = vec!["ui-intent".to_string(), "prerequisites".to_string()];
+            if path_part.map(percent_decode).as_deref() == Some("codex") {
+                args.push("codex".to_string());
+            }
+            args
+        }
+        "activate-roadmap" => {
+            let mut args = vec!["activate-roadmap".to_string()];
+            if let Some(roadmap_id) = query_value(&query, "roadmapId") {
+                args.push(roadmap_id);
+            }
+            args
         }
         "sign-in" => vec!["login".to_string(), "--gui".to_string()],
         "sign-out" => vec!["logout".to_string()],

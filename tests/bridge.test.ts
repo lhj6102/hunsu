@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -36,6 +36,7 @@ import {
   createStudioServer,
   createStudioRoadmap,
   createStudioState,
+  codexRuntimePreflightError,
   decideStudioLine,
   evaluateBridgeCompatibility,
   executeStudioCommand,
@@ -46,9 +47,12 @@ import {
   filesystemBrowseRoots,
   inspectProject,
   inspectStudioPort,
+  getCodexRuntimeStatus,
+  listManagedRoadmapRegistry,
   openStudioRoadmap,
   pauseStudioRun,
   planStudioArtifactActionRun,
+  parseCodexDeviceAuthOutput,
   readMoveFileBlob,
   readMoveDiff,
   readMoveFileTree,
@@ -60,6 +64,7 @@ import {
   selectStudioRepository,
   startStudioArtifactActionRun,
   startStudioRun,
+  setRoadmapLifecycle,
   stopStudioRun,
   subscribeAgentSessionEvents,
   subscribeStudioLiveEvents,
@@ -170,6 +175,137 @@ test("Bridge server creates a Roadmap root inside an existing Git parent", () =>
   const reopened = createStudioRoadmap({ path: child, title: "t3" }, state, { persist: true, roadmapRegistryPath: registryPath });
   assert.equal(reopened.repository.root, child);
   assert.equal(reopened.board.requests.length, 1);
+});
+
+test("Bridge Roadmap registry exposes active Roadmaps by default and keeps managed inactive entries", () => {
+  const parent = createRepo();
+  const repoA = join(parent, "roadmap-a");
+  const repoB = join(parent, "roadmap-b");
+  const repoC = join(parent, "roadmap-c");
+  const registryPath = join(parent, "roadmaps.json");
+  const state = createStudioState();
+  const first = createStudioRoadmap({ path: repoA, title: "roadmap-a" }, state, { persist: true, roadmapRegistryPath: registryPath });
+  const second = createStudioRoadmap({ path: repoB, title: "roadmap-b" }, state, { persist: true, roadmapRegistryPath: registryPath });
+  const third = createStudioRoadmap({ path: repoC, title: "roadmap-c" }, state, { persist: true, roadmapRegistryPath: registryPath });
+
+  setRoadmapLifecycle({ roadmapId: first.roadmap.roadmapId }, "inactive", { roadmapRegistryPath: registryPath });
+  rmSync(third.repository.root, { recursive: true, force: true });
+
+  const active = listRoadmapRegistry({ roadmapRegistryPath: registryPath });
+  const managed = listManagedRoadmapRegistry({ roadmapRegistryPath: registryPath });
+
+  assert.deepEqual(active.map(entry => entry.roadmapId), [second.roadmap.roadmapId]);
+  assert.equal(managed.length, 3);
+  assert.equal(managed.find(entry => entry.roadmapId === first.roadmap.roadmapId)?.lifecycle, "inactive");
+  assert.equal(managed.find(entry => entry.roadmapId === second.roadmap.roadmapId)?.lifecycle, "active");
+  assert.equal(managed.find(entry => entry.roadmapId === third.roadmap.roadmapId)?.lifecycle, "missing");
+});
+
+test("Bridge Codex runtime status detects missing and custom Codex CLI without reading credentials", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-runtime-test-"));
+  const fakeCodex = join(root, "codex");
+  writeFileSync(fakeCodex, [
+    "#!/usr/bin/env node",
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] !== 'app-server') process.exit(2);",
+    "const rl = readline.createInterface({ input: process.stdin });",
+    "rl.on('line', line => {",
+    "  const msg = JSON.parse(line);",
+    "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test', planLabel: 'Team' } }));",
+    "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "});",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const missing = await getCodexRuntimeStatus({ env: { PATH: join(root, "missing") }, force: true });
+    assert.equal(missing.cli.installed, false);
+    assert.equal(codexRuntimePreflightError(missing)?.error, "CODEX_CLI_MISSING");
+
+    const ready = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: fakeCodex }, force: true });
+    assert.equal(ready.cli.installed, true);
+    assert.equal(ready.cli.source, "custom");
+    assert.equal(ready.cli.version, "codex 1.2.3");
+    assert.equal(ready.appServer.available, true);
+    assert.equal(ready.auth.state, "authenticated");
+    assert.equal(ready.auth.method, "chatgpt");
+    assert.equal(ready.auth.access, "subscription");
+    assert.equal(ready.ready, true);
+    assert.equal(codexRuntimePreflightError(ready), undefined);
+
+    const rateLimitedCodex = join(root, "codex-rate-limited");
+    writeFileSync(rateLimitedCodex, [
+      "#!/usr/bin/env node",
+      "const readline = require('node:readline');",
+      "const args = process.argv.slice(2);",
+      "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+      "if (args[0] !== 'app-server') process.exit(2);",
+      "const rl = readline.createInterface({ input: process.stdin });",
+      "rl.on('line', line => {",
+      "  const msg = JSON.parse(line);",
+      "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+      "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+      "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { rateLimits: { label: 'Rate limited', remaining: '0 remaining', rateLimitReachedType: 'primary', resetAt: '2026-07-08T12:00:00.000Z' } } }));",
+      "});",
+      ""
+    ].join("\n"), "utf8");
+    chmodSync(rateLimitedCodex, 0o755);
+    const limited = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: rateLimitedCodex }, force: true });
+    assert.equal(limited.auth.state, "authenticated");
+    assert.equal(limited.usage.rateLimited, true);
+    assert.equal(limited.ready, false);
+    assert.equal(codexRuntimePreflightError(limited)?.error, "CODEX_RATE_LIMITED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge Codex device auth output parser extracts verification URL and user code", () => {
+  assert.deepEqual(parseCodexDeviceAuthOutput([
+    "Open https://auth.openai.com/activate?user_code=HUNSU-1234",
+    "Then enter code HUNSU-1234."
+  ].join("\n")), {
+    verificationUri: "https://auth.openai.com/activate?user_code=HUNSU-1234",
+    verificationUriComplete: "https://auth.openai.com/activate?user_code=HUNSU-1234",
+    userCode: "HUNSU-1234"
+  });
+});
+
+test("Bridge runtime Codex device login endpoint returns device-code details", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-device-login-test-"));
+  const fakeCodex = join(root, "codex");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const args = process.argv.slice(2);",
+    "if (args[0] === 'login' && args[1] === '--device-auth') {",
+    "  console.log('Open https://auth.openai.com/activate?user_code=HUNSU-1234');",
+    "  console.log('Code: HUNSU-1234');",
+    "  process.exit(0);",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: fakeCodex
+    }, { cwd: root }));
+    const server = createStudioServer({ cwd: root, persist: false, runner: new FakeRunner(), runtimeConfig });
+    const response = await requestStudioServerJson(server, "POST", "/api/runtimes/codex/login/device");
+
+    assert.equal(response.status, 202);
+    assert.equal(response.body.started, true);
+    assert.equal(response.body.state, "device_code");
+    assert.equal(response.body.verificationUriComplete, "https://auth.openai.com/activate?user_code=HUNSU-1234");
+    assert.equal(response.body.userCode, "HUNSU-1234");
+    assert.deepEqual(response.body.args, ["login", "--device-auth"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Bridge server scopes runs to the selected Roadmap repository", async () => {
@@ -1094,13 +1230,31 @@ test("Bridge server accumulates Codex app-server items separately from raw trans
   assert.equal(run.liveStatus?.phase, "working");
 });
 
-test("Bridge server exposes Codex provider status through the runner boundary", async () => {
+test("Bridge server exposes sanitized legacy Codex provider status", async () => {
   const runner = new FakeRunner();
   runner.providerStatusResponse = {
     backend: "app-server",
     available: true,
-    account: { account: { type: "chatgpt", email: "test@hunsu.app", planType: "plus" }, requiresOpenaiAuth: false },
-    rateLimits: { rateLimits: { limitId: "codex", primary: null, secondary: null, credits: null, planType: "plus", rateLimitReachedType: null } }
+    initialized: { protocolVersion: "test", accessToken: "codex-token-secret" },
+    account: {
+      account: {
+        type: "chatgpt",
+        email: "test@hunsu.app",
+        planType: "plus",
+        apiKey: "sk-provider-secret"
+      },
+      requiresOpenaiAuth: false,
+      refreshToken: "refresh-provider-secret"
+    },
+    rateLimits: {
+      rateLimits: {
+        limitId: "raw-limit-id",
+        primary: { remaining: 10, resetAt: "2026-07-08T12:00:00.000Z" },
+        credits: { hardLimitUsd: 20 },
+        planType: "plus",
+        rateLimitReachedType: null
+      }
+    }
   };
   const server = createStudioServer({ cwd: "/repo", persist: false, runner });
   const response = await requestStudioServerJson(server, "GET", "/api/codex/status");
@@ -1108,7 +1262,15 @@ test("Bridge server exposes Codex provider status through the runner boundary", 
   assert.equal(response.status, 200);
   assert.equal(response.body.backend, "app-server");
   assert.equal(response.body.available, true);
-  assert.equal(response.body.account.account.email, "test@hunsu.app");
+  assert.equal(response.body.auth.method, "chatgpt");
+  assert.equal(response.body.auth.access, "subscription");
+  assert.equal(response.body.accountSummary.email, "test@hunsu.app");
+  assert.equal(response.body.accountSummary.planLabel, "plus");
+  assert.equal(response.body.rateLimitSummary.label, "Available");
+  assert.equal(response.body.account, undefined);
+  assert.equal(response.body.rateLimits, undefined);
+  const serialized = JSON.stringify(response.body);
+  assert.doesNotMatch(serialized, /sk-provider-secret|refresh-provider-secret|codex-token-secret|raw-limit-id|hardLimitUsd/);
 });
 
 test("Bridge supervisor starts, stops, and creates pairing URLs", async () => {
@@ -1584,7 +1746,7 @@ test("Bridge server uses resolved runtime config for Roadmap registry path", asy
     roadmapRegistryPath: registryPath
   }));
   const server = createStudioServer({ cwd: root, persist: false, runner, runtimeConfig });
-  const response = await requestStudioServerJson(server, "GET", "/api/roadmaps/recent");
+  const response = await requestStudioServerJson(server, "GET", "/api/roadmaps/managed");
 
   assert.equal(response.status, 200);
   assert.equal(response.body.roadmaps[0].roadmapId, "roadmap_config");
@@ -2389,6 +2551,7 @@ test("Bridge Project Finder classifies Roadmaps, Git projects, new folders, and 
   const inspectedMissing = inspectProject({ path: missingRoadmap }, { roadmapRegistryPath: registryPath });
   const inspectedMissingRuntime = inspectProject({ path: missingRuntimeRoadmap }, { roadmapRegistryPath: registryPath });
   const recent = listRoadmapRegistry({ roadmapRegistryPath: registryPath });
+  const managed = listManagedRoadmapRegistry({ roadmapRegistryPath: registryPath });
 
   assert.equal(inspectedRoadmap.kind, "hunsu-roadmap");
   assert.equal(inspectedRoadmap.kind === "hunsu-roadmap" ? inspectedRoadmap.roadmapId : undefined, roadmap.roadmap.roadmapId);
@@ -2403,11 +2566,13 @@ test("Bridge Project Finder classifies Roadmaps, Git projects, new folders, and 
   assert.equal(inspectedMissingRuntime.kind, "missing-roadmap");
   assert.equal(inspectedMissingRuntime.kind === "missing-roadmap" ? inspectedMissingRuntime.health : undefined, "missing-runtime");
   assert.equal(inspectedMissingRuntime.kind === "missing-roadmap" ? inspectedMissingRuntime.recommendedAction : undefined, "repair");
-  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing")?.health, "missing");
-  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing")?.type, "missing");
-  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing")?.primaryAction, "remove");
-  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing_runtime")?.health, "missing-runtime");
-  assert.equal(recent.find(entry => entry.roadmapId === "roadmap_missing_runtime")?.primaryAction, "repair");
+  assert.equal(recent.some(entry => entry.roadmapId === "roadmap_missing"), false);
+  assert.equal(recent.some(entry => entry.roadmapId === "roadmap_missing_runtime"), false);
+  assert.equal(managed.find(entry => entry.roadmapId === "roadmap_missing")?.health, "missing");
+  assert.equal(managed.find(entry => entry.roadmapId === "roadmap_missing")?.type, "missing");
+  assert.equal(managed.find(entry => entry.roadmapId === "roadmap_missing")?.primaryAction, "remove");
+  assert.equal(managed.find(entry => entry.roadmapId === "roadmap_missing_runtime")?.health, "missing-runtime");
+  assert.equal(managed.find(entry => entry.roadmapId === "roadmap_missing_runtime")?.primaryAction, "repair");
   const removed = removeRoadmapRegistryEntry({ roadmapId: "roadmap_missing" }, { roadmapRegistryPath: registryPath });
   assert.equal(removed.removed, true);
   assert.equal(removed.roadmaps.some(entry => entry.roadmapId === "roadmap_missing"), false);

@@ -55,6 +55,13 @@ import { isUsableRemoteStudioConnectionStatus } from "@/shared/api/studioConnect
 
 const SERVER_URL = BRIDGE_API_BASE_URL;
 
+export class BridgeRequestError extends Error {
+  constructor(message: string, readonly status: number, readonly body: unknown) {
+    super(message);
+    this.name = "BridgeRequestError";
+  }
+}
+
 async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge API request"): Promise<T> {
   const method = init?.method?.toUpperCase() ?? "GET";
   const body = parseRequestBody(init?.body);
@@ -68,7 +75,12 @@ async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge 
   });
   if (!response.ok) {
     const result = await response.json().catch(() => ({ error: `${label} failed with ${response.status}` }));
-    throw new Error(typeof result.error === "string" ? result.error : `${label} failed with ${response.status}`);
+    const message = typeof result.message === "string"
+      ? result.message
+      : typeof result.error === "string"
+        ? result.error
+        : `${label} failed with ${response.status}`;
+    throw new BridgeRequestError(message, response.status, result);
   }
   return response.json() as Promise<T>;
 }

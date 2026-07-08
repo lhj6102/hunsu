@@ -149,12 +149,12 @@ export function StudioLauncher({
         <div className="shrink-0">
           <p className="text-[13px] font-medium leading-5 text-muted-foreground">{modeLabel(mode)}</p>
           <h1 className="mt-1 font-[family-name:var(--apple-font-display)] text-[44px] font-semibold leading-[1.08] tracking-normal text-[color:var(--apple-ink)]">
-            Project Finder
+            Active Roadmaps
           </h1>
           <div className="mt-5 flex flex-wrap gap-3">
-            <Button type="button" size="lg" onClick={() => openBridgeLink("hunsu://open-project")}>
+            <Button type="button" size="lg" onClick={() => openBridgeLink("hunsu://add-roadmap")}>
               <ExternalLink className="size-4" />
-              Choose Folder in Bridge App
+              Add Roadmap in Bridge App
             </Button>
             <Button type="button" size="lg" variant="outline" onClick={() => openBridgeLink("hunsu://pair?next=/studio")}>
               <ExternalLink className="size-4" />
@@ -177,7 +177,11 @@ export function StudioLauncher({
               ))}
             </div>
           </section>
-        ) : null}
+        ) : (
+          <section className="mt-6 shrink-0 rounded-[18px] border border-[color:var(--apple-hairline)] bg-white/58 px-4 py-5 text-[13px] leading-5 text-muted-foreground">
+            No active Roadmaps. Add a Roadmap in Hunsu Bridge App to start working.
+          </section>
+        )}
 
         {message ? <p className="mt-4 shrink-0 text-[13px] leading-5 text-muted-foreground">{message}</p> : null}
 

@@ -50,6 +50,14 @@ The web app does not call the runner directly.
 
 ## App-Server Boundary
 
+Codex is an external prerequisite runtime. Hunsu Bridge resolves and probes a
+user-installed Codex CLI before Execute instead of treating `@openai/codex` in
+`node_modules` as a bundled runtime. Resolution order is custom
+`HUNSU_CODEX_BINARY_PATH`, `HUNSU_CODEX_APP_SERVER_COMMAND`, `codex` on `PATH`,
+then missing. Bridge may call Codex CLI/app-server APIs for readiness, account,
+and rate-limit summaries, but it must not inspect Codex credential files or
+return raw credential-bearing payloads to Studio.
+
 Hunsu Bridge constructs the default runner with `createDefaultCodexRunner()`.
 That factory always creates a `CodexAppServerRunner`.
 

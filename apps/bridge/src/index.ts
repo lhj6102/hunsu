@@ -7,7 +7,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { createDefaultCodexRunner, GOAL_EVALUATION_SCHEMA, type CodexProviderStatus, type TeamRunEvent, type HunsuDraftConversationMessage, type HunsuDraftSessionInput, type HunsuDraftSourceSnapshot, type HunsuDraftTurnInput, type JsonRpcMessage, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerAppServerCommandAction, type RunnerAppServerItem, type RunnerRun, type StartRunInput } from "@hunsu/codex-runner";
+import { createDefaultCodexRunner, GOAL_EVALUATION_SCHEMA, type AppServerUsage, type CodexProviderStatus, type TeamRunEvent, type HunsuDraftConversationMessage, type HunsuDraftSessionInput, type HunsuDraftSourceSnapshot, type HunsuDraftTurnInput, type JsonRpcMessage, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerAppServerCommandAction, type RunnerAppServerItem, type RunnerRun, type StartRunInput } from "@hunsu/codex-runner";
 import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveRelayClientConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
 import {
   createFinalizedMoveCommit,
@@ -101,6 +101,22 @@ import {
   ensureTerminalOutput,
   planExecuteStart
 } from "./execute/execute-workflow.ts";
+import {
+  codexRuntimePreflightError,
+  detectCodexBinary,
+  getCodexRuntimeStatus,
+  sanitizeDiagnostics,
+  type CodexRuntimeStatus,
+  type ExecutePreflightError
+} from "./runtimes/codex.ts";
+
+export {
+  codexRuntimePreflightError,
+  detectCodexBinary,
+  getCodexRuntimeStatus,
+  sanitizeDiagnostics
+} from "./runtimes/codex.ts";
+export type { CodexCliStatus, CodexRuntimeStatus, ExecutePreflightError } from "./runtimes/codex.ts";
 import type {
   AgentConversationRef,
   ArtifactActionDefinition,
@@ -281,6 +297,7 @@ export type StudioRunState = {
   providerMemberThreadId?: string;
   providerFinalizerThreadId?: string;
   providerTurnIds?: string[];
+  lastRunUsage?: CodexRuntimeStatus["usage"]["lastRunUsage"];
   finalResponse?: string;
   attemptCount?: 0 | PositiveInteger;
   maxAttemptCount?: PositiveInteger;
@@ -629,11 +646,26 @@ export type RoadmapRegistryEntry = {
   roadmapId: string;
   displayName: string;
   repositoryPath: string;
+  kind?: "hunsu-roadmap" | "git-project" | "new-project";
+  lifecycle?: "active" | "inactive" | "missing" | "needs_upgrade" | "error";
+  localAccess?: { enabled: boolean };
+  remoteAccess?: {
+    enabled: boolean;
+    scopes: Array<"remoteRelay.access" | "execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose">;
+  };
+  codex?: {
+    readyForExecute: boolean;
+    lastCheckedAt?: string;
+  };
   lastOpenedAt: string;
   lastKnownBranch?: string;
   health: "ok" | "missing" | "missing-runtime" | "needs-upgrade" | "git-dirty" | "unknown";
   type?: "roadmap" | "git-project" | "missing";
   primaryAction?: "open" | "port" | "repair" | "remove";
+};
+
+export type RoadmapRemoteAccessRequest = {
+  roadmapId?: string;
 };
 
 export type RoadmapOpenRequest = {
@@ -646,6 +678,32 @@ export type RoadmapOpenRequest = {
 export type RoadmapRemoveRequest = {
   roadmapId?: string;
   path?: string;
+};
+
+export type RoadmapLifecycleRequest = {
+  roadmapId: string;
+};
+
+export type ToolStatus = {
+  installed: boolean;
+  binaryPath?: string;
+  version?: string;
+  error?: string;
+};
+
+export type PrerequisiteStatus = {
+  bridge: {
+    connected: boolean;
+    version?: string;
+    protocolVersion?: string;
+  };
+  runtimes: {
+    codex: CodexRuntimeStatus;
+  };
+  tools: {
+    git?: ToolStatus;
+    node?: ToolStatus;
+  };
 };
 
 export type RoadmapPortRequest = RoadmapOpenRequest & {
@@ -2114,14 +2172,287 @@ function createConfiguredRunner(runtimeConfig: BridgeRuntimeConfig): Runner {
   if (runtimeConfig.testRunner === "deterministic") {
     return new DeterministicLocalTestRunner();
   }
+  const codexBinaryPath = runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH?.trim();
   return createDefaultCodexRunner({
     clientOptions: {
-      command: runtimeConfig.codexAppServer.command,
+      command: codexBinaryPath || runtimeConfig.codexAppServer.command,
       args: runtimeConfig.codexAppServer.args,
       environment: runtimeConfig.codexAppServer.environment
     },
     threadOptions: runtimeConfig.codexThreadOptions
   });
+}
+
+async function prerequisiteStatus(env: Record<string, string | undefined>, state?: StudioServerState): Promise<PrerequisiteStatus> {
+  return {
+    bridge: {
+      connected: true,
+      version: HUNSU_BRIDGE_VERSION,
+      protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION
+    },
+    runtimes: {
+      codex: await getCodexRuntimeStatus({ env, lastRunUsage: state ? latestCodexRunUsage(state) : undefined })
+    },
+    tools: {
+      git: await toolStatus("git", ["--version"]),
+      node: await toolStatus(process.execPath, ["--version"])
+    }
+  };
+}
+
+function sanitizeLegacyCodexStatus(status: CodexProviderStatus | { backend: string; available: boolean; error?: string }): Record<string, unknown> {
+  const account = "account" in status ? codexProviderAccountSummary(status.account) : undefined;
+  const rateLimit = "rateLimits" in status ? codexProviderRateLimitSummary(status.rateLimits) : undefined;
+  const errors = [
+    "accountError" in status ? status.accountError : undefined,
+    "rateLimitsError" in status ? status.rateLimitsError : undefined,
+    status.error
+  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+  return {
+    backend: status.backend,
+    available: status.available,
+    initialized: "initialized" in status ? status.initialized !== undefined : undefined,
+    auth: account?.auth,
+    accountSummary: account?.summary,
+    rateLimitSummary: rateLimit?.summary,
+    rateLimited: rateLimit?.rateLimited,
+    accountError: "accountError" in status ? sanitizeLegacyStatusText(status.accountError) : undefined,
+    rateLimitsError: "rateLimitsError" in status ? sanitizeLegacyStatusText(status.rateLimitsError) : undefined,
+    error: errors.length > 0 ? sanitizeLegacyStatusText(errors.join("; ")) : undefined
+  };
+}
+
+function codexProviderAccountSummary(account: unknown): {
+  auth: { state: "authenticated" | "not_authenticated" | "unknown"; method?: "chatgpt" | "api_key" | "access_token" | "unknown"; access?: "subscription" | "usage_based" | "unknown" };
+  summary?: { displayName?: string; email?: string; workspaceName?: string; planLabel?: string };
+} | undefined {
+  if (!isRecord(account)) {
+    return undefined;
+  }
+  const nested = isRecord(account.account) ? account.account : {};
+  const merged = { ...nested, ...account };
+  const requiresAuth = merged.requiresOpenaiAuth === true;
+  const method = legacyAuthMethod(merged);
+  return {
+    auth: {
+      state: requiresAuth ? "not_authenticated" : "authenticated",
+      method,
+      access: method === "chatgpt" ? "subscription" : method === "api_key" || method === "access_token" ? "usage_based" : "unknown"
+    },
+    summary: requiresAuth ? undefined : {
+      displayName: legacyStringField(merged, ["displayName", "name", "userName"]),
+      email: legacyStringField(merged, ["email", "userEmail"]),
+      workspaceName: legacyStringField(merged, ["workspaceName", "organizationName", "orgName"]),
+      planLabel: legacyStringField(merged, ["planLabel", "plan", "planType", "subscriptionPlan"])
+    }
+  };
+}
+
+function codexProviderRateLimitSummary(rateLimits: unknown): { summary?: { label: string; resetAt?: string; remainingLabel?: string }; rateLimited?: boolean } | undefined {
+  if (!isRecord(rateLimits)) {
+    return undefined;
+  }
+  const nested = isRecord(rateLimits.rateLimits) ? rateLimits.rateLimits : {};
+  const merged = { ...rateLimits, ...nested };
+  const reachedType = legacyStringField(merged, ["rateLimitReachedType", "rate_limit_reached_type"]);
+  const label = legacyStringField(merged, ["label", "status", "summary"]) ?? (reachedType && reachedType.toLowerCase() !== "none" ? "Rate limited" : "Available");
+  const remainingLabel = legacyStringField(merged, ["remainingLabel", "remaining"]);
+  const rateLimited = merged.rateLimited === true
+    || merged.limited === true
+    || (reachedType !== undefined && reachedType.toLowerCase() !== "none")
+    || /\brate.?limited\b|quota exceeded|temporarily unavailable|no remaining/i.test(`${label} ${remainingLabel ?? ""}`);
+  return {
+    summary: {
+      label,
+      resetAt: legacyStringField(merged, ["resetAt", "reset_at"]),
+      remainingLabel
+    },
+    rateLimited
+  };
+}
+
+function legacyAuthMethod(object: Record<string, unknown>): "chatgpt" | "api_key" | "access_token" | "unknown" {
+  const raw = `${legacyStringField(object, ["authMethod", "method", "loginMethod", "accountType", "type"]) ?? ""}`.toLowerCase();
+  if (raw.includes("chatgpt") || raw.includes("subscription")) return "chatgpt";
+  if (raw.includes("api")) return "api_key";
+  if (raw.includes("access")) return "access_token";
+  return "unknown";
+}
+
+function legacyStringField(object: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = object[key];
+    if (typeof value === "string" && value.trim()) return sanitizeLegacyStatusText(value.trim());
+    if (typeof value === "number") return String(value);
+  }
+  return undefined;
+}
+
+function sanitizeLegacyStatusText(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const sanitized = sanitizeDiagnostics(value);
+  return typeof sanitized === "string" ? sanitized : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function toolStatus(command: string, args: string[]): Promise<ToolStatus> {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, args, { timeout: 2_000, windowsHide: true });
+    const version = `${stdout}\n${stderr}`.trim().split(/\r?\n/).find(Boolean);
+    return { installed: true, binaryPath: command, version };
+  } catch (error) {
+    return { installed: false, binaryPath: command, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function latestCodexRunUsage(state: StudioServerState): CodexRuntimeStatus["usage"]["lastRunUsage"] | undefined {
+  const runs = Object.values(state.runs)
+    .filter(run => run.lastRunUsage)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return runs[0]?.lastRunUsage;
+}
+
+function codexRuntimeUsageFromAppServerUsage(usage: AppServerUsage | undefined): CodexRuntimeStatus["usage"]["lastRunUsage"] | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  return {
+    inputTokens: usage.input_tokens,
+    cachedInputTokens: usage.cached_input_tokens,
+    outputTokens: usage.output_tokens,
+    reasoningTokens: usage.reasoning_output_tokens
+  };
+}
+
+function codexInstallPlan(): { action: "confirm_required"; command: string; url: string; message: string } {
+  return {
+    action: "confirm_required",
+    command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+    url: "https://chatgpt.com/codex",
+    message: "Hunsu does not run network installer commands without user confirmation."
+  };
+}
+
+type CodexActionStartResult = {
+  started: boolean;
+  command?: string;
+  args: string[];
+  message?: string;
+};
+
+type CodexDeviceLoginResult = CodexActionStartResult & {
+  state?: "device_code" | "pending" | "failed";
+  verificationUri?: string;
+  verificationUriComplete?: string;
+  userCode?: string;
+};
+
+async function spawnCodexAction(args: string[], env: Record<string, string | undefined>): Promise<CodexActionStartResult> {
+  const cli = await detectCodexBinary({ env });
+  if (!cli.installed || !cli.binaryPath) {
+    return { started: false, args, message: cli.error ?? "Codex CLI was not found." };
+  }
+  const child = spawn(cli.binaryPath, args, {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, ...env },
+    windowsHide: false
+  });
+  child.unref();
+  return { started: true, command: cli.binaryPath, args };
+}
+
+async function spawnCodexDeviceLogin(env: Record<string, string | undefined>, timeoutMs = 3_000): Promise<CodexDeviceLoginResult> {
+  const args = ["login", "--device-auth"];
+  const cli = await detectCodexBinary({ env });
+  if (!cli.installed || !cli.binaryPath) {
+    return { started: false, args, state: "failed", message: cli.error ?? "Codex CLI was not found." };
+  }
+
+  const child = spawn(cli.binaryPath, args, {
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...env },
+    windowsHide: false
+  });
+  let output = "";
+  const append = (chunk: Buffer | string) => {
+    output = `${output}${chunk.toString()}`.slice(-64 * 1024);
+  };
+  child.stdout?.on("data", append);
+  child.stderr?.on("data", append);
+
+  const outcome = await Promise.race([
+    new Promise<{ kind: "exit"; code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+      child.once("close", (code, signal) => resolve({ kind: "exit", code, signal }));
+    }),
+    new Promise<{ kind: "error"; error: Error }>(resolve => {
+      child.once("error", error => resolve({ kind: "error", error }));
+    }),
+    sleep(timeoutMs).then(() => ({ kind: "timeout" as const }))
+  ]);
+  const details = parseCodexDeviceAuthOutput(output);
+
+  if (outcome.kind === "timeout") {
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    child.unref();
+    return {
+      started: true,
+      command: cli.binaryPath,
+      args,
+      state: details.verificationUri || details.userCode ? "device_code" : "pending",
+      ...details,
+      message: details.verificationUri || details.userCode
+        ? "Codex device login started. Complete authorization in your browser."
+        : "Codex device login started, but no device code has been emitted yet."
+    };
+  }
+
+  if (outcome.kind === "error") {
+    return { started: false, command: cli.binaryPath, args, state: "failed", message: outcome.error.message };
+  }
+
+  const failed = outcome.code !== 0;
+  return {
+    started: true,
+    command: cli.binaryPath,
+    args,
+    state: details.verificationUri || details.userCode ? "device_code" : failed ? "failed" : "pending",
+    ...details,
+    message: details.verificationUri || details.userCode
+      ? "Codex device login started. Complete authorization in your browser."
+      : failed
+        ? `Codex device login exited with status ${outcome.code ?? outcome.signal ?? "unknown"}.`
+        : "Codex device login started."
+  };
+}
+
+export function parseCodexDeviceAuthOutput(output: string): Pick<CodexDeviceLoginResult, "verificationUri" | "verificationUriComplete" | "userCode"> {
+  const urls = [...output.matchAll(/https?:\/\/[^\s)'"]+/g)].map(match => match[0].replace(/[.,;:]+$/, ""));
+  const verificationUriComplete = urls.find(url => /[?&](user_?code|code)=/i.test(url));
+  const verificationUri = urls.find(url => url !== verificationUriComplete) ?? verificationUriComplete;
+  const codeFromUrl = verificationUriComplete ? codeFromVerificationUrl(verificationUriComplete) : undefined;
+  const codeFromText = output.match(/(?:user\s+code|one[-\s]?time\s+code|code)[:\s]+([A-Z0-9][A-Z0-9\-\s]{3,}[A-Z0-9])/i)?.[1]
+    ?.trim()
+    .replace(/\s+/g, "-");
+  return {
+    ...(verificationUri ? { verificationUri } : {}),
+    ...(verificationUriComplete ? { verificationUriComplete } : {}),
+    ...(codeFromUrl ?? codeFromText ? { userCode: codeFromUrl ?? codeFromText } : {})
+  };
+}
+
+function codeFromVerificationUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    return url.searchParams.get("user_code") ?? url.searchParams.get("user-code") ?? url.searchParams.get("code") ?? undefined;
+  } catch (_error) {
+    return undefined;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -2640,8 +2971,48 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
 
+      if (request.method === "GET" && pathname === "/api/prerequisites") {
+        sendJson(response, 200, await prerequisiteStatus(runtimeConfig.processEnv, state));
+        return;
+      }
+
       if (request.method === "GET" && pathname === "/api/codex/status") {
-        sendJson(response, 200, runner.providerStatus ? await runner.providerStatus() : { backend: "sdk", available: true });
+        sendJson(response, 200, sanitizeLegacyCodexStatus(runner.providerStatus ? await runner.providerStatus() : { backend: "sdk", available: true }));
+        return;
+      }
+
+      if (request.method === "GET" && pathname === "/api/runtimes/codex/status") {
+        sendJson(response, 200, await getCodexRuntimeStatus({ env: runtimeConfig.processEnv }));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/runtimes/codex/recheck") {
+        sendJson(response, 202, await getCodexRuntimeStatus({ env: runtimeConfig.processEnv, force: true }));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/runtimes/codex/install") {
+        sendJson(response, 202, codexInstallPlan());
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/runtimes/codex/login/chatgpt") {
+        sendJson(response, 202, await spawnCodexAction(["login"], runtimeConfig.processEnv));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/runtimes/codex/login/device") {
+        sendJson(response, 202, await spawnCodexDeviceLogin(runtimeConfig.processEnv));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/runtimes/codex/login/api-key") {
+        sendJson(response, 202, await spawnCodexAction(["login"], runtimeConfig.processEnv));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/runtimes/codex/logout") {
+        sendJson(response, 202, await spawnCodexAction(["logout"], runtimeConfig.processEnv));
         return;
       }
 
@@ -2650,9 +3021,26 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
 
+      if (request.method === "GET" && pathname === "/api/roadmaps/managed") {
+        sendJson(response, 200, { roadmaps: listManagedRoadmapRegistry({ roadmapRegistryPath }) });
+        return;
+      }
+
       if (request.method === "POST" && pathname === "/api/roadmaps/recent/remove") {
         const body = await readJson<RoadmapRemoveRequest>(request);
         sendJson(response, 202, removeRoadmapRegistryEntry(body, { roadmapRegistryPath }));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/roadmaps/activate") {
+        const body = await readJson<RoadmapLifecycleRequest>(request);
+        sendJson(response, 202, setRoadmapLifecycle(body, "active", { roadmapRegistryPath }));
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/roadmaps/deactivate") {
+        const body = await readJson<RoadmapLifecycleRequest>(request);
+        sendJson(response, 202, setRoadmapLifecycle(body, "inactive", { roadmapRegistryPath }));
         return;
       }
 
@@ -2738,7 +3126,8 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           actionAmbientEnv: runtimeConfig.processEnv,
           actionProcessEnv: runtimeConfig.processEnv,
           actionWorktreeRoot: runtimeConfig.actionWorktreeRoot,
-          skillsEnv: runtimeConfig.processEnv
+          skillsEnv: runtimeConfig.processEnv,
+          codexEnv: runtimeConfig.processEnv
         });
         if (handled) {
           return;
@@ -2855,12 +3244,34 @@ export function createStudioServer(options: StudioServerOptions = {}) {
 
       if (request.method === "POST" && request.url === "/api/runs/start") {
         const body = await readJson<StudioRunStartRequest>(request);
+        const activeError = repositoryActivePreflight(repositoryPath, roadmapRegistryPath);
+        if (activeError) {
+          sendJson(response, 409, activeError);
+          return;
+        }
+        const codexStatus = await getCodexRuntimeStatus({ env: runtimeConfig.processEnv, force: true });
+        const codexError = codexRuntimePreflightError(codexStatus);
+        if (codexError) {
+          sendJson(response, 409, codexError);
+          return;
+        }
         sendJson(response, 202, await startStudioRun(body, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient, routeWorktreeRoot: runtimeConfig.routeWorktreeRoot }));
         return;
       }
 
       if (request.method === "POST" && request.url === "/api/executes/start") {
         const body = await readJson<StudioRunStartRequest>(request);
+        const activeError = repositoryActivePreflight(repositoryPath, roadmapRegistryPath);
+        if (activeError) {
+          sendJson(response, 409, activeError);
+          return;
+        }
+        const codexStatus = await getCodexRuntimeStatus({ env: runtimeConfig.processEnv, force: true });
+        const codexError = codexRuntimePreflightError(codexStatus);
+        if (codexError) {
+          sendJson(response, 409, codexError);
+          return;
+        }
         sendJson(response, 202, await startStudioRun(body, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient, routeWorktreeRoot: runtimeConfig.routeWorktreeRoot }));
         return;
       }
@@ -2962,6 +3373,7 @@ type ScopedRoadmapOptions = {
   actionProcessEnv?: Record<string, string | undefined>;
   actionWorktreeRoot?: string;
   skillsEnv?: Record<string, string | undefined>;
+  codexEnv?: Record<string, string | undefined>;
 };
 
 function parseRoadmapApiPath(pathname: string): RoadmapApiRoute | undefined {
@@ -3136,6 +3548,17 @@ async function handleRoadmapApiRequest(
 
   if (request.method === "POST" && (suffix === "/runs/start" || suffix === "/executes/start")) {
     const body = await readJson<StudioRunStartRequest>(request);
+    const activeError = roadmapActivePreflight(roadmapId, options.roadmapRegistryPath);
+    if (activeError) {
+      sendJson(response, 409, activeError);
+      return true;
+    }
+    const codexStatus = await getCodexRuntimeStatus({ env: options.codexEnv, force: true });
+    const codexError = codexRuntimePreflightError(codexStatus);
+    if (codexError) {
+      sendJson(response, 409, codexError);
+      return true;
+    }
     sendJson(response, 202, await startStudioRun(body, state, {
       cwd,
       persist,
@@ -5080,8 +5503,13 @@ function normalizeGitStatusBranch(value: string | undefined): string {
   return unborn?.[1] ?? value;
 }
 
-export function listRoadmapRegistry(options: { roadmapRegistryPath?: string } = {}): RoadmapRegistryEntry[] {
-  return readRoadmapRegistry(options).roadmaps.map(entry => roadmapRegistryEntryWithInspection(entry, options));
+export function listRoadmapRegistry(options: { roadmapRegistryPath?: string; activeOnly?: boolean } = {}): RoadmapRegistryEntry[] {
+  const entries = readRoadmapRegistry(options).roadmaps.map(entry => roadmapRegistryEntryWithInspection(entry, options));
+  return options.activeOnly === false ? entries : entries.filter(entry => entry.lifecycle === "active");
+}
+
+export function listManagedRoadmapRegistry(options: { roadmapRegistryPath?: string } = {}): RoadmapRegistryEntry[] {
+  return listRoadmapRegistry({ ...options, activeOnly: false });
 }
 
 function roadmapRegistryEntryWithInspection(
@@ -5094,6 +5522,7 @@ function roadmapRegistryEntryWithInspection(
       ...entry,
       repositoryPath: inspection.path,
       health: inspection.health === "missing-path" ? "missing" : inspection.health,
+      lifecycle: inspection.health === "missing-path" ? "missing" : "error",
       type: "missing",
       primaryAction: inspection.recommendedAction
     };
@@ -5105,6 +5534,10 @@ function roadmapRegistryEntryWithInspection(
       displayName: inspection.displayName,
       repositoryPath: inspection.path,
       health: inspection.health,
+      kind: "hunsu-roadmap",
+      lifecycle: entry.lifecycle === "inactive" ? "inactive" : inspection.health === "needs-upgrade" ? "needs_upgrade" : "active",
+      localAccess: entry.localAccess ?? { enabled: true },
+      remoteAccess: entry.remoteAccess ?? { enabled: false, scopes: [] },
       type: "roadmap",
       primaryAction: inspection.health === "ok" || inspection.health === "git-dirty" ? "open" : "repair"
     };
@@ -5115,6 +5548,8 @@ function roadmapRegistryEntryWithInspection(
       repositoryPath: inspection.path,
       lastKnownBranch: inspection.branch ?? entry.lastKnownBranch,
       health: "missing-runtime",
+      kind: "git-project",
+      lifecycle: entry.lifecycle === "inactive" ? "inactive" : "error",
       type: "git-project",
       primaryAction: "repair"
     };
@@ -5122,6 +5557,7 @@ function roadmapRegistryEntryWithInspection(
   return {
     ...entry,
     health: inspection.kind === "unsupported" ? "unknown" : "missing-runtime",
+    lifecycle: entry.lifecycle === "inactive" ? "inactive" : "error",
     type: inspection.kind === "unsupported" ? "missing" : "roadmap",
     primaryAction: inspection.kind === "unsupported" ? "remove" : "repair"
   };
@@ -5431,7 +5867,79 @@ export function removeRoadmapRegistryEntry(
   }
   return {
     removed,
-    roadmaps: listRoadmapRegistry(options)
+    roadmaps: listManagedRoadmapRegistry(options)
+  };
+}
+
+export function setRoadmapLifecycle(
+  request: RoadmapLifecycleRequest,
+  lifecycle: "active" | "inactive",
+  options: { roadmapRegistryPath?: string } = {}
+): { roadmap?: RoadmapRegistryEntry; roadmaps: RoadmapRegistryEntry[] } {
+  const roadmapId = request.roadmapId?.trim();
+  if (!roadmapId) {
+    throw new Error("Roadmap id is required.");
+  }
+  const store = readRoadmapRegistry(options);
+  const now = new Date().toISOString();
+  let updated: RoadmapRegistryEntry | undefined;
+  const roadmaps = store.roadmaps.map(entry => {
+    if (entry.roadmapId !== roadmapId) {
+      return entry;
+    }
+    updated = {
+      ...entry,
+      lifecycle,
+      localAccess: { enabled: lifecycle === "active" },
+      remoteAccess: lifecycle === "active" ? entry.remoteAccess ?? { enabled: false, scopes: [] } : { enabled: false, scopes: entry.remoteAccess?.scopes ?? [] },
+      lastOpenedAt: lifecycle === "active" ? now : entry.lastOpenedAt
+    };
+    return updated;
+  });
+  if (!updated) {
+    throw new Error(`Unknown Roadmap: ${roadmapId}`);
+  }
+  writeRoadmapRegistry({ version: 1, roadmaps }, options);
+  return {
+    roadmap: roadmapRegistryEntryWithInspection(updated, options),
+    roadmaps: listManagedRoadmapRegistry(options)
+  };
+}
+
+export function setRoadmapRemoteAccess(
+  request: RoadmapRemoteAccessRequest,
+  remoteAccess: { enabled: boolean; scopes: BridgeCommandScope[] },
+  options: { roadmapRegistryPath?: string } = {}
+): { roadmap?: RoadmapRegistryEntry; roadmaps: RoadmapRegistryEntry[] } {
+  const roadmapId = request.roadmapId?.trim();
+  if (!roadmapId) {
+    throw new Error("Roadmap id is required.");
+  }
+  const store = readRoadmapRegistry(options);
+  let updated: RoadmapRegistryEntry | undefined;
+  const roadmaps = store.roadmaps.map(entry => {
+    if (entry.roadmapId !== roadmapId) {
+      return entry;
+    }
+    if (remoteAccess.enabled && entry.lifecycle === "inactive") {
+      throw new Error(`Inactive Roadmap cannot be exposed over Remote Access: ${roadmapId}`);
+    }
+    updated = {
+      ...entry,
+      remoteAccess: {
+        enabled: remoteAccess.enabled,
+        scopes: [...new Set(remoteAccess.scopes)]
+      }
+    };
+    return updated;
+  });
+  if (!updated) {
+    throw new Error(`Unknown Roadmap: ${roadmapId}`);
+  }
+  writeRoadmapRegistry({ version: 1, roadmaps }, options);
+  return {
+    roadmap: roadmapRegistryEntryWithInspection(updated, options),
+    roadmaps: listManagedRoadmapRegistry(options)
   };
 }
 
@@ -6695,6 +7203,11 @@ function upsertRoadmapRegistryEntry(
     roadmapId,
     displayName: displayName?.trim() || store.roadmaps.find(candidate => candidate.roadmapId === roadmapId)?.displayName || basename(repository.root),
     repositoryPath: repository.root,
+    kind: "hunsu-roadmap",
+    lifecycle: "active",
+    localAccess: { enabled: true },
+    remoteAccess: existingRoadmapRemoteAccess(store.roadmaps.find(candidate => candidate.roadmapId === roadmapId)),
+    codex: { readyForExecute: false },
     lastOpenedAt: now,
     lastKnownBranch: repository.branch,
     health: "ok",
@@ -6836,6 +7349,58 @@ function isRoadmapRegistryEntry(value: unknown): value is RoadmapRegistryEntry {
     && typeof candidate.displayName === "string"
     && typeof candidate.repositoryPath === "string"
     && typeof candidate.lastOpenedAt === "string";
+}
+
+function existingRoadmapRemoteAccess(entry: RoadmapRegistryEntry | undefined): NonNullable<RoadmapRegistryEntry["remoteAccess"]> {
+  return entry?.remoteAccess ?? { enabled: false, scopes: [] };
+}
+
+function roadmapActivePreflight(roadmapId: string, roadmapRegistryPath: string | undefined): ExecutePreflightError | undefined {
+  const entry = listManagedRoadmapRegistry({ roadmapRegistryPath }).find(candidate => candidate.roadmapId === roadmapId);
+  if (entry?.lifecycle === "active") {
+    return undefined;
+  }
+  return roadmapInactivePreflight(entry?.lifecycle, roadmapId);
+}
+
+function repositoryActivePreflight(repositoryPath: string, roadmapRegistryPath: string | undefined): ExecutePreflightError | undefined {
+  const normalizedRepositoryPath = resolve(repositoryPath);
+  const entry = listManagedRoadmapRegistry({ roadmapRegistryPath }).find(candidate => resolve(candidate.repositoryPath) === normalizedRepositoryPath);
+  if (entry?.lifecycle === "active") {
+    return undefined;
+  }
+  return roadmapInactivePreflight(entry?.lifecycle, entry?.roadmapId);
+}
+
+function roadmapInactivePreflight(lifecycle: RoadmapRegistryEntry["lifecycle"] | undefined, roadmapId: string | undefined): ExecutePreflightError {
+  const state = lifecycle ?? "missing";
+  return {
+    error: "CODEX_RUNTIME_UNKNOWN",
+    message: roadmapInactiveMessage(state, roadmapId),
+    runtime: "codex",
+    actions: [
+      { type: "open_bridge_app", label: "Open Bridge App" },
+      { type: "open_prerequisites", label: "Open Roadmaps" }
+    ]
+  };
+}
+
+function roadmapInactiveMessage(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing", roadmapId: string | undefined): string {
+  const suffix = roadmapId ? ` (${roadmapId})` : "";
+  switch (lifecycle) {
+    case "inactive":
+      return `This Roadmap${suffix} is inactive. Activate it in Hunsu Bridge App before starting Execute.`;
+    case "missing":
+      return `This Roadmap${suffix} is missing from the active registry or its project path cannot be found. Repair or activate it in Hunsu Bridge App before starting Execute.`;
+    case "needs_upgrade":
+      return `This Roadmap${suffix} needs an upgrade before Execute can start.`;
+    case "error":
+      return `This Roadmap${suffix} is not healthy. Repair it in Hunsu Bridge App before starting Execute.`;
+    case "active":
+      return `This Roadmap${suffix} is active.`;
+    default:
+      return `This Roadmap${suffix} is not active. Activate or repair it in Hunsu Bridge App before starting Execute.`;
+  }
 }
 
 function isRemoteBridgeDevice(value: unknown): value is RemoteBridgeDevice {
@@ -8405,6 +8970,7 @@ function applyCodexAppServerEvent(run: StudioRunState, event: TeamRunEvent, stat
       });
       break;
     case "runner.turn.completed":
+      run.lastRunUsage = codexRuntimeUsageFromAppServerUsage(event.usage) ?? run.lastRunUsage;
       if (event.providerTurnId) {
         upsertCodexTurn(run, {
           providerThreadId: event.providerThreadId,
@@ -11125,6 +11691,7 @@ function toStudioRunSummary(run: StudioRunState | StudioRunSummary): StudioRunSu
     providerMemberThreadId: run.providerMemberThreadId,
     providerFinalizerThreadId: run.providerFinalizerThreadId,
     providerTurnIds: run.providerTurnIds ? [...run.providerTurnIds] : undefined,
+    lastRunUsage: run.lastRunUsage,
     finalResponse: truncateOptionalText(run.finalResponse, SUMMARY_TEXT_MAX_BYTES),
     attemptCount: run.attemptCount,
     maxAttemptCount: run.maxAttemptCount,

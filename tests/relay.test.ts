@@ -68,6 +68,13 @@ test("Relay service authenticates device flow, registers WebSocket devices, and 
     }) as { projectAccess: string };
     assert.equal(needsGrantStatus.projectAccess, "needs_grant");
 
+    const inactiveGrantStatus = await relayJson(`${urls.apiUrl}/v1/project-grants/status`, token.access_token, {
+      deviceId: "device_123",
+      projectPath: "/tmp/inactive-project",
+      requestedScopes: ["remoteRelay.access"]
+    }) as { projectAccess: string };
+    assert.equal(inactiveGrantStatus.projectAccess, "needs_grant");
+
     const deniedGrantStatus = await relayJson(`${urls.apiUrl}/v1/project-grants/status`, token.access_token, {
       deviceId: "device_123",
       projectPath: "/tmp/hunsu-project",
@@ -101,6 +108,11 @@ test("Relay service authenticates device flow, registers WebSocket devices, and 
         path: "/tmp/hunsu-project",
         grantedAt: new Date().toISOString(),
         scopes: ["execute.start", "remoteRelay.access"]
+      }, {
+        path: "/tmp/inactive-project",
+        grantedAt: new Date().toISOString(),
+        scopes: ["execute.start", "remoteRelay.access"],
+        active: false
       }]
     }));
 
@@ -125,6 +137,14 @@ test("Relay service authenticates device flow, registers WebSocket devices, and 
       payload: { roadmapId: "roadmap_123", actionId: "host-web" }
     }, 403) as { ok: false; reason: string };
     assert.equal(denied.reason, "command_scope_denied");
+
+    const inactiveCommand = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
+      deviceId: "device_123",
+      command: "execute.start",
+      projectPath: "/tmp/inactive-project",
+      payload: { roadmapId: "roadmap_inactive" }
+    }, 403) as { ok: false; reason: string };
+    assert.equal(inactiveCommand.reason, "project_grant_denied");
 
     const routed = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
       deviceId: "device_123",
