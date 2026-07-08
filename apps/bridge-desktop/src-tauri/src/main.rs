@@ -5,6 +5,9 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(Serialize)]
 struct FolderSelection {
     path: String,
@@ -50,7 +53,7 @@ async fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String>
 
 #[tauri::command]
 async fn start_bridge_sidecar(app: tauri::AppHandle, cwd: Option<String>) -> Result<(), String> {
-    let mut command = Command::new(sidecar_path(&app)?);
+    let mut command = sidecar_command(&app)?;
     command.arg("start");
     if let Some(cwd) = cwd {
         validate_path_arg(&cwd)?;
@@ -64,7 +67,7 @@ async fn start_bridge_sidecar(app: tauri::AppHandle, cwd: Option<String>) -> Res
 #[tauri::command]
 async fn spawn_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInput) -> Result<(), String> {
     validate_bridge_command_args(&input.args)?;
-    Command::new(sidecar_path(&app)?)
+    sidecar_command(&app)?
         .args(input.args)
         .spawn()
         .map_err(|error| error.to_string())?;
@@ -74,7 +77,7 @@ async fn spawn_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInp
 #[tauri::command]
 async fn run_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInput) -> Result<BridgeCommandOutput, String> {
     validate_bridge_command_args(&input.args)?;
-    let output = Command::new(sidecar_path(&app)?)
+    let output = sidecar_command(&app)?
         .args(input.args)
         .output()
         .map_err(|error| error.to_string())?;
@@ -95,6 +98,21 @@ fn sidecar_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
         .resolve(resource_name, tauri::path::BaseDirectory::Resource)
         .map_err(|error| error.to_string())
 }
+
+fn sidecar_command(app: &tauri::AppHandle) -> Result<Command, String> {
+    let mut command = Command::new(sidecar_path(app)?);
+    hide_child_console_window(&mut command);
+    Ok(command)
+}
+
+#[cfg(target_os = "windows")]
+fn hide_child_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_child_console_window(_command: &mut Command) {}
 
 fn validate_external_url(value: &str) -> Result<(), String> {
     if value.len() > 4096 || value.contains('\0') {
@@ -229,8 +247,8 @@ fn handle_protocol_url(app: &tauri::AppHandle, url: &str) {
             return;
         }
     };
-    if let Ok(sidecar) = sidecar_path(app) {
-        let _ = Command::new(sidecar).args(args).spawn();
+    if let Ok(mut command) = sidecar_command(app) {
+        let _ = command.args(args).spawn();
     }
 }
 
