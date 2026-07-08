@@ -2,6 +2,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
+import { currentProcessEnv } from "@hunsu/config";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_PROBE_TIMEOUT_MS = 3_500;
@@ -114,7 +115,7 @@ type JsonRpcMessage = {
 let cachedStatus: { at: number; key: string; status: CodexRuntimeStatus } | undefined;
 
 export async function detectCodexBinary(options: CodexRuntimeStatusOptions = {}): Promise<CodexCliStatus> {
-  const env = options.env ?? process.env;
+  const env = options.env ?? currentProcessEnv();
   const customPath = options.customBinaryPath?.trim() || env.HUNSU_CODEX_BINARY_PATH?.trim();
   if (customPath) {
     return binaryStatusFromCandidate(customPath, "custom", env);
@@ -218,7 +219,7 @@ export async function probeCodexRuntimeWithAppServer(input: {
 }
 
 export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions = {}): Promise<CodexRuntimeStatus> {
-  const env = options.env ?? process.env;
+  const env = options.env ?? currentProcessEnv();
   const cacheKey = JSON.stringify({
     customBinaryPath: options.customBinaryPath ?? env.HUNSU_CODEX_BINARY_PATH,
     envCommand: env.HUNSU_CODEX_APP_SERVER_COMMAND,

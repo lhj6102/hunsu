@@ -477,6 +477,78 @@ test("Bridge runtime Codex device login endpoint returns device-code details", a
   }
 });
 
+test("Bridge runtime Codex ChatGPT login endpoint records pending state and authenticated recheck clears it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-chatgpt-login-test-"));
+  const fakeCodex = join(root, "codex");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login') { process.exit(0); }",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: fakeCodex
+    }, { cwd: root }));
+    const state = createStudioState();
+    const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
+    const response = await requestStudioServerJson(server, "POST", "/api/runtimes/codex/login/chatgpt");
+
+    assert.equal(response.status, 202);
+    assert.equal(response.body.started, true);
+    assert.equal(response.body.state, "pending");
+    assert.equal(response.body.status, "pending");
+    assert.deepEqual(response.body.args, ["login"]);
+    assert.equal(state.codexLogin?.kind, "chatgpt");
+    assert.equal(state.codexLogin?.status, "pending");
+
+    const prerequisites = await requestStudioServerJson(server, "GET", "/api/prerequisites");
+    assert.equal(prerequisites.body.runtimes.codex.auth.state, "authenticated");
+    assert.equal(prerequisites.body.codexLogin, undefined);
+    assert.equal(prerequisites.body.runtimes.codex.codexLogin, undefined);
+    assert.equal(state.codexLogin, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge runtime Codex ChatGPT login endpoint records failed state when Codex is missing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-chatgpt-login-fail-test-"));
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: join(root, "missing-codex")
+    }, { cwd: root }));
+    const state = createStudioState();
+    const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
+    const response = await requestStudioServerJson(server, "POST", "/api/runtimes/codex/login/chatgpt");
+
+    assert.equal(response.status, 202);
+    assert.equal(response.body.started, false);
+    assert.equal(response.body.state, "failed");
+    assert.equal(state.codexLogin?.kind, "chatgpt");
+    assert.equal(state.codexLogin?.status, "failed");
+    assert.match(state.codexLogin?.error ?? "", /not found|missing|no such file/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Bridge runtime Codex device login endpoint preserves code details when later exit fails", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-device-login-code-then-fail-test-"));
   const fakeCodex = join(root, "codex");
@@ -558,7 +630,7 @@ test("Bridge runtime Codex device login tracker captures later output and failur
     assert.equal(started.status, 202);
     assert.equal(started.body.state, "pending");
 
-    await delay(700);
+    await delay(1200);
     const prerequisites = await requestStudioServerJson(server, "GET", "/api/prerequisites");
     assert.equal(prerequisites.body.codexLogin.status, "device_code");
     assert.equal(prerequisites.body.codexLogin.userCode, "HUNSU-LATE");

@@ -2374,6 +2374,13 @@ type CodexDeviceLoginResult = CodexActionStartResult & {
   error?: string;
 };
 
+type CodexChatGptLoginResult = CodexActionStartResult & {
+  state?: CodexLoginProcessState["status"];
+  status?: CodexLoginProcessState["status"];
+  lastOutput?: string;
+  error?: string;
+};
+
 type TrackedCodexLoginProcess = {
   child: ReturnType<typeof spawn>;
   startedAt: string;
@@ -2396,6 +2403,48 @@ async function spawnCodexAction(args: string[], env: Record<string, string | und
   });
   child.unref();
   return { started: true, command: cli.binaryPath, args };
+}
+
+async function spawnCodexChatGptLogin(state: StudioServerState, env: Record<string, string | undefined>): Promise<CodexChatGptLoginResult> {
+  const args = ["login"];
+  const cli = await detectCodexBinary({ env });
+  const startedAt = new Date().toISOString();
+  if (!cli.installed || !cli.binaryPath) {
+    const failed = updateCodexLoginState(state, {
+      kind: "chatgpt",
+      startedAt,
+      status: "failed",
+      error: cli.error ?? "Codex CLI was not found.",
+      lastOutput: "Browser login failed to start."
+    });
+    return codexChatGptLoginResult(undefined, args, failed, false);
+  }
+  try {
+    const child = spawn(cli.binaryPath, args, {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, ...env },
+      windowsHide: false
+    });
+    child.unref();
+    const pending = updateCodexLoginState(state, {
+      kind: "chatgpt",
+      pid: child.pid,
+      startedAt,
+      status: "pending",
+      lastOutput: "Browser login started. Complete sign-in, then click Recheck."
+    });
+    return codexChatGptLoginResult(cli.binaryPath, args, pending);
+  } catch (error) {
+    const failed = updateCodexLoginState(state, {
+      kind: "chatgpt",
+      startedAt,
+      status: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      lastOutput: "Browser login failed to start."
+    });
+    return codexChatGptLoginResult(cli.binaryPath, args, failed, false);
+  }
 }
 
 async function spawnCodexDeviceLogin(state: StudioServerState, env: Record<string, string | undefined>, timeoutMs = 3_000): Promise<CodexDeviceLoginResult> {
@@ -2502,6 +2551,21 @@ async function waitForCodexLoginInitialState(state: StudioServerState, timeoutMs
   if (tracker && !tracker.cleared && state.codexLogin?.startedAt === tracker.startedAt && state.codexLogin.status === "starting") {
     updateCodexLoginState(state, { ...state.codexLogin, status: "pending" });
   }
+}
+
+function codexChatGptLoginResult(command: string | undefined, args: string[], state: CodexLoginProcessState, started = true): CodexChatGptLoginResult {
+  return {
+    started,
+    command,
+    args,
+    state: state.status,
+    status: state.status,
+    lastOutput: state.lastOutput,
+    error: state.error,
+    message: state.status === "failed"
+      ? state.error ?? "Codex login failed to start."
+      : "Codex login started. Complete sign-in in your browser, then click Recheck."
+  };
 }
 
 function codexDeviceLoginResult(command: string | undefined, args: string[], state: CodexLoginProcessState | undefined, started = true): CodexDeviceLoginResult {
@@ -3115,7 +3179,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       }
 
       if (request.method === "POST" && pathname === "/api/runtimes/codex/login/chatgpt") {
-        sendJson(response, 202, await spawnCodexAction(["login"], runtimeConfig.processEnv));
+        sendJson(response, 202, await spawnCodexChatGptLogin(state, runtimeConfig.processEnv));
         return;
       }
 

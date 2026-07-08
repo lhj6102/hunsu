@@ -98,7 +98,11 @@ function renderSnapshot(snapshot) {
     diagnostics: snapshot.diagnostics,
     logs: snapshot.logLines
   }, null, 2);
-  latestCodexDeviceLoginResult = snapshot.codexLogin ?? latestCodexDeviceLoginResult;
+  if (snapshot.codexLogin) {
+    latestCodexDeviceLoginResult = snapshot.codexLogin;
+  } else if (codex?.ready || codex?.auth?.state === "authenticated") {
+    latestCodexDeviceLoginResult = undefined;
+  }
   renderCodexCard(codex);
   renderToolCards(snapshot.prerequisites?.tools);
   activeRoadmapList.replaceChildren(...roadmapRows(activeRoadmaps, "active", snapshot.projectGrants ?? []));
@@ -301,7 +305,7 @@ function renderCodexCard(codex) {
     const login = document.createElement("button");
     login.className = "primary";
     login.textContent = "Sign in with ChatGPT";
-    login.addEventListener("click", () => spawn(["codex", "login"]));
+    login.addEventListener("click", startCodexChatGptLogin);
     buttons.append(login);
     const device = document.createElement("button");
     device.textContent = "Use Device Code";
@@ -309,17 +313,38 @@ function renderCodexCard(codex) {
     buttons.append(device);
     const apiKey = document.createElement("button");
     apiKey.textContent = "Use API Key - Advanced";
-    apiKey.addEventListener("click", () => spawn(["codex", "login"]));
+    apiKey.addEventListener("click", startCodexChatGptLogin);
     buttons.append(apiKey);
   }
   if (codex?.recommendedAction !== "login_codex") {
     const apiKey = document.createElement("button");
     apiKey.textContent = "Use API Key - Advanced";
-    apiKey.addEventListener("click", () => spawn(["codex", "login"]));
+    apiKey.addEventListener("click", startCodexChatGptLogin);
     buttons.append(apiKey);
   }
   row.append(body, buttons);
   codexCard.append(row);
+}
+
+async function startCodexChatGptLogin() {
+  latestCodexDeviceLoginResult = {
+    kind: "chatgpt",
+    status: "pending",
+    message: "Codex login started.",
+    lastOutput: "Browser login started. Complete sign-in, then click Recheck."
+  };
+  renderCodexCard(latestSnapshot?.prerequisites?.codex);
+  try {
+    await spawn(["codex", "login"]);
+  } catch (error) {
+    latestCodexDeviceLoginResult = {
+      kind: "chatgpt",
+      status: "failed",
+      message: "Codex login failed to start.",
+      error: String(error)
+    };
+  }
+  await refresh();
 }
 
 async function startCodexDeviceLogin() {
@@ -353,8 +378,20 @@ async function startCodexDeviceLogin() {
 function codexDeviceLoginStatus() {
   const result = latestCodexDeviceLoginResult;
   const container = document.createElement("div");
-  container.className = "message";
   if (!result) {
+    return container;
+  }
+  container.className = "message";
+  if (result.kind === "chatgpt") {
+    const failed = result.status === "failed" || result.state === "failed";
+    const lines = [
+      failed ? result.message || "Codex login failed to start." : "Codex login started.",
+      failed ? result.error : "Complete sign-in in your browser, then click Recheck."
+    ].filter(Boolean);
+    container.textContent = lines.join("\n");
+    if (failed) {
+      container.className = "message status-error";
+    }
     return container;
   }
   const failed = result.state === "failed" || result.status === "failed";

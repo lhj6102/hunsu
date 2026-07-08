@@ -219,7 +219,7 @@ fn validate_codex_args(args: &[String]) -> bool {
     match args {
         [command, subcommand] if command == "codex" && matches!(subcommand.as_str(), "status" | "install" | "recheck" | "logout") => true,
         [command, subcommand] if command == "codex" && subcommand == "login" => true,
-        [command, subcommand, flag] if command == "codex" && subcommand == "login" && matches!(flag.as_str(), "--device" | "--background") => true,
+        [command, subcommand, flag] if command == "codex" && subcommand == "login" && flag == "--device" => true,
         [command, subcommand, first_flag, second_flag]
             if command == "codex"
                 && subcommand == "login"
@@ -251,7 +251,7 @@ fn valid_codex_login_flags(flags: &[&str]) -> bool {
             _ => return false,
         }
     }
-    saw_device || saw_background
+    saw_device
 }
 
 fn validate_codex_settings_set_args(args: &[String]) -> bool {
@@ -637,8 +637,14 @@ mod tests {
 
     #[test]
     fn codex_sidecar_commands_cannot_pass_arbitrary_arguments() {
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into()]).is_ok());
         assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into()]).is_ok());
         assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--background".into()]).is_ok());
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--json".into()]).is_ok());
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--json".into(), "--device".into(), "--background".into()]).is_ok());
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--background".into()]).is_err());
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--json".into()]).is_err());
+        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--background".into(), "--json".into()]).is_err());
         assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--danger".into()]).is_err());
         assert!(validate_bridge_command_args(&["codex".into(), "exec".into(), "rm -rf /".into()]).is_err());
     }

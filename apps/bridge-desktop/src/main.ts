@@ -739,7 +739,10 @@ async function codexCommand(parsed: ParsedArgs): Promise<void> {
       await runCodexDeviceLoginCli({ json: hasFlag(parsed, "json"), background: hasFlag(parsed, "background") });
       return;
     }
-    runCodexCli(["login"]);
+    if (hasFlag(parsed, "json") || hasFlag(parsed, "background")) {
+      throw new Error("codex login --json/--background requires --device.");
+    }
+    await runCodexChatGptLoginCli();
     return;
   }
   if (action === "logout") {
@@ -1894,6 +1897,50 @@ async function runCodexDeviceLoginCli(options: { json: boolean; background: bool
   }
   if (result.userCode) {
     console.log(`Code: ${result.userCode}`);
+  }
+}
+
+async function runCodexChatGptLoginCli(): Promise<void> {
+  const args = ["login"];
+  const codex = await getCodexRuntimeStatus({ env: codexProbeEnv(), force: true });
+  const binaryPath = codex.cli.binaryPath;
+  const startedAt = new Date().toISOString();
+  if (!binaryPath || !codex.cli.installed) {
+    writeCodexLoginState({
+      kind: "chatgpt",
+      startedAt,
+      status: "failed",
+      error: codex.cli.error ?? "Codex CLI was not found.",
+      lastOutput: "Browser login failed to start."
+    });
+    throw new Error(codex.cli.error ?? "Codex CLI was not found.");
+  }
+  try {
+    const child = spawn(binaryPath, args, {
+      detached: true,
+      stdio: "ignore",
+      env: codexProbeEnv(),
+      windowsHide: false
+    });
+    child.unref();
+    writeCodexLoginState({
+      kind: "chatgpt",
+      pid: child.pid,
+      startedAt,
+      status: "pending",
+      lastOutput: "Browser login started. Complete sign-in, then click Recheck."
+    });
+    console.log("Codex login started. Complete sign-in in your browser, then click Recheck.");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeCodexLoginState({
+      kind: "chatgpt",
+      startedAt,
+      status: "failed",
+      error: message,
+      lastOutput: "Browser login failed to start."
+    });
+    throw error;
   }
 }
 

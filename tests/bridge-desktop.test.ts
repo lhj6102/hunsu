@@ -7,6 +7,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { runInNewContext } from "node:vm";
 import {
   createDeviceAuthorizationRequest,
   createPkceAuthorizationRequest,
@@ -309,6 +310,139 @@ test("Bridge App Codex device background login persists delayed failure after de
     restoreEnv(previousEnv);
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Bridge App Codex ChatGPT login command records pending state and recheck clears authenticated state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-chatgpt-login-test-"));
+  const fakeCodex = join(root, "codex");
+  const statePath = join(root, "state.json");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'login') { process.exit(0); }",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  const previousEnv = snapshotEnv(["HUNSU_CODEX_BINARY_PATH", "HUNSU_BRIDGE_APP_STATE_PATH", "PATH"]);
+  const previousLog = console.log;
+  console.log = () => {};
+  try {
+    process.env.HUNSU_CODEX_BINARY_PATH = fakeCodex;
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "login"]), 0);
+    const pendingState = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: { kind?: string; status?: string; lastOutput?: string } };
+    assert.equal(pendingState.codexLogin?.kind, "chatgpt");
+    assert.equal(pendingState.codexLogin?.status, "pending");
+    assert.match(pendingState.codexLogin?.lastOutput ?? "", /Complete sign-in/);
+
+    assert.equal(await main(["codex", "recheck"]), 0);
+    const recheckedState = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: unknown };
+    assert.equal(recheckedState.codexLogin, undefined);
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex ChatGPT login command records failed state when Codex is missing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-chatgpt-login-fail-test-"));
+  const statePath = join(root, "state.json");
+  const previousEnv = snapshotEnv(["HUNSU_CODEX_BINARY_PATH", "HUNSU_BRIDGE_APP_STATE_PATH", "HUNSU_BRIDGE_APP_LOG_PATH", "PATH"]);
+  const previousError = console.error;
+  console.error = () => {};
+  try {
+    process.env.HUNSU_CODEX_BINARY_PATH = join(root, "missing-codex");
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+    process.env.HUNSU_BRIDGE_APP_LOG_PATH = join(root, "bridge-app.log");
+    process.env.PATH = "";
+    assert.equal(await main(["codex", "login"]), 1);
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as { codexLogin?: { kind?: string; status?: string; error?: string } };
+    assert.equal(state.codexLogin?.kind, "chatgpt");
+    assert.equal(state.codexLogin?.status, "failed");
+    assert.match(state.codexLogin?.error ?? "", /not found|missing|no such file/i);
+  } finally {
+    console.error = previousError;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App desktop UI clears stale Codex login status after authentication", () => {
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "device",
+      status: "device_code",
+      state: "device_code",
+      message: "Codex device login started.",
+      verificationUriComplete: "https://auth.openai.com/activate?user_code=HUNSU-UI",
+      userCode: "HUNSU-UI"
+    },
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "login_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /HUNSU-UI/);
+
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      tools: {}
+    }
+  });
+  assert.doesNotMatch(textForTestElement(ui.elements.get("#codex-card")), /HUNSU-UI/);
+});
+
+test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGPT pending state", () => {
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "device",
+      status: "failed",
+      state: "failed",
+      message: "Codex device login failed.",
+      error: "browser unavailable"
+    },
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "login_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /browser unavailable/);
+
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "chatgpt",
+      status: "pending",
+      lastOutput: "Browser login started. Complete sign-in, then click Recheck."
+    },
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "login_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /Codex login started/);
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /Complete sign-in in your browser, then click Recheck/);
 });
 
 test("Bridge App headless commands persist device, Remote Access, Project Grant, and service state", async () => {
@@ -2182,6 +2316,119 @@ function fakeNativeExecutable(kind: "elf" | "mach-o" | "pe"): Buffer {
       break;
   }
   return buffer;
+}
+
+type BridgeUiTestElement = {
+  textContent: string;
+  className: string;
+  children: unknown[];
+  dataset: Record<string, string>;
+  value: string;
+  checked: boolean;
+  disabled: boolean;
+  hidden: boolean;
+  title: string;
+  type: string;
+  append: (...nodes: unknown[]) => void;
+  replaceChildren: (...nodes: unknown[]) => void;
+  addEventListener: () => void;
+  focus: () => void;
+  scrollIntoView: () => void;
+  setAttribute: (name: string, value: string) => void;
+};
+
+function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => void; elements: Map<string, BridgeUiTestElement> } {
+  const elements = new Map<string, BridgeUiTestElement>();
+  const document = {
+    querySelector(selector: string) {
+      if (!elements.has(selector)) {
+        elements.set(selector, createBridgeUiTestElement());
+      }
+      return elements.get(selector);
+    },
+    querySelectorAll(_selector: string) {
+      return [];
+    },
+    createElement(_tagName: string) {
+      return createBridgeUiTestElement();
+    },
+    createTextNode(value: string) {
+      return { textContent: value };
+    }
+  };
+  const window = {
+    __TAURI__: undefined,
+    location: { href: "" },
+    setTimeout: () => 0,
+    setInterval: () => 0
+  };
+  const context = {
+    window,
+    document,
+    navigator: { clipboard: { writeText: () => Promise.resolve() } },
+    console,
+    Promise,
+    JSON,
+    Date,
+    String,
+    setTimeout: () => 0,
+    clearTimeout: () => undefined
+  };
+  runInNewContext(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/app.js"), "utf8"), context);
+  return {
+    renderSnapshot: (context as unknown as { renderSnapshot: (snapshot: unknown) => void }).renderSnapshot,
+    elements
+  };
+}
+
+function createBridgeUiTestElement(): BridgeUiTestElement {
+  return {
+    textContent: "",
+    className: "",
+    children: [],
+    dataset: {},
+    value: "",
+    checked: false,
+    disabled: false,
+    hidden: false,
+    title: "",
+    type: "",
+    append(...nodes: unknown[]) {
+      this.children.push(...nodes);
+    },
+    replaceChildren(...nodes: unknown[]) {
+      this.children = nodes;
+    },
+    addEventListener() {},
+    focus() {},
+    scrollIntoView() {},
+    setAttribute(name: string, value: string) {
+      if (name === "aria-selected") {
+        this.dataset.ariaSelected = value;
+      }
+    }
+  };
+}
+
+function textForTestElement(element: unknown): string {
+  if (!element || typeof element !== "object") {
+    return "";
+  }
+  const node = element as { textContent?: unknown; children?: unknown[] };
+  return [
+    typeof node.textContent === "string" ? node.textContent : "",
+    ...(node.children ?? []).map(child => textForTestElement(child))
+  ].filter(Boolean).join("\n");
+}
+
+function bridgeUiStatusFixture() {
+  return {
+    localBridge: "connected",
+    account: "Signed out",
+    remoteAccess: "Off",
+    device: { name: "Test Device", registered: false },
+    service: { installed: false, manager: "manual" }
+  };
 }
 
 test("Bridge App sidecar supervisor cancels crash restart when stopped intentionally", async () => {
