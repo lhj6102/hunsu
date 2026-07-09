@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type SpawnOptions } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { Buffer } from "node:buffer";
@@ -116,7 +116,14 @@ export {
   getCodexRuntimeStatus,
   sanitizeDiagnostics
 } from "./runtimes/codex.ts";
-export type { CodexCliStatus, CodexRuntimeStatus, ExecutePreflightError } from "./runtimes/codex.ts";
+export type {
+  CodexBinarySource,
+  CodexCliStatus,
+  CodexDiscoveryCandidate,
+  CodexDiscoveryReport,
+  CodexRuntimeStatus,
+  ExecutePreflightError
+} from "./runtimes/codex.ts";
 import type {
   AgentConversationRef,
   ArtifactActionDefinition,
@@ -208,6 +215,7 @@ const CODEX_ITEMS_MAX_BYTES = 512 * 1024;
 const ASSISTANT_TRANSCRIPT_MAX_BYTES = 256 * 1024;
 const AGENT_SESSION_MAX_BYTES = 1024 * 1024;
 const RUN_UPDATE_DEBOUNCE_MS = 250;
+const CODEX_DEVICE_LOGIN_CODE_SETTLE_MS = 150;
 const FILESYSTEM_BROWSE_ENTRY_LIMIT = 300;
 const FILESYSTEM_CAPABILITY_TTL_MS = 15 * 60 * 1000;
 const MOVE_FILE_TEXT_MAX_BYTES = 256 * 1024;
@@ -1614,7 +1622,7 @@ function printStudioBridgeStartInfo(info: StudioBridgeStartInfo, options: Pick<S
 function openStudioBridgeBrowser(url: string): void {
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  const child = spawn(command, args, bridgeBackgroundSpawnOptions({ detached: true, stdio: "ignore" }));
   child.unref();
 }
 
@@ -2386,21 +2394,28 @@ type TrackedCodexLoginProcess = {
   startedAt: string;
   output: string;
   cleared: boolean;
+  finished: boolean;
 };
 
 const codexLoginTrackers = new WeakMap<StudioServerState, TrackedCodexLoginProcess>();
+
+export function bridgeBackgroundSpawnOptions(options: SpawnOptions, platform: NodeJS.Platform = process.platform): SpawnOptions {
+  return {
+    ...options,
+    windowsHide: platform === "win32" ? true : options.windowsHide
+  };
+}
 
 async function spawnCodexAction(args: string[], env: Record<string, string | undefined>): Promise<CodexActionStartResult> {
   const cli = await detectCodexBinary({ env });
   if (!cli.installed || !cli.binaryPath) {
     return { started: false, args, message: cli.error ?? "Codex CLI was not found." };
   }
-  const child = spawn(cli.binaryPath, args, {
+  const child = spawn(cli.binaryPath, args, bridgeBackgroundSpawnOptions({
     detached: true,
     stdio: "ignore",
-    env: { ...process.env, ...env },
-    windowsHide: false
-  });
+    env: { ...process.env, ...env }
+  }));
   child.unref();
   return { started: true, command: cli.binaryPath, args };
 }
@@ -2420,12 +2435,11 @@ async function spawnCodexChatGptLogin(state: StudioServerState, env: Record<stri
     return codexChatGptLoginResult(undefined, args, failed, false);
   }
   try {
-    const child = spawn(cli.binaryPath, args, {
+    const child = spawn(cli.binaryPath, args, bridgeBackgroundSpawnOptions({
       detached: true,
       stdio: "ignore",
-      env: { ...process.env, ...env },
-      windowsHide: false
-    });
+      env: { ...process.env, ...env }
+    }));
     child.unref();
     const pending = updateCodexLoginState(state, {
       kind: "chatgpt",
@@ -2464,17 +2478,17 @@ async function spawnCodexDeviceLogin(state: StudioServerState, env: Record<strin
     return codexDeviceLoginResult(undefined, args, failed, false);
   }
 
-  const child = spawn(cli.binaryPath, args, {
+  const child = spawn(cli.binaryPath, args, bridgeBackgroundSpawnOptions({
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ...env },
-    windowsHide: false
-  });
+    env: { ...process.env, ...env }
+  }));
   const tracker: TrackedCodexLoginProcess = {
     child,
     startedAt: new Date().toISOString(),
     output: "",
-    cleared: false
+    cleared: false,
+    finished: false
   };
   codexLoginTrackers.set(state, tracker);
   updateCodexLoginState(state, {
@@ -2504,6 +2518,7 @@ async function spawnCodexDeviceLogin(state: StudioServerState, env: Record<strin
     if (tracker.cleared) {
       return;
     }
+    tracker.finished = true;
     updateCodexLoginState(state, {
       kind: "device",
       pid: child.pid,
@@ -2518,6 +2533,7 @@ async function spawnCodexDeviceLogin(state: StudioServerState, env: Record<strin
     if (tracker.cleared) {
       return;
     }
+    tracker.finished = true;
     const details = parseCodexDeviceAuthOutput(tracker.output);
     const failed = code !== 0;
     updateCodexLoginState(state, {
@@ -2542,8 +2558,18 @@ async function waitForCodexLoginInitialState(state: StudioServerState, timeoutMs
   while (Date.now() < deadline) {
     const codexLogin = state.codexLogin;
     const status = codexLogin && codexLogin.startedAt === startedAt ? codexLogin.status : undefined;
-    if (status === "device_code" || status === "failed" || status === "completed") {
+    if (status === "failed" || status === "completed") {
       return;
+    }
+    if (status === "device_code") {
+      const tracker = codexLoginTrackers.get(state);
+      if (!tracker || tracker.cleared || tracker.startedAt !== startedAt || tracker.finished) {
+        return;
+      }
+      await sleep(CODEX_DEVICE_LOGIN_CODE_SETTLE_MS);
+      if (state.codexLogin?.startedAt === startedAt && (state.codexLogin.status === "failed" || state.codexLogin.status === "completed" || state.codexLogin.status === "device_code")) {
+        return;
+      }
     }
     await sleep(50);
   }
@@ -7560,14 +7586,14 @@ function roadmapInactivePreflight(lifecycle: RoadmapRegistryEntry["lifecycle"] |
   return {
     area: "roadmap",
     error: roadmapPreflightError(state),
-    message: roadmapInactiveMessage(state, roadmapId),
+    message: roadmapInactiveMessage(state),
     roadmapId,
     lifecycle: roadmapPreflightLifecycle(state),
     actions: [
       { type: "open_bridge_app", label: "Open Bridge App", href: "hunsu://open" },
-      { type: "open_roadmaps", label: "Open Roadmaps", href: "hunsu://roadmaps" },
+      { type: "open_roadmaps", label: "Open Workspaces", href: "hunsu://workspaces" },
       ...(encodedRoadmapId && state === "inactive"
-        ? [{ type: "activate_roadmap" as const, label: "Activate Roadmap", href: `hunsu://activate-roadmap?roadmapId=${encodedRoadmapId}`, roadmapId }]
+        ? [{ type: "activate_roadmap" as const, label: "Activate workspace", href: `hunsu://activate-roadmap?roadmapId=${encodedRoadmapId}`, roadmapId }]
         : [])
     ]
   };
@@ -7592,21 +7618,20 @@ function roadmapPreflightLifecycle(lifecycle: RoadmapRegistryEntry["lifecycle"] 
   return lifecycle === "active" ? "missing" : lifecycle;
 }
 
-function roadmapInactiveMessage(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing", roadmapId: string | undefined): string {
-  const suffix = roadmapId ? ` (${roadmapId})` : "";
+function roadmapInactiveMessage(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing"): string {
   switch (lifecycle) {
     case "inactive":
-      return `This Roadmap${suffix} is inactive. Activate it in Hunsu Bridge App before starting Execute.`;
+      return "This workspace is inactive. Activate it in Hunsu Bridge App before starting Execute.";
     case "missing":
-      return `This Roadmap${suffix} is missing from the active registry or its project path cannot be found. Repair or activate it in Hunsu Bridge App before starting Execute.`;
+      return "This workspace is missing from the active registry or its project path cannot be found. Repair or activate it in Hunsu Bridge App before starting Execute.";
     case "needs_upgrade":
-      return `This Roadmap${suffix} needs an upgrade before Execute can start.`;
+      return "This workspace needs an upgrade before Execute can start.";
     case "error":
-      return `This Roadmap${suffix} is not healthy. Repair it in Hunsu Bridge App before starting Execute.`;
+      return "This workspace is not healthy. Repair it in Hunsu Bridge App before starting Execute.";
     case "active":
-      return `This Roadmap${suffix} is active.`;
+      return "This workspace is active.";
     default:
-      return `This Roadmap${suffix} is not active. Activate or repair it in Hunsu Bridge App before starting Execute.`;
+      return "This workspace is not active. Activate or repair it in Hunsu Bridge App before starting Execute.";
   }
 }
 

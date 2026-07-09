@@ -1,5 +1,6 @@
 const invoke = window.__TAURI__?.core?.invoke;
 const diagnostics = document.querySelector("#diagnostics");
+const logsPanel = document.querySelector("#logs");
 const statusEls = {
   localBridge: document.querySelector("#local-bridge"),
   codexSummary: document.querySelector("#codex-summary"),
@@ -24,6 +25,8 @@ const codexAuthPreference = document.querySelector("#codex-auth-preference");
 const codexEnvHome = document.querySelector("#codex-env-home");
 const codexEnvCommand = document.querySelector("#codex-env-command");
 const codexEnvArgs = document.querySelector("#codex-env-args");
+const openStudioButton = document.querySelector("#open-studio");
+const openStudioConnectionButton = document.querySelector("#open-studio-connection");
 let latestSnapshot = undefined;
 let selectedInspection = undefined;
 let lastHandledUiIntentId = undefined;
@@ -85,11 +88,12 @@ function renderSnapshot(snapshot) {
   statusEls.localBridge.className = status.localBridge === "connected" ? "status-connected" : status.localBridge === "error" ? "status-error" : "status-warning";
   const codex = snapshot.prerequisites?.codex;
   statusEls.codexSummary.textContent = codexSummary(codex);
-  statusEls.codexSummary.className = codex?.ready ? "status-connected" : codex?.recommendedAction === "install_codex" || codex?.recommendedAction === "login_codex" ? "status-warning" : "status-error";
+  statusEls.codexSummary.className = codex?.ready ? "status-connected" : codex?.recommendedAction === "install_codex" || codex?.recommendedAction === "select_codex_path" || codex?.recommendedAction === "login_codex" ? "status-warning" : "status-error";
   const managed = snapshot.managedRoadmaps ?? snapshot.recentProjects ?? [];
-  const activeRoadmaps = managed.filter(project => project.lifecycle === "active");
+  const activeRoadmaps = activeWorkspaceSnapshots(snapshot);
   const inactiveRoadmaps = managed.filter(project => project.lifecycle !== "active");
   statusEls.activeRoadmaps.textContent = `${activeRoadmaps.length} active`;
+  setOpenStudioAvailability(activeRoadmaps.length > 0);
   statusEls.account.textContent = status.account;
   statusEls.remoteAccess.textContent = status.remoteAccess;
   statusEls.device.textContent = `${status.device.name}${status.device.registered ? " (registered)" : ""}`;
@@ -98,6 +102,7 @@ function renderSnapshot(snapshot) {
     diagnostics: snapshot.diagnostics,
     logs: snapshot.logLines
   }, null, 2);
+  logsPanel.textContent = (snapshot.logLines ?? []).join("\n") || "No logs yet.";
   if (snapshot.codexLogin) {
     latestCodexDeviceLoginResult = snapshot.codexLogin;
   } else if (codex?.ready || codex?.auth?.state === "authenticated") {
@@ -112,17 +117,30 @@ function renderSnapshot(snapshot) {
   renderCodexSettings(snapshot.codexSettings, snapshot.diagnostics?.app?.codex);
 }
 
+function activeWorkspaceSnapshots(snapshot) {
+  const managed = snapshot?.managedRoadmaps ?? snapshot?.recentProjects ?? [];
+  return managed.filter(project => project.lifecycle === "active");
+}
+
+function setOpenStudioAvailability(available) {
+  for (const button of [openStudioButton, openStudioConnectionButton]) {
+    button.hidden = !available;
+    button.disabled = !available;
+    button.title = available ? "Open Studio" : "Activate a workspace before opening Studio.";
+  }
+}
+
 function roadmapRows(projects, lifecycle, grants) {
   if (!projects.length) {
     const empty = document.createElement("div");
     empty.className = "empty-row";
-    empty.textContent = lifecycle === "active" ? "No active Roadmaps." : lifecycle === "remote" ? "No managed Roadmaps." : "No inactive Roadmaps.";
+    empty.textContent = lifecycle === "active" ? "No active workspaces." : lifecycle === "remote" ? "No managed workspaces." : "No inactive workspaces.";
     return [empty];
   }
-  return projects.map(project => projectRow(project, grants));
+  return projects.map(project => projectRow(project, grants, lifecycle));
 }
 
-function projectRow(project, grants = []) {
+function projectRow(project, grants = [], lifecycle = project.lifecycle) {
   const row = document.createElement("div");
   row.className = "project-row";
   const body = document.createElement("div");
@@ -133,58 +151,86 @@ function projectRow(project, grants = []) {
   meta.className = "project-meta";
   const grant = project.projectGrant ?? grantForProject(project, grants);
   const remote = remoteAccessState(project, grant);
-  meta.textContent = [
-    `Local: ${project.lifecycle === "active" ? "Active" : "Inactive"}`,
-    `Codex: ${project.codex?.readyForExecute ? "Ready" : "Not Ready"}`,
-    `Remote: ${remote.label}`,
-    project.health,
-    project.lastKnownBranch,
-    project.lastOpenedAt ? new Date(project.lastOpenedAt).toLocaleString() : undefined,
-    project.repositoryPath
-  ].filter(Boolean).join(" · ");
-  body.append(title, meta, scopeControls(project, grant, remote));
+  meta.textContent = project.lifecycle === "active" ? "Active workspace" : "Inactive workspace";
+  body.append(title, meta, workspaceDetails(project, grant, remote));
   const buttons = document.createElement("div");
   buttons.className = "actions";
-  const button = document.createElement("button");
-  const action = project.primaryAction || (project.health === "ok" ? "open" : "remove");
-  button.textContent = actionLabel(action);
-  button.addEventListener("click", async () => {
-    if (action === "open") {
+  if (project.lifecycle === "active") {
+    const openButton = document.createElement("button");
+    openButton.className = "primary";
+    openButton.textContent = "Open Studio";
+    openButton.disabled = project.health !== "ok";
+    openButton.addEventListener("click", async () => {
       await spawn(["open-roadmap", project.roadmapId]);
-    } else if (action === "repair") {
-      await spawn(["create", project.repositoryPath]);
-    } else {
-      await run(["projects", "remove", "--roadmap-id", project.roadmapId]);
-    }
-    await refresh();
-  });
-  buttons.append(button);
-  const lifecycleButton = document.createElement("button");
-  lifecycleButton.textContent = project.lifecycle === "inactive" ? "Activate" : "Deactivate";
-  lifecycleButton.addEventListener("click", async () => {
-    await run(["roadmaps", project.lifecycle === "inactive" ? "activate" : "deactivate", project.roadmapId]);
-    await refresh();
-  });
-  buttons.append(lifecycleButton);
+      await refresh();
+    });
+    buttons.append(openButton);
+  }
+  if (project.lifecycle === "inactive") {
+    const activateButton = document.createElement("button");
+    activateButton.className = "primary";
+    activateButton.textContent = "Activate";
+    activateButton.addEventListener("click", async () => {
+      await run(["roadmaps", "activate", project.roadmapId]);
+      await refresh();
+    });
+    buttons.append(activateButton);
+  } else {
+    const deactivateButton = document.createElement("button");
+    deactivateButton.textContent = "Deactivate";
+    deactivateButton.addEventListener("click", async () => {
+      await run(["roadmaps", "deactivate", project.roadmapId]);
+      await refresh();
+    });
+    buttons.append(deactivateButton);
+  }
+  if (project.lifecycle !== "active") {
+    const removeButton = document.createElement("button");
+    removeButton.textContent = "Remove";
+    removeButton.addEventListener("click", async () => {
+      await run(["roadmaps", "remove", project.roadmapId]);
+      await refresh();
+    });
+    buttons.append(removeButton);
+  }
+  row.append(body, buttons);
+  return row;
+}
+
+function workspaceDetails(project, grant, remote) {
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = "Details";
+  const content = document.createElement("div");
+  content.className = "project-meta";
+  content.textContent = [
+    `Path: ${project.repositoryPath}`,
+    `Health: ${project.health}`,
+    project.lastKnownBranch ? `Git branch: ${project.lastKnownBranch}` : undefined,
+    `Codex: ${project.codex?.readyForExecute ? "Ready" : "Not Ready"}`,
+    `Remote Access: ${remote.label}`,
+    project.lastOpenedAt ? `Last opened: ${new Date(project.lastOpenedAt).toLocaleString()}` : undefined
+  ].filter(Boolean).join(" · ");
+  const advancedActions = document.createElement("div");
+  advancedActions.className = "actions";
   const remoteButton = document.createElement("button");
   remoteButton.textContent = remote.enabled ? "Disable Remote Access" : "Enable Remote Access";
   remoteButton.disabled = !remote.available;
   remoteButton.title = remote.available ? remoteButton.textContent : remote.reason;
-  remoteButton.className = remote.enabled ? "" : remote.available ? "primary" : "";
   remoteButton.addEventListener("click", async () => {
     await run(["roadmaps", "remote", remote.enabled ? "disable" : "enable", project.roadmapId]);
     await refresh();
   });
-  buttons.append(remoteButton);
+  advancedActions.append(remoteButton);
   const removeButton = document.createElement("button");
-  removeButton.textContent = "Remove";
+  removeButton.textContent = "Remove from Bridge";
   removeButton.addEventListener("click", async () => {
     await run(["roadmaps", "remove", project.roadmapId]);
     await refresh();
   });
-  buttons.append(removeButton);
-  row.append(body, buttons);
-  return row;
+  advancedActions.append(removeButton);
+  details.append(summary, content, advancedActions);
+  return details;
 }
 
 function grantForProject(project, grants) {
@@ -257,19 +303,11 @@ function renderCodexCard(codex) {
   const body = document.createElement("div");
   const title = document.createElement("div");
   title.className = "project-title";
-  title.textContent = "Codex CLI";
+  title.textContent = "Codex";
   const meta = document.createElement("div");
   meta.className = "project-meta";
-  meta.textContent = [
-    codexSummary(codex),
-    codex?.cli?.version,
-    codex?.cli?.source ? `Source: ${codex.cli.source}` : undefined,
-    codex?.auth?.access ? `Access: ${formatCodexAccess(codex)}` : undefined,
-    codex?.usage?.rateLimitSummary ? `Rate limits: ${formatRateLimit(codex)}` : undefined,
-    codex?.usage?.lastRunUsage ? `Last run: ${formatUsage(codex.usage.lastRunUsage)}` : undefined,
-    codex?.cli?.binaryPath
-  ].filter(Boolean).join(" · ");
-  body.append(title, meta, codexDeviceLoginStatus());
+  meta.textContent = codexPrimaryMessage(codex);
+  body.append(title, meta, codexDeviceLoginStatus(), codexDetails(codex));
   const buttons = document.createElement("div");
   buttons.className = "actions";
   const recheck = document.createElement("button");
@@ -278,7 +316,16 @@ function renderCodexCard(codex) {
     await run(["codex", "recheck"]);
     await refresh();
   });
-  buttons.append(recheck);
+  if (codex?.recommendedAction !== "login_codex") {
+    buttons.append(recheck);
+  }
+  if (codex?.recommendedAction === "install_codex" || codex?.recommendedAction === "select_codex_path") {
+    const selectExisting = document.createElement("button");
+    selectExisting.className = codex?.recommendedAction === "select_codex_path" ? "primary" : "";
+    selectExisting.textContent = "Select existing Codex";
+    selectExisting.addEventListener("click", selectCodexBinary);
+    buttons.append(selectExisting);
+  }
   if (codex?.recommendedAction === "install_codex") {
     const install = document.createElement("button");
     install.className = "primary";
@@ -287,13 +334,6 @@ function renderCodexCard(codex) {
       diagnostics.textContent = await run(["codex", "install"]);
     });
     buttons.append(install);
-    const existing = document.createElement("button");
-    existing.textContent = "Use Existing Installation";
-    existing.addEventListener("click", () => {
-      document.querySelector("[data-tab='settings']")?.click();
-      codexBinaryPath.focus();
-    });
-    buttons.append(existing);
     const copy = document.createElement("button");
     copy.textContent = "Copy Install Command";
     copy.addEventListener("click", async () => {
@@ -304,26 +344,81 @@ function renderCodexCard(codex) {
   if (codex?.recommendedAction === "login_codex") {
     const login = document.createElement("button");
     login.className = "primary";
-    login.textContent = "Sign in with ChatGPT";
+    login.textContent = "Sign in";
     login.addEventListener("click", startCodexChatGptLogin);
     buttons.append(login);
     const device = document.createElement("button");
-    device.textContent = "Use Device Code";
+    device.textContent = "Use device code";
     device.addEventListener("click", startCodexDeviceLogin);
     buttons.append(device);
-    const apiKey = document.createElement("button");
-    apiKey.textContent = "Use API Key - Advanced";
-    apiKey.addEventListener("click", startCodexChatGptLogin);
-    buttons.append(apiKey);
+    buttons.append(recheck);
   }
-  if (codex?.recommendedAction !== "login_codex") {
-    const apiKey = document.createElement("button");
-    apiKey.textContent = "Use API Key - Advanced";
-    apiKey.addEventListener("click", startCodexChatGptLogin);
-    buttons.append(apiKey);
+  if (codex?.ready) {
+    const changePath = document.createElement("button");
+    changePath.textContent = "Change Codex path";
+    changePath.addEventListener("click", selectCodexBinary);
+    buttons.append(changePath);
   }
   row.append(body, buttons);
   codexCard.append(row);
+}
+
+function codexPrimaryMessage(codex) {
+  if (!codex) return "Checking Codex readiness.";
+  if (codex.usage?.rateLimited) return "Temporarily unavailable.";
+  if (codex.ready) {
+    return [
+      "Ready",
+      codex.auth?.access ? `Access: ${formatCodexAccess(codex)}` : "Access: Unknown",
+      codex.cli?.version ? `Version: ${codex.cli.version}` : undefined
+    ].filter(Boolean).join(" · ");
+  }
+  if (codex.recommendedAction === "login_codex") return "Login required.";
+  if (codex.recommendedAction === "select_codex_path") {
+    return "Codex works in your terminal, but Hunsu Bridge App cannot find a usable codex.exe. Select the real codex.exe file or restart Hunsu Bridge App after updating PATH.";
+  }
+  if (codex.recommendedAction === "install_codex") return "Not found by Hunsu Bridge App. Codex may be installed, but Bridge App cannot find it.";
+  if (codex.appServer?.available === false) return "Error";
+  return codex.cli?.error || codex.auth?.error || "Codex readiness could not be confirmed.";
+}
+
+function codexDetails(codex) {
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = "Details";
+  const content = document.createElement("div");
+  content.className = "project-meta";
+  content.textContent = [
+    codex?.cli?.binaryPath ? `Binary path: ${codex.cli.binaryPath}` : undefined,
+    codex?.cli?.source ? `Source: ${codex.cli.source}` : undefined,
+    codex?.appServer?.available === false ? `App server: ${codex.appServer.error ?? "Unavailable"}` : undefined,
+    codex?.usage?.rateLimitSummary ? `Rate limits: ${formatRateLimit(codex)}` : undefined,
+    codex?.usage?.lastRunUsage ? `Last run: ${formatUsage(codex.usage.lastRunUsage)}` : undefined,
+    codex?.cli?.discovery?.message,
+    codex?.cli?.discovery?.candidates?.length ? `Candidates checked: ${codex.cli.discovery.candidates.length}` : undefined
+  ].filter(Boolean).join("\n");
+  details.append(summary, content);
+  return details;
+}
+
+async function selectCodexBinary() {
+  if (!invoke) {
+    selectTab("settings");
+    codexBinaryPath.focus();
+    return;
+  }
+  try {
+    const selected = await invoke("choose_codex_binary");
+    if (!selected?.path) {
+      return;
+    }
+    await run(["codex", "path", "set", selected.path]);
+    await refresh();
+  } catch (error) {
+    diagnostics.textContent = String(error);
+    selectTab("diagnostics");
+    diagnostics.hidden = false;
+  }
 }
 
 async function startCodexChatGptLogin() {
@@ -459,11 +554,12 @@ function toolRow(titleText, tool) {
 
 function codexSummary(codex) {
   if (!codex) return "Unknown";
-  if (codex.usage?.rateLimited) return "Rate Limited";
+  if (codex.usage?.rateLimited) return "Temporarily unavailable";
   if (codex.ready) return "Ready";
-  if (codex.recommendedAction === "install_codex") return "Install Required";
-  if (codex.recommendedAction === "login_codex") return "Login Required";
-  if (!codex.appServer?.available) return "App Server Unavailable";
+  if (codex.recommendedAction === "select_codex_path") return "Needs setup";
+  if (codex.recommendedAction === "install_codex") return "Needs setup";
+  if (codex.recommendedAction === "login_codex") return "Needs setup";
+  if (!codex.appServer?.available) return "Error";
   return "Error";
 }
 
@@ -526,11 +622,11 @@ function projectGrantRow(grant) {
 }
 
 function actionLabel(action) {
-  if (action === "open") return "Open";
-  if (action === "port") return "Port";
-  if (action === "create") return "Create";
+  if (action === "open") return "Activate workspace";
+  if (action === "port") return "Port into Hunsu";
+  if (action === "create") return "Create workspace";
   if (action === "repair") return "Repair";
-  if (action === "explain") return "Explain";
+  if (action === "explain") return "Explain issue";
   return "Remove";
 }
 
@@ -578,10 +674,10 @@ function renderSelectedProjectAction() {
 }
 
 function formatProjectKind(kind) {
-  if (kind === "hunsu-roadmap") return "Existing Hunsu Roadmap";
+  if (kind === "hunsu-roadmap") return "Existing Hunsu workspace";
   if (kind === "git-project") return "Git project";
-  if (kind === "new-project") return "New project folder";
-  if (kind === "missing-roadmap") return "Missing Roadmap";
+  if (kind === "new-project") return "Empty folder";
+  if (kind === "missing-roadmap") return "Missing workspace";
   return "Unsupported folder";
 }
 
@@ -614,8 +710,15 @@ async function runSelectedAction() {
 }
 
 document.querySelector("#refresh").addEventListener("click", refresh);
-document.querySelector("#open-studio").addEventListener("click", () => spawn(["pair"]));
-document.querySelector("#open-studio-connection").addEventListener("click", () => spawn(["pair"]));
+async function openStudioFromActiveWorkspace() {
+  if (activeWorkspaceSnapshots(latestSnapshot).length === 0) {
+    return;
+  }
+  await spawn(["pair"]);
+}
+
+document.querySelector("#open-studio").addEventListener("click", openStudioFromActiveWorkspace);
+document.querySelector("#open-studio-connection").addEventListener("click", openStudioFromActiveWorkspace);
 selectedProjectAction.addEventListener("click", runSelectedAction);
 document.querySelector("#enable-remote").addEventListener("click", async () => {
   await run(["remote", "enable"]);
@@ -649,6 +752,9 @@ document.querySelector("#choose-folder").addEventListener("click", chooseProject
 document.querySelector("#copy-diagnostics").addEventListener("click", async () => {
   await navigator.clipboard.writeText(diagnostics.textContent || "{}");
 });
+document.querySelector("[data-tab='diagnostic-details']")?.addEventListener("click", () => {
+  diagnostics.hidden = false;
+});
 document.querySelector("#save-codex-path").addEventListener("click", async () => {
   const value = codexBinaryPath.value.trim();
   if (value) await run(["codex", "path", "set", value]);
@@ -672,20 +778,35 @@ document.querySelector("#reset-codex-path").addEventListener("click", async () =
   await refresh();
 });
 
-for (const tab of document.querySelectorAll("nav [data-tab]")) {
+for (const tab of document.querySelectorAll("nav [data-tab], footer [data-tab]")) {
   tab.addEventListener("click", () => {
     selectTab(tab.dataset.tab);
   });
 }
 
 function selectTab(tabName) {
-  if (!tabName) return;
-  for (const candidate of document.querySelectorAll("nav [data-tab]")) {
-    candidate.setAttribute("aria-selected", String(candidate.dataset.tab === tabName));
+  const normalized = normalizeTab(tabName);
+  if (!normalized) return;
+  for (const candidate of document.querySelectorAll("nav [data-tab], footer [data-tab]")) {
+    candidate.setAttribute("aria-selected", String(candidate.dataset.tab === normalized));
   }
   for (const panel of document.querySelectorAll("[data-panel]")) {
-    panel.hidden = panel.dataset.panel !== tabName;
+    if (panel.dataset.panel === "codex" || panel.dataset.panel === "workspaces") {
+      panel.hidden = false;
+      continue;
+    }
+    panel.hidden = panel.dataset.panel !== normalized;
   }
+  if (normalized === "diagnostics") diagnostics.hidden = true;
+  document.querySelector(`[data-panel='${normalized}']`)?.scrollIntoView({ block: "start" });
+}
+
+function normalizeTab(tabName) {
+  if (tabName === "prerequisites") return "codex";
+  if (tabName === "roadmaps") return "workspaces";
+  if (tabName === "connection" || tabName === "remote") return "advanced";
+  if (tabName === "diagnostic-details") return "diagnostics";
+  return tabName;
 }
 
 void refresh();

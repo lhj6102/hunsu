@@ -71,10 +71,10 @@ test("Connection Center card labels cover required Studio connection states", as
 test("Roadmap workspace preflight actions map to Bridge App destinations", async () => {
   const { module, close } = await loadPreflightActionsModule();
   try {
-    assert.equal(module.bridgeActionHref({ type: "install_codex", label: "Install Codex" }), "hunsu://prerequisites/codex");
-    assert.equal(module.bridgeActionHref({ type: "codex_login_device", label: "Use Device Code" }), "hunsu://prerequisites/codex");
-    assert.equal(module.bridgeActionHref({ type: "open_roadmaps", label: "Open Roadmaps" }), "hunsu://roadmaps");
-    assert.equal(module.bridgeActionHref({ type: "activate_roadmap", label: "Activate Roadmap", roadmapId: "roadmap 123" }), "hunsu://activate-roadmap?roadmapId=roadmap%20123");
+    assert.equal(module.bridgeActionHref({ type: "install_codex", label: "Install Codex" }), "hunsu://codex");
+    assert.equal(module.bridgeActionHref({ type: "codex_login_device", label: "Use Device Code" }), "hunsu://codex");
+    assert.equal(module.bridgeActionHref({ type: "open_roadmaps", label: "Open Workspaces" }), "hunsu://workspaces");
+    assert.equal(module.bridgeActionHref({ type: "activate_roadmap", label: "Activate workspace", roadmapId: "roadmap 123" }), "hunsu://activate-roadmap?roadmapId=roadmap%20123");
     assert.equal(module.bridgeActionHref({ type: "open_bridge_app", label: "Open Bridge App" }), "hunsu://open");
     assert.equal(module.bridgeActionHref({ type: "open_roadmaps", label: "Server href", href: "hunsu://roadmaps" }), "hunsu://roadmaps");
   } finally {
@@ -91,19 +91,20 @@ test("Roadmap workspace renders multiple server-provided preflight actions", asy
       preflight: {
         area: "roadmap",
         error: "ROADMAP_INACTIVE",
-        message: "This Roadmap is inactive.",
+        message: "This workspace is inactive.",
         roadmapId: "roadmap_123",
         lifecycle: "inactive",
         actions: [
-          { type: "open_roadmaps", label: "Open Roadmaps", href: "hunsu://roadmaps" },
-          { type: "activate_roadmap", label: "Activate Roadmap", href: "hunsu://activate-roadmap?roadmapId=roadmap_123" }
+          { type: "open_roadmaps", label: "Open Workspaces", href: "hunsu://workspaces" },
+          { type: "activate_roadmap", label: "Activate workspace", href: "hunsu://activate-roadmap?roadmapId=roadmap_123" }
         ]
       },
       open: () => undefined
     }));
 
-    assert.match(html, /Open Roadmaps/);
-    assert.match(html, /Activate Roadmap/);
+    assert.match(html, /Open Workspaces/);
+    assert.match(html, /Activate workspace/);
+    assert.doesNotMatch(html, /Activate Roadmap/);
   } finally {
     await close();
   }
@@ -721,6 +722,7 @@ async function loadPreflightActionsModule(): Promise<{
   const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
   const server = await vite.createServer({
     root: WEB_ROOT,
+    configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true },
     appType: "custom",

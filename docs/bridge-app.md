@@ -8,9 +8,16 @@ Hunsu Studio. It is not an IDE and it does not replace Studio.
 ```text
 Install Hunsu Bridge App
 Open the app
-Choose or create a project
-Hunsu Bridge starts locally
-Studio opens in the browser
+Confirm Codex is ready
+Add or activate a workspace
+Open Studio
+```
+
+The first screen should make the local flow obvious:
+
+```text
+Codex Runtime
+Workspaces
 ```
 
 The advanced developer fallback remains:
@@ -23,6 +30,8 @@ Headless machines use the same foundation through the command surface:
 
 ```sh
 hunsu-bridge login
+hunsu-bridge codex status
+hunsu-bridge codex login --device
 hunsu-bridge remote status
 hunsu-bridge projects grant /path/to/project
 hunsu-bridge start --remote
@@ -34,6 +43,9 @@ Browser and Studio handoff use the app protocol surface:
 ```text
 hunsu://open
 hunsu://pair?next=/studio
+hunsu://codex
+hunsu://workspaces
+hunsu://add-roadmap
 hunsu://open-project?path=/path/to/project
 hunsu://open-roadmap?roadmapId=<id>
 hunsu://sign-in
@@ -48,18 +60,43 @@ Hunsu Bridge App owns local runtime supervision:
 - start, stop, restart, and report local Bridge health
 - open Studio with a fresh pairing token
 - handle `hunsu://` browser handoff links
-- show Overview, Prerequisites, Roadmaps, Connection, Remote Access,
-  Diagnostics, and Settings navigation
+- show Codex and Workspaces as the primary app surfaces
+- keep Settings, Diagnostics, Logs, and Advanced as secondary footer or overflow
+  actions
+- keep Remote Access hidden by default unless a feature flag, sign-in state, or
+  Advanced panel makes it relevant
 - check Codex CLI readiness without reading Codex credential files
 - inspect selected folders through Project Finder
-- add, activate, deactivate, and remove managed Roadmaps
+- add, activate, deactivate, and remove managed Workspaces
 - open existing Hunsu Roadmaps
 - port Git projects into Hunsu
-- create Roadmaps in new folders
+- create Workspaces in new folders
 - expose diagnostics for support
 - hold account/device state for Remote Access
 - persist Project Grants and no-GUI service state with strict file permissions
   until platform installers own those native stores
+
+## App Information Architecture
+
+Bridge App is a local readiness companion, not an admin console. The primary
+screen should show Bridge health, Studio handoff, Codex readiness, and active
+Workspaces without requiring users to understand Bridge internals.
+
+Primary sections:
+
+- Codex
+- Workspaces
+
+Secondary actions:
+
+- Settings
+- Diagnostics
+- Logs
+- Advanced
+
+Remote Access lives under Advanced or workspace details until the remote feature
+is ready for ordinary users. It should not be a top-level tab during first-run
+or local-only usage.
 
 ## Desktop Shell
 
@@ -102,18 +139,37 @@ passed to the sidecar.
 Studio remains the main product UI for Roadmaps, Execute, Hunsu Drafts,
 Artifact Actions, and Hub.
 
-## Prerequisites
+## Codex Runtime
 
 Codex is an external prerequisite runtime. Bridge App starts and remains useful
-when Codex is missing: local Bridge pairing, Project Finder, Roadmap activation,
+when Codex is missing: local Bridge pairing, Project Finder, Workspace activation,
 Hub, and non-Execute Studio flows still work.
+
+The Codex card owns the runtime setup flow:
+
+- Not found: show Install Codex, Select existing Codex, and Recheck.
+- Login required: show Sign in, Use device code, and Recheck.
+- Ready: show safe access/version summary, Recheck, and Change Codex path.
+- Rate limited: show Temporarily unavailable and Recheck.
+- Error: show Recheck and a diagnostics affordance without credential material.
+
+Advanced details such as binary path, source, raw rate-limit labels, last run
+usage, app-server details, and environment variables stay collapsed by default.
 
 Codex resolution order is:
 
-1. saved custom `HUNSU_CODEX_BINARY_PATH`
-2. `HUNSU_CODEX_APP_SERVER_COMMAND`
-3. `codex` on `PATH`
-4. missing
+1. user-configured custom Codex path
+2. `HUNSU_CODEX_BINARY_PATH`
+3. `HUNSU_CODEX_APP_SERVER_COMMAND`
+4. Bridge App process `PATH`
+5. Windows user `PATH` from the registry
+6. Windows machine `PATH` from the registry
+7. `where.exe codex`
+8. PowerShell `Get-Command codex -All`
+9. known install directories such as
+   `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`
+10. WindowsApps alias detection at
+    `%LOCALAPPDATA%\Microsoft\WindowsApps\codex.exe`
 
 Bridge App may run `codex --version`, `codex app-server --stdio`, and Codex
 app-server account/rate-limit requests. It must not read `~/.codex/auth.json`,
@@ -121,37 +177,74 @@ token files, OpenAI API keys, or credential stores directly. Diagnostics include
 safe readiness fields such as installed/version/source/app-server/auth/access
 state, and redact token-like values.
 
-Codex UI states:
+Every discovered candidate must pass both `codex --version` and
+`codex app-server --stdio` probing before Bridge App treats it as usable. If
+Windows discovery finds only an App Execution Alias or another non-usable
+candidate, Bridge App should recommend Select existing Codex instead of
+presenting only Install Codex.
 
-- Install Required: show Install Codex, Use Existing Installation, Copy Install
-  Command, and Recheck.
-- Login Required: show Sign in with ChatGPT, Use Device Code, API key advanced,
-  and Recheck.
-- Ready: show auth method/access where safely detectable.
-- Error: show Recheck and diagnostics without credential material.
+Windows copy for that state:
+
+```text
+Codex works in your terminal, but Hunsu Bridge App cannot find it.
+
+This can happen when Windows resolves `codex` through an App Execution Alias or
+a shell-specific PATH that desktop apps do not inherit.
+
+Select the real codex.exe file or restart Hunsu Bridge App after updating PATH.
+```
 
 ## Project Finder
 
 Project Finder classifies selected folders as:
 
-- Existing Hunsu Roadmap: primary action `Open in Studio`
+- Existing Hunsu Roadmap: primary action `Activate workspace`
 - Git project not yet ported: primary action `Port into Hunsu`
-- Empty or new project folder: primary action `Create Roadmap`
+- Empty or new project folder: primary action `Create workspace`
 - Unsupported folder: primary action `Explain problem`
 - Missing recent path: unhealthy recent project with remove/repair recovery
 
 Inspection is a Bridge API primitive so the Bridge App, Studio, and headless
 commands can share classification rules.
 
-## Active Roadmaps
+## Workspaces
 
-Bridge App manages Roadmaps through Add Roadmap, Activate Roadmap, Deactivate
-Roadmap, and Remove Roadmap. Remove only deletes the Bridge registry entry; it
-does not delete local files.
+Bridge App uses Workspaces as the user-facing label. The internal model can
+remain Roadmaps.
 
-Studio consumes active Roadmaps from Bridge by default. Inactive Roadmaps remain
-visible in Bridge App Roadmaps but are hidden from Studio navigation and are not
+Bridge App manages Workspaces through Add workspace, Activate, Deactivate, and
+Remove. Remove only deletes the Bridge registry entry; it does not delete local
+files.
+
+Active Workspaces are the default list. Inactive Workspaces are collapsed or
+secondary. Full repository paths, health details, Project Grant scopes, Remote
+Access scopes, last-opened timestamps, and per-workspace Codex details stay
+behind expanded details.
+
+Studio consumes active Workspaces from Bridge by default. Inactive Workspaces
+remain visible in Bridge App but are hidden from Studio navigation and are not
 Remote Access candidates until activated again.
+
+## Secondary UI
+
+Settings, Diagnostics, Logs, and Advanced are available but not part of the
+first-run path.
+
+Diagnostics default actions:
+
+- Copy diagnostics
+- Open logs
+
+Raw diagnostic JSON is shown only from Advanced details.
+
+Settings default actions:
+
+- Codex binary path
+- Reset Codex path
+- Bridge startup
+
+Advanced settings may include environment variables, service install, protocol
+handler repair, Project Grants, and Remote Access.
 
 ## Connection Center
 
