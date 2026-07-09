@@ -1,14 +1,13 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { execFile, spawn, type SpawnOptions } from "node:child_process";
+import { type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { Buffer } from "node:buffer";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createDefaultCodexRunner, GOAL_EVALUATION_SCHEMA, type AppServerUsage, type CodexProviderStatus, type TeamRunEvent, type HunsuDraftConversationMessage, type HunsuDraftSessionInput, type HunsuDraftSourceSnapshot, type HunsuDraftTurnInput, type JsonRpcMessage, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerAppServerCommandAction, type RunnerAppServerItem, type RunnerRun, type StartRunInput } from "@hunsu/codex-runner";
-import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveRelayClientConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
+import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
 import {
   createFinalizedMoveCommit,
   createMoveCommitFromWorktree,
@@ -102,28 +101,110 @@ import {
   planExecuteStart
 } from "./execute/execute-workflow.ts";
 import {
-  codexRuntimePreflightError,
-  detectCodexBinary,
   getCodexRuntimeStatus,
   sanitizeDiagnostics,
-  type CodexRuntimeStatus,
-  type ExecutePreflightError
+  type CodexRuntimeStatus
 } from "./runtimes/codex.ts";
+import { createRuntimeProviderRegistry } from "./runtime-providers/registry.ts";
+import { createBridgeAppRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
+import {
+  codexRuntimeStatusForResponse,
+  type CodexLoginProcessState
+} from "./runtime-providers/codex.ts";
+import { handleProviderRoute } from "./providers/providerRoutes.ts";
+import type { RuntimeProviderRegistry, RuntimeProviderStatus } from "./runtime-providers/types.ts";
+import {
+  connectRemoteBridgeForRequest,
+  deactivateRemoteWorkspaceAccess,
+  localRemoteBridgeDevice,
+  publishRemoteWorkspaceAccess,
+  relayRequestConfig,
+  remoteBridgeDeviceStoreAccess,
+  type RemoteBridgeConnectRequest,
+  type BridgeCommandScope
+} from "./connections/remoteConnection.ts";
+import {
+  bridgeVersionInfo,
+  createStudioConnectionStatus
+} from "./connections/studioConnectionStatus.ts";
+import { handleConnectionRoute } from "./connections/connectionRoutes.ts";
+import { handleWorkspaceRoute } from "./workspaces/workspaceRoutes.ts";
+import {
+  accountStatusForBridgeRequest,
+  createBridgeStatusForRequest,
+  currentRuntimeProviderStatus
+} from "./server/bridgeStatus.ts";
+import { bridgeCodexBinaryPathFromBridgeAppState } from "./server/bridgeAppState.ts";
+import { createStudioHttpServer, studioRequestUrl } from "./server/createStudioServer.ts";
+import { handleRemoteBridgeRoute, handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
+import { baseCorsHeaders, createResponseSecurityHeaderStore } from "./server/security.ts";
+import { handleExecuteRoute, handleRoadmapExecuteRoute } from "./executes/executeRoutes.ts";
+import { handleFilesystemRoute } from "./filesystem/filesystemRoutes.ts";
 
 export {
-  codexRuntimePreflightError,
   detectCodexBinary,
   getCodexRuntimeStatus,
   sanitizeDiagnostics
 } from "./runtimes/codex.ts";
+export type { CodexCliStatus, CodexDiscoveryCandidate, CodexRuntimeStatus } from "./runtimes/codex.ts";
+export { createRuntimeProviderRegistry, placeholderProvider } from "./runtime-providers/registry.ts";
+export { normalizeCodexRuntimeStatus, parseCodexDeviceAuthOutput } from "./runtime-providers/codex.ts";
+export type { CodexLoginProcessState } from "./runtime-providers/codex.ts";
 export type {
-  CodexBinarySource,
-  CodexCliStatus,
-  CodexDiscoveryCandidate,
-  CodexDiscoveryReport,
-  CodexRuntimeStatus,
-  ExecutePreflightError
-} from "./runtimes/codex.ts";
+  RuntimeProviderAdapter,
+  RuntimeProviderRegistry,
+  RuntimeProviderStatus
+} from "./runtime-providers/types.ts";
+export {
+  workspaceSummariesFromRoadmaps,
+  workspaceSummaryFromRoadmap
+} from "./workspaces/workspaceRegistry.ts";
+export type { ConnectedWorkspaceSummary } from "./workspaces/workspaceRegistry.ts";
+export { createLocalBackendStatus } from "./connections/localConnection.ts";
+export type { BridgeBackendStatus } from "./connections/localConnection.ts";
+export {
+  connectRemoteBridge,
+  connectRemoteBridgeForRequest,
+  createRemoteBackendStatus,
+  createRemoteWorkspacePublication,
+  listRemoteBridgeDevices,
+  listRemoteBridgeDevicesForRequest,
+  routeRemoteBridgeCommand,
+  streamRemoteBridgeCommand
+} from "./connections/remoteConnection.ts";
+export type {
+  BridgeCommandScope,
+  RelayCommandName,
+  RemoteBridgeCommandRequest,
+  RemoteBridgeCommandResult,
+  RemoteBridgeConnectRequest,
+  RemoteBridgeConnectResult,
+  RemoteBridgeDevice,
+  RemoteProjectGrantStatus,
+  RemoteProjectGrantStatusRequest,
+  RemoteProjectGrantStatusResult
+} from "./connections/remoteConnection.ts";
+export {
+  bridgeVersionInfo,
+  createDisconnectedStudioConnectionStatus,
+  createRemoteStudioConnectionStatus,
+  createStudioConnectionStatus,
+  evaluateBridgeCompatibility
+} from "./connections/studioConnectionStatus.ts";
+export type {
+  BridgeCompatibility,
+  BridgeVersionInfo,
+  StudioBridgeRequirement,
+  StudioConnectionStatus
+} from "./connections/studioConnectionStatus.ts";
+export type { BridgeStatusResponse } from "./server/bridgeStatus.ts";
+export {
+  connectionExecutePreflightError,
+  providerExecutePreflightError,
+  workspaceExecutePreflightError,
+  workspaceExecutePreflightErrorFromRoadmap
+} from "./executes/executePreflight.ts";
+export type { ProviderAwareExecutePreflightError as ExecutePreflightError, ProviderAwareExecutePreflightError } from "./executes/executePreflight.ts";
 import type {
   AgentConversationRef,
   ArtifactActionDefinition,
@@ -215,12 +296,11 @@ const CODEX_ITEMS_MAX_BYTES = 512 * 1024;
 const ASSISTANT_TRANSCRIPT_MAX_BYTES = 256 * 1024;
 const AGENT_SESSION_MAX_BYTES = 1024 * 1024;
 const RUN_UPDATE_DEBOUNCE_MS = 250;
-const CODEX_DEVICE_LOGIN_CODE_SETTLE_MS = 150;
 const FILESYSTEM_BROWSE_ENTRY_LIMIT = 300;
 const FILESYSTEM_CAPABILITY_TTL_MS = 15 * 60 * 1000;
 const MOVE_FILE_TEXT_MAX_BYTES = 256 * 1024;
 const queuedRunUpdates = new WeakMap<StudioServerState, Map<string, ReturnType<typeof setTimeout>>>();
-const responseSecurityHeaders = new WeakMap<object, Record<string, string>>();
+const responseSecurityHeaders = createResponseSecurityHeaderStore();
 const BRIDGE_API_TOKEN_QUERY_PARAM = "hunsuBridgeToken";
 const BRIDGE_API_TOKEN_HEADER = "x-hunsu-bridge-token";
 const BRIDGE_CONTROL_TOKEN_HEADER = "x-hunsu-bridge-control-token";
@@ -229,23 +309,6 @@ const DEFAULT_BRIDGE_STUDIO_ORIGINS = [
   "http://127.0.0.1:19688",
   "http://localhost:19688"
 ];
-const HUNSU_BRIDGE_VERSION = "0.1.2";
-const HUNSU_BRIDGE_PROTOCOL_VERSION = "local-bridge-v1";
-const HUNSU_BRIDGE_SUPPORTED_FEATURES = [
-  "local-pairing",
-  "project-finder",
-  "roadmap-registry",
-  "artifact-actions",
-  "connection-status",
-  "bridge-supervisor",
-  "remote-ready"
-];
-const DEFAULT_STUDIO_BRIDGE_REQUIREMENT: StudioBridgeRequirement = {
-  minBridgeVersion: HUNSU_BRIDGE_VERSION,
-  requiredProtocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
-  requiredFeatures: ["local-pairing", "connection-status"]
-};
-
 export type StudioRunStatus = ExecuteRunStatus;
 
 export type StudioSkillFile = {
@@ -836,170 +899,6 @@ export type BridgeSupervisor = {
   revokePairing(): Promise<BridgeRuntimeHandle | undefined>;
 };
 
-export type BridgeVersionInfo = {
-  bridgeVersion: string;
-  bridgeAppVersion?: string;
-  protocolVersion: string;
-  minSupportedStudioVersion?: string;
-  supportedFeatures: string[];
-};
-
-export type StudioBridgeRequirement = {
-  minBridgeVersion: string;
-  minBridgeAppVersionForRelay?: string;
-  requiredProtocolVersion: string;
-  requiredFeatures: string[];
-};
-
-export type BridgeCompatibility =
-  | { compatible: true }
-  | { compatible: false; reason: "bridge_update_needed" | "studio_update_needed" | "feature_unavailable" | "bridge_app_update_needed"; message: string };
-
-export type StudioConnectionStatus = {
-  mode: "none" | "local" | "remote";
-  transport: "direct" | "relay" | "unreachable";
-  health: "checking" | "connected" | "disconnected" | "error";
-  auth: "paired" | "missing_token" | "expired" | "invalid" | "account_mismatch" | "unknown";
-  projectAccess: "granted" | "needs_grant" | "denied" | "not_applicable";
-  bridge?: {
-    id?: string;
-    name?: string;
-    version?: string;
-    protocolVersion?: string;
-    startedAt?: string;
-    lastSeenAt?: string;
-  };
-  endpoint?: {
-    apiUrl?: string;
-    relayLabel?: string;
-  };
-  account?: {
-    webUserId?: string;
-    bridgeUserId?: string;
-    sameUser?: boolean;
-  };
-  project?: {
-    roadmapId?: string;
-    displayName?: string;
-    repositoryPath?: string;
-  };
-  warnings: Array<
-    | "public_bind"
-    | "version_mismatch"
-    | "origin_not_allowed"
-    | "relay_unavailable"
-    | "project_missing"
-  >;
-  error?: string;
-  version: BridgeVersionInfo;
-  compatibility?: BridgeCompatibility;
-};
-
-export type RemoteBridgeDevice = {
-  deviceId: string;
-  deviceName: string;
-  userId: string;
-  registeredAt: string;
-  lastSeenAt?: string;
-  status: "online" | "offline";
-  bridgeVersion?: string;
-  bridgeAppVersion?: string;
-  protocolVersion?: string;
-};
-
-export type RemoteBridgeDeviceListResult = {
-  devices: RemoteBridgeDevice[];
-};
-
-export type RemoteBridgeConnectRequest = {
-  deviceId?: string;
-  webUserId?: string;
-  projectPath?: string;
-  minBridgeVersion?: string;
-  requiredProtocolVersion?: string;
-  requiredFeatures?: string[];
-};
-
-export type RemoteBridgeConnectResult = {
-  connection: StudioConnectionStatus;
-  device?: RemoteBridgeDevice;
-  compatibility: BridgeCompatibility;
-};
-
-export type RemoteProjectGrantStatus = "granted" | "needs_grant" | "denied";
-
-export type RemoteProjectGrantStatusRequest = {
-  deviceId: string;
-  projectPath: string;
-  requestedScopes?: BridgeCommandScope[];
-};
-
-export type RemoteProjectGrantStatusResult = {
-  projectAccess: RemoteProjectGrantStatus;
-  missingScopes?: BridgeCommandScope[];
-  message?: string;
-};
-
-export type RelayCommandName =
-  | "health"
-  | "connection.status"
-  | "roadmap.registry.list"
-  | "roadmap.registry.remove"
-  | "roadmap.open"
-  | "roadmap.port.inspect"
-  | "roadmap.port.apply"
-  | "roadmap.create"
-  | "roadmap.board"
-  | "roadmap.worktree"
-  | "roadmap.skills"
-  | "roadmap.commands"
-  | "execute.start"
-  | "execute.pause"
-  | "execute.resume"
-  | "execute.stop"
-  | "execute.completeMove"
-  | "execute.status"
-  | "artifactAction.list"
-  | "artifactAction.runs"
-  | "artifactAction.start"
-  | "artifactAction.stop"
-  | "moveFile.tree"
-  | "moveFile.blob"
-  | "moveFile.diff"
-  | "hunsuDraft.list"
-  | "hunsuDraft.start"
-  | "hunsuDraft.get"
-  | "hunsuDraft.message"
-  | "hunsuDraft.diffArtifact.create"
-  | "hunsuDraft.diffArtifact.get"
-  | "hunsuDraft.approve"
-  | "hunsuDraft.discard"
-  | "line.accept"
-  | "line.reject"
-  | "agentSession.list"
-  | "agentSession.get"
-  | "agentSession.events"
-  | "live.events";
-
-export type BridgeCommandScope =
-  | "execute.start"
-  | "artifactAction.run"
-  | "env.read"
-  | "hostAlias.expose"
-  | "remoteRelay.access";
-
-export type RemoteBridgeCommandRequest = {
-  deviceId: string;
-  command: RelayCommandName;
-  projectPath?: string;
-  requestedScopes?: BridgeCommandScope[];
-  payload?: unknown;
-};
-
-export type RemoteBridgeCommandResult =
-  | { ok: true; status: number; body?: unknown }
-  | { ok: false; status?: number; error?: string; reason?: string; message?: string };
-
 export type BrowseRootId = string & { readonly __brand: "BrowseRootId" };
 export type BrowseToken = string & { readonly __brand: "BrowseToken" };
 export type CanonicalLocalPath = string & { readonly __brand: "CanonicalLocalPath" };
@@ -1089,6 +988,13 @@ export type StudioRunStartRequest = {
   requestId?: string;
   lineId?: string;
   selectedDestinationIds?: string[];
+  backendId?: string;
+  connectionMode?: "local" | "remote";
+  workspace?: {
+    workspaceId?: string;
+    backendId?: string;
+    connectionMode?: "local" | "remote";
+  };
 };
 
 export type StudioRunActionRequest = {
@@ -1462,61 +1368,6 @@ export function bridgePairingSessionState(session: BridgePairingSession, now = n
   return "active";
 }
 
-export function bridgeVersionInfo(input: { bridgeAppVersion?: string } = {}): BridgeVersionInfo {
-  return {
-    bridgeVersion: HUNSU_BRIDGE_VERSION,
-    bridgeAppVersion: input.bridgeAppVersion,
-    protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
-    supportedFeatures: [...HUNSU_BRIDGE_SUPPORTED_FEATURES]
-  };
-}
-
-export function evaluateBridgeCompatibility(
-  version: BridgeVersionInfo,
-  requirement: StudioBridgeRequirement,
-  studioVersion = "0.1.0"
-): BridgeCompatibility {
-  if (compareDottedVersions(version.bridgeVersion, requirement.minBridgeVersion) < 0) {
-    return {
-      compatible: false,
-      reason: "bridge_update_needed",
-      message: `Bridge ${version.bridgeVersion} is older than required ${requirement.minBridgeVersion}.`
-    };
-  }
-  if (version.protocolVersion !== requirement.requiredProtocolVersion) {
-    return {
-      compatible: false,
-      reason: "bridge_update_needed",
-      message: `Bridge protocol ${version.protocolVersion} does not match required ${requirement.requiredProtocolVersion}.`
-    };
-  }
-  const missingFeature = requirement.requiredFeatures.find(feature => !version.supportedFeatures.includes(feature));
-  if (missingFeature) {
-    return {
-      compatible: false,
-      reason: "feature_unavailable",
-      message: `Bridge feature is unavailable: ${missingFeature}.`
-    };
-  }
-  if (requirement.minBridgeAppVersionForRelay) {
-    if (!version.bridgeAppVersion || compareDottedVersions(version.bridgeAppVersion, requirement.minBridgeAppVersionForRelay) < 0) {
-      return {
-        compatible: false,
-        reason: "bridge_app_update_needed",
-        message: `Remote Relay requires Bridge App ${requirement.minBridgeAppVersionForRelay} or newer.`
-      };
-    }
-  }
-  if (version.minSupportedStudioVersion && compareDottedVersions(studioVersion, version.minSupportedStudioVersion) < 0) {
-    return {
-      compatible: false,
-      reason: "studio_update_needed",
-      message: `Studio ${studioVersion} is older than Bridge requires ${version.minSupportedStudioVersion}.`
-    };
-  }
-  return { compatible: true };
-}
-
 export type StudioBridgeStartOptions = {
   cwd?: string;
   webUrl?: string;
@@ -1622,138 +1473,12 @@ function printStudioBridgeStartInfo(info: StudioBridgeStartInfo, options: Pick<S
 function openStudioBridgeBrowser(url: string): void {
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  const child = spawn(command, args, bridgeBackgroundSpawnOptions({ detached: true, stdio: "ignore" }));
+  const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
   child.unref();
 }
 
 export function openStudioInBrowser(url: string): void {
   openStudioBridgeBrowser(url);
-}
-
-export function createStudioConnectionStatus(input: {
-  bridgeApiUrl: string;
-  repositoryPath?: string;
-  roadmapId?: string;
-  roadmapDisplayName?: string;
-  runtimeConfig: BridgeRuntimeConfig;
-  startedAt?: string;
-  auth?: StudioConnectionStatus["auth"];
-  projectAccess?: StudioConnectionStatus["projectAccess"];
-  bridgeVersion?: BridgeVersionInfo;
-  requirement?: StudioBridgeRequirement;
-  studioVersion?: string;
-  error?: string;
-}): StudioConnectionStatus {
-  const warnings: StudioConnectionStatus["warnings"] = [];
-  if (isWildcardHost(input.runtimeConfig.bridgeApi.host)) {
-    warnings.push("public_bind");
-  }
-  if (input.repositoryPath && !existsSync(input.repositoryPath)) {
-    warnings.push("project_missing");
-  }
-  const version = input.bridgeVersion ?? bridgeVersionInfo();
-  const compatibility = evaluateBridgeCompatibility(version, input.requirement ?? DEFAULT_STUDIO_BRIDGE_REQUIREMENT, input.studioVersion);
-  if (!compatibility.compatible) {
-    warnings.push("version_mismatch");
-  }
-  const error = input.error ?? (compatibility.compatible ? undefined : compatibility.message);
-  const healthy = error === undefined;
-  return {
-    mode: "local",
-    transport: "direct",
-    health: healthy ? "connected" : "error",
-    auth: input.auth ?? "paired",
-    projectAccess: input.projectAccess ?? (input.repositoryPath ? "granted" : "not_applicable"),
-    bridge: {
-      id: `local:${input.runtimeConfig.bridgeApi.host}:${input.runtimeConfig.bridgeApi.port}`,
-      name: "Local Bridge",
-      version: version.bridgeVersion,
-      protocolVersion: version.protocolVersion,
-      startedAt: input.startedAt,
-      lastSeenAt: new Date().toISOString()
-    },
-    endpoint: {
-      apiUrl: input.bridgeApiUrl
-    },
-    project: input.repositoryPath ? {
-      roadmapId: input.roadmapId,
-      displayName: input.roadmapDisplayName,
-      repositoryPath: input.repositoryPath
-    } : undefined,
-    warnings,
-    error,
-    version,
-    compatibility
-  };
-}
-
-export function createDisconnectedStudioConnectionStatus(error?: string): StudioConnectionStatus {
-  return {
-    mode: "none",
-    transport: "unreachable",
-    health: "disconnected",
-    auth: "unknown",
-    projectAccess: "not_applicable",
-    warnings: [],
-    error,
-    version: bridgeVersionInfo(),
-    compatibility: { compatible: true }
-  };
-}
-
-export function createRemoteStudioConnectionStatus(input: {
-  device: RemoteBridgeDevice;
-  account?: StudioConnectionStatus["account"];
-  projectAccess?: StudioConnectionStatus["projectAccess"];
-  projectPath?: string;
-  roadmapId?: string;
-  roadmapDisplayName?: string;
-  requirement?: StudioBridgeRequirement;
-  studioVersion?: string;
-  error?: string;
-}): StudioConnectionStatus {
-  const connected = input.device.status === "online" && input.error === undefined;
-  const version: BridgeVersionInfo = {
-    ...bridgeVersionInfo(),
-    bridgeVersion: input.device.bridgeVersion ?? "unknown",
-    bridgeAppVersion: input.device.bridgeAppVersion,
-    protocolVersion: input.device.protocolVersion ?? "unknown"
-  };
-  const compatibility = evaluateBridgeCompatibility(version, input.requirement ?? DEFAULT_STUDIO_BRIDGE_REQUIREMENT, input.studioVersion);
-  const warnings: StudioConnectionStatus["warnings"] = [];
-  if (!connected) {
-    warnings.push("relay_unavailable");
-  }
-  if (!compatibility.compatible) {
-    warnings.push("version_mismatch");
-  }
-  return {
-    mode: "remote",
-    transport: "relay",
-    health: connected && compatibility.compatible ? "connected" : input.error || !compatibility.compatible ? "error" : "disconnected",
-    auth: input.account?.sameUser === false ? "account_mismatch" : "paired",
-    projectAccess: input.projectAccess ?? "needs_grant",
-    bridge: {
-      id: input.device.deviceId,
-      name: input.device.deviceName,
-      version: input.device.bridgeVersion,
-      protocolVersion: input.device.protocolVersion,
-      lastSeenAt: input.device.lastSeenAt
-    },
-    endpoint: {
-      relayLabel: "Hunsu Relay"
-    },
-    account: input.account,
-    project: input.projectPath ? {
-      roadmapId: input.roadmapId,
-      displayName: input.roadmapDisplayName,
-      repositoryPath: input.projectPath
-    } : undefined,
-    warnings,
-    error: input.error ?? (compatibility.compatible ? undefined : compatibility.message),
-    version,
-    compatibility
-  };
 }
 
 export function createBridgeSupervisor(): BridgeSupervisor {
@@ -1991,7 +1716,7 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
     };
   }
   const headers = corsHeaders ?? baseCorsHeaders();
-  const tokenValidation = !options.skipAuth && security.authToken && !isPublicBridgeRequest(url)
+  const tokenValidation = !options.skipAuth && security.authToken && !isPublicBridgeRoute(url.pathname)
     ? validateBridgeApiToken(request, url, security)
     : { valid: true as const };
   if (!tokenValidation.valid) {
@@ -2006,14 +1731,6 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
   return { allowed: true, corsHeaders: headers };
 }
 
-function baseCorsHeaders(): Record<string, string> {
-  return {
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": `authorization,content-type,${BRIDGE_API_TOKEN_HEADER},${BRIDGE_CONTROL_TOKEN_HEADER}`,
-    "vary": "origin"
-  };
-}
-
 function corsHeadersForOrigin(origin: string | undefined, security: StudioServerSecurity): Record<string, string> | undefined {
   if (!origin) {
     return baseCorsHeaders();
@@ -2026,16 +1743,6 @@ function corsHeadersForOrigin(origin: string | undefined, security: StudioServer
     ...baseCorsHeaders(),
     "access-control-allow-origin": normalized
   };
-}
-
-function isPublicBridgeRequest(url: URL): boolean {
-  return url.pathname === "/health";
-}
-
-function isBridgeControlRequest(pathname: string): boolean {
-  return pathname === "/api/bridge/pairing/rotate"
-    || pathname === "/api/bridge/pairing/revoke"
-    || pathname === "/api/bridge/control/shutdown";
 }
 
 function validateBridgeControlToken(request: IncomingMessage, security: StudioServerSecurity): StudioRequestSecurity {
@@ -2160,20 +1867,6 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function compareDottedVersions(left: string, right: string): number {
-  const leftParts = left.split(/[.-]/).map(part => Number.parseInt(part, 10));
-  const rightParts = right.split(/[.-]/).map(part => Number.parseInt(part, 10));
-  const length = Math.max(leftParts.length, rightParts.length);
-  for (let index = 0; index < length; index += 1) {
-    const leftPart = Number.isFinite(leftParts[index]) ? leftParts[index] : 0;
-    const rightPart = Number.isFinite(rightParts[index]) ? rightParts[index] : 0;
-    if (leftPart !== rightPart) {
-      return leftPart > rightPart ? 1 : -1;
-    }
-  }
-  return 0;
-}
-
 function isWildcardHost(host: string): boolean {
   return host === "0.0.0.0" || host === "::" || host === "[::]";
 }
@@ -2203,8 +1896,8 @@ async function prerequisiteStatus(env: Record<string, string | undefined>, state
   return {
     bridge: {
       connected: true,
-      version: HUNSU_BRIDGE_VERSION,
-      protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION
+      version: bridgeVersionInfo().bridgeVersion,
+      protocolVersion: bridgeVersionInfo().protocolVersion
     },
     runtimes: {
       codex
@@ -2342,329 +2035,6 @@ function codexRuntimeUsageFromAppServerUsage(usage: AppServerUsage | undefined):
     outputTokens: usage.output_tokens,
     reasoningTokens: usage.reasoning_output_tokens
   };
-}
-
-function codexInstallPlan(): { action: "confirm_required"; command: string; url: string; message: string } {
-  return {
-    action: "confirm_required",
-    command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
-    url: "https://chatgpt.com/codex",
-    message: "Hunsu does not run network installer commands without user confirmation."
-  };
-}
-
-type CodexActionStartResult = {
-  started: boolean;
-  command?: string;
-  args: string[];
-  message?: string;
-};
-
-export type CodexLoginProcessState = {
-  kind: "chatgpt" | "device";
-  pid?: number;
-  startedAt: string;
-  status: "starting" | "device_code" | "pending" | "completed" | "failed";
-  verificationUri?: string;
-  verificationUriComplete?: string;
-  userCode?: string;
-  lastOutput?: string;
-  error?: string;
-};
-
-type CodexDeviceLoginResult = CodexActionStartResult & {
-  state?: CodexLoginProcessState["status"];
-  status?: CodexLoginProcessState["status"];
-  verificationUri?: string;
-  verificationUriComplete?: string;
-  userCode?: string;
-  lastOutput?: string;
-  error?: string;
-};
-
-type CodexChatGptLoginResult = CodexActionStartResult & {
-  state?: CodexLoginProcessState["status"];
-  status?: CodexLoginProcessState["status"];
-  lastOutput?: string;
-  error?: string;
-};
-
-type TrackedCodexLoginProcess = {
-  child: ReturnType<typeof spawn>;
-  startedAt: string;
-  output: string;
-  cleared: boolean;
-  finished: boolean;
-};
-
-const codexLoginTrackers = new WeakMap<StudioServerState, TrackedCodexLoginProcess>();
-
-export function bridgeBackgroundSpawnOptions(options: SpawnOptions, platform: NodeJS.Platform = process.platform): SpawnOptions {
-  return {
-    ...options,
-    windowsHide: platform === "win32" ? true : options.windowsHide
-  };
-}
-
-async function spawnCodexAction(args: string[], env: Record<string, string | undefined>): Promise<CodexActionStartResult> {
-  const cli = await detectCodexBinary({ env });
-  if (!cli.installed || !cli.binaryPath) {
-    return { started: false, args, message: cli.error ?? "Codex CLI was not found." };
-  }
-  const child = spawn(cli.binaryPath, args, bridgeBackgroundSpawnOptions({
-    detached: true,
-    stdio: "ignore",
-    env: { ...process.env, ...env }
-  }));
-  child.unref();
-  return { started: true, command: cli.binaryPath, args };
-}
-
-async function spawnCodexChatGptLogin(state: StudioServerState, env: Record<string, string | undefined>): Promise<CodexChatGptLoginResult> {
-  const args = ["login"];
-  const cli = await detectCodexBinary({ env });
-  const startedAt = new Date().toISOString();
-  if (!cli.installed || !cli.binaryPath) {
-    const failed = updateCodexLoginState(state, {
-      kind: "chatgpt",
-      startedAt,
-      status: "failed",
-      error: cli.error ?? "Codex CLI was not found.",
-      lastOutput: "Browser login failed to start."
-    });
-    return codexChatGptLoginResult(undefined, args, failed, false);
-  }
-  try {
-    const child = spawn(cli.binaryPath, args, bridgeBackgroundSpawnOptions({
-      detached: true,
-      stdio: "ignore",
-      env: { ...process.env, ...env }
-    }));
-    child.unref();
-    const pending = updateCodexLoginState(state, {
-      kind: "chatgpt",
-      pid: child.pid,
-      startedAt,
-      status: "pending",
-      lastOutput: "Browser login started. Complete sign-in, then click Recheck."
-    });
-    return codexChatGptLoginResult(cli.binaryPath, args, pending);
-  } catch (error) {
-    const failed = updateCodexLoginState(state, {
-      kind: "chatgpt",
-      startedAt,
-      status: "failed",
-      error: error instanceof Error ? error.message : String(error),
-      lastOutput: "Browser login failed to start."
-    });
-    return codexChatGptLoginResult(cli.binaryPath, args, failed, false);
-  }
-}
-
-async function spawnCodexDeviceLogin(state: StudioServerState, env: Record<string, string | undefined>, timeoutMs = 3_000): Promise<CodexDeviceLoginResult> {
-  const args = ["login", "--device-auth"];
-  const existing = codexLoginTrackers.get(state);
-  if (existing && !existing.cleared) {
-    return codexDeviceLoginResult(existing.child.spawnfile, args, state.codexLogin);
-  }
-  const cli = await detectCodexBinary({ env });
-  if (!cli.installed || !cli.binaryPath) {
-    const failed = updateCodexLoginState(state, {
-      kind: "device",
-      startedAt: new Date().toISOString(),
-      status: "failed",
-      error: cli.error ?? "Codex CLI was not found."
-    });
-    return codexDeviceLoginResult(undefined, args, failed, false);
-  }
-
-  const child = spawn(cli.binaryPath, args, bridgeBackgroundSpawnOptions({
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ...env }
-  }));
-  const tracker: TrackedCodexLoginProcess = {
-    child,
-    startedAt: new Date().toISOString(),
-    output: "",
-    cleared: false,
-    finished: false
-  };
-  codexLoginTrackers.set(state, tracker);
-  updateCodexLoginState(state, {
-    kind: "device",
-    pid: child.pid,
-    startedAt: tracker.startedAt,
-    status: "starting"
-  });
-  const append = (chunk: Buffer | string) => {
-    if (tracker.cleared) {
-      return;
-    }
-    tracker.output = `${tracker.output}${chunk.toString()}`.slice(-64 * 1024);
-    const details = parseCodexDeviceAuthOutput(tracker.output);
-    updateCodexLoginState(state, {
-      kind: "device",
-      pid: child.pid,
-      startedAt: tracker.startedAt,
-      status: details.verificationUri || details.userCode ? "device_code" : "pending",
-      ...details,
-      lastOutput: tracker.output.trim().slice(-4096)
-    });
-  };
-  child.stdout?.on("data", append);
-  child.stderr?.on("data", append);
-  child.once("error", error => {
-    if (tracker.cleared) {
-      return;
-    }
-    tracker.finished = true;
-    updateCodexLoginState(state, {
-      kind: "device",
-      pid: child.pid,
-      startedAt: tracker.startedAt,
-      status: "failed",
-      error: error.message,
-      lastOutput: tracker.output.trim().slice(-4096)
-    });
-    codexLoginTrackers.delete(state);
-  });
-  child.once("close", (code, signal) => {
-    if (tracker.cleared) {
-      return;
-    }
-    tracker.finished = true;
-    const details = parseCodexDeviceAuthOutput(tracker.output);
-    const failed = code !== 0;
-    updateCodexLoginState(state, {
-      kind: "device",
-      pid: child.pid,
-      startedAt: tracker.startedAt,
-      status: failed ? "failed" : details.verificationUri || details.userCode ? "device_code" : "completed",
-      ...details,
-      lastOutput: tracker.output.trim().slice(-4096),
-      error: failed ? `Codex device login exited with status ${code ?? signal ?? "unknown"}.` : undefined
-    });
-    codexLoginTrackers.delete(state);
-  });
-
-  await waitForCodexLoginInitialState(state, timeoutMs);
-  return codexDeviceLoginResult(cli.binaryPath, args, state.codexLogin);
-}
-
-async function waitForCodexLoginInitialState(state: StudioServerState, timeoutMs: number): Promise<void> {
-  const startedAt = state.codexLogin?.startedAt;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const codexLogin = state.codexLogin;
-    const status = codexLogin && codexLogin.startedAt === startedAt ? codexLogin.status : undefined;
-    if (status === "failed" || status === "completed") {
-      return;
-    }
-    if (status === "device_code") {
-      const tracker = codexLoginTrackers.get(state);
-      if (!tracker || tracker.cleared || tracker.startedAt !== startedAt || tracker.finished) {
-        return;
-      }
-      await sleep(CODEX_DEVICE_LOGIN_CODE_SETTLE_MS);
-      if (state.codexLogin?.startedAt === startedAt && (state.codexLogin.status === "failed" || state.codexLogin.status === "completed" || state.codexLogin.status === "device_code")) {
-        return;
-      }
-    }
-    await sleep(50);
-  }
-  const tracker = codexLoginTrackers.get(state);
-  if (tracker && !tracker.cleared && state.codexLogin?.startedAt === tracker.startedAt && state.codexLogin.status === "starting") {
-    updateCodexLoginState(state, { ...state.codexLogin, status: "pending" });
-  }
-}
-
-function codexChatGptLoginResult(command: string | undefined, args: string[], state: CodexLoginProcessState, started = true): CodexChatGptLoginResult {
-  return {
-    started,
-    command,
-    args,
-    state: state.status,
-    status: state.status,
-    lastOutput: state.lastOutput,
-    error: state.error,
-    message: state.status === "failed"
-      ? state.error ?? "Codex login failed to start."
-      : "Codex login started. Complete sign-in in your browser, then click Recheck."
-  };
-}
-
-function codexDeviceLoginResult(command: string | undefined, args: string[], state: CodexLoginProcessState | undefined, started = true): CodexDeviceLoginResult {
-  const status = state?.status ?? "pending";
-  return {
-    started,
-    command,
-    args,
-    state: status,
-    status,
-    verificationUri: state?.verificationUri,
-    verificationUriComplete: state?.verificationUriComplete,
-    userCode: state?.userCode,
-    lastOutput: state?.lastOutput,
-    error: state?.error,
-    message: status === "failed"
-      ? state?.error ?? "Codex device login failed."
-      : state?.verificationUri || state?.userCode
-        ? "Codex device login started. Complete authorization in your browser."
-        : status === "completed"
-          ? "Codex device login completed."
-        : "Codex device login started."
-  };
-}
-
-function updateCodexLoginState(state: StudioServerState, codexLogin: CodexLoginProcessState): CodexLoginProcessState {
-  state.codexLogin = codexLogin;
-  return codexLogin;
-}
-
-function clearCodexLoginState(state: StudioServerState): void {
-  const tracker = codexLoginTrackers.get(state);
-  if (tracker) {
-    tracker.cleared = true;
-    codexLoginTrackers.delete(state);
-  }
-  state.codexLogin = undefined;
-}
-
-async function codexRuntimeStatusForResponse(env: Record<string, string | undefined>, state: StudioServerState, options: { force?: boolean; lastRunUsage?: CodexRuntimeStatus["usage"]["lastRunUsage"] } = {}): Promise<CodexRuntimeStatus & { codexLogin?: CodexLoginProcessState }> {
-  const status = await getCodexRuntimeStatus({ env, force: options.force, lastRunUsage: options.lastRunUsage });
-  if (status.auth.state === "authenticated" && state.codexLogin) {
-    clearCodexLoginState(state);
-  }
-  return state.codexLogin ? { ...status, codexLogin: state.codexLogin } : status;
-}
-
-export function parseCodexDeviceAuthOutput(output: string): Pick<CodexDeviceLoginResult, "verificationUri" | "verificationUriComplete" | "userCode"> {
-  const urls = [...output.matchAll(/https?:\/\/[^\s)'"]+/g)].map(match => match[0].replace(/[.,;:]+$/, ""));
-  const verificationUriComplete = urls.find(url => /[?&](user_?code|code)=/i.test(url));
-  const verificationUri = urls.find(url => url !== verificationUriComplete) ?? verificationUriComplete;
-  const codeFromUrl = verificationUriComplete ? codeFromVerificationUrl(verificationUriComplete) : undefined;
-  const codeFromText = output.match(/(?:user\s+code|one[-\s]?time\s+code|code)[:\s]+([A-Z0-9][A-Z0-9\-\s]{3,}[A-Z0-9])/i)?.[1]
-    ?.trim()
-    .replace(/\s+/g, "-");
-  return {
-    ...(verificationUri ? { verificationUri } : {}),
-    ...(verificationUriComplete ? { verificationUriComplete } : {}),
-    ...(codeFromUrl ?? codeFromText ? { userCode: codeFromUrl ?? codeFromText } : {})
-  };
-}
-
-function codeFromVerificationUrl(value: string): string | undefined {
-  try {
-    const url = new URL(value);
-    return url.searchParams.get("user_code") ?? url.searchParams.get("user-code") ?? url.searchParams.get("code") ?? undefined;
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 class DeterministicLocalTestRunner implements Runner {
@@ -3051,17 +2421,40 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     cwd: repositoryPath,
     roadmapRegistryPath: options.roadmapRegistryPath
   }));
+  const bridgeAppCodexBinaryPath = bridgeCodexBinaryPathFromBridgeAppState(runtimeConfig.processEnv);
+  if (bridgeAppCodexBinaryPath && !runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH?.trim()) {
+    runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH = bridgeAppCodexBinaryPath;
+    runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH_SOURCE = "user_config";
+  }
   const roadmapRegistryPath = options.roadmapRegistryPath ?? runtimeConfig.roadmapRegistryPath;
-  const runner = options.runner ?? createConfiguredRunner(runtimeConfig);
+  let runner = options.runner ?? createConfiguredRunner(runtimeConfig);
+  const ownsRunner = options.runner === undefined;
   const actionRunner = options.actionRunner;
   const security = createStudioServerSecurity(options.security, runtimeConfig);
+  const providerRegistry = createRuntimeProviderRegistry({
+    providerStateStore: createBridgeAppRuntimeProviderStore(runtimeConfig.processEnv),
+    codex: {
+      env: () => runtimeConfig.processEnv,
+      loginState: state,
+      onConfigure(configuration) {
+        if (configuration.binaryPath) {
+          runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH = configuration.binaryPath;
+        } else {
+          delete runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH;
+        }
+        if (ownsRunner) {
+          runner = createConfiguredRunner(runtimeConfig);
+        }
+      }
+    }
+  });
 
-  const server = createServer(async (request, response) => {
+  const server = createStudioHttpServer(async (request, response) => {
     try {
-      const url = new URL(request.url ?? "/", "http://localhost");
+      const url = studioRequestUrl(request);
       const pathname = url.pathname;
       const requestSecurity = evaluateStudioRequestSecurity(request, url, security, {
-        skipAuth: request.method === "OPTIONS" || isBridgeControlRequest(pathname)
+        skipAuth: request.method === "OPTIONS" || isBridgeControlRoute(pathname)
       });
       responseSecurityHeaders.set(response, requestSecurity.corsHeaders);
       if (request.method === "OPTIONS") {
@@ -3073,12 +2466,12 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
 
-      if (request.method === "GET" && pathname === "/health") {
+      if (request.method === "GET" && isHealthRoute(pathname)) {
         sendJson(response, 200, { ok: true, service: "hunsu-bridge", version: bridgeVersionInfo() });
         return;
       }
 
-      if (isBridgeControlRequest(pathname)) {
+      if (isBridgeControlRoute(pathname)) {
         const controlSecurity = validateBridgeControlToken(request, security);
         if (!controlSecurity.allowed) {
           sendJson(response, controlSecurity.status ?? 401, {
@@ -3134,48 +2527,12 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
 
-      if (request.method === "GET" && pathname === "/api/connection/status") {
-        const currentRoadmap = findRoadmapRegistryEntryByPath(repositoryPath, { roadmapRegistryPath });
-        sendJson(response, 200, createStudioConnectionStatus({
-          bridgeApiUrl: endpointUrl(runtimeConfig.bridgeApi),
-          repositoryPath,
-          roadmapId: currentRoadmap?.roadmapId,
-          roadmapDisplayName: currentRoadmap?.displayName,
-          runtimeConfig
-        }));
-        return;
-      }
-
-      if (request.method === "GET" && pathname === "/api/remote/devices") {
-        sendJson(response, 200, { devices: await listRemoteBridgeDevicesForRequest(request, runtimeConfig, {
-          relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH,
-          userId: url.searchParams.get("userId") ?? undefined
-        }) });
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/remote/connect") {
-        const body = await readJson<RemoteBridgeConnectRequest>(request);
-        sendJson(response, 202, await connectRemoteBridgeForRequest(body, request, runtimeConfig, {
-          relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH
-        }));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/remote/commands") {
-        const body = await readJson<RemoteBridgeCommandRequest>(request);
-        const result = await routeRemoteBridgeCommand(body, request, runtimeConfig);
-        sendJson(response, result.ok ? result.status : result.status ?? 502, result);
-        return;
-      }
-
-      if (request.method === "GET" && pathname === "/api/remote/commands/events") {
-        const command = remoteBridgeCommandFromEventUrl(url);
-        if (!command) {
-          sendJson(response, 400, { ok: false, error: "Remote event stream command payload is invalid." });
-          return;
-        }
-        await streamRemoteBridgeCommand(command, request, response, runtimeConfig);
+      if (await handleRemoteBridgeRoute(request, response, pathname, url, {
+        runtimeConfig,
+        readJson,
+        sendJson,
+        responseHeaders: targetResponse => responseSecurityHeaders.get(targetResponse)
+      })) {
         return;
       }
 
@@ -3184,363 +2541,233 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
 
-      if (request.method === "GET" && pathname === "/api/codex/status") {
-        sendJson(response, 200, sanitizeLegacyCodexStatus(runner.providerStatus ? await runner.providerStatus() : { backend: "sdk", available: true }));
+      if (await handleProviderRoute(request, response, pathname, url, {
+        providerRegistry,
+        env: runtimeConfig.processEnv,
+        codexLoginState: state,
+        latestCodexRunUsage: () => latestCodexRunUsage(state),
+        legacyCodexStatus: async () => runner.providerStatus ? await runner.providerStatus() : { backend: "sdk", available: true },
+        sanitizeLegacyCodexStatus: status => sanitizeLegacyCodexStatus(status as CodexProviderStatus | { backend: string; available: boolean; error?: string }),
+        readJson,
+        sendJson
+      })) {
         return;
       }
 
-      if (request.method === "GET" && pathname === "/api/runtimes/codex/status") {
-        sendJson(response, 200, await codexRuntimeStatusForResponse(runtimeConfig.processEnv, state));
+      if (await handleConnectionRoute(request, response, pathname, {
+        studioConnectionStatus: () => {
+          const currentRoadmap = findRoadmapRegistryEntryByPath(repositoryPath, { roadmapRegistryPath });
+          return createStudioConnectionStatus({
+            bridgeApiUrl: endpointUrl(runtimeConfig.bridgeApi),
+            repositoryPath,
+            roadmapId: currentRoadmap?.roadmapId,
+            roadmapDisplayName: currentRoadmap?.displayName,
+            runtimeConfig
+          });
+        },
+        bridgeStatus: () => createBridgeStatusForRequest({
+          request,
+          runtimeConfig,
+          providerRegistry,
+          managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
+        }),
+        account: () => accountStatusForBridgeRequest(request, runtimeConfig),
+        currentProvider: () => currentRuntimeProviderStatus(providerRegistry, runtimeConfig.processEnv),
+        remoteDevice: input => localRemoteBridgeDevice(runtimeConfig, input.account, input.status, input.provider),
+        relay: () => relayRequestConfig(request, runtimeConfig),
+        deviceStore: remoteBridgeDeviceStoreAccess({ relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH }),
+        managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath }),
+        publishWorkspaceAccess: publication => publishRemoteWorkspaceAccess(publication, {
+          setWorkspaceRemoteAccess: (remoteAccessRequest, remoteAccess) => setRoadmapRemoteAccess(remoteAccessRequest, remoteAccess, { roadmapRegistryPath })
+        }),
+        deactivateWorkspaceAccess: () => deactivateRemoteWorkspaceAccess(listManagedRoadmapRegistry({ roadmapRegistryPath }), {
+          setWorkspaceRemoteAccess: (remoteAccessRequest, remoteAccess) => setRoadmapRemoteAccess(remoteAccessRequest, remoteAccess, { roadmapRegistryPath })
+        }),
+        connectRemote: body => connectRemoteBridgeForRequest(body as RemoteBridgeConnectRequest, request, runtimeConfig, {
+          relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH
+        }),
+        readJson,
+        sendJson
+      })) {
         return;
       }
 
-      if (request.method === "POST" && pathname === "/api/runtimes/codex/recheck") {
-        sendJson(response, 202, await codexRuntimeStatusForResponse(runtimeConfig.processEnv, state, { force: true }));
+      if (await handleWorkspaceRoute(request, response, pathname, {
+        bridgeStatus: () => createBridgeStatusForRequest({
+          request,
+          runtimeConfig,
+          providerRegistry,
+          managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
+        }),
+        currentProvider: () => currentRuntimeProviderStatus(providerRegistry, runtimeConfig.processEnv),
+        managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath }),
+        addWorkspace: body => addStudioWorkspace(body as RoadmapOpenRequest, state, { persist, roadmapRegistryPath }),
+        selectRepository: path => {
+          repositoryPath = path;
+        },
+        setWorkspaceLifecycle: (body, lifecycle) => setRoadmapLifecycle(body as RoadmapLifecycleRequest, lifecycle, { roadmapRegistryPath }),
+        removeWorkspace: body => removeRoadmapRegistryEntry(body as RoadmapRemoveRequest, { roadmapRegistryPath }),
+        recentRoadmaps: () => listRoadmapRegistry({ roadmapRegistryPath }),
+        removeRoadmap: body => removeRoadmapRegistryEntry(body as RoadmapRemoveRequest, { roadmapRegistryPath }),
+        activateRoadmap: body => setRoadmapLifecycle(body as RoadmapLifecycleRequest, "active", { roadmapRegistryPath }),
+        deactivateRoadmap: body => setRoadmapLifecycle(body as RoadmapLifecycleRequest, "inactive", { roadmapRegistryPath }),
+        inspectProject: body => inspectProject(resolveRoadmapOpenRequestPath(body as ProjectInspectionRequest, state), { roadmapRegistryPath }),
+        openRoadmap: body => openStudioRoadmap(body as RoadmapOpenRequest, state, { persist, roadmapRegistryPath }),
+        inspectRoadmapPort: body => inspectStudioPort(resolveRoadmapOpenRequestPath(body as RoadmapPortRequest, state)),
+        applyRoadmapPort: body => applyStudioPort(resolveRoadmapOpenRequestPath(body as RoadmapPortRequest, state), state, { roadmapRegistryPath }),
+        createRoadmap: body => createStudioRoadmap(body as RoadmapOpenRequest, state, { persist, roadmapRegistryPath }),
+        readJson,
+        sendJson
+      })) {
         return;
       }
 
-      if (request.method === "POST" && pathname === "/api/runtimes/codex/install") {
-        sendJson(response, 202, codexInstallPlan());
+      if (await handleFilesystemRoute(request, response, pathname, url, {
+        cwd: repositoryPath,
+        browseRootEntries: filesystemBrowseRootEntries,
+        browse: browseFilesystem,
+        createGrant: (body, filesystemOptions) => createFilesystemBrowseGrant(body as FilesystemGrantRequest, state, filesystemOptions),
+        readJson,
+        sendJson
+      })) {
         return;
       }
 
-      if (request.method === "POST" && pathname === "/api/runtimes/codex/login/chatgpt") {
-        sendJson(response, 202, await spawnCodexChatGptLogin(state, runtimeConfig.processEnv));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/runtimes/codex/login/device") {
-        sendJson(response, 202, await spawnCodexDeviceLogin(state, runtimeConfig.processEnv));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/runtimes/codex/login/api-key") {
-        sendJson(response, 202, await spawnCodexAction(["login"], runtimeConfig.processEnv));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/runtimes/codex/logout") {
-        sendJson(response, 202, await spawnCodexAction(["logout"], runtimeConfig.processEnv));
-        return;
-      }
-
-      if (request.method === "GET" && pathname === "/api/roadmaps/recent") {
-        sendJson(response, 200, { roadmaps: listRoadmapRegistry({ roadmapRegistryPath }) });
-        return;
-      }
-
-      if (request.method === "GET" && pathname === "/api/roadmaps/managed") {
-        sendJson(response, 200, { roadmaps: listManagedRoadmapRegistry({ roadmapRegistryPath }) });
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/roadmaps/recent/remove") {
-        const body = await readJson<RoadmapRemoveRequest>(request);
-        sendJson(response, 202, removeRoadmapRegistryEntry(body, { roadmapRegistryPath }));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/roadmaps/activate") {
-        const body = await readJson<RoadmapLifecycleRequest>(request);
-        sendJson(response, 202, setRoadmapLifecycle(body, "active", { roadmapRegistryPath }));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/roadmaps/deactivate") {
-        const body = await readJson<RoadmapLifecycleRequest>(request);
-        sendJson(response, 202, setRoadmapLifecycle(body, "inactive", { roadmapRegistryPath }));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/projects/inspect") {
-        const body = await readJson<ProjectInspectionRequest>(request);
-        sendJson(response, 200, { project: inspectProject(resolveRoadmapOpenRequestPath(body, state), { roadmapRegistryPath }) });
-        return;
-      }
-
-      if (request.method === "GET" && pathname === "/api/filesystem/roots") {
-        sendJson(response, 200, { roots: filesystemBrowseRootEntries(repositoryPath) });
-        return;
-      }
-
-      if (request.method === "GET" && pathname === "/api/filesystem/browse") {
-        sendJson(response, 200, browseFilesystem(url.searchParams.get("path") ?? undefined, {
-          cwd: repositoryPath,
-          rootId: url.searchParams.get("rootId") ?? undefined
-        }));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/filesystem/grants") {
-        const body = await readJson<FilesystemGrantRequest>(request);
-        sendJson(response, 201, createFilesystemBrowseGrant(body, state, { cwd: repositoryPath }));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/roadmaps/open") {
-        const body = await readJson<RoadmapOpenRequest>(request);
-        const result = openStudioRoadmap(body, state, { persist, roadmapRegistryPath });
-        repositoryPath = result.repository.root;
-        sendJson(response, 202, result);
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/roadmaps/port/inspect") {
-        const body = await readJson<RoadmapPortRequest>(request);
-        sendJson(response, 200, inspectStudioPort(resolveRoadmapOpenRequestPath(body, state)));
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/roadmaps/port/apply") {
-        const body = await readJson<RoadmapPortRequest>(request);
-        const result = applyStudioPort(resolveRoadmapOpenRequestPath(body, state), state, { roadmapRegistryPath });
-        repositoryPath = result.repository.root;
-        sendJson(response, 202, result);
-        return;
-      }
-
-      if (request.method === "POST" && pathname === "/api/roadmaps/create") {
-        const body = await readJson<RoadmapOpenRequest>(request);
-        const result = createStudioRoadmap(body, state, { persist, roadmapRegistryPath });
-        repositoryPath = result.repository.root;
-        sendJson(response, 202, result);
-        return;
-      }
-
-      if (pathname === "/api/artifact-actions" || pathname.startsWith("/api/artifact-actions/") || pathname === "/api/action-runs" || pathname.startsWith("/api/action-runs/")) {
-        const handled = await handleArtifactActionApiRequest(pathname, request, response, {
+      if (await handleStudioResourceRoute(request, response, pathname, {
+        board: () => currentBoard(state, { cwd: repositoryPath, persist }),
+        roadmapView: () => toStudioRoadmapView(currentBoard(state, { cwd: repositoryPath, persist })),
+        events: () => currentEvents(state, { cwd: repositoryPath, persist }),
+        repository: () => readWorktreeStatus(repositoryPath),
+        selectRepository: body => {
+          const result = selectStudioRepository((body as RepositorySelectionRequest).cwd, state, { persist });
+          repositoryPath = result.repository.root;
+          return result;
+        },
+        worktree: () => readWorktreeStatus(repositoryPath),
+        artifacts: () => currentBoard(state, { cwd: repositoryPath, persist }).artifacts,
+        artifact: artifactId => findArtifact(currentBoard(state, { cwd: repositoryPath, persist }), artifactId),
+        artifactActions: routePath => handleArtifactActionApiRequest(routePath, request, response, {
           cwd: repositoryPath,
           actionRunner,
           ambientEnv: runtimeConfig.processEnv,
           processEnv: runtimeConfig.processEnv,
           worktreeRoot: runtimeConfig.actionWorktreeRoot
-        });
-        if (handled) {
-          return;
-        }
+        }),
+        skills: () => listCodexSkills(runtimeConfig.processEnv),
+        moveDiff: moveId => readMoveDiff(currentBoard(state, { cwd: repositoryPath, persist }), moveId, repositoryPath),
+        executeCommands: body => executeStudioCommands(studioCommandsFromRequestBody(body), state, { cwd: repositoryPath, persist }),
+        decideLine: (decision, body) => decideStudioLine(decision, body as StudioLineDecisionRequest, state, { cwd: repositoryPath, persist }),
+        readJson,
+        sendJson
+      })) {
+        return;
       }
 
-      const scopedRoadmap = parseRoadmapApiPath(pathname);
-      if (scopedRoadmap) {
-        const handled = await handleRoadmapApiRequest(scopedRoadmap.roadmapId, scopedRoadmap.suffix, request, response, state, {
-          persist,
-          runner,
+      if (await handleScopedRoadmapRoute(request, response, pathname, {
+        repositoryPath: roadmapId => resolveRoadmapRepositoryPath(roadmapId, { roadmapRegistryPath }),
+        loadRoadmap: roadmapId => loadStudioRoadmap(roadmapId, state, { persist, roadmapRegistryPath }),
+        board: (_roadmapId, cwd) => currentBoard(state, { cwd, persist }),
+        roadmapView: (_roadmapId, cwd) => toStudioRoadmapView(currentBoard(state, { cwd, persist })),
+        events: (_roadmapId, cwd) => currentEvents(state, { cwd, persist }),
+        repository: (_roadmapId, cwd) => readWorktreeStatus(cwd),
+        worktree: (_roadmapId, cwd) => readWorktreeStatus(cwd),
+        artifacts: (_roadmapId, cwd) => currentBoard(state, { cwd, persist }).artifacts,
+        artifact: (_roadmapId, cwd, artifactId) => findArtifact(currentBoard(state, { cwd, persist }), artifactId),
+        artifactActions: (suffix, roadmapId, cwd) => handleArtifactActionApiRequest(suffix, request, response, {
+          cwd,
+          roadmapId,
           actionRunner,
-          apmSkillRegistryClient: options.apmSkillRegistryClient,
-          roadmapRegistryPath,
+          ambientEnv: runtimeConfig.processEnv,
+          processEnv: runtimeConfig.processEnv,
+          worktreeRoot: runtimeConfig.actionWorktreeRoot
+        }),
+        hunsuDrafts: (draftSuffix, roadmapId, cwd) => handleHunsuDraftApiRequest(draftSuffix, request, response, state, {
+          cwd,
+          persist,
+          roadmapId,
+          runner,
           bridgeApiBaseUrl: endpointUrl(runtimeConfig.bridgeApi),
           bridgeApiAuthToken: security.authToken,
-          routeWorktreeRoot: runtimeConfig.routeWorktreeRoot,
-          actionAmbientEnv: runtimeConfig.processEnv,
-          actionProcessEnv: runtimeConfig.processEnv,
-          actionWorktreeRoot: runtimeConfig.actionWorktreeRoot,
-          skillsEnv: runtimeConfig.processEnv,
-          codexEnv: runtimeConfig.processEnv
-        });
-        if (handled) {
-          return;
-        }
-      }
-
-      if (request.method === "GET" && request.url === "/api/board") {
-        sendJson(response, 200, currentBoard(state, { cwd: repositoryPath, persist }));
+          apmSkillRegistryClient: options.apmSkillRegistryClient,
+          routeWorktreeRoot: runtimeConfig.routeWorktreeRoot
+        }),
+        executes: (suffix, roadmapId, cwd) => handleRoadmapExecuteRoute(request, response, suffix, {
+          repositoryPath: cwd,
+          roadmapId,
+          providerRegistry,
+          env: runtimeConfig.processEnv,
+          managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath }),
+          bridgeStatus: () => createBridgeStatusForRequest({
+            request,
+            runtimeConfig,
+            providerRegistry,
+            managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
+          }),
+          localBridgeTokenPresent: () => Boolean(requestHeader(request, BRIDGE_API_TOKEN_HEADER)),
+          runSummaries: () => runsForRepository(state, cwd).filter(run => !run.roadmapId || run.roadmapId === roadmapId).map(toStudioRunSummary),
+          executeView: run => toStudioExecuteView(run as StudioRunSummary),
+          startRun: body => startStudioRun(body as StudioRunStartRequest, state, {
+            cwd,
+            persist,
+            roadmapId,
+            runner,
+            apmSkillRegistryClient: options.apmSkillRegistryClient,
+            routeWorktreeRoot: runtimeConfig.routeWorktreeRoot
+          }),
+          pauseRun: body => pauseStudioRun(body as StudioRunActionRequest, state, { cwd, persist, runner }),
+          resumeRun: body => resumeStudioRun(body as StudioRunActionRequest, state, {
+            cwd,
+            persist,
+            runner,
+            apmSkillRegistryClient: options.apmSkillRegistryClient
+          }),
+          stopRun: body => stopStudioRun(body as StudioRunActionRequest, state, { cwd, persist, runner }),
+          completeMove: body => completeStudioMove(body as StudioMoveCompletionRequest, state, { cwd, persist }),
+          streamLiveEvents: () => streamStudioLiveEvents(request, response, state, { cwd }),
+          agentSessions: () => agentSessionsForRepository(state, cwd).filter(session => agentSessionMatchesRoadmap(session, roadmapId)).map(toAgentSessionSummary),
+          findAgentSession: sessionId => findAgentSessionById(state, sessionId, { cwd, roadmapId }),
+          streamAgentSessionEvents: sessionId => streamAgentSessionEvents(request, response, state, { cwd, roadmapId, sessionId }),
+          readJson,
+          sendJson
+        }),
+        skills: () => listCodexSkills(runtimeConfig.processEnv),
+        moveFileTree: (_roadmapId, cwd, moveId, filePath) => readMoveFileTree(currentBoard(state, { cwd, persist }), moveId, cwd, filePath),
+        moveFileBlob: (_roadmapId, cwd, moveId, filePath) => readMoveFileBlob(currentBoard(state, { cwd, persist }), moveId, cwd, filePath),
+        moveDiff: (_roadmapId, cwd, moveId) => readMoveDiff(currentBoard(state, { cwd, persist }), moveId, cwd),
+        executeCommands: (_roadmapId, cwd, body) => executeStudioCommands(studioCommandsFromRequestBody(body), state, { cwd, persist }),
+        decideLine: (_roadmapId, cwd, decision, body) => decideStudioLine(decision, body as StudioLineDecisionRequest, state, { cwd, persist }),
+        readJson,
+        sendJson
+      })) {
         return;
       }
 
-      if (request.method === "GET" && request.url === "/api/roadmap") {
-        sendJson(response, 200, toStudioRoadmapView(currentBoard(state, { cwd: repositoryPath, persist })));
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/api/events") {
-        sendJson(response, 200, { events: currentEvents(state, { cwd: repositoryPath, persist }) });
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/api/repository") {
-        sendJson(response, 200, { repository: readWorktreeStatus(repositoryPath) });
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/repository") {
-        const body = await readJson<RepositorySelectionRequest>(request);
-        const result = selectStudioRepository(body.cwd, state, { persist });
-        repositoryPath = result.repository.root;
-        sendJson(response, 202, result);
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/api/worktree") {
-        sendJson(response, 200, readWorktreeStatus(repositoryPath));
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/api/artifacts") {
-        sendJson(response, 200, { artifacts: currentBoard(state, { cwd: repositoryPath, persist }).artifacts });
-        return;
-      }
-
-      if (request.method === "GET" && request.url?.startsWith("/api/artifacts/")) {
-        const artifactId = decodeURIComponent(request.url.slice("/api/artifacts/".length));
-        const artifact = findArtifact(currentBoard(state, { cwd: repositoryPath, persist }), artifactId);
-        sendJson(response, artifact ? 200 : 404, artifact ? { artifact } : { error: `Unknown artifact: ${artifactId}` });
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/api/runs") {
-        const runs = runsForRepository(state, repositoryPath).map(toStudioRunSummary);
-        sendJson(response, 200, { runs, executes: runs.map(toStudioExecuteView) });
-        return;
-      }
-
-	      if (request.method === "GET" && request.url === "/api/executes") {
-	        const runs = runsForRepository(state, repositoryPath).map(toStudioRunSummary);
-	        sendJson(response, 200, { executes: runs.map(toStudioExecuteView), runs });
-	        return;
-	      }
-
-	      if (request.method === "GET" && request.url === "/api/agent-sessions") {
-	        sendJson(response, 200, { sessions: agentSessionsForRepository(state, repositoryPath).map(toAgentSessionSummary) });
-	        return;
-	      }
-
-      if (request.method === "GET" && request.url === "/api/skills") {
-        sendJson(response, 200, { skills: listCodexSkills(runtimeConfig.processEnv) });
-        return;
-      }
-
-      if (request.method === "GET" && request.url === "/api/runs/events") {
-        streamStudioLiveEvents(request, response, state, { cwd: repositoryPath });
-        return;
-      }
-
-	      if (request.method === "GET" && request.url === "/api/executes/events") {
-	        streamStudioLiveEvents(request, response, state, { cwd: repositoryPath });
-	        return;
-	      }
-
-	      if (request.method === "GET" && request.url?.startsWith("/api/agent-sessions/") && request.url !== "/api/agent-sessions/events") {
-	        const route = parseAgentSessionRoute(request.url.slice("/api/agent-sessions".length));
-	        if (route?.action === "show") {
-	          const session = findAgentSessionById(state, route.sessionId, { cwd: repositoryPath });
-	          sendJson(response, session ? 200 : 404, session ? { session } : { error: `Unknown AgentSession: ${route.sessionId}` });
-	          return;
-	        }
-	        if (route?.action === "events") {
-	          streamAgentSessionEvents(request, response, state, { cwd: repositoryPath, sessionId: route.sessionId });
-	          return;
-	        }
-	      }
-
-	      if (request.method === "GET" && request.url === "/api/agent-sessions/events") {
-	        streamAgentSessionEvents(request, response, state, { cwd: repositoryPath });
-	        return;
-	      }
-
-      if (request.method === "GET" && request.url?.startsWith("/api/moves/") && request.url.endsWith("/diff")) {
-        const moveId = decodeURIComponent(request.url.slice("/api/moves/".length, -"/diff".length));
-        sendJson(response, 200, { diff: readMoveDiff(currentBoard(state, { cwd: repositoryPath, persist }), moveId, repositoryPath) });
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/commands") {
-        const body = await readJson<StudioCommandRequest>(request);
-        const commands = isCommandBatch(body) ? body.commands : [body];
-        sendJson(response, 202, await executeStudioCommands(commands, state, { cwd: repositoryPath, persist }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/runs/start") {
-        const body = await readJson<StudioRunStartRequest>(request);
-        const activeError = repositoryActivePreflight(repositoryPath, roadmapRegistryPath);
-        if (activeError) {
-          sendJson(response, 409, activeError);
-          return;
-        }
-        const codexStatus = await getCodexRuntimeStatus({ env: runtimeConfig.processEnv, force: true });
-        const codexError = codexRuntimePreflightError(codexStatus);
-        if (codexError) {
-          sendJson(response, 409, codexError);
-          return;
-        }
-        sendJson(response, 202, await startStudioRun(body, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient, routeWorktreeRoot: runtimeConfig.routeWorktreeRoot }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/executes/start") {
-        const body = await readJson<StudioRunStartRequest>(request);
-        const activeError = repositoryActivePreflight(repositoryPath, roadmapRegistryPath);
-        if (activeError) {
-          sendJson(response, 409, activeError);
-          return;
-        }
-        const codexStatus = await getCodexRuntimeStatus({ env: runtimeConfig.processEnv, force: true });
-        const codexError = codexRuntimePreflightError(codexStatus);
-        if (codexError) {
-          sendJson(response, 409, codexError);
-          return;
-        }
-        sendJson(response, 202, await startStudioRun(body, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient, routeWorktreeRoot: runtimeConfig.routeWorktreeRoot }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/runs/pause") {
-        const body = await readJson<StudioRunActionRequest>(request);
-        sendJson(response, 202, await pauseStudioRun(body, state, { cwd: repositoryPath, persist, runner }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/executes/pause") {
-        const body = await readJson<StudioRunActionRequest>(request);
-        sendJson(response, 202, await pauseStudioRun(body, state, { cwd: repositoryPath, persist, runner }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/runs/resume") {
-        const body = await readJson<StudioRunActionRequest>(request);
-        sendJson(response, 202, await resumeStudioRun(body, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/executes/resume") {
-        const body = await readJson<StudioRunActionRequest>(request);
-        sendJson(response, 202, await resumeStudioRun(body, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/runs/stop") {
-        const body = await readJson<StudioRunActionRequest>(request);
-        sendJson(response, 202, await stopStudioRun(body, state, { cwd: repositoryPath, persist, runner }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/executes/stop") {
-        const body = await readJson<StudioRunActionRequest>(request);
-        sendJson(response, 202, await stopStudioRun(body, state, { cwd: repositoryPath, persist, runner }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/runs/complete-move") {
-        const body = await readJson<StudioMoveCompletionRequest>(request);
-        sendJson(response, 202, await completeStudioMove(body, state, { cwd: repositoryPath, persist }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/executes/complete-move") {
-        const body = await readJson<StudioMoveCompletionRequest>(request);
-        sendJson(response, 202, await completeStudioMove(body, state, { cwd: repositoryPath, persist }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/lines/accept") {
-        const body = await readJson<StudioLineDecisionRequest>(request);
-        sendJson(response, 202, await decideStudioLine("accept", body, state, { cwd: repositoryPath, persist }));
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/api/lines/reject") {
-        const body = await readJson<StudioLineDecisionRequest>(request);
-        sendJson(response, 202, await decideStudioLine("reject", body, state, { cwd: repositoryPath, persist }));
+      if (await handleExecuteRoute(request, response, pathname, {
+        repositoryPath,
+        providerRegistry,
+        env: runtimeConfig.processEnv,
+        managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath }),
+        bridgeStatus: () => createBridgeStatusForRequest({
+          request,
+          runtimeConfig,
+          providerRegistry,
+          managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
+        }),
+        localBridgeTokenPresent: () => Boolean(requestHeader(request, BRIDGE_API_TOKEN_HEADER)),
+        runSummaries: () => runsForRepository(state, repositoryPath).map(toStudioRunSummary),
+        executeView: run => toStudioExecuteView(run as StudioRunSummary),
+        startRun: body => startStudioRun(body as StudioRunStartRequest, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient, routeWorktreeRoot: runtimeConfig.routeWorktreeRoot }),
+        pauseRun: body => pauseStudioRun(body as StudioRunActionRequest, state, { cwd: repositoryPath, persist, runner }),
+        resumeRun: body => resumeStudioRun(body as StudioRunActionRequest, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient }),
+        stopRun: body => stopStudioRun(body as StudioRunActionRequest, state, { cwd: repositoryPath, persist, runner }),
+        completeMove: body => completeStudioMove(body as StudioMoveCompletionRequest, state, { cwd: repositoryPath, persist }),
+        streamLiveEvents: () => streamStudioLiveEvents(request, response, state, { cwd: repositoryPath }),
+        agentSessions: () => agentSessionsForRepository(state, repositoryPath).map(toAgentSessionSummary),
+        findAgentSession: sessionId => findAgentSessionById(state, sessionId, { cwd: repositoryPath }),
+        streamAgentSessionEvents: sessionId => streamAgentSessionEvents(request, response, state, { cwd: repositoryPath, sessionId }),
+        readJson,
+        sendJson
+      })) {
         return;
       }
 
@@ -3553,274 +2780,29 @@ export function createStudioServer(options: StudioServerOptions = {}) {
   return server;
 }
 
-type RoadmapApiRoute = {
-  roadmapId: string;
-  suffix: string;
-};
+function addStudioWorkspace(
+  body: RoadmapOpenRequest,
+  state: StudioServerState,
+  options: { persist: boolean; roadmapRegistryPath?: string }
+): RoadmapOpenResult {
+  const request = resolveRoadmapOpenRequestPath(body, state);
+  const project = inspectProject(request, { roadmapRegistryPath: options.roadmapRegistryPath });
+  if (project.kind === "hunsu-roadmap") {
+    return openStudioRoadmap({ path: project.path, title: body.title }, state, options);
+  }
+  if (project.kind === "git-project") {
+    return applyStudioPort({ path: project.path, title: body.title ?? basename(project.path), goal: `Port ${basename(project.path)} into Hunsu.` }, state, options);
+  }
+  if (project.kind === "new-project") {
+    return createStudioRoadmap({ path: project.path, title: body.title ?? basename(project.path) }, state, options);
+  }
+  throw new Error(project.reason);
+}
 
 type RoadmapRegistryStore = {
   version: 1;
   roadmaps: RoadmapRegistryEntry[];
 };
-
-type RemoteBridgeDeviceStore = {
-  schema: "hunsu.relay-registry.v1";
-  devices: RemoteBridgeDevice[];
-};
-
-type ScopedRoadmapOptions = {
-  persist: boolean;
-  runner: Runner;
-  actionRunner?: ArtifactActionCommandRunner;
-  apmSkillRegistryClient?: ApmSkillRegistryClient;
-  roadmapRegistryPath?: string;
-  bridgeApiBaseUrl?: string;
-  bridgeApiAuthToken?: string;
-  routeWorktreeRoot?: string;
-  actionAmbientEnv?: Record<string, string | undefined>;
-  actionProcessEnv?: Record<string, string | undefined>;
-  actionWorktreeRoot?: string;
-  skillsEnv?: Record<string, string | undefined>;
-  codexEnv?: Record<string, string | undefined>;
-};
-
-function parseRoadmapApiPath(pathname: string): RoadmapApiRoute | undefined {
-  const prefix = "/api/roadmaps/";
-  if (!pathname.startsWith(prefix)) {
-    return undefined;
-  }
-  const rest = pathname.slice(prefix.length);
-  const [rawRoadmapId, ...suffixParts] = rest.split("/");
-  if (!rawRoadmapId) {
-    return undefined;
-  }
-  return {
-    roadmapId: decodeURIComponent(rawRoadmapId),
-    suffix: suffixParts.length > 0 ? `/${suffixParts.join("/")}` : ""
-  };
-}
-
-async function handleRoadmapApiRequest(
-  roadmapId: string,
-  suffix: string,
-  request: IncomingMessage,
-  response: ServerResponse,
-  state: StudioServerState,
-  options: ScopedRoadmapOptions
-): Promise<boolean> {
-  const cwd = resolveRoadmapRepositoryPath(roadmapId, { roadmapRegistryPath: options.roadmapRegistryPath });
-  const persist = options.persist;
-
-  if (request.method === "GET" && suffix === "") {
-    sendJson(response, 200, loadStudioRoadmap(roadmapId, state, { persist, roadmapRegistryPath: options.roadmapRegistryPath }));
-    return true;
-  }
-
-  if (request.method === "GET" && suffix === "/board") {
-    sendJson(response, 200, currentBoard(state, { cwd, persist }));
-    return true;
-  }
-
-  if (request.method === "GET" && suffix === "/roadmap") {
-    sendJson(response, 200, toStudioRoadmapView(currentBoard(state, { cwd, persist })));
-    return true;
-  }
-
-  if (request.method === "GET" && suffix === "/events") {
-    sendJson(response, 200, { events: currentEvents(state, { cwd, persist }) });
-    return true;
-  }
-
-  if (request.method === "GET" && suffix === "/repository") {
-    sendJson(response, 200, { repository: readWorktreeStatus(cwd) });
-    return true;
-  }
-
-  if (request.method === "GET" && suffix === "/worktree") {
-    sendJson(response, 200, readWorktreeStatus(cwd));
-    return true;
-  }
-
-  if (request.method === "GET" && suffix === "/artifacts") {
-    sendJson(response, 200, { artifacts: currentBoard(state, { cwd, persist }).artifacts });
-    return true;
-  }
-
-  if (request.method === "GET" && suffix.startsWith("/artifacts/")) {
-    const artifactId = decodeURIComponent(suffix.slice("/artifacts/".length));
-    const artifact = findArtifact(currentBoard(state, { cwd, persist }), artifactId);
-    sendJson(response, artifact ? 200 : 404, artifact ? { artifact } : { error: `Unknown artifact: ${artifactId}` });
-    return true;
-  }
-
-  if (suffix === "/artifact-actions" || suffix.startsWith("/artifact-actions/") || suffix === "/action-runs" || suffix.startsWith("/action-runs/")) {
-    return handleArtifactActionApiRequest(suffix, request, response, {
-      cwd,
-      roadmapId,
-      actionRunner: options.actionRunner,
-      ambientEnv: options.actionAmbientEnv,
-      processEnv: options.actionProcessEnv,
-      worktreeRoot: options.actionWorktreeRoot
-    });
-  }
-
-  if (suffix === "/hunsu/drafts" || suffix.startsWith("/hunsu/drafts/")) {
-    return handleHunsuDraftApiRequest(suffix.slice("/hunsu/drafts".length), request, response, state, {
-      cwd,
-      persist,
-      roadmapId,
-      runner: options.runner,
-      bridgeApiBaseUrl: options.bridgeApiBaseUrl ?? defaultBridgeApiBaseUrl(cwd),
-      bridgeApiAuthToken: options.bridgeApiAuthToken,
-      apmSkillRegistryClient: options.apmSkillRegistryClient,
-      routeWorktreeRoot: options.routeWorktreeRoot
-    });
-  }
-
-  if (request.method === "GET" && suffix === "/runs") {
-    const runs = runsForRepository(state, cwd).filter(run => !run.roadmapId || run.roadmapId === roadmapId).map(toStudioRunSummary);
-    sendJson(response, 200, { runs, executes: runs.map(toStudioExecuteView) });
-    return true;
-  }
-
-	  if (request.method === "GET" && suffix === "/executes") {
-	    const runs = runsForRepository(state, cwd).filter(run => !run.roadmapId || run.roadmapId === roadmapId).map(toStudioRunSummary);
-	    sendJson(response, 200, { executes: runs.map(toStudioExecuteView), runs });
-	    return true;
-	  }
-
-	  if (request.method === "GET" && suffix === "/agent-sessions") {
-	    sendJson(response, 200, { sessions: agentSessionsForRepository(state, cwd).filter(session => agentSessionMatchesRoadmap(session, roadmapId)).map(toAgentSessionSummary) });
-	    return true;
-	  }
-
-	  if (request.method === "GET" && suffix.startsWith("/agent-sessions/") && suffix !== "/agent-sessions/events") {
-	    const route = parseAgentSessionRoute(suffix.slice("/agent-sessions".length));
-	    if (route?.action === "show") {
-	      const session = findAgentSessionById(state, route.sessionId, { cwd, roadmapId });
-	      sendJson(response, session ? 200 : 404, session ? { session } : { error: `Unknown AgentSession: ${route.sessionId}` });
-	      return true;
-	    }
-	    if (route?.action === "events") {
-	      streamAgentSessionEvents(request, response, state, { cwd, roadmapId, sessionId: route.sessionId });
-	      return true;
-	    }
-	  }
-
-  if (request.method === "GET" && suffix === "/skills") {
-    sendJson(response, 200, { skills: listCodexSkills(options.skillsEnv) });
-    return true;
-  }
-
-	  if (request.method === "GET" && suffix === "/agent-sessions/events") {
-	    streamAgentSessionEvents(request, response, state, { cwd, roadmapId });
-	    return true;
-	  }
-
-	  if (request.method === "GET" && (suffix === "/runs/events" || suffix === "/executes/events")) {
-	    streamStudioLiveEvents(request, response, state, { cwd });
-	    return true;
-	  }
-
-  const moveFilesRoute = parseMoveFilesRoute(suffix);
-  if (moveFilesRoute && request.method === "GET") {
-    const board = currentBoard(state, { cwd, persist });
-    const requestUrl = new URL(request.url ?? "/", "http://localhost");
-    const filePath = requestUrl.searchParams.get("path") ?? undefined;
-    if (moveFilesRoute.action === "tree") {
-      sendJson(response, 200, { tree: readMoveFileTree(board, moveFilesRoute.moveId, cwd, filePath) });
-      return true;
-    }
-    if (moveFilesRoute.action === "blob") {
-      sendJson(response, 200, { blob: readMoveFileBlob(board, moveFilesRoute.moveId, cwd, filePath ?? "") });
-      return true;
-    }
-    if (moveFilesRoute.action === "diff") {
-      sendJson(response, 200, { diff: readMoveDiff(board, moveFilesRoute.moveId, cwd) });
-      return true;
-    }
-  }
-
-  if (request.method === "GET" && suffix.startsWith("/moves/") && suffix.endsWith("/diff")) {
-    const moveId = decodeURIComponent(suffix.slice("/moves/".length, -"/diff".length));
-    sendJson(response, 200, { diff: readMoveDiff(currentBoard(state, { cwd, persist }), moveId, cwd) });
-    return true;
-  }
-
-  if (request.method === "POST" && suffix === "/commands") {
-    const body = await readJson<StudioCommandRequest>(request);
-    const commands = isCommandBatch(body) ? body.commands : [body];
-    sendJson(response, 202, await executeStudioCommands(commands, state, { cwd, persist }));
-    return true;
-  }
-
-  if (request.method === "POST" && (suffix === "/runs/start" || suffix === "/executes/start")) {
-    const body = await readJson<StudioRunStartRequest>(request);
-    const activeError = roadmapActivePreflight(roadmapId, options.roadmapRegistryPath);
-    if (activeError) {
-      sendJson(response, 409, activeError);
-      return true;
-    }
-    const codexStatus = await getCodexRuntimeStatus({ env: options.codexEnv, force: true });
-    const codexError = codexRuntimePreflightError(codexStatus);
-    if (codexError) {
-      sendJson(response, 409, codexError);
-      return true;
-    }
-    sendJson(response, 202, await startStudioRun(body, state, {
-      cwd,
-      persist,
-      roadmapId,
-      runner: options.runner,
-      apmSkillRegistryClient: options.apmSkillRegistryClient,
-      routeWorktreeRoot: options.routeWorktreeRoot
-    }));
-    return true;
-  }
-
-  if (request.method === "POST" && (suffix === "/runs/pause" || suffix === "/executes/pause")) {
-    const body = await readJson<StudioRunActionRequest>(request);
-    sendJson(response, 202, await pauseStudioRun(body, state, { cwd, persist, runner: options.runner }));
-    return true;
-  }
-
-  if (request.method === "POST" && (suffix === "/runs/resume" || suffix === "/executes/resume")) {
-    const body = await readJson<StudioRunActionRequest>(request);
-    sendJson(response, 202, await resumeStudioRun(body, state, {
-      cwd,
-      persist,
-      runner: options.runner,
-      apmSkillRegistryClient: options.apmSkillRegistryClient
-    }));
-    return true;
-  }
-
-  if (request.method === "POST" && (suffix === "/runs/stop" || suffix === "/executes/stop")) {
-    const body = await readJson<StudioRunActionRequest>(request);
-    sendJson(response, 202, await stopStudioRun(body, state, { cwd, persist, runner: options.runner }));
-    return true;
-  }
-
-  if (request.method === "POST" && (suffix === "/runs/complete-move" || suffix === "/executes/complete-move")) {
-    const body = await readJson<StudioMoveCompletionRequest>(request);
-    sendJson(response, 202, await completeStudioMove(body, state, { cwd, persist }));
-    return true;
-  }
-
-  if (request.method === "POST" && suffix === "/lines/accept") {
-    const body = await readJson<StudioLineDecisionRequest>(request);
-    sendJson(response, 202, await decideStudioLine("accept", body, state, { cwd, persist }));
-    return true;
-  }
-
-  if (request.method === "POST" && suffix === "/lines/reject") {
-    const body = await readJson<StudioLineDecisionRequest>(request);
-    sendJson(response, 202, await decideStudioLine("reject", body, state, { cwd, persist }));
-    return true;
-  }
-
-  return false;
-}
 
 type ArtifactActionApiOptions = {
   cwd: string;
@@ -3837,48 +2819,6 @@ type ArtifactActionApiRoute =
   | { resource: "run"; runId: string; action: "stop" }
   | { resource: "run"; runId: string; action: "proxy"; alias: string; path: string };
 
-type AgentSessionApiRoute =
-  | { action: "show"; sessionId: string }
-  | { action: "events"; sessionId: string };
-
-type MoveFilesApiRoute =
-  | { action: "tree"; moveId: string }
-  | { action: "blob"; moveId: string }
-  | { action: "diff"; moveId: string };
-
-function parseAgentSessionRoute(suffix: string): AgentSessionApiRoute | undefined {
-  if (!suffix.startsWith("/")) {
-    return undefined;
-  }
-  if (suffix.endsWith("/events")) {
-    const rawSessionId = suffix.slice(1, -"/events".length);
-    return rawSessionId ? { action: "events", sessionId: decodeURIComponent(rawSessionId) } : undefined;
-  }
-  const rawSessionId = suffix.slice(1);
-  return rawSessionId ? { action: "show", sessionId: decodeURIComponent(rawSessionId) } : undefined;
-}
-
-function parseMoveFilesRoute(suffix: string): MoveFilesApiRoute | undefined {
-  if (!suffix.startsWith("/moves/")) {
-    return undefined;
-  }
-  const parts = suffix.slice(1).split("/");
-  if (parts.length < 4 || parts[0] !== "moves" || parts[2] !== "files") {
-    return undefined;
-  }
-  const moveId = decodeURIComponent(parts[1]);
-  if (parts[3] === "tree") {
-    return { action: "tree", moveId };
-  }
-  if (parts[3] === "blob") {
-    return { action: "blob", moveId };
-  }
-  if (parts[3] === "diff") {
-    return { action: "diff", moveId };
-  }
-  return undefined;
-}
-
 type HunsuDraftApiOptions = {
   cwd: string;
   persist: boolean;
@@ -3889,10 +2829,6 @@ type HunsuDraftApiOptions = {
   apmSkillRegistryClient?: ApmSkillRegistryClient;
   routeWorktreeRoot?: string;
 };
-
-function defaultBridgeApiBaseUrl(cwd: string): string {
-  return endpointUrl(unwrapConfigResult(resolveBridgeRuntimeConfig(process.env, { cwd })).bridgeApi);
-}
 
 async function handleHunsuDraftApiRequest(
   suffix: string,
@@ -5421,17 +4357,19 @@ async function handleArtifactActionApiRequest(
   response: ServerResponse,
   options: ArtifactActionApiOptions
 ): Promise<boolean> {
-  if (request.method === "GET" && (path.endsWith("/artifact-actions") || path === "/artifact-actions" || path === "/api/artifact-actions")) {
+  const routePath = normalizeArtifactActionRoutePath(path);
+  const routeParts = routePath.split("/").filter(Boolean);
+  if (request.method === "GET" && routeParts.length === 1 && routeParts[0] === "artifact-actions") {
     sendJson(response, 200, { actions: listArtifactActions(options.cwd) });
     return true;
   }
 
-  if (request.method === "GET" && (path.endsWith("/action-runs") || path === "/action-runs" || path === "/api/action-runs")) {
+  if (request.method === "GET" && routeParts.length === 1 && routeParts[0] === "action-runs") {
     sendJson(response, 200, { runs: listArtifactActionRuns(options.cwd) });
     return true;
   }
 
-  const route = parseArtifactActionApiRoute(path.startsWith("/api/") ? path.replace(/^\/api/, "") : path);
+  const route = parseArtifactActionApiRoute(routePath);
   if (!route) {
     return false;
   }
@@ -5463,6 +4401,13 @@ async function handleArtifactActionApiRequest(
   }
 
   return false;
+}
+
+function normalizeArtifactActionRoutePath(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  const start = parts[0] === "api" ? 1 : 0;
+  const resourceIndex = parts.findIndex((part, index) => index >= start && (part === "artifact-actions" || part === "action-runs"));
+  return resourceIndex >= 0 ? `/${parts.slice(resourceIndex).join("/")}` : path;
 }
 
 export function planStudioArtifactActionRun(request: StudioActionRunStartRequest, options: ArtifactActionApiOptions): ArtifactActionRunPlan {
@@ -5769,289 +4714,6 @@ function roadmapRegistryEntryWithInspection(
     type: inspection.kind === "unsupported" ? "missing" : "roadmap",
     primaryAction: inspection.kind === "unsupported" ? "remove" : "repair"
   };
-}
-
-export function listRemoteBridgeDevices(options: { relayRegistryPath?: string; userId?: string } = {}): RemoteBridgeDevice[] {
-  const devices = readRemoteBridgeDeviceStore(options).devices;
-  return options.userId ? devices.filter(device => device.userId === options.userId) : devices;
-}
-
-export async function listRemoteBridgeDevicesForRequest(
-  request: IncomingMessage,
-  runtimeConfig: BridgeRuntimeConfig,
-  options: { relayRegistryPath?: string; userId?: string } = {}
-): Promise<RemoteBridgeDevice[]> {
-  const relay = relayRequestConfig(request, runtimeConfig);
-  if (!relay) {
-    return listRemoteBridgeDevices(options);
-  }
-  const response = await fetch(new URL("/v1/devices", relay.relayApiUrl), {
-    headers: {
-      "authorization": `Bearer ${relay.accessToken}`
-    }
-  });
-  const body = await response.json().catch(() => undefined) as { devices?: RemoteBridgeDevice[]; error?: string } | undefined;
-  if (!response.ok) {
-    throw new Error(body?.error ?? `Relay device list failed with HTTP ${response.status}.`);
-  }
-  const devices = Array.isArray(body?.devices) ? body.devices.filter(isRemoteBridgeDevice) : [];
-  return options.userId ? devices.filter(device => device.userId === options.userId) : devices;
-}
-
-export function connectRemoteBridge(
-  request: RemoteBridgeConnectRequest,
-  options: { relayRegistryPath?: string } = {}
-): RemoteBridgeConnectResult {
-  const deviceId = request.deviceId?.trim();
-  const requirement: StudioBridgeRequirement = {
-    minBridgeVersion: request.minBridgeVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.minBridgeVersion,
-    requiredProtocolVersion: request.requiredProtocolVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredProtocolVersion,
-    requiredFeatures: request.requiredFeatures?.length ? request.requiredFeatures : DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredFeatures
-  };
-  if (!deviceId) {
-    const compatibility: BridgeCompatibility = { compatible: false, reason: "bridge_update_needed", message: "Choose a Remote Bridge device before connecting." };
-    return {
-      connection: {
-        ...createDisconnectedStudioConnectionStatus("Choose a Remote Bridge device before connecting."),
-        compatibility
-      },
-      compatibility
-    };
-  }
-  const device = listRemoteBridgeDevices(options).find(candidate => candidate.deviceId === deviceId);
-  if (!device) {
-    const compatibility: BridgeCompatibility = { compatible: false, reason: "bridge_update_needed", message: "Remote Bridge device is not registered." };
-    return {
-      compatibility,
-      connection: {
-        mode: "remote",
-        transport: "relay",
-        health: "disconnected",
-        auth: "unknown",
-        projectAccess: "not_applicable",
-        warnings: ["relay_unavailable"],
-        error: "Remote Bridge device is not registered.",
-        version: bridgeVersionInfo(),
-        compatibility
-      }
-    };
-  }
-  const account = request.webUserId?.trim()
-    ? {
-        webUserId: request.webUserId.trim(),
-        bridgeUserId: device.userId,
-        sameUser: request.webUserId.trim() === device.userId
-      }
-    : {
-        bridgeUserId: device.userId,
-        sameUser: undefined
-      };
-  const connection = createRemoteStudioConnectionStatus({
-    device,
-    account,
-    projectAccess: request.projectPath?.trim() ? "needs_grant" : "not_applicable",
-    projectPath: request.projectPath?.trim() || undefined,
-    requirement
-  });
-  return {
-    connection,
-    device,
-    compatibility: connection.compatibility ?? { compatible: true }
-  };
-}
-
-export async function connectRemoteBridgeForRequest(
-  request: RemoteBridgeConnectRequest,
-  httpRequest: IncomingMessage,
-  runtimeConfig: BridgeRuntimeConfig,
-  options: { relayRegistryPath?: string } = {}
-): Promise<RemoteBridgeConnectResult> {
-  const relay = relayRequestConfig(httpRequest, runtimeConfig);
-  if (!relay) {
-    return connectRemoteBridge(request, options);
-  }
-  const devices = await listRemoteBridgeDevicesForRequest(httpRequest, runtimeConfig);
-  const device = devices.find(candidate => candidate.deviceId === request.deviceId?.trim());
-  if (!device) {
-    const compatibility: BridgeCompatibility = { compatible: false, reason: "bridge_update_needed", message: "Remote Bridge device is not registered." };
-    return {
-      compatibility,
-      connection: {
-        mode: "remote",
-        transport: "relay",
-        health: "disconnected",
-        auth: "unknown",
-        projectAccess: "not_applicable",
-        warnings: ["relay_unavailable"],
-        error: "Remote Bridge device is not registered.",
-        version: bridgeVersionInfo(),
-        compatibility
-      }
-    };
-  }
-  const connection = createRemoteStudioConnectionStatus({
-    device,
-    account: {
-      webUserId: request.webUserId,
-      bridgeUserId: device.userId,
-      sameUser: request.webUserId ? request.webUserId === device.userId : undefined
-    },
-    projectAccess: await remoteProjectAccessForRequest(request, httpRequest, runtimeConfig),
-    projectPath: request.projectPath?.trim() || undefined,
-    requirement: {
-      minBridgeVersion: request.minBridgeVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.minBridgeVersion,
-      requiredProtocolVersion: request.requiredProtocolVersion?.trim() || DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredProtocolVersion,
-      requiredFeatures: request.requiredFeatures?.length ? request.requiredFeatures : DEFAULT_STUDIO_BRIDGE_REQUIREMENT.requiredFeatures
-    }
-  });
-  return {
-    connection,
-    device,
-    compatibility: connection.compatibility ?? { compatible: true }
-  };
-}
-
-async function remoteProjectAccessForRequest(
-  request: RemoteBridgeConnectRequest,
-  httpRequest: IncomingMessage,
-  runtimeConfig: BridgeRuntimeConfig
-): Promise<StudioConnectionStatus["projectAccess"]> {
-  const projectPath = request.projectPath?.trim();
-  if (!projectPath) {
-    return "not_applicable";
-  }
-  const relay = relayRequestConfig(httpRequest, runtimeConfig);
-  if (!relay || !request.deviceId?.trim()) {
-    return "needs_grant";
-  }
-  const response = await fetch(new URL("/v1/project-grants/status", relay.relayApiUrl), {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${relay.accessToken}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      deviceId: request.deviceId.trim(),
-      projectPath,
-      requestedScopes: ["remoteRelay.access"]
-    } satisfies RemoteProjectGrantStatusRequest)
-  });
-  const body = await response.json().catch(() => undefined) as Partial<RemoteProjectGrantStatusResult> | undefined;
-  if (!response.ok || (body?.projectAccess !== "granted" && body?.projectAccess !== "needs_grant" && body?.projectAccess !== "denied")) {
-    return "denied";
-  }
-  return body.projectAccess;
-}
-
-export async function routeRemoteBridgeCommand(
-  command: RemoteBridgeCommandRequest,
-  request: IncomingMessage,
-  runtimeConfig: BridgeRuntimeConfig
-): Promise<RemoteBridgeCommandResult> {
-  const relay = relayRequestConfig(request, runtimeConfig);
-  if (!relay) {
-    return { ok: false, status: 503, error: "Remote Relay is not configured for this Bridge API." };
-  }
-  const response = await fetch(new URL("/v1/commands", relay.relayApiUrl), {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${relay.accessToken}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(command)
-  });
-  const body = await response.json().catch(() => undefined) as RemoteBridgeCommandResult | undefined;
-  if (!body) {
-    return { ok: false, status: response.status, error: `Relay command returned HTTP ${response.status}.` };
-  }
-  return body.status === undefined ? { ...body, status: response.status } : body;
-}
-
-export async function streamRemoteBridgeCommand(
-  command: RemoteBridgeCommandRequest,
-  request: IncomingMessage,
-  response: ServerResponse,
-  runtimeConfig: BridgeRuntimeConfig
-): Promise<void> {
-  const relay = relayRequestConfig(request, runtimeConfig);
-  if (!relay) {
-    sendJson(response, 503, { ok: false, error: "Remote Relay is not configured for this Bridge API." });
-    return;
-  }
-  const controller = new AbortController();
-  request.on("close", () => controller.abort());
-  const upstream = await fetch(new URL("/v1/commands/events", relay.relayApiUrl), {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${relay.accessToken}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(command),
-    signal: controller.signal
-  }).catch(error => {
-    if (error instanceof Error && error.name === "AbortError") {
-      return undefined;
-    }
-    throw error;
-  });
-  if (!upstream) {
-    return;
-  }
-  if (!upstream.ok) {
-    const body = await upstream.json().catch(() => undefined) as { error?: string; message?: string } | undefined;
-    sendJson(response, upstream.status, { ok: false, error: body?.error ?? body?.message ?? `Relay event stream returned HTTP ${upstream.status}.` });
-    return;
-  }
-  if (!upstream.body) {
-    sendJson(response, 502, { ok: false, error: "Relay did not return an event stream." });
-    return;
-  }
-  response.writeHead(200, {
-    ...securityHeadersForResponse(response),
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
-    "connection": "keep-alive"
-  });
-  response.flushHeaders?.();
-  const reader = upstream.body.getReader();
-  try {
-    while (!response.destroyed) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-      response.write(Buffer.from(value));
-    }
-  } finally {
-    reader.releaseLock();
-    if (!response.destroyed) {
-      response.end();
-    }
-  }
-}
-
-function remoteBridgeCommandFromEventUrl(url: URL): RemoteBridgeCommandRequest | undefined {
-  const raw = url.searchParams.get("command");
-  if (!raw) {
-    return undefined;
-  }
-  try {
-    const parsed = JSON.parse(raw) as Partial<RemoteBridgeCommandRequest>;
-    return isRemoteBridgeCommandRequest(parsed) ? parsed : undefined;
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function isRemoteBridgeCommandRequest(value: unknown): value is RemoteBridgeCommandRequest {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  const candidate = value as Partial<RemoteBridgeCommandRequest>;
-  return typeof candidate.deviceId === "string"
-    && candidate.deviceId.trim().length > 0
-    && typeof candidate.command === "string"
-    && isRelayCommandName(candidate.command);
 }
 
 export function removeRoadmapRegistryEntry(
@@ -7447,93 +6109,6 @@ function readRoadmapRegistry(options: { roadmapRegistryPath?: string } = {}): Ro
   }
 }
 
-function readRemoteBridgeDeviceStore(options: { relayRegistryPath?: string } = {}): RemoteBridgeDeviceStore {
-  const path = remoteBridgeDeviceRegistryPath(options);
-  if (!existsSync(path)) {
-    return { schema: "hunsu.relay-registry.v1", devices: [] };
-  }
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RemoteBridgeDeviceStore>;
-    return {
-      schema: "hunsu.relay-registry.v1",
-      devices: Array.isArray(parsed.devices) ? parsed.devices.filter(isRemoteBridgeDevice) : []
-    };
-  } catch (_error) {
-    return { schema: "hunsu.relay-registry.v1", devices: [] };
-  }
-}
-
-function relayRequestConfig(request: IncomingMessage, runtimeConfig: BridgeRuntimeConfig): { relayApiUrl: string; accessToken: string } | undefined {
-  const relayConfig = unwrapConfigResult(resolveRelayClientConfig(runtimeConfig.processEnv));
-  const relayApiUrl = relayConfig.relayApiUrl;
-  const accessToken = requestHeader(request, "x-hunsu-relay-token")
-    ?? relayAccessTokenFromAuthorization(request)
-    ?? relayAccessTokenFromQuery(request)
-    ?? runtimeConfig.processEnv.HUNSU_RELAY_WEB_TOKEN?.trim();
-  return relayApiUrl && accessToken
-    ? { relayApiUrl, accessToken }
-    : undefined;
-}
-
-function relayAccessTokenFromAuthorization(request: IncomingMessage): string | undefined {
-  const authorization = requestHeader(request, "authorization");
-  const match = authorization?.match(/^Relay\s+(.+)$/i);
-  return match?.[1]?.trim();
-}
-
-function relayAccessTokenFromQuery(request: IncomingMessage): string | undefined {
-  try {
-    const url = new URL(request.url ?? "/", "http://localhost");
-    return url.searchParams.get("hunsuRelayToken")?.trim() || undefined;
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function isRelayCommandName(value: string): value is RelayCommandName {
-  return [
-    "health",
-    "connection.status",
-    "roadmap.registry.list",
-    "roadmap.registry.remove",
-    "roadmap.open",
-    "roadmap.port.inspect",
-    "roadmap.port.apply",
-    "roadmap.create",
-    "roadmap.board",
-    "roadmap.worktree",
-    "roadmap.skills",
-    "roadmap.commands",
-    "execute.start",
-    "execute.pause",
-    "execute.resume",
-    "execute.stop",
-    "execute.completeMove",
-    "execute.status",
-    "artifactAction.list",
-    "artifactAction.runs",
-    "artifactAction.start",
-    "artifactAction.stop",
-    "moveFile.tree",
-    "moveFile.blob",
-    "moveFile.diff",
-    "hunsuDraft.list",
-    "hunsuDraft.start",
-    "hunsuDraft.get",
-    "hunsuDraft.message",
-    "hunsuDraft.diffArtifact.create",
-    "hunsuDraft.diffArtifact.get",
-    "hunsuDraft.approve",
-    "hunsuDraft.discard",
-    "line.accept",
-    "line.reject",
-    "agentSession.list",
-    "agentSession.get",
-    "agentSession.events",
-    "live.events"
-  ].includes(value);
-}
-
 function writeRoadmapRegistry(store: RoadmapRegistryStore, options: { roadmapRegistryPath?: string } = {}): void {
   const path = roadmapRegistryPath(options);
   mkdirSync(dirname(path), { recursive: true });
@@ -7542,10 +6117,6 @@ function writeRoadmapRegistry(store: RoadmapRegistryStore, options: { roadmapReg
 
 function roadmapRegistryPath(options: { roadmapRegistryPath?: string } = {}): string {
   return resolve(options.roadmapRegistryPath ?? join(homedir(), ".config", "hunsu", "roadmaps.json"));
-}
-
-function remoteBridgeDeviceRegistryPath(options: { relayRegistryPath?: string } = {}): string {
-  return resolve(options.relayRegistryPath ?? join(homedir(), ".config", "hunsu", "relay-devices.json"));
 }
 
 function isRoadmapRegistryEntry(value: unknown): value is RoadmapRegistryEntry {
@@ -7561,90 +6132,6 @@ function isRoadmapRegistryEntry(value: unknown): value is RoadmapRegistryEntry {
 
 function existingRoadmapRemoteAccess(entry: RoadmapRegistryEntry | undefined): NonNullable<RoadmapRegistryEntry["remoteAccess"]> {
   return entry?.remoteAccess ?? { enabled: false, scopes: [] };
-}
-
-function roadmapActivePreflight(roadmapId: string, roadmapRegistryPath: string | undefined): ExecutePreflightError | undefined {
-  const entry = listManagedRoadmapRegistry({ roadmapRegistryPath }).find(candidate => candidate.roadmapId === roadmapId);
-  if (entry?.lifecycle === "active") {
-    return undefined;
-  }
-  return roadmapInactivePreflight(entry?.lifecycle, roadmapId);
-}
-
-function repositoryActivePreflight(repositoryPath: string, roadmapRegistryPath: string | undefined): ExecutePreflightError | undefined {
-  const normalizedRepositoryPath = resolve(repositoryPath);
-  const entry = listManagedRoadmapRegistry({ roadmapRegistryPath }).find(candidate => resolve(candidate.repositoryPath) === normalizedRepositoryPath);
-  if (entry?.lifecycle === "active") {
-    return undefined;
-  }
-  return roadmapInactivePreflight(entry?.lifecycle, entry?.roadmapId);
-}
-
-function roadmapInactivePreflight(lifecycle: RoadmapRegistryEntry["lifecycle"] | undefined, roadmapId: string | undefined): ExecutePreflightError {
-  const state = lifecycle ?? "missing";
-  const encodedRoadmapId = roadmapId ? encodeURIComponent(roadmapId) : undefined;
-  return {
-    area: "roadmap",
-    error: roadmapPreflightError(state),
-    message: roadmapInactiveMessage(state),
-    roadmapId,
-    lifecycle: roadmapPreflightLifecycle(state),
-    actions: [
-      { type: "open_bridge_app", label: "Open Bridge App", href: "hunsu://open" },
-      { type: "open_roadmaps", label: "Open Workspaces", href: "hunsu://workspaces" },
-      ...(encodedRoadmapId && state === "inactive"
-        ? [{ type: "activate_roadmap" as const, label: "Activate workspace", href: `hunsu://activate-roadmap?roadmapId=${encodedRoadmapId}`, roadmapId }]
-        : [])
-    ]
-  };
-}
-
-function roadmapPreflightError(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing"): Extract<ExecutePreflightError, { area: "roadmap" }>["error"] {
-  switch (lifecycle) {
-    case "inactive":
-      return "ROADMAP_INACTIVE";
-    case "needs_upgrade":
-      return "ROADMAP_NEEDS_UPGRADE";
-    case "error":
-      return "ROADMAP_UNHEALTHY";
-    case "missing":
-    case "active":
-    default:
-      return "ROADMAP_MISSING";
-  }
-}
-
-function roadmapPreflightLifecycle(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing"): Extract<ExecutePreflightError, { area: "roadmap" }>["lifecycle"] {
-  return lifecycle === "active" ? "missing" : lifecycle;
-}
-
-function roadmapInactiveMessage(lifecycle: RoadmapRegistryEntry["lifecycle"] | "missing"): string {
-  switch (lifecycle) {
-    case "inactive":
-      return "This workspace is inactive. Activate it in Hunsu Bridge App before starting Execute.";
-    case "missing":
-      return "This workspace is missing from the active registry or its project path cannot be found. Repair or activate it in Hunsu Bridge App before starting Execute.";
-    case "needs_upgrade":
-      return "This workspace needs an upgrade before Execute can start.";
-    case "error":
-      return "This workspace is not healthy. Repair it in Hunsu Bridge App before starting Execute.";
-    case "active":
-      return "This workspace is active.";
-    default:
-      return "This workspace is not active. Activate or repair it in Hunsu Bridge App before starting Execute.";
-  }
-}
-
-function isRemoteBridgeDevice(value: unknown): value is RemoteBridgeDevice {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  const candidate = value as Partial<RemoteBridgeDevice>;
-  return typeof candidate.deviceId === "string"
-    && typeof candidate.deviceName === "string"
-    && typeof candidate.userId === "string"
-    && typeof candidate.registeredAt === "string"
-    && (candidate.status === "online" || candidate.status === "offline");
 }
 
 function createRoadmapId(repositoryPath: string): string {
@@ -8387,6 +6874,11 @@ function isCommandBatch(value: StudioCommandRequest): value is { commands: Comma
   return typeof value === "object" && value !== null && "commands" in value && Array.isArray(value.commands);
 }
 
+function studioCommandsFromRequestBody(value: unknown): Command[] {
+  const request = value as StudioCommandRequest;
+  return isCommandBatch(request) ? request.commands : [request as Command];
+}
+
 function currentEvents(state: StudioServerState, options: { cwd: string; persist: boolean }): DomainEvent[] {
   return options.persist ? loadDomainStore(options.cwd).events : state.events;
 }
@@ -8397,7 +6889,7 @@ function currentBoard(state: StudioServerState, options: { cwd: string; persist:
 
 function streamStudioLiveEvents(request: IncomingMessage, response: ServerResponse, state: StudioServerState, options: { cwd?: string } = {}): void {
 		  response.writeHead(200, {
-		    ...securityHeadersForResponse(response),
+		    ...responseSecurityHeaders.get(response),
 		    "content-type": "text/event-stream; charset=utf-8",
 		    "cache-control": "no-cache, no-transform",
 		    "connection": "keep-alive"
@@ -8410,7 +6902,7 @@ function streamStudioLiveEvents(request: IncomingMessage, response: ServerRespon
 
 function streamAgentSessionEvents(request: IncomingMessage, response: ServerResponse, state: StudioServerState, options: AgentSessionSubscriptionScope = {}): void {
 		  response.writeHead(200, {
-		    ...securityHeadersForResponse(response),
+		    ...responseSecurityHeaders.get(response),
 		    "content-type": "text/event-stream; charset=utf-8",
 		    "cache-control": "no-cache, no-transform",
 		    "connection": "keep-alive"
@@ -12077,14 +10569,10 @@ function normalizeRepositoryPath(path: string): string {
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, {
-    ...securityHeadersForResponse(response),
+    ...responseSecurityHeaders.get(response),
     "content-type": "application/json; charset=utf-8",
   });
   response.end(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-function securityHeadersForResponse(response: ServerResponse): Record<string, string> {
-  return responseSecurityHeaders.get(response) ?? baseCorsHeaders();
 }
 
 async function readJson<T>(request: IncomingMessage): Promise<T> {
@@ -12093,6 +10581,18 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+}
+
+async function readOptionalJsonBody<T>(request: IncomingMessage): Promise<Partial<T>> {
+  try {
+    return await readJson<Partial<T>>(request);
+  } catch (_error) {
+    return {};
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 if (!(globalThis as { __HUNSU_BRIDGE_BUNDLED_SIDECAR?: boolean }).__HUNSU_BRIDGE_BUNDLED_SIDECAR && process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {

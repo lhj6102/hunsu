@@ -1,6 +1,5 @@
 const invoke = window.__TAURI__?.core?.invoke;
 const diagnostics = document.querySelector("#diagnostics");
-const logsPanel = document.querySelector("#logs");
 const statusEls = {
   localBridge: document.querySelector("#local-bridge"),
   codexSummary: document.querySelector("#codex-summary"),
@@ -17,6 +16,14 @@ const gitCard = document.querySelector("#git-card");
 const nodeCard = document.querySelector("#node-card");
 const remoteRoadmapList = document.querySelector("#remote-roadmap-list");
 const projectGrants = document.querySelector("#project-grants");
+const runtimeProviderList = document.querySelector("#runtime-provider-list");
+const connectionEls = {
+  localStatus: document.querySelector("#connection-local-status"),
+  remoteStatus: document.querySelector("#connection-remote-status"),
+  remoteDetail: document.querySelector("#connection-remote-detail"),
+  primaryAction: document.querySelector("#connection-primary-action"),
+  secondaryAction: document.querySelector("#connection-secondary-action")
+};
 const selectedProject = document.querySelector("#selected-project");
 const selectedProjectAction = document.querySelector("#selected-project-action");
 const codexBinaryPath = document.querySelector("#codex-binary-path");
@@ -25,12 +32,11 @@ const codexAuthPreference = document.querySelector("#codex-auth-preference");
 const codexEnvHome = document.querySelector("#codex-env-home");
 const codexEnvCommand = document.querySelector("#codex-env-command");
 const codexEnvArgs = document.querySelector("#codex-env-args");
-const openStudioButton = document.querySelector("#open-studio");
-const openStudioConnectionButton = document.querySelector("#open-studio-connection");
 let latestSnapshot = undefined;
 let selectedInspection = undefined;
 let lastHandledUiIntentId = undefined;
 let latestCodexDeviceLoginResult = undefined;
+let localBridgeAutoStartAttempted = false;
 const projectGrantScopes = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"];
 
 async function open(url) {
@@ -58,13 +64,41 @@ async function spawn(args) {
 async function refresh() {
   try {
     const stdout = await run(["snapshot"]);
-    latestSnapshot = JSON.parse(stdout);
+    latestSnapshot = await ensureLocalBridgeAvailable(JSON.parse(stdout));
     renderSnapshot(latestSnapshot);
     await handleUiIntent(latestSnapshot.uiIntent);
   } catch (error) {
     statusEls.localBridge.textContent = "Error";
     statusEls.localBridge.className = "status-error";
     diagnostics.textContent = JSON.stringify({ error: String(error) }, null, 2);
+  }
+}
+
+async function ensureLocalBridgeAvailable(snapshot) {
+  if (!invoke || localBridgeAutoStartAttempted || snapshot?.status?.localBridge !== "not-running") {
+    return snapshot;
+  }
+  localBridgeAutoStartAttempted = true;
+  try {
+    await invoke("start_bridge_sidecar", {});
+    window.setTimeout(refresh, 900);
+    return {
+      ...snapshot,
+      status: {
+        ...snapshot.status,
+        localBridge: "starting",
+        healthError: undefined
+      }
+    };
+  } catch (error) {
+    return {
+      ...snapshot,
+      status: {
+        ...snapshot.status,
+        localBridge: "error",
+        healthError: String(error)
+      }
+    };
   }
 }
 
@@ -77,23 +111,29 @@ async function handleUiIntent(intent) {
   if (intent.focus === "codex") {
     codexCard?.scrollIntoView({ block: "start" });
   }
+  if (intent.focus === "remote") {
+    connectionEls.remoteStatus?.scrollIntoView({ block: "center" });
+  }
   if (intent.action === "add-roadmap") {
+    await chooseProjectFolder();
+  }
+  if (intent.action === "add-workspace") {
     await chooseProjectFolder();
   }
 }
 
 function renderSnapshot(snapshot) {
   const status = snapshot.status;
-  statusEls.localBridge.textContent = labelLocalBridge(status.localBridge);
+  statusEls.localBridge.textContent = providerConnectionSummary(status);
   statusEls.localBridge.className = status.localBridge === "connected" ? "status-connected" : status.localBridge === "error" ? "status-error" : "status-warning";
   const codex = snapshot.prerequisites?.codex;
-  statusEls.codexSummary.textContent = codexSummary(codex);
-  statusEls.codexSummary.className = codex?.ready ? "status-connected" : codex?.recommendedAction === "install_codex" || codex?.recommendedAction === "select_codex_path" || codex?.recommendedAction === "login_codex" ? "status-warning" : "status-error";
-  const managed = snapshot.managedRoadmaps ?? snapshot.recentProjects ?? [];
-  const activeRoadmaps = activeWorkspaceSnapshots(snapshot);
-  const inactiveRoadmaps = managed.filter(project => project.lifecycle !== "active");
+  const currentProvider = currentRuntimeProvider(snapshot.providers ?? snapshot.runtimeProviders, codex);
+  statusEls.codexSummary.textContent = `${currentProvider.label} · ${providerStatusSummary(currentProvider)}`;
+  statusEls.codexSummary.className = currentProvider.ready ? "status-connected" : currentProvider.recommendedAction === "install" || currentProvider.recommendedAction === "login" || currentProvider.recommendedAction === "select_binary" ? "status-warning" : "status-error";
+  const managed = snapshot.workspaces?.managed ?? snapshot.managedRoadmaps ?? snapshot.recentProjects ?? [];
+  const activeRoadmaps = snapshot.workspaces?.active ?? managed.filter(project => project.lifecycle === "active");
+  const inactiveRoadmaps = snapshot.workspaces?.inactive ?? managed.filter(project => project.lifecycle !== "active");
   statusEls.activeRoadmaps.textContent = `${activeRoadmaps.length} active`;
-  setOpenStudioAvailability(activeRoadmaps.length > 0);
   statusEls.account.textContent = status.account;
   statusEls.remoteAccess.textContent = status.remoteAccess;
   statusEls.device.textContent = `${status.device.name}${status.device.registered ? " (registered)" : ""}`;
@@ -102,45 +142,33 @@ function renderSnapshot(snapshot) {
     diagnostics: snapshot.diagnostics,
     logs: snapshot.logLines
   }, null, 2);
-  logsPanel.textContent = (snapshot.logLines ?? []).join("\n") || "No logs yet.";
   if (snapshot.codexLogin) {
     latestCodexDeviceLoginResult = snapshot.codexLogin;
-  } else if (codex?.ready || codex?.auth?.state === "authenticated") {
+  } else if (currentProvider.ready || currentProvider.auth?.state === "authenticated") {
     latestCodexDeviceLoginResult = undefined;
   }
-  renderCodexCard(codex);
+  renderProviderCard(currentProvider);
   renderToolCards(snapshot.prerequisites?.tools);
   activeRoadmapList.replaceChildren(...roadmapRows(activeRoadmaps, "active", snapshot.projectGrants ?? []));
   inactiveRoadmapList.replaceChildren(...roadmapRows(inactiveRoadmaps, "inactive", snapshot.projectGrants ?? []));
-  remoteRoadmapList.replaceChildren(...roadmapRows(managed, "remote", snapshot.projectGrants ?? []));
+  remoteRoadmapList.replaceChildren(...roadmapRows(managed, "remote", snapshot.projectGrants ?? [], { advanced: true }));
   projectGrants.replaceChildren(...projectGrantRows(snapshot.projectGrants ?? []));
+  renderConnection(snapshot);
+  renderRuntimeProviders(snapshot.providers ?? snapshot.runtimeProviders, codex);
   renderCodexSettings(snapshot.codexSettings, snapshot.diagnostics?.app?.codex);
 }
 
-function activeWorkspaceSnapshots(snapshot) {
-  const managed = snapshot?.managedRoadmaps ?? snapshot?.recentProjects ?? [];
-  return managed.filter(project => project.lifecycle === "active");
-}
-
-function setOpenStudioAvailability(available) {
-  for (const button of [openStudioButton, openStudioConnectionButton]) {
-    button.hidden = !available;
-    button.disabled = !available;
-    button.title = available ? "Open Studio" : "Activate a workspace before opening Studio.";
-  }
-}
-
-function roadmapRows(projects, lifecycle, grants) {
+function roadmapRows(projects, lifecycle, grants, options = {}) {
   if (!projects.length) {
     const empty = document.createElement("div");
     empty.className = "empty-row";
-    empty.textContent = lifecycle === "active" ? "No active workspaces." : lifecycle === "remote" ? "No managed workspaces." : "No inactive workspaces.";
+    empty.textContent = lifecycle === "active" ? "No active Workspaces." : lifecycle === "remote" ? "No managed Workspaces." : "No inactive Workspaces.";
     return [empty];
   }
-  return projects.map(project => projectRow(project, grants, lifecycle));
+  return projects.map(project => projectRow(project, grants, options));
 }
 
-function projectRow(project, grants = [], lifecycle = project.lifecycle) {
+function projectRow(project, grants = [], options = {}) {
   const row = document.createElement("div");
   row.className = "project-row";
   const body = document.createElement("div");
@@ -151,86 +179,194 @@ function projectRow(project, grants = [], lifecycle = project.lifecycle) {
   meta.className = "project-meta";
   const grant = project.projectGrant ?? grantForProject(project, grants);
   const remote = remoteAccessState(project, grant);
-  meta.textContent = project.lifecycle === "active" ? "Active workspace" : "Inactive workspace";
-  body.append(title, meta, workspaceDetails(project, grant, remote));
+  meta.textContent = (options.advanced ? [
+    `Local: ${project.lifecycle === "active" ? "Active" : "Inactive"}`,
+    `Provider: ${workspaceProviderLabel(project)}`,
+    `Remote: ${remote.label}`,
+    project.health,
+    project.lastKnownBranch,
+    project.lastOpenedAt ? new Date(project.lastOpenedAt).toLocaleString() : undefined,
+    project.repositoryPath
+  ] : [
+    project.lifecycle === "active" ? "Active" : "Inactive",
+    `Provider: ${workspaceProviderLabel(project)}`,
+    project.health
+  ]).filter(Boolean).join(" · ");
+  body.append(title, meta);
+  if (options.advanced) {
+    body.append(scopeControls(project, grant, remote));
+  }
   const buttons = document.createElement("div");
   buttons.className = "actions";
-  if (project.lifecycle === "active") {
-    const openButton = document.createElement("button");
-    openButton.className = "primary";
-    openButton.textContent = "Open Studio";
-    openButton.disabled = project.health !== "ok";
-    openButton.addEventListener("click", async () => {
-      await spawn(["open-roadmap", project.roadmapId]);
+  const action = project.primaryAction || (project.health === "ok" ? "open" : "remove");
+  if (project.lifecycle === "active" || action === "repair") {
+    const button = document.createElement("button");
+    button.textContent = actionLabel(action);
+    button.addEventListener("click", async () => {
+      if (action === "open") {
+        await spawn(["open-roadmap", project.roadmapId]);
+      } else if (action === "repair") {
+        await spawn(["create", project.repositoryPath]);
+      } else {
+        await run(["projects", "remove", "--roadmap-id", project.roadmapId]);
+      }
       await refresh();
     });
-    buttons.append(openButton);
+    buttons.append(button);
   }
-  if (project.lifecycle === "inactive") {
-    const activateButton = document.createElement("button");
-    activateButton.className = "primary";
-    activateButton.textContent = "Activate";
-    activateButton.addEventListener("click", async () => {
-      await run(["roadmaps", "activate", project.roadmapId]);
-      await refresh();
-    });
-    buttons.append(activateButton);
-  } else {
-    const deactivateButton = document.createElement("button");
-    deactivateButton.textContent = "Deactivate";
-    deactivateButton.addEventListener("click", async () => {
-      await run(["roadmaps", "deactivate", project.roadmapId]);
-      await refresh();
-    });
-    buttons.append(deactivateButton);
-  }
-  if (project.lifecycle !== "active") {
-    const removeButton = document.createElement("button");
-    removeButton.textContent = "Remove";
-    removeButton.addEventListener("click", async () => {
-      await run(["roadmaps", "remove", project.roadmapId]);
-      await refresh();
-    });
-    buttons.append(removeButton);
-  }
-  row.append(body, buttons);
-  return row;
-}
-
-function workspaceDetails(project, grant, remote) {
-  const details = document.createElement("details");
-  const summary = document.createElement("summary");
-  summary.textContent = "Details";
-  const content = document.createElement("div");
-  content.className = "project-meta";
-  content.textContent = [
-    `Path: ${project.repositoryPath}`,
-    `Health: ${project.health}`,
-    project.lastKnownBranch ? `Git branch: ${project.lastKnownBranch}` : undefined,
-    `Codex: ${project.codex?.readyForExecute ? "Ready" : "Not Ready"}`,
-    `Remote Access: ${remote.label}`,
-    project.lastOpenedAt ? `Last opened: ${new Date(project.lastOpenedAt).toLocaleString()}` : undefined
-  ].filter(Boolean).join(" · ");
-  const advancedActions = document.createElement("div");
-  advancedActions.className = "actions";
-  const remoteButton = document.createElement("button");
-  remoteButton.textContent = remote.enabled ? "Disable Remote Access" : "Enable Remote Access";
-  remoteButton.disabled = !remote.available;
-  remoteButton.title = remote.available ? remoteButton.textContent : remote.reason;
-  remoteButton.addEventListener("click", async () => {
-    await run(["roadmaps", "remote", remote.enabled ? "disable" : "enable", project.roadmapId]);
+  const lifecycleButton = document.createElement("button");
+  lifecycleButton.textContent = project.lifecycle === "inactive" ? "Activate" : "Deactivate";
+  lifecycleButton.addEventListener("click", async () => {
+    await run(["roadmaps", project.lifecycle === "inactive" ? "activate" : "deactivate", project.roadmapId]);
     await refresh();
   });
-  advancedActions.append(remoteButton);
+  buttons.append(lifecycleButton);
+  if (options.advanced) {
+    const remoteButton = document.createElement("button");
+    remoteButton.textContent = remote.enabled ? "Disable Remote Access" : "Enable Remote Access";
+    remoteButton.disabled = !remote.available;
+    remoteButton.title = remote.available ? remoteButton.textContent : remote.reason;
+    remoteButton.className = remote.enabled ? "" : remote.available ? "primary" : "";
+    remoteButton.addEventListener("click", async () => {
+      await run(["roadmaps", "remote", remote.enabled ? "disable" : "enable", project.roadmapId]);
+      await refresh();
+    });
+    buttons.append(remoteButton);
+  }
   const removeButton = document.createElement("button");
-  removeButton.textContent = "Remove from Bridge";
+  removeButton.textContent = "Remove";
   removeButton.addEventListener("click", async () => {
     await run(["roadmaps", "remove", project.roadmapId]);
     await refresh();
   });
-  advancedActions.append(removeButton);
-  details.append(summary, content, advancedActions);
-  return details;
+  buttons.append(removeButton);
+  row.append(body, buttons);
+  return row;
+}
+
+function renderConnection(snapshot) {
+  const status = snapshot.status ?? {};
+  const signedIn = !String(status.account ?? "").toLowerCase().includes("signed out");
+  connectionEls.localStatus.textContent = `This computer · ${labelLocalBridge(status.localBridge)}`;
+  connectionEls.localStatus.className = status.localBridge === "connected" ? "project-meta status-connected" : status.localBridge === "error" ? "project-meta status-error" : "project-meta status-warning";
+  const remoteAccess = status.remoteAccess ?? "Off";
+  const remoteOn = remoteAccess === "On" || remoteAccess === "Registered but offline";
+  if (!signedIn) {
+    connectionEls.remoteStatus.textContent = "Sign in to use this computer from Hunsu Web when away.";
+    connectionEls.remoteStatus.className = "project-meta";
+    connectionEls.remoteDetail.textContent = "";
+    configureConnectionButton(connectionEls.primaryAction, "Sign in to Hunsu", "sign-in", true);
+    configureConnectionButton(connectionEls.secondaryAction, "", "", false);
+    return;
+  }
+  if (remoteOn) {
+    const publishedCount = publishedWorkspaceCount(snapshot);
+    connectionEls.remoteStatus.textContent = `Remote · ${remoteAccess === "On" ? "On" : "Registered but offline"}`;
+    connectionEls.remoteStatus.className = remoteAccess === "On" ? "project-meta status-connected" : "project-meta status-warning";
+    connectionEls.remoteDetail.textContent = [
+      `Device: ${status.device?.name ?? "This computer"}`,
+      `Published workspaces: ${publishedCount}`
+    ].join("\n");
+    configureConnectionButton(connectionEls.primaryAction, "Disable Remote Access", "disable-remote", true);
+    configureConnectionButton(connectionEls.secondaryAction, "Sign out", "sign-out", true);
+    return;
+  }
+  connectionEls.remoteStatus.textContent = "Remote · Off";
+  connectionEls.remoteStatus.className = "project-meta";
+  connectionEls.remoteDetail.textContent = "Use this computer from Hunsu Web when away.";
+  configureConnectionButton(connectionEls.primaryAction, "Enable Remote Access", "enable-remote", true);
+  configureConnectionButton(connectionEls.secondaryAction, "Sign out", "sign-out", true);
+}
+
+function publishedWorkspaceCount(snapshot) {
+  const activeWorkspaces = snapshot.workspaces?.active
+    ?? (snapshot.managedRoadmaps ?? []).filter(project => project.lifecycle === "active")
+    ?? [];
+  return activeWorkspaces.length;
+}
+
+function configureConnectionButton(button, label, action, visible) {
+  button.textContent = label;
+  button.dataset.action = action;
+  button.hidden = !visible;
+  button.disabled = !visible;
+}
+
+function renderRuntimeProviders(runtimeProviders, codex) {
+  const currentProviderId = runtimeProviders?.currentProviderId ?? "codex";
+  const providers = (runtimeProviders?.providers?.length ? runtimeProviders.providers : [{
+    providerId: "codex",
+    label: "Codex",
+    ready: codex?.ready,
+    recommendedAction: providerRecommendedActionFromCodex(codex),
+    safeMessage: codexSummary(codex)
+  }]).map(provider => ({
+    group: provider.providerId === currentProviderId ? "Current" : "Coming later",
+    label: provider.label,
+    status: provider.providerId === currentProviderId
+      ? providerStatusSummary(provider)
+      : provider.safeMessage ?? providerStatusSummary(provider)
+  }));
+  runtimeProviderList.replaceChildren(...providers.map(provider => runtimeProviderRow(provider)));
+}
+
+function currentRuntimeProvider(runtimeProviders, codex) {
+  const currentProviderId = runtimeProviders?.currentProviderId ?? "codex";
+  if (runtimeProviders?.current?.providerId === currentProviderId) {
+    return runtimeProviders.current;
+  }
+  const current = runtimeProviders?.providers?.find(provider => provider.providerId === currentProviderId);
+  if (current) return current;
+  return {
+    providerId: "codex",
+    label: "Codex",
+    ready: codex?.ready,
+    recommendedAction: providerRecommendedActionFromCodex(codex),
+    safeMessage: codexSummary(codex)
+  };
+}
+
+function workspaceProviderLabel(project) {
+  const provider = project.provider ?? {
+    providerId: "codex",
+    label: "Codex",
+    readyForExecute: project.codex?.readyForExecute
+  };
+  return `${provider.label} ${provider.readyForExecute ? "Ready" : "Not Ready"}`;
+}
+
+function providerRecommendedActionFromCodex(codex) {
+  if (codex?.recommendedAction === "install_codex") return "install";
+  if (codex?.recommendedAction === "select_binary") return "select_binary";
+  if (codex?.recommendedAction === "login_codex") return "login";
+  if (codex?.recommendedAction === "recheck") return "recheck";
+  return codex?.ready ? "none" : "recheck";
+}
+
+function providerStatusSummary(provider) {
+  if (provider?.usage?.rateLimited) return "Rate Limited";
+  if (provider?.ready) return "Ready";
+  if (provider?.recommendedAction === "install") return "Not Found";
+  if (provider?.recommendedAction === "select_binary") return "Select Binary";
+  if (provider?.recommendedAction === "login") return "Login Required";
+  if (provider?.recommendedAction === "configure") return "Setup Required";
+  if (provider?.recommendedAction === "recheck") return "Needs Attention";
+  return provider?.safeMessage ?? "Unknown";
+}
+
+function runtimeProviderRow(provider) {
+  const row = document.createElement("div");
+  row.className = "project-row";
+  const body = document.createElement("div");
+  const title = document.createElement("div");
+  title.className = "project-title";
+  title.textContent = provider.label;
+  const meta = document.createElement("div");
+  meta.className = "project-meta";
+  meta.textContent = `${provider.group} · ${provider.status}`;
+  body.append(title, meta);
+  row.append(body);
+  return row;
 }
 
 function grantForProject(project, grants) {
@@ -241,7 +377,7 @@ function remoteAccessState(project, grant) {
   const available = project.lifecycle === "active";
   const scopes = scopesForProject(project, grant);
   const enabled = available && scopes.includes("remoteRelay.access") && grant?.active !== false;
-  const reason = available ? undefined : project.remoteAccess?.reason ?? "Inactive Roadmaps are not exposed over Relay.";
+  const reason = available ? undefined : project.remoteAccess?.reason ?? "Inactive Workspaces are not available for Remote Access.";
   return {
     available,
     enabled,
@@ -296,129 +432,121 @@ function normalizePath(path) {
   return String(path ?? "").replace(/\/+$/, "");
 }
 
-function renderCodexCard(codex) {
+function renderProviderCard(provider) {
   codexCard.replaceChildren();
   const row = document.createElement("div");
   row.className = "project-row";
   const body = document.createElement("div");
   const title = document.createElement("div");
   title.className = "project-title";
-  title.textContent = "Codex";
+  title.textContent = provider?.label ?? "Provider";
   const meta = document.createElement("div");
   meta.className = "project-meta";
-  meta.textContent = codexPrimaryMessage(codex);
-  body.append(title, meta, codexDeviceLoginStatus(), codexDetails(codex));
+  meta.textContent = providerStatusSummary(provider);
+  body.append(title, meta, codexDeviceLoginStatus());
   const buttons = document.createElement("div");
   buttons.className = "actions";
-  const recheck = document.createElement("button");
-  recheck.textContent = "Recheck";
-  recheck.addEventListener("click", async () => {
-    await run(["codex", "recheck"]);
-    await refresh();
-  });
-  if (codex?.recommendedAction !== "login_codex") {
-    buttons.append(recheck);
-  }
-  if (codex?.recommendedAction === "install_codex" || codex?.recommendedAction === "select_codex_path") {
-    const selectExisting = document.createElement("button");
-    selectExisting.className = codex?.recommendedAction === "select_codex_path" ? "primary" : "";
-    selectExisting.textContent = "Select existing Codex";
-    selectExisting.addEventListener("click", selectCodexBinary);
-    buttons.append(selectExisting);
-  }
-  if (codex?.recommendedAction === "install_codex") {
+  if (provider?.recommendedAction === "install") {
     const install = document.createElement("button");
     install.className = "primary";
-    install.textContent = "Install Codex";
+    install.textContent = `Install ${provider.label}`;
     install.addEventListener("click", async () => {
-      diagnostics.textContent = await run(["codex", "install"]);
+      if (provider.providerId !== "codex") {
+        selectTab("advanced");
+        return;
+      }
+      const confirmed = window.confirm("Install Codex with the OpenAI Codex npm package now?");
+      if (!confirmed) {
+        diagnostics.textContent = "Codex install was not started.";
+        return;
+      }
+      diagnostics.textContent = await run(["codex", "install", "--confirm"]);
+      await refresh();
     });
     buttons.append(install);
-    const copy = document.createElement("button");
-    copy.textContent = "Copy Install Command";
-    copy.addEventListener("click", async () => {
-      await navigator.clipboard.writeText("curl -fsSL https://chatgpt.com/codex/install.sh | sh");
-    });
-    buttons.append(copy);
+    const existing = document.createElement("button");
+    existing.textContent = `Select Existing ${provider.label}`;
+    existing.addEventListener("click", chooseCodexBinary);
+    buttons.append(existing);
   }
-  if (codex?.recommendedAction === "login_codex") {
+  if (provider?.recommendedAction === "select_binary") {
+    const existing = document.createElement("button");
+    existing.className = "primary";
+    existing.textContent = `Select Existing ${provider.label}`;
+    existing.addEventListener("click", chooseCodexBinary);
+    buttons.append(existing);
+  }
+  if (provider?.recommendedAction === "login" && provider.providerId === "codex") {
     const login = document.createElement("button");
     login.className = "primary";
-    login.textContent = "Sign in";
+    login.textContent = "Sign in with ChatGPT";
     login.addEventListener("click", startCodexChatGptLogin);
     buttons.append(login);
     const device = document.createElement("button");
-    device.textContent = "Use device code";
+    device.textContent = "Use Device Code";
     device.addEventListener("click", startCodexDeviceLogin);
     buttons.append(device);
+  }
+  if (providerNeedsAttention(provider)) {
+    const recheck = document.createElement("button");
+    recheck.className = "primary";
+    recheck.textContent = "Recheck";
+    recheck.addEventListener("click", async () => {
+      await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
+      await refresh();
+    });
     buttons.append(recheck);
   }
-  if (codex?.ready) {
-    const changePath = document.createElement("button");
-    changePath.textContent = "Change Codex path";
-    changePath.addEventListener("click", selectCodexBinary);
-    buttons.append(changePath);
+  if (provider?.recommendedAction === "none") {
+    const recheck = document.createElement("button");
+    recheck.textContent = "Recheck";
+    recheck.addEventListener("click", async () => {
+      await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
+      await refresh();
+    });
+    buttons.append(recheck);
   }
   row.append(body, buttons);
   codexCard.append(row);
+  const advancedDetails = providerAdvancedDetails(provider);
+  if (advancedDetails) {
+    codexCard.append(advancedDetails);
+  }
 }
 
-function codexPrimaryMessage(codex) {
-  if (!codex) return "Checking Codex readiness.";
-  if (codex.usage?.rateLimited) return "Temporarily unavailable.";
-  if (codex.ready) {
-    return [
-      "Ready",
-      codex.auth?.access ? `Access: ${formatCodexAccess(codex)}` : "Access: Unknown",
-      codex.cli?.version ? `Version: ${codex.cli.version}` : undefined
-    ].filter(Boolean).join(" · ");
-  }
-  if (codex.recommendedAction === "login_codex") return "Login required.";
-  if (codex.recommendedAction === "select_codex_path") {
-    return "Codex works in your terminal, but Hunsu Bridge App cannot find a usable codex.exe. Select the real codex.exe file or restart Hunsu Bridge App after updating PATH.";
-  }
-  if (codex.recommendedAction === "install_codex") return "Not found by Hunsu Bridge App. Codex may be installed, but Bridge App cannot find it.";
-  if (codex.appServer?.available === false) return "Error";
-  return codex.cli?.error || codex.auth?.error || "Codex readiness could not be confirmed.";
+function providerNeedsAttention(provider) {
+  return provider
+    && !provider.ready
+    && provider.recommendedAction !== "install"
+    && provider.recommendedAction !== "select_binary"
+    && provider.recommendedAction !== "login";
 }
 
-function codexDetails(codex) {
+function providerAdvancedDetails(provider) {
+  if (provider?.providerId !== "codex") {
+    return undefined;
+  }
   const details = document.createElement("details");
   const summary = document.createElement("summary");
-  summary.textContent = "Details";
-  const content = document.createElement("div");
-  content.className = "project-meta";
-  content.textContent = [
-    codex?.cli?.binaryPath ? `Binary path: ${codex.cli.binaryPath}` : undefined,
-    codex?.cli?.source ? `Source: ${codex.cli.source}` : undefined,
-    codex?.appServer?.available === false ? `App server: ${codex.appServer.error ?? "Unavailable"}` : undefined,
-    codex?.usage?.rateLimitSummary ? `Rate limits: ${formatRateLimit(codex)}` : undefined,
-    codex?.usage?.lastRunUsage ? `Last run: ${formatUsage(codex.usage.lastRunUsage)}` : undefined,
-    codex?.cli?.discovery?.message,
-    codex?.cli?.discovery?.candidates?.length ? `Candidates checked: ${codex.cli.discovery.candidates.length}` : undefined
+  summary.textContent = "Advanced provider details";
+  const detailRows = document.createElement("div");
+  detailRows.className = "project-meta";
+  detailRows.textContent = [
+    provider?.install?.binaryPath ? `Binary path: ${provider.install.binaryPath}` : "Binary path: Auto-detect",
+    provider?.install?.source ? `Source: ${provider.install.source}` : undefined,
+    provider?.install?.version ? `Version: ${provider.install.version}` : undefined,
+    `Auth access: ${formatProviderAccess(provider)}`,
+    `Rate limit summary: ${formatProviderRateLimit(provider)}`
   ].filter(Boolean).join("\n");
-  details.append(summary, content);
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  actions.setAttribute("style", "margin-top: 10px;");
+  const apiKey = document.createElement("button");
+  apiKey.textContent = "Use API Key - Advanced";
+  apiKey.addEventListener("click", startCodexApiKeyLogin);
+  actions.append(apiKey);
+  details.append(summary, detailRows, actions);
   return details;
-}
-
-async function selectCodexBinary() {
-  if (!invoke) {
-    selectTab("settings");
-    codexBinaryPath.focus();
-    return;
-  }
-  try {
-    const selected = await invoke("choose_codex_binary");
-    if (!selected?.path) {
-      return;
-    }
-    await run(["codex", "path", "set", selected.path]);
-    await refresh();
-  } catch (error) {
-    diagnostics.textContent = String(error);
-    selectTab("diagnostics");
-    diagnostics.hidden = false;
-  }
 }
 
 async function startCodexChatGptLogin() {
@@ -428,7 +556,7 @@ async function startCodexChatGptLogin() {
     message: "Codex login started.",
     lastOutput: "Browser login started. Complete sign-in, then click Recheck."
   };
-  renderCodexCard(latestSnapshot?.prerequisites?.codex);
+  renderProviderCard(currentRuntimeProvider(latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders, latestSnapshot?.prerequisites?.codex));
   try {
     await spawn(["codex", "login"]);
   } catch (error) {
@@ -447,7 +575,7 @@ async function startCodexDeviceLogin() {
     state: "pending",
     message: "Starting Codex device login..."
   };
-  renderCodexCard(latestSnapshot?.prerequisites?.codex);
+  renderProviderCard(currentRuntimeProvider(latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders, latestSnapshot?.prerequisites?.codex));
   try {
     await spawn(["codex", "login", "--device", "--background"]);
     latestCodexDeviceLoginResult = {
@@ -460,7 +588,7 @@ async function startCodexDeviceLogin() {
       message: String(error)
     };
   }
-  renderCodexCard(latestSnapshot?.prerequisites?.codex);
+  renderProviderCard(currentRuntimeProvider(latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders, latestSnapshot?.prerequisites?.codex));
   for (let attempt = 0; attempt < 6; attempt += 1) {
     await delay(750);
     await refresh();
@@ -470,6 +598,27 @@ async function startCodexDeviceLogin() {
   }
 }
 
+async function startCodexApiKeyLogin() {
+  latestCodexDeviceLoginResult = {
+    kind: "api_key",
+    status: "pending",
+    message: "Codex API-key configuration started.",
+    lastOutput: "Complete API-key configuration, then click Recheck."
+  };
+  renderProviderCard(currentRuntimeProvider(latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders, latestSnapshot?.prerequisites?.codex));
+  try {
+    diagnostics.textContent = await run(["codex", "login", "--api-key"]);
+  } catch (error) {
+    latestCodexDeviceLoginResult = {
+      kind: "api_key",
+      status: "failed",
+      message: "Codex API-key configuration failed to start.",
+      error: String(error)
+    };
+  }
+  await refresh();
+}
+
 function codexDeviceLoginStatus() {
   const result = latestCodexDeviceLoginResult;
   const container = document.createElement("div");
@@ -477,11 +626,11 @@ function codexDeviceLoginStatus() {
     return container;
   }
   container.className = "message";
-  if (result.kind === "chatgpt") {
+  if (result.kind === "chatgpt" || result.kind === "api_key") {
     const failed = result.status === "failed" || result.state === "failed";
     const lines = [
-      failed ? result.message || "Codex login failed to start." : "Codex login started.",
-      failed ? result.error : "Complete sign-in in your browser, then click Recheck."
+      failed ? result.message || "Codex login failed to start." : result.message || "Codex login started.",
+      failed ? result.error : result.kind === "api_key" ? "Complete API-key configuration, then click Recheck." : "Complete sign-in in your browser, then click Recheck."
     ].filter(Boolean);
     container.textContent = lines.join("\n");
     if (failed) {
@@ -554,13 +703,13 @@ function toolRow(titleText, tool) {
 
 function codexSummary(codex) {
   if (!codex) return "Unknown";
-  if (codex.usage?.rateLimited) return "Temporarily unavailable";
+  if (codex.usage?.rateLimited) return "Rate Limited";
   if (codex.ready) return "Ready";
-  if (codex.recommendedAction === "select_codex_path") return "Needs setup";
-  if (codex.recommendedAction === "install_codex") return "Needs setup";
-  if (codex.recommendedAction === "login_codex") return "Needs setup";
-  if (!codex.appServer?.available) return "Error";
-  return "Error";
+  if (codex.recommendedAction === "install_codex") return "Not Found";
+  if (codex.recommendedAction === "select_binary") return "Select Binary";
+  if (codex.recommendedAction === "login_codex") return "Login Required";
+  if (!codex.appServer?.available) return "App Server Unavailable";
+  return "Needs Attention";
 }
 
 function formatCodexAccess(codex) {
@@ -568,6 +717,25 @@ function formatCodexAccess(codex) {
   if (codex?.auth?.access === "subscription") return "Subscription";
   if (codex?.auth?.access === "usage_based") return "Usage-based";
   return "Unknown";
+}
+
+function formatProviderAccess(provider) {
+  if (provider?.usage?.rateLimited) return "Temporarily unavailable";
+  if (provider?.auth?.access === "subscription") return "Subscription";
+  if (provider?.auth?.access === "usage_based") return "Usage-based";
+  if (provider?.auth?.access === "gateway") return "Gateway";
+  if (provider?.auth?.access === "local") return "Local";
+  return "Unknown";
+}
+
+function formatProviderRateLimit(provider) {
+  const summary = provider?.usage?.summary;
+  if (!provider?.usage?.available && !summary) return "Unavailable";
+  return [
+    summary?.label ?? "Available",
+    summary?.remainingLabel,
+    summary?.resetAt ? `Reset ${summary.resetAt}` : undefined
+  ].filter(Boolean).join(", ");
 }
 
 function formatRateLimit(codex) {
@@ -622,11 +790,11 @@ function projectGrantRow(grant) {
 }
 
 function actionLabel(action) {
-  if (action === "open") return "Activate workspace";
-  if (action === "port") return "Port into Hunsu";
-  if (action === "create") return "Create workspace";
+  if (action === "open") return "Open";
+  if (action === "port") return "Port";
+  if (action === "create") return "Create";
   if (action === "repair") return "Repair";
-  if (action === "explain") return "Explain issue";
+  if (action === "explain") return "Explain";
   return "Remove";
 }
 
@@ -634,7 +802,14 @@ function labelLocalBridge(value) {
   if (value === "connected") return "Connected";
   if (value === "starting") return "Starting";
   if (value === "error") return "Error";
-  return "Not Running";
+  return "Connecting";
+}
+
+function providerConnectionSummary(status) {
+  const local = `Local · ${labelLocalBridge(status?.localBridge)}`;
+  const remoteAccess = status?.remoteAccess ?? "Off";
+  const remote = `Remote · ${remoteAccess === "On" ? "On" : remoteAccess === "Registered but offline" ? "Registered but offline" : "Off"}`;
+  return `${local}\n${remote}`;
 }
 
 async function inspectSelectedFolder(path) {
@@ -674,10 +849,10 @@ function renderSelectedProjectAction() {
 }
 
 function formatProjectKind(kind) {
-  if (kind === "hunsu-roadmap") return "Existing Hunsu workspace";
+  if (kind === "hunsu-roadmap") return "Existing Hunsu Roadmap";
   if (kind === "git-project") return "Git project";
-  if (kind === "new-project") return "Empty folder";
-  if (kind === "missing-roadmap") return "Missing workspace";
+  if (kind === "new-project") return "New project folder";
+  if (kind === "missing-roadmap") return "Missing Roadmap";
   return "Unsupported folder";
 }
 
@@ -710,15 +885,8 @@ async function runSelectedAction() {
 }
 
 document.querySelector("#refresh").addEventListener("click", refresh);
-async function openStudioFromActiveWorkspace() {
-  if (activeWorkspaceSnapshots(latestSnapshot).length === 0) {
-    return;
-  }
-  await spawn(["pair"]);
-}
-
-document.querySelector("#open-studio").addEventListener("click", openStudioFromActiveWorkspace);
-document.querySelector("#open-studio-connection").addEventListener("click", openStudioFromActiveWorkspace);
+document.querySelector("#open-studio").addEventListener("click", () => spawn(["pair"]));
+document.querySelector("#open-studio-connection").addEventListener("click", () => spawn(["pair"]));
 selectedProjectAction.addEventListener("click", runSelectedAction);
 document.querySelector("#enable-remote").addEventListener("click", async () => {
   await run(["remote", "enable"]);
@@ -728,6 +896,8 @@ document.querySelector("#disable-remote").addEventListener("click", async () => 
   await run(["remote", "disable"]);
   await refresh();
 });
+connectionEls.primaryAction.addEventListener("click", runConnectionAction);
+connectionEls.secondaryAction.addEventListener("click", runConnectionAction);
 document.querySelector("#install-protocol").addEventListener("click", async () => {
   const stdout = await run(["protocol", "install"]);
   diagnostics.textContent = stdout;
@@ -748,12 +918,38 @@ async function chooseProjectFolder() {
   }
 }
 
+async function chooseCodexBinary() {
+  if (!invoke) {
+    selectTab("settings");
+    codexBinaryPath.focus();
+    return;
+  }
+  const binary = await invoke("choose_codex_binary");
+  if (!binary?.path) {
+    return;
+  }
+  diagnostics.textContent = await run(["codex", "path", "set", binary.path]);
+  await refresh();
+}
+
 document.querySelector("#choose-folder").addEventListener("click", chooseProjectFolder);
+
+async function runConnectionAction(event) {
+  const action = event?.currentTarget?.dataset?.action;
+  if (action === "sign-in") {
+    await spawn(["login", "--gui"]);
+  } else if (action === "enable-remote") {
+    await run(["remote", "enable"]);
+  } else if (action === "disable-remote") {
+    await run(["remote", "disable"]);
+  } else if (action === "sign-out") {
+    await run(["logout"]);
+  }
+  await refresh();
+}
+
 document.querySelector("#copy-diagnostics").addEventListener("click", async () => {
   await navigator.clipboard.writeText(diagnostics.textContent || "{}");
-});
-document.querySelector("[data-tab='diagnostic-details']")?.addEventListener("click", () => {
-  diagnostics.hidden = false;
 });
 document.querySelector("#save-codex-path").addEventListener("click", async () => {
   const value = codexBinaryPath.value.trim();
@@ -778,34 +974,27 @@ document.querySelector("#reset-codex-path").addEventListener("click", async () =
   await refresh();
 });
 
-for (const tab of document.querySelectorAll("nav [data-tab], footer [data-tab]")) {
+for (const tab of document.querySelectorAll("[data-tab]")) {
   tab.addEventListener("click", () => {
     selectTab(tab.dataset.tab);
   });
 }
 
 function selectTab(tabName) {
-  const normalized = normalizeTab(tabName);
-  if (!normalized) return;
-  for (const candidate of document.querySelectorAll("nav [data-tab], footer [data-tab]")) {
-    candidate.setAttribute("aria-selected", String(candidate.dataset.tab === normalized));
+  if (!tabName) return;
+  const canonical = canonicalTabName(tabName);
+  for (const candidate of document.querySelectorAll("[data-tab]")) {
+    candidate.setAttribute("aria-selected", String(candidate.dataset.tab === canonical));
   }
   for (const panel of document.querySelectorAll("[data-panel]")) {
-    if (panel.dataset.panel === "codex" || panel.dataset.panel === "workspaces") {
-      panel.hidden = false;
-      continue;
-    }
-    panel.hidden = panel.dataset.panel !== normalized;
+    panel.hidden = panel.dataset.panel !== canonical;
   }
-  if (normalized === "diagnostics") diagnostics.hidden = true;
-  document.querySelector(`[data-panel='${normalized}']`)?.scrollIntoView({ block: "start" });
 }
 
-function normalizeTab(tabName) {
-  if (tabName === "prerequisites") return "codex";
+function canonicalTabName(tabName) {
+  if (tabName === "overview" || tabName === "prerequisites") return "provider";
   if (tabName === "roadmaps") return "workspaces";
-  if (tabName === "connection" || tabName === "remote") return "advanced";
-  if (tabName === "diagnostic-details") return "diagnostics";
+  if (tabName === "remote") return "advanced";
   return tabName;
 }
 

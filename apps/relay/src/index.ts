@@ -8,6 +8,7 @@ import { currentProcessEnv, endpointUrl, resolveRelayServerConfig, unwrapConfigR
 
 export type RelayCommandName =
   | "health"
+  | "bridge.status"
   | "connection.status"
   | "roadmap.registry.list"
   | "roadmap.registry.remove"
@@ -68,6 +69,11 @@ export type RemoteBridgeDevice = {
   registeredAt: string;
   lastSeenAt?: string;
   status: "online" | "offline";
+  remoteAccess?: "enabled" | "disabled";
+  provider?: unknown;
+  workspaces?: unknown[];
+  projectGrants?: ProjectGrant[];
+  lastSnapshotAt?: string;
   bridgeVersion?: string;
   bridgeAppVersion?: string;
   protocolVersion?: string;
@@ -489,8 +495,16 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
     const projectGrants = explicitProjectGrants === undefined
       ? existing?.projectGrants ?? []
       : parseProjectGrants(explicitProjectGrants);
+    const explicitWorkspaces = bodyWorkspacesValue(object, candidate);
+    const workspaces = explicitWorkspaces === undefined
+      ? existing?.workspaces ?? []
+      : parseWorkspaceSnapshots(explicitWorkspaces);
     const nowIso = new Date(now()).toISOString();
     const connectedDevice = options.connected || connected.has(deviceId);
+    const remoteAccess = parseRemoteAccess(candidate.remoteAccess) ?? (connectedDevice ? "enabled" : existing?.remoteAccess ?? "enabled");
+    const lastSnapshotAt = optionalString(candidate.lastSnapshotAt)
+      ?? optionalString(object?.lastSnapshotAt)
+      ?? (explicitWorkspaces === undefined ? existing?.lastSnapshotAt : nowIso);
     const device: StoredRelayDevice = {
       deviceId,
       deviceName,
@@ -498,6 +512,10 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
       registeredAt: existing?.registeredAt ?? nowIso,
       lastSeenAt: connectedDevice ? nowIso : existing?.lastSeenAt,
       status: connectedDevice ? "online" : "offline",
+      remoteAccess,
+      provider: parseJsonObject(candidate.provider),
+      workspaces,
+      lastSnapshotAt,
       bridgeVersion: optionalString(candidate.bridgeVersion),
       bridgeAppVersion: optionalString(candidate.bridgeAppVersion),
       protocolVersion: optionalString(candidate.protocolVersion),
@@ -610,6 +628,9 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
     if (input.requestUserId && input.device.userId !== input.requestUserId) {
       return { ok: false, reason: "account_mismatch", message: "Web session and Bridge device belong to different accounts." };
     }
+    if (input.device.remoteAccess === "disabled") {
+      return { ok: false, reason: "device_offline", message: "Remote Bridge is disabled for this device." };
+    }
     if (input.device.status !== "online") {
       return { ok: false, reason: "device_offline", message: "Bridge device is offline." };
     }
@@ -669,6 +690,7 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
   function publicDevices(userId?: string): RemoteBridgeDevice[] {
     return [...devices.values()]
       .filter(device => userId === undefined || device.userId === userId)
+      .filter(device => device.remoteAccess !== "disabled")
       .map(publicDevice);
   }
 
@@ -764,6 +786,7 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "roadmap.registry.remove":
       return ["remoteRelay.access"];
     case "health":
+    case "bridge.status":
     case "connection.status":
     case "roadmap.registry.list":
       return [];
@@ -840,6 +863,19 @@ function bodyProjectGrantsValue(
   return undefined;
 }
 
+function bodyWorkspacesValue(
+  object: Record<string, unknown> | undefined,
+  candidate: Record<string, unknown> | undefined
+): unknown {
+  if (hasOwnJsonField(object, "workspaces")) {
+    return object.workspaces;
+  }
+  if (hasOwnJsonField(candidate, "workspaces")) {
+    return candidate.workspaces;
+  }
+  return undefined;
+}
+
 function hasOwnJsonField(object: Record<string, unknown> | undefined, field: string): object is Record<string, unknown> {
   return Boolean(object && Object.prototype.hasOwnProperty.call(object, field));
 }
@@ -862,6 +898,24 @@ function parseProjectGrants(value: unknown): ProjectGrant[] {
   }));
 }
 
+function parseWorkspaceSnapshots(value: unknown): unknown[] {
+  return Array.isArray(value)
+    ? value.filter(isWorkspaceSnapshotLike)
+    : [];
+}
+
+function isWorkspaceSnapshotLike(value: unknown): boolean {
+  const object = parseJsonObject(value);
+  return typeof object?.workspaceId === "string"
+    && typeof object.roadmapId === "string"
+    && typeof object.displayName === "string"
+    && typeof object.backendId === "string"
+    && (object.connectionMode === "local" || object.connectionMode === "remote")
+    && typeof object.provider === "object"
+    && object.provider !== null
+    && Array.isArray(object.actions);
+}
+
 function publicDevice(device: StoredRelayDevice): RemoteBridgeDevice {
   return {
     deviceId: device.deviceId,
@@ -870,10 +924,19 @@ function publicDevice(device: StoredRelayDevice): RemoteBridgeDevice {
     registeredAt: device.registeredAt,
     lastSeenAt: device.lastSeenAt,
     status: device.status,
+    remoteAccess: device.remoteAccess,
+    provider: device.provider,
+    workspaces: device.workspaces,
+    projectGrants: device.projectGrants,
+    lastSnapshotAt: device.lastSnapshotAt,
     bridgeVersion: device.bridgeVersion,
     bridgeAppVersion: device.bridgeAppVersion,
     protocolVersion: device.protocolVersion
   };
+}
+
+function parseRemoteAccess(value: unknown): RemoteBridgeDevice["remoteAccess"] | undefined {
+  return value === "enabled" || value === "disabled" ? value : undefined;
 }
 
 function normalizeRelayProjectPath(path: string): string {
@@ -1012,6 +1075,7 @@ function isRelayCommandResult(value: unknown): value is RelayCommandResult {
 function isRelayCommandName(value: string): value is RelayCommandName {
   return [
     "health",
+    "bridge.status",
     "connection.status",
     "roadmap.registry.list",
     "roadmap.registry.remove",

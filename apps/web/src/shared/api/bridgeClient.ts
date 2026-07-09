@@ -35,6 +35,7 @@ import type {
   SkillListResult,
   StudioLiveEvent,
   AgentSession,
+  BridgeStatusResponse,
   FilesystemGrantResult,
   MoveFileBlob,
   MoveFileBlobResult,
@@ -65,16 +66,28 @@ export class BridgeRequestError extends Error {
 async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge API request"): Promise<T> {
   const method = init?.method?.toUpperCase() ?? "GET";
   const body = parseRequestBody(init?.body);
-  const remoteCommand = remoteBridgeCommandForRequest(path, method, body, currentRoutableRemoteBridgeSession());
+  const remoteCommand = remoteBridgeCommandForRequest(path, method, body, currentRoutableRemoteBridgeSessionForRequest(body));
   if (remoteCommand) {
     return requestRemoteJson<T>(remoteCommand, label);
   }
-  const response = await fetch(`${SERVER_URL}${path}`, {
-    ...init,
-    headers: bridgeClientRequestHeaders(path, init?.headers)
-  });
+  const remoteStatusFallback = remoteBridgeStatusFallbackCommand(path, method, body);
+  let response: Response;
+  try {
+    response = await fetch(`${SERVER_URL}${path}`, {
+      ...init,
+      headers: bridgeClientRequestHeaders(path, init?.headers)
+    });
+  } catch (error) {
+    if (remoteStatusFallback) {
+      return requestRemoteJson<T>(remoteStatusFallback, label);
+    }
+    throw error;
+  }
   if (!response.ok) {
     const result = await response.json().catch(() => ({ error: `${label} failed with ${response.status}` }));
+    if (remoteStatusFallback) {
+      return requestRemoteJson<T>(remoteStatusFallback, label);
+    }
     const message = typeof result.message === "string"
       ? result.message
       : typeof result.error === "string"
@@ -83,6 +96,17 @@ async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge 
     throw new BridgeRequestError(message, response.status, result);
   }
   return response.json() as Promise<T>;
+}
+
+function remoteBridgeStatusFallbackCommand(path: string, method: string, body: unknown): RemoteBridgeCommandRequest | undefined {
+  if (method !== "GET") {
+    return undefined;
+  }
+  const pathname = new URL(path, "http://hunsu.local").pathname;
+  if (pathname !== "/api/bridge/status") {
+    return undefined;
+  }
+  return remoteBridgeCommandForRequest(path, method, body, currentRemoteBridgeSession());
 }
 
 function bridgeClientRequestHeaders(path: string, headers: HeadersInit = {}): HeadersInit {
@@ -108,7 +132,7 @@ async function requestRemoteJson<T>(command: RemoteBridgeCommandRequest, label: 
     if (!response.ok) {
       throw new Error(`${label} failed through Relay with ${response.status}`);
     }
-    return result.body as T;
+    return normalizeRemoteCommandBody<T>(command, result.body);
   }
   const session = currentRemoteBridgeSession();
   const nextHeaders = new Headers(bridgeApiRequestHeaders({ "content-type": "application/json" }));
@@ -127,7 +151,77 @@ async function requestRemoteJson<T>(command: RemoteBridgeCommandRequest, label: 
   if (!response.ok) {
     throw new Error(`${label} failed through Relay with ${response.status}`);
   }
-  return result.body as T;
+  return normalizeRemoteCommandBody<T>(command, result.body);
+}
+
+function normalizeRemoteCommandBody<T>(command: RemoteBridgeCommandRequest, body: unknown): T {
+  if (command.command !== "bridge.status") {
+    return body as T;
+  }
+  return normalizeRemoteBridgeStatus(body, currentRemoteBridgeSession() ?? { deviceId: command.deviceId }) as T;
+}
+
+function normalizeRemoteBridgeStatus(body: unknown, session: RemoteBridgeSession): unknown {
+  if (!isBridgeStatusLike(body)) {
+    return body;
+  }
+  const local = body.connections.find(connection => connection.mode === "local") ?? body.connections[0];
+  const label = session.deviceName ?? local?.label ?? "Remote Bridge";
+  const normalizeWorkspace = (workspace: BridgeStatusResponse["workspaces"]["active"][number]) => {
+    const granted = typeof session.projectPath === "string"
+      && typeof workspace.path === "string"
+      && normalizePathForRemoteSession(workspace.path) === normalizePathForRemoteSession(session.projectPath);
+    return {
+      ...workspace,
+      backendId: `remote:${session.deviceId}`,
+      connectionMode: "remote" as const,
+      path: granted ? workspace.path : undefined,
+      pathRedacted: granted ? undefined : true
+    };
+  };
+  const workspaces = (local?.workspaces ?? body.workspaces.active).map(normalizeWorkspace);
+  return {
+    ...body,
+    connections: [{
+      ...(local ?? {}),
+      backendId: `remote:${session.deviceId}`,
+      mode: "remote" as const,
+      label,
+      device: {
+        deviceId: session.deviceId,
+        name: label,
+        registered: true,
+        online: true,
+        lastSeenAt: new Date().toISOString()
+      },
+      connection: { state: "connected" as const },
+      workspaces
+    }],
+    workspaces: {
+      active: workspaces,
+      managed: body.workspaces.managed.map(normalizeWorkspace)
+    },
+    account: {
+      ...body.account,
+      signedIn: true,
+      userId: body.account.userId ?? session.webUserId
+    }
+  };
+}
+
+function normalizePathForRemoteSession(path: string): string {
+  return path.replace(/[\\/]+$/, "");
+}
+
+function isBridgeStatusLike(value: unknown): value is BridgeStatusResponse {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<BridgeStatusResponse>;
+  return Boolean(candidate.provider)
+    && Array.isArray(candidate.connections)
+    && typeof candidate.workspaces === "object"
+    && candidate.workspaces !== null;
 }
 
 function postJson<T>(path: string, body: unknown, label: string): Promise<T> {
@@ -141,6 +235,70 @@ function postJson<T>(path: string, body: unknown, label: string): Promise<T> {
 export async function fetchRoadmapRegistry(): Promise<RoadmapRegistryEntry[]> {
   const result = await requestJson<RoadmapListResult>("/api/roadmaps/recent", undefined, "Roadmap registry request");
   return result.roadmaps;
+}
+
+export async function fetchBridgeStatus(): Promise<BridgeStatusResponse> {
+  const status = await requestJson<BridgeStatusResponse>("/api/bridge/status", undefined, "Bridge status request");
+  const session = currentRemoteBridgeSession();
+  if (!session || !status.connections.some(connection => connection.mode === "local")) {
+    return status;
+  }
+  const command = remoteBridgeCommandForRequest("/api/bridge/status", "GET", undefined, session);
+  if (!command) {
+    return status;
+  }
+  try {
+    const remoteStatus = await requestRemoteJson<BridgeStatusResponse>(command, "Remote Bridge status request");
+    return mergeBridgeStatuses(status, remoteStatus);
+  } catch (_error) {
+    return status;
+  }
+}
+
+function mergeBridgeStatuses(localStatus: BridgeStatusResponse, remoteStatus: BridgeStatusResponse): BridgeStatusResponse {
+  const remoteConnections = remoteStatus.connections.filter(connection => connection.mode === "remote");
+  if (remoteConnections.length === 0) {
+    return localStatus;
+  }
+  const remoteBackendIds = new Set(remoteConnections.map(connection => connection.backendId));
+  return {
+    ...localStatus,
+    connections: mergeByReplacing(localStatus.connections, remoteConnections, connection => connection.backendId),
+    workspaces: {
+      active: [
+        ...localStatus.workspaces.active.filter(workspace => !remoteBackendIds.has(workspace.backendId)),
+        ...remoteStatus.workspaces.active
+      ],
+      managed: [
+        ...localStatus.workspaces.managed.filter(workspace => !remoteBackendIds.has(workspace.backendId)),
+        ...remoteStatus.workspaces.managed
+      ]
+    },
+    account: {
+      signedIn: localStatus.account.signedIn || remoteStatus.account.signedIn,
+      userId: localStatus.account.userId ?? remoteStatus.account.userId,
+      email: localStatus.account.email ?? remoteStatus.account.email
+    }
+  };
+}
+
+function mergeByReplacing<T>(left: T[], right: T[], key: (value: T) => string): T[] {
+  const replacements = new Map(right.map(item => [key(item), item]));
+  const seen = new Set<string>();
+  const merged = left.map(item => {
+    const itemKey = key(item);
+    const replacement = replacements.get(itemKey);
+    seen.add(itemKey);
+    return replacement ?? item;
+  });
+  for (const item of right) {
+    const itemKey = key(item);
+    if (!seen.has(itemKey)) {
+      seen.add(itemKey);
+      merged.push(item);
+    }
+  }
+  return merged;
 }
 
 export async function postRoadmapRegistryRemove(input: { roadmapId?: string; path?: string }): Promise<RoadmapRegistryEntry[]> {
@@ -198,6 +356,7 @@ export async function postRemoteBridgeConnect(input: RemoteBridgeConnectRequest)
     if (shouldStoreRemoteBridgeSession(result)) {
       storeRemoteBridgeSession({
         deviceId: result.device.deviceId,
+        deviceName: result.device.deviceName,
         projectPath: input.projectPath,
         webUserId: input.webUserId,
         relayAccessToken: currentRelayAccessToken()
@@ -207,11 +366,12 @@ export async function postRemoteBridgeConnect(input: RemoteBridgeConnectRequest)
   }
   const result = await postJson<RemoteBridgeConnectResult>("/api/remote/connect", input, "Remote Bridge connect");
   if (shouldStoreRemoteBridgeSession(result)) {
-    storeRemoteBridgeSession({
-      deviceId: result.device.deviceId,
-      projectPath: input.projectPath,
-      webUserId: input.webUserId
-    });
+      storeRemoteBridgeSession({
+        deviceId: result.device.deviceId,
+        deviceName: result.device.deviceName,
+        projectPath: input.projectPath,
+        webUserId: input.webUserId
+      });
   }
   return result;
 }
@@ -297,7 +457,8 @@ export function postHunsuDraftDiscard(roadmapId: string, draftSessionId: string)
 }
 
 export function postRunAction(roadmapId: string, action: "start" | "pause" | "resume" | "stop", body: unknown): Promise<RunResult> {
-  return postJson<RunResult>(roadmapApiPath(roadmapId, `/runs/${action}`), body, "Run action");
+  const nextBody = action === "start" ? executeStartBodyWithSelectedBackend(roadmapId, body) : body;
+  return postJson<RunResult>(roadmapApiPath(roadmapId, `/runs/${action}`), nextBody, "Run action");
 }
 
 export function postLineDecision(roadmapId: string, decision: "accept" | "reject", body: { lineId: string; reason?: string }): Promise<CommandResult> {
@@ -335,7 +496,7 @@ export function postActionRunStop(roadmapId: string, runId: string): Promise<Act
 }
 
 export function subscribeRunEvents(roadmapId: string, onEvent: (event: StudioLiveEvent) => void, onError: () => void): () => void {
-  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, "/runs/events"), "GET", undefined, currentRoutableRemoteBridgeSession());
+  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, "/runs/events"), "GET", undefined, currentRemoteBridgeSession() ?? currentRoutableRemoteBridgeSession());
   if (remoteCommand) {
     return subscribeRemoteCommand(remoteCommand, onEvent, onError);
   }
@@ -361,7 +522,7 @@ export function subscribeRunEvents(roadmapId: string, onEvent: (event: StudioLiv
 }
 
 export function subscribeAgentSessionEvents(roadmapId: string, sessionId: string, onEvent: (event: AgentSessionEvent) => void, onError: () => void): () => void {
-  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, `/agent-sessions/${encodeURIComponent(sessionId)}/events`), "GET", undefined, currentRoutableRemoteBridgeSession());
+  const remoteCommand = remoteBridgeCommandForRequest(roadmapApiPath(roadmapId, `/agent-sessions/${encodeURIComponent(sessionId)}/events`), "GET", undefined, currentRemoteBridgeSession() ?? currentRoutableRemoteBridgeSession());
   if (remoteCommand) {
     return subscribeRemoteCommand(remoteCommand, onEvent, onError);
   }
@@ -400,6 +561,7 @@ export type RemoteBridgeCommandRequest = {
   deviceId: string;
   command:
     | "health"
+    | "bridge.status"
     | "connection.status"
     | "roadmap.registry.list"
     | "roadmap.registry.remove"
@@ -464,6 +626,9 @@ export function remoteBridgeCommandForRequest(
   const projectPath = stringField(payload, "path") ?? session.projectPath;
   if (method === "GET" && pathname === "/api/roadmaps/recent") {
     return { deviceId: session.deviceId, command: "roadmap.registry.list" };
+  }
+  if (method === "GET" && pathname === "/api/bridge/status") {
+    return { deviceId: session.deviceId, command: "bridge.status" };
   }
   if (method === "POST" && pathname === "/api/roadmaps/recent/remove") {
     return { deviceId: session.deviceId, command: "roadmap.registry.remove", projectPath, payload: body };
@@ -663,8 +828,51 @@ function remoteBridgeCommandEventUrl(command: RemoteBridgeCommandRequest): strin
   return BRIDGE_API_BASE_URL ? url.toString() : `${url.pathname}${url.search}`;
 }
 
+function currentRoutableRemoteBridgeSessionForRequest(body: unknown): RemoteBridgeSession | undefined {
+  const selectedSession = selectedRemoteBridgeSessionFromRequestBody(body);
+  if (selectedSession) {
+    return selectedSession;
+  }
+  return currentRoutableRemoteBridgeSession();
+}
+
 function currentRoutableRemoteBridgeSession(): RemoteBridgeSession | undefined {
   return hasBridgeApiAuthToken() ? undefined : currentRemoteBridgeSession();
+}
+
+function executeStartBodyWithSelectedBackend(roadmapId: string, body: unknown): unknown {
+  const payload = objectBody(body);
+  if (!payload) {
+    return body;
+  }
+  const session = currentRemoteBridgeSession();
+  const backendId = stringField(payload, "backendId") ?? (session?.deviceId ? `remote:${session.deviceId}` : "local");
+  const connectionMode = payload.connectionMode === "remote" || backendId.startsWith("remote:") ? "remote" : "local";
+  const existingWorkspace = objectBody(payload.workspace);
+  return {
+    ...payload,
+    backendId,
+    connectionMode,
+    workspace: {
+      ...(existingWorkspace ?? {}),
+      workspaceId: stringField(existingWorkspace, "workspaceId") ?? roadmapId,
+      backendId: stringField(existingWorkspace, "backendId") ?? backendId,
+      connectionMode: existingWorkspace?.connectionMode === "remote" || connectionMode === "remote" ? "remote" : "local"
+    }
+  };
+}
+
+function selectedRemoteBridgeSessionFromRequestBody(body: unknown): RemoteBridgeSession | undefined {
+  const session = currentRemoteBridgeSession();
+  if (!session?.deviceId) {
+    return undefined;
+  }
+  const payload = objectBody(body);
+  const workspace = objectBody(payload?.workspace);
+  const backendId = stringField(payload, "backendId") ?? stringField(workspace, "backendId");
+  const connectionMode = payload?.connectionMode ?? workspace?.connectionMode;
+  const selectedRemote = connectionMode === "remote" || backendId === `remote:${session.deviceId}`;
+  return selectedRemote ? session : undefined;
 }
 
 function parseRequestBody(body: BodyInit | null | undefined): unknown {

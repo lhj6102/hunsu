@@ -38,14 +38,14 @@ Recommended local-first path:
 ```text
 Install Hunsu Bridge App
 Open the app
-Confirm Codex is ready
-Add and activate a workspace
+Add and activate a Roadmap
+Hunsu Bridge starts locally
 Studio opens in the browser
 ```
 
 The Bridge App starts Hunsu Bridge on `127.0.0.1`, creates a temporary pairing
-session, opens Studio, and keeps local workspace access on your machine. Login
-is optional for local use; Remote Access is an advanced flow available through
+session, opens Studio, and keeps local repository access on your machine. Login
+is optional for local use; signing in enables Remote Bridge access through
 authenticated Relay commands. Remote Registry and connection-status responses
 redact local filesystem paths until the matching Project Grant exists.
 
@@ -65,9 +65,9 @@ Headless Linux/devbox path:
 
 ```sh
 hunsu-bridge login
+hunsu-bridge prerequisites status
 hunsu-bridge codex status
 hunsu-bridge codex login --device
-# Workspace management currently uses the internal Roadmap command group.
 hunsu-bridge roadmaps add /path/to/project
 hunsu-bridge roadmaps activate <roadmapId>
 hunsu-bridge remote status
@@ -99,16 +99,28 @@ Studio recovery links use the Bridge App protocol surface:
 
 ```text
 hunsu://open
+hunsu://provider
+hunsu://provider/codex
 hunsu://pair?next=/studio
-hunsu://add-roadmap
+hunsu://add-workspace
 hunsu://workspaces
-hunsu://codex
+hunsu://connection
+hunsu://connection/remote
+hunsu://open-workspace?workspaceId=<id>
 hunsu://activate-roadmap?roadmapId=<id>
 hunsu://open-project?path=/path/to/project
 hunsu://open-roadmap?roadmapId=<id>
 hunsu://sign-in
 hunsu://remote-disable
 ```
+
+Older aliases remain accepted: `hunsu://codex`,
+`hunsu://prerequisites`, `hunsu://prerequisites/codex`,
+`hunsu://roadmaps`, and `hunsu://add-roadmap`.
+
+`hunsu://open` is the safe default open/focus intent and opens Bridge App on
+Provider setup. Older `roadmaps`, `add-roadmap`, and `prerequisites` aliases
+remain supported for compatibility.
 
 The desktop bundle includes macOS and Windows installer metadata for the
 `hunsu://` protocol. Linux GUI installs can register the user-level handler with
@@ -306,16 +318,16 @@ MOVE-scoped checks from depending on hardcoded ports.
 
 Troubleshooting:
 
-- Codex CLI not found: open the Bridge App Codex card, install Codex, or use
-  Select existing Codex to set a custom path.
+- Codex CLI not found: open Bridge App Prerequisites, install Codex, or set a
+  custom Codex path.
 - Codex login required or expired: run `hunsu-bridge codex login` or use the
   Bridge App Codex card.
 - Codex app-server unavailable: run `hunsu-bridge codex recheck` and verify
   `codex app-server --stdio` works in your shell.
 - Codex rate limited: wait for Codex access to recover; Hunsu shows only safe
   rate-limit summaries when Codex provides them.
-- Workspace inactive or missing: activate, repair, or remove it from Bridge App
-  Workspaces. Studio shows active Workspaces only.
+- Roadmap inactive or missing: activate, repair, or remove it from Bridge App
+  Roadmaps. Studio shows Active Roadmaps only.
 - Project Grant missing: grant the project path before Remote Access Execute or
   Artifact Action commands.
 

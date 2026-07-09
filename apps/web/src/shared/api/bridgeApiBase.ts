@@ -12,6 +12,7 @@ export const RELAY_ACCESS_TOKEN = readRelayAccessToken();
 
 export type RemoteBridgeSession = {
   deviceId: string;
+  deviceName?: string;
   projectPath?: string;
   webUserId?: string;
   relayAccessToken?: string;
@@ -91,6 +92,7 @@ export function currentRemoteBridgeSession(): RemoteBridgeSession | undefined {
     return typeof parsed.deviceId === "string" && parsed.deviceId.trim()
       ? {
           deviceId: parsed.deviceId.trim(),
+          deviceName: typeof parsed.deviceName === "string" && parsed.deviceName.trim() ? parsed.deviceName.trim() : undefined,
           projectPath: typeof parsed.projectPath === "string" && parsed.projectPath.trim() ? parsed.projectPath.trim() : undefined,
           webUserId: typeof parsed.webUserId === "string" && parsed.webUserId.trim() ? parsed.webUserId.trim() : undefined,
           relayAccessToken: typeof parsed.relayAccessToken === "string" && parsed.relayAccessToken.trim() ? parsed.relayAccessToken.trim() : currentRelayAccessToken()

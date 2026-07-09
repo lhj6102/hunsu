@@ -50,14 +50,6 @@
       section[hidden] {
         display: none;
       }
-      footer {
-        align-items: center;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        justify-content: space-between;
-        margin-top: 18px;
-      }
       h2 {
         margin: 0 0 12px;
         font-size: 14px;
@@ -77,39 +69,9 @@
         margin: 0;
         min-width: 0;
         overflow-wrap: anywhere;
+        white-space: pre-line;
       }
       .actions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-      }
-      .status-bar {
-        display: grid;
-        gap: 10px;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        margin-top: 18px;
-      }
-      .status-item {
-        border: 1px solid #dce2ea;
-        border-radius: 8px;
-        background: rgba(255, 255, 255, 0.72);
-        padding: 12px;
-      }
-      .status-item span {
-        color: #667085;
-        display: block;
-        font-size: 11px;
-        font-weight: 700;
-        line-height: 1.4;
-        text-transform: uppercase;
-      }
-      .status-item strong {
-        display: block;
-        font-size: 14px;
-        line-height: 1.5;
-        overflow-wrap: anywhere;
-      }
-      .secondary-actions {
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
@@ -208,15 +170,6 @@
       .scope-off {
         color: #667085;
       }
-      details {
-        margin-top: 8px;
-      }
-      summary {
-        cursor: pointer;
-        color: #475467;
-        font-size: 12px;
-        font-weight: 700;
-      }
       .status-connected {
         color: #138a4f;
       }
@@ -226,6 +179,19 @@
       .status-error {
         color: #b42318;
       }
+      .connection-state {
+        display: grid;
+        gap: 10px;
+      }
+      details {
+        margin-top: 14px;
+      }
+      summary {
+        color: #344054;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 700;
+      }
     </style>
   </head>
   <body>
@@ -234,99 +200,101 @@
         <h1>Hunsu Bridge</h1>
         <div class="actions">
           <button id="refresh">Refresh</button>
-          <button id="open-studio" class="primary" hidden disabled>Open Studio</button>
+          <button id="open-studio" class="primary">Open Hunsu Web</button>
         </div>
       </header>
 
-      <div class="status-bar" aria-label="Bridge status">
-        <div class="status-item">
-          <span>Local Bridge</span>
-          <strong id="local-bridge">Not Running</strong>
-        </div>
-        <div class="status-item">
-          <span>Codex</span>
-          <strong id="codex-summary">Unknown</strong>
-        </div>
-        <div class="status-item">
-          <span>Workspaces</span>
-          <strong id="active-roadmaps">0 active</strong>
-        </div>
-      </div>
-
       <nav aria-label="Bridge sections">
-        <button data-tab="codex" aria-selected="true">Codex</button>
+        <button data-tab="provider" aria-selected="true">Provider</button>
         <button data-tab="workspaces">Workspaces</button>
+        <button data-tab="connection">Connection</button>
       </nav>
+      <details>
+        <summary>Advanced</summary>
+        <div class="actions" style="margin-top: 10px;">
+          <button data-tab="advanced">Runtime Providers</button>
+          <button data-tab="diagnostics">Diagnostics</button>
+          <button data-tab="settings">Settings</button>
+        </div>
+      </details>
 
-      <section data-panel="codex">
-        <h2>Codex Runtime</h2>
+      <section data-panel="provider">
+        <h2>Provider</h2>
+        <dl>
+          <dt>Provider</dt>
+          <dd id="codex-summary">Unknown</dd>
+          <dt>Workspaces</dt>
+          <dd id="active-roadmaps">0 active</dd>
+          <dt>Connection</dt>
+          <dd id="local-bridge">Connecting</dd>
+        </dl>
         <div id="codex-card" class="grid"></div>
       </section>
 
-      <section data-panel="workspaces">
+      <section data-panel="workspaces" hidden>
         <h2>Workspaces</h2>
         <div class="actions">
-          <button id="choose-folder" class="primary">Add workspace</button>
+          <button id="choose-folder" class="primary">Add Workspace</button>
           <button id="selected-project-action" disabled>Select a Folder</button>
         </div>
         <div id="selected-project" class="message">No folder selected.</div>
-        <h2 style="margin-top: 18px;">Active</h2>
+        <h2 style="margin-top: 18px;">Active Workspaces</h2>
         <div id="active-roadmap-list" class="grid"></div>
+        <h2 style="margin-top: 18px;">Inactive Workspaces</h2>
+        <div id="inactive-roadmap-list" class="grid"></div>
+      </section>
+
+      <section data-panel="connection" hidden>
+        <h2>Connection</h2>
+        <div class="connection-state">
+          <div class="project-row">
+            <div>
+              <div class="project-title">Local</div>
+              <div id="connection-local-status" class="project-meta">This computer · Connected</div>
+            </div>
+          </div>
+          <div class="project-row">
+            <div>
+              <div class="project-title">Remote</div>
+              <div id="connection-remote-status" class="project-meta">Sign in to use this computer from Hunsu Web when away.</div>
+              <div id="connection-remote-detail" class="message"></div>
+            </div>
+            <div class="actions">
+              <button id="connection-primary-action" class="primary">Sign in to Hunsu</button>
+              <button id="connection-secondary-action">Sign out</button>
+            </div>
+          </div>
+        </div>
         <details>
-          <summary>Inactive workspaces</summary>
-          <div id="inactive-roadmap-list" class="grid" style="margin-top: 10px;"></div>
+          <summary>Advanced connection details</summary>
+          <dl style="margin-top: 10px;">
+            <dt>Account</dt>
+            <dd id="account">Signed out</dd>
+            <dt>Remote Access</dt>
+            <dd id="remote-access">Off</dd>
+            <dt>Device</dt>
+            <dd id="device">Unknown</dd>
+            <dt>Service</dt>
+            <dd id="service">Not installed</dd>
+          </dl>
+          <div class="actions" style="margin-top: 10px;">
+            <button id="start-bridge">Start Bridge</button>
+            <button id="stop-bridge">Stop Bridge</button>
+            <button id="open-studio-connection">Open Hunsu Web</button>
+            <button id="install-protocol">Install hunsu:// Handler</button>
+          </div>
         </details>
       </section>
 
-      <footer>
-        <div class="actions">
-          <button id="start-bridge">Start Bridge</button>
-          <button id="stop-bridge">Stop Bridge</button>
-          <button id="open-studio-connection" hidden disabled>Open Studio</button>
-        </div>
-        <div class="secondary-actions" aria-label="Secondary Bridge actions">
-          <button data-tab="settings">Settings</button>
-          <button data-tab="diagnostics">Diagnostics</button>
-          <button data-tab="logs">Logs</button>
-          <button data-tab="advanced">Advanced</button>
-        </div>
-      </footer>
-
       <section data-panel="advanced" hidden>
-        <h2>Advanced</h2>
-        <dl>
-          <dt>Account</dt>
-          <dd id="account">Signed out</dd>
-          <dt>Remote Access</dt>
-          <dd id="remote-access">Off</dd>
-          <dt>Device</dt>
-          <dd id="device">Unknown</dd>
-          <dt>Service</dt>
-          <dd id="service">Not installed</dd>
-        </dl>
-        <h2 style="margin-top: 18px;">Tools</h2>
+        <h2>Runtime Providers</h2>
+        <div id="runtime-provider-list" class="grid"></div>
+        <h2 style="margin-top: 18px;">Advanced Checks</h2>
+        <h3>Git</h3>
         <div id="git-card" class="grid"></div>
+        <h3 style="margin-top: 18px;">Node / Package Manager</h3>
         <div id="node-card" class="grid"></div>
-        <h2 style="margin-top: 18px;">Environment variables</h2>
-        <div class="grid">
-          <label>
-            <span class="project-meta">CODEX_HOME</span>
-            <input id="codex-env-home" readonly />
-          </label>
-          <label>
-            <span class="project-meta">HUNSU_CODEX_APP_SERVER_COMMAND</span>
-            <input id="codex-env-command" readonly />
-          </label>
-          <label>
-            <span class="project-meta">HUNSU_CODEX_APP_SERVER_ARGS</span>
-            <input id="codex-env-args" readonly />
-          </label>
-        </div>
-        <h2 style="margin-top: 18px;">Protocol</h2>
-        <div class="actions">
-          <button id="install-protocol">Install hunsu:// Handler</button>
-        </div>
-        <h2>Active Roadmap Remote Access</h2>
+        <h2 style="margin-top: 18px;">Advanced Remote Details</h2>
         <div id="remote-roadmap-list" class="grid"></div>
         <h2 style="margin-top: 18px;">Project Grants</h2>
         <div id="project-grants" class="grid"></div>
@@ -340,14 +308,8 @@
         <h2>Diagnostics</h2>
         <div class="actions">
           <button id="copy-diagnostics">Copy Diagnostics</button>
-          <button data-tab="diagnostic-details">Show diagnostic details</button>
         </div>
-        <pre id="diagnostics" hidden>{}</pre>
-      </section>
-
-      <section data-panel="logs" hidden>
-        <h2>Logs</h2>
-        <pre id="logs">{}</pre>
+        <pre id="diagnostics">{}</pre>
       </section>
 
       <section data-panel="settings" hidden>
@@ -372,6 +334,18 @@
               <option value="device_code">Device code</option>
               <option value="api_key">API key</option>
             </select>
+          </label>
+          <label>
+            <span class="project-meta">CODEX_HOME</span>
+            <input id="codex-env-home" readonly />
+          </label>
+          <label>
+            <span class="project-meta">HUNSU_CODEX_APP_SERVER_COMMAND</span>
+            <input id="codex-env-command" readonly />
+          </label>
+          <label>
+            <span class="project-meta">HUNSU_CODEX_APP_SERVER_ARGS</span>
+            <input id="codex-env-args" readonly />
           </label>
           <div class="actions">
             <button id="save-codex-path" class="primary">Save Codex Path</button>

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -18,13 +18,6 @@ export type SidecarSupervisorOptions = {
   restartLimit?: number;
   restartDelayMs?: number;
 };
-
-export function backgroundSpawnOptions(options: SpawnOptions, platform: NodeJS.Platform = process.platform): SpawnOptions {
-  return {
-    ...options,
-    windowsHide: platform === "win32" ? true : options.windowsHide
-  };
-}
 
 export class BridgeSidecarSupervisor {
   private readonly options: SidecarSupervisorOptions;
@@ -79,11 +72,12 @@ export class BridgeSidecarSupervisor {
   private spawnSidecar(): void {
     this.statusValue = { status: "starting", restartCount: this.restartCount };
     this.writeLog({ event: "sidecar.starting", command: this.options.command, args: this.options.args });
-    const child = spawn(this.options.command, this.options.args, backgroundSpawnOptions({
+    const child = spawn(this.options.command, this.options.args, {
       cwd: this.options.cwd,
       env: this.options.env,
-      stdio: ["ignore", "pipe", "pipe"]
-    }));
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    });
     this.child = child;
     this.statusValue = {
       status: "running",

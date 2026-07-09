@@ -1,18 +1,11 @@
 #!/usr/bin/env node
-import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { homedir, hostname, platform } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isSea } from "node:sea";
 import { fileURLToPath } from "node:url";
-import { backgroundSpawnOptions, BridgeSidecarSupervisor } from "./sidecar-supervisor.ts";
 import {
-  createDefaultCredentialStore,
-  createPkceAuthorizationRequest,
-  exchangeAuthorizationCode,
-  pollDeviceAuthorization,
-  startDeviceAuthorization,
   startLocalDevAuthServer,
   type BridgeAccountCredentials
 } from "./auth.ts";
@@ -21,19 +14,83 @@ import {
   installLinuxProtocolHandler,
   protocolRegistrationPlan
 } from "./native-shell.ts";
+import { normalizeBridgeAppArgv } from "./ui-intents/deepLinks.ts";
 import {
-  evaluateRelayCommand,
-  FileRelayRegistry,
-  registerRelayDevice,
-  RelayOutboundClient,
+  parseCodexAuthenticationPreference,
+  parseCodexInstallChannel,
+  providerStatusSummary
+} from "./commands/providerCommands.ts";
+import {
+  reconcileCodexLoginFromStatus,
+  runCodexApiKeyLoginCli as runCodexApiKeyLoginCliAction,
+  runCodexChatGptLoginCli as runCodexChatGptLoginCliAction,
+  runCodexCli as runCodexCliAction,
+  runCodexCommand,
+  runCodexDeviceLoginCli as runCodexDeviceLoginCliAction
+} from "./commands/codexCommands.ts";
+import { runAuthCallbackCommand, runLoginCommand, runLogoutCommand } from "./commands/authCommands.ts";
+import { buildDiagnostics, packageManagerStatus, runDiagnosticsCommand, toolStatus } from "./commands/diagnosticsCommands.ts";
+import {
+  activeManagedProjectGrantsForRoadmaps,
+  projectGrantsWithRemoteRelay,
+  projectGrantsWithoutRemoteRelay,
+  roadmapAccessSnapshots,
+  runProjectsCommand,
+  runRoadmapsCommand,
+  snapshotProjectGrants
+} from "./commands/workspaceCommands.ts";
+import {
+  enableRemoteAccessIfSignedIn,
+  localBridgeStatusFromProcessState,
+  publishProjectGrantsToRelay,
+  runRemoteCommand,
+  startRelayIfConfigured,
+  waitForRelayConnection,
+  writeRemoteAccessState
+} from "./commands/connectionCommands.ts";
+import {
+  BRIDGE_PROCESS_NONCE_ENV,
+  bridgeNodeExecArgs,
+  bridgeProcessRuntimeMetadata,
+  commandLineLooksLikeBridgeApp,
+  createBridgeAppSidecarSupervisor as createBridgeAppSidecarSupervisorFromProcess,
+  currentBridgeProcessCommandIdentity,
+  handleToRuntimeState,
+  processCommandLine,
+  processEnvironmentValue,
+  processIsAlive,
+  processStartMetadata,
+  sameProcessStartMetadata
+} from "./processes/backgroundSpawn.ts";
+import {
+  canonicalBridgeUiIntentTab,
+  bridgeAppStatePath as appStatePath,
+  createBridgeAppSnapshot,
+  defaultBridgeServiceManager,
+  formatBridgeRemoteAccess,
+  hashBridgeDeviceSeed,
+  isBridgeUiIntentTab,
+  readBridgeAppState as readAppState,
+  recordBridgeUiIntent,
+  writeBridgeAppState as writeAppState,
+  type BridgeAppSnapshot,
+  type BridgeAppState,
+  type BridgeProcessCommandIdentity,
+  type BridgeProcessRuntimeMetadata,
+  type BridgeRoadmapAccessSnapshot,
+  type BridgeServiceState,
+  type BridgeUiIntent,
+  bridgeCodexProviderSettings
+} from "./state/appState.ts";
+import {
   type BridgeCommandScope,
   type ProjectGrant,
   type RelayCommandName
 } from "./relay.ts";
 import {
   applyStudioPort,
-  bridgeVersionInfo,
   createBridgeSupervisor,
+  createRuntimeProviderRegistry,
   createStudioRoadmap,
   createStudioState,
   getCodexRuntimeStatus,
@@ -42,7 +99,6 @@ import {
   listRoadmapRegistry,
   openStudioInBrowser,
   openStudioRoadmap,
-  parseCodexDeviceAuthOutput,
   removeRoadmapRegistryEntry,
   resolveRoadmapRepositoryPath,
   resolveStudioBridgeWebUrl,
@@ -50,11 +106,11 @@ import {
   setRoadmapLifecycle,
   setRoadmapRemoteAccess,
   type BridgePairingSession,
+  type RuntimeProviderStatus,
   type BridgeRuntimeHandle,
-  type ProjectInspection,
-  type RoadmapRegistryEntry
+  type ProjectInspection
 } from "@hunsu/bridge";
-import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveRelayClientConfig, unwrapConfigResult } from "@hunsu/config";
+import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, unwrapConfigResult } from "@hunsu/config";
 
 type ParsedArgs = {
   command: string;
@@ -62,170 +118,6 @@ type ParsedArgs = {
   flags: Map<string, string | boolean>;
 };
 
-type BridgeAppState = {
-  schema: "hunsu.bridge-app-state.v1";
-  supervisorPid?: number;
-  pid?: number;
-  supervisorProcess?: BridgeProcessRuntimeMetadata;
-  bridgeProcess?: BridgeProcessRuntimeMetadata;
-  bridgeApiUrl?: string;
-  processNonce?: string;
-  commandIdentity?: BridgeProcessCommandIdentity;
-  authToken?: string;
-  controlToken?: string;
-  pairing?: BridgePairingSession;
-  cwd?: string;
-  webUrl?: string;
-  startedAt?: string;
-  account?: BridgeAccountState;
-  pendingAuth?: BridgePendingAuthState;
-  codex?: BridgeCodexSettings;
-  codexLogin?: CodexLoginProcessState;
-  device: BridgeDeviceState;
-  remoteAccess: "off" | "on" | "registered-offline" | "unavailable";
-  projectGrants: ProjectGrant[];
-  uiIntent?: BridgeUiIntent;
-  service: BridgeServiceState;
-};
-
-type CodexLoginProcessState = {
-  kind: "chatgpt" | "device";
-  pid?: number;
-  startedAt: string;
-  status: "starting" | "device_code" | "pending" | "completed" | "failed";
-  verificationUri?: string;
-  verificationUriComplete?: string;
-  userCode?: string;
-  lastOutput?: string;
-  error?: string;
-};
-
-type BridgeUiIntent = {
-  id: string;
-  tab: "codex" | "workspaces" | "advanced" | "diagnostics" | "settings" | "overview" | "prerequisites" | "roadmaps" | "connection" | "remote";
-  focus?: "codex";
-  action?: "add-roadmap";
-  createdAt: string;
-};
-
-type BridgeAccountState =
-  | { status: "signed-out" }
-  | { status: "signed-in"; userId: string; email?: string };
-
-type BridgeDeviceState = {
-  name: string;
-  id: string;
-  registered: boolean;
-};
-
-type BridgePendingAuthState = {
-  state: string;
-  codeVerifier: string;
-  redirectUri: string;
-  authBaseUrl: string;
-  startedAt: string;
-};
-
-type BridgeServiceState = {
-  installed: boolean;
-  manager: "systemd-user" | "launchd-user" | "windows-service" | "manual";
-  unitPath?: string;
-  updatedAt?: string;
-};
-
-type BridgeCodexSettings = {
-  binaryPath?: string;
-  installChannel?: "stable" | "latest" | "manual";
-  authenticationPreference?: "chatgpt" | "api_key" | "device_code";
-};
-
-type BridgeToolStatus = {
-  installed: boolean;
-  binaryPath?: string;
-  version?: string;
-  error?: string;
-};
-
-type BridgeProcessCommandIdentity = {
-  kind: "start" | "supervise" | "daemon" | "remote-attach";
-  executable: string;
-  argv: string[];
-  nonce: string;
-};
-
-type BridgeProcessRuntimeMetadata = {
-  pid: number;
-  processNonce?: string;
-  commandIdentity: BridgeProcessCommandIdentity;
-  startMetadata?: BridgeProcessStartMetadata;
-  recordedAt: string;
-};
-
-type BridgeProcessStartMetadata = {
-  platform: NodeJS.Platform;
-  source: "proc-stat" | "ps-lstart";
-  value: string;
-};
-
-type CodexDeviceLoginOutcome =
-  | { kind: "exit"; code: number | null; signal: NodeJS.Signals | null }
-  | { kind: "error"; error: Error }
-  | { kind: "timeout" };
-
-type BridgeAppSnapshot = {
-  schema: "hunsu.bridge-app-snapshot.v1";
-  status: {
-    localBridge: "connected" | "not-running" | "starting" | "error";
-    account: string;
-    remoteAccess: "Off" | "On" | "Registered but offline" | "Unavailable";
-    device: BridgeDeviceState;
-    service: BridgeServiceState;
-    supervisorPid?: number;
-    pid?: number;
-    bridgeApiUrl?: string;
-    startedAt?: string;
-    healthError?: string;
-  };
-  projectGrants: ProjectGrant[];
-  activeProjectGrants: ProjectGrant[];
-  recentProjects: ReturnType<typeof listRoadmapRegistry>;
-  managedRoadmaps: BridgeRoadmapAccessSnapshot[];
-  prerequisites: {
-    codex: Awaited<ReturnType<typeof getCodexRuntimeStatus>>;
-    tools: {
-      git: BridgeToolStatus;
-      node: BridgeToolStatus;
-      packageManager: BridgeToolStatus;
-    };
-  };
-  codexSettings: BridgeCodexSettings & {
-    environment: {
-      CODEX_HOME?: string;
-      HUNSU_CODEX_APP_SERVER_COMMAND?: string;
-      HUNSU_CODEX_APP_SERVER_ARGS?: string;
-    };
-  };
-  codexLogin?: CodexLoginProcessState;
-  diagnostics: unknown;
-  logLines: string[];
-  uiIntent?: BridgeUiIntent;
-};
-
-type BridgeRoadmapAccessSnapshot = Omit<RoadmapRegistryEntry, "codex" | "remoteAccess"> & {
-  codex: {
-    readyForExecute: boolean;
-  };
-  projectGrant?: ProjectGrant;
-  remoteAccess: {
-    available: boolean;
-    enabled: boolean;
-    reason?: string;
-    scopes: BridgeCommandScope[];
-    scopeState: Record<BridgeCommandScope, boolean>;
-  };
-};
-
-const DEFAULT_APP_STATE_PATH = join(homedir(), ".config", "hunsu", "bridge-app.json");
 const DEFAULT_CREDENTIAL_PATH = join(homedir(), ".config", "hunsu", "bridge-credentials.json");
 const DEFAULT_RELAY_REGISTRY_PATH = join(homedir(), ".config", "hunsu", "relay-devices.json");
 const DEFAULT_APP_LOG_PATH = join(homedir(), ".cache", "hunsu", "bridge-app.log");
@@ -235,10 +127,6 @@ const PROJECT_GRANT_SCOPE_VALUES = ["execute.start", "artifactAction.run", "env.
 const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose"];
 const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
 const BRIDGE_STARTING_GRACE_MS = 15_000;
-const BRIDGE_PROCESS_NONCE_ENV = "HUNSU_BRIDGE_PROCESS_NONCE";
-const CODEX_DEVICE_LOGIN_STARTUP_GRACE_MS = 3_000;
-const CODEX_DEVICE_LOGIN_JSON_TIMEOUT_MS = 10_000;
-const CODEX_DEVICE_LOGIN_BACKGROUND_LIFECYCLE_TIMEOUT_MS = 15 * 60_000;
 
 async function main(argv = process.argv.slice(2)): Promise<number> {
   const parsed = parseArgs(normalizeBridgeAppArgv(argv));
@@ -276,7 +164,7 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
         await stopCommand();
         return 0;
       case "diagnostics":
-        await diagnosticsCommand();
+        await runDiagnosticsCommand(diagnosticsCommandContext());
         return 0;
       case "snapshot":
         await snapshotCommand();
@@ -288,13 +176,13 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
         await codexCommand(parsed);
         return 0;
       case "login":
-        await loginCommand(parsed);
+        await runLoginCommand(parsed, authCommandContext());
         return 0;
       case "auth-callback":
-        await authCallbackCommand(parsed);
+        await runAuthCallbackCommand(parsed, authCommandContext());
         return 0;
       case "logout":
-        logoutCommand();
+        runLogoutCommand(authCommandContext());
         return 0;
       case "remote":
         await remoteCommand(parsed);
@@ -343,11 +231,21 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
 }
 
 async function supervisedStartCommand(parsed: ParsedArgs): Promise<void> {
-  const supervisor = createBridgeAppSidecarSupervisor(parsed);
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
+  const state = readAppState();
+  const supervisor = createBridgeAppSidecarSupervisorFromProcess({
+    cwd,
+    webUrl: getFlag(parsed, "web-url"),
+    remote: hasFlag(parsed, "remote"),
+    noOpen: hasFlag(parsed, "no-open"),
+    restartLimit: Number(getFlag(parsed, "restart-limit") ?? 3),
+    appLogPath: appLogPath(),
+    state,
+    activeProjectGrants: activeManagedProjectGrants(state.projectGrants)
+  });
   const commandIdentity = currentBridgeProcessCommandIdentity("start");
   writeAppState({
-    ...readAppState(),
+    ...state,
     supervisorPid: process.pid,
     supervisorProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
     processNonce: commandIdentity.nonce,
@@ -379,11 +277,12 @@ async function daemonCommand(parsed: ParsedArgs): Promise<void> {
     noOpen: hasFlag(parsed, "no-open"),
     mode: remote ? "remote-ready" : "local"
   });
-  let relayClient: RelayOutboundClient | undefined;
+  let relayClient: Awaited<ReturnType<typeof startRelayIfConfigured>> | undefined;
   if (remote) {
-    await enableRemoteAccessIfSignedIn();
-    relayClient = startRelayIfConfigured(handle);
-  writeRemoteAccessState(relayClient && await waitForRelayConnection(relayClient) ? "on" : "registered-offline");
+    const remoteContext = remoteAccessRuntimeContext();
+    await enableRemoteAccessIfSignedIn(remoteContext);
+    relayClient = await startRelayIfConfigured(handle, remoteContext);
+    writeRemoteAccessState(relayClient && await waitForRelayConnection(relayClient) ? "on" : "registered-offline", remoteContext);
   }
   rememberRunningBridge(handle, cwd, getFlag(parsed, "web-url"));
   printAppStatus(handle);
@@ -597,25 +496,25 @@ async function statusCommand(): Promise<void> {
   console.log(`  Device: ${snapshot.status.device.name}${snapshot.status.device.registered ? " (registered)" : ""}`);
   console.log(`  Service: ${snapshot.status.service.installed ? `Installed (${snapshot.status.service.manager})` : "Not installed"}`);
   console.log("");
-  console.log("Prerequisites:");
-  console.log(`  Codex: ${codexStatusLabel(snapshot.prerequisites.codex)}`);
+  console.log("Provider:");
+  console.log(`  ${snapshot.providers.current.label}: ${providerStatusSummary(snapshot.providers.current)}`);
   console.log(`  Git: ${snapshot.prerequisites.tools.git.installed ? "Ready" : "Missing"}`);
   console.log(`  Node: ${snapshot.prerequisites.tools.node.installed ? "Ready" : "Missing"}`);
   console.log("");
   const activeRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle === "active");
   const inactiveRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle !== "active");
-  console.log("Active Roadmaps:");
+  console.log("Active Workspaces:");
   for (const roadmap of activeRoadmaps) {
     console.log(`  ${roadmap.displayName}`);
     console.log(`    ${roadmap.repositoryPath}`);
-    console.log(`    Codex: ${roadmap.codex.readyForExecute ? "Ready" : "Not Ready"}`);
+    console.log(`    Provider: ${roadmap.provider.label} ${roadmap.provider.readyForExecute ? "Ready" : "Not Ready"}`);
     console.log(`    Remote Access: ${roadmap.remoteAccess.enabled ? "On" : "Off"}`);
   }
   if (activeRoadmaps.length === 0) {
     console.log("  None");
   }
   console.log("");
-  console.log("Inactive Roadmaps:");
+  console.log("Inactive Workspaces:");
   for (const roadmap of inactiveRoadmaps) {
     console.log(`  ${roadmap.displayName}`);
     console.log(`    ${roadmap.repositoryPath}`);
@@ -633,7 +532,6 @@ async function statusCommand(): Promise<void> {
 
 function codexStatusLabel(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus>>): string {
   if (codex.ready) return "Ready";
-  if (codex.recommendedAction === "select_codex_path") return "Select Codex path";
   if (!codex.cli.installed) return "Missing";
   if (codex.auth.state === "not_authenticated" || codex.auth.state === "expired" || codex.auth.state === "invalid") return "Login required";
   if (codex.usage.rateLimited) return "Rate limited";
@@ -696,8 +594,20 @@ async function stopCommand(): Promise<void> {
   console.log("Hunsu Bridge stopped.");
 }
 
-async function diagnosticsCommand(): Promise<void> {
-  console.log(JSON.stringify(await buildDiagnostics(), null, 2));
+function diagnosticsCommandContext() {
+  return {
+    appStatePath,
+    appLogPath,
+    credentialPath,
+    relayRegistryPath,
+    readState: readAppState,
+    readBridgeHealth,
+    snapshotProjectGrants,
+    activeManagedProjectGrants,
+    roadmapRegistryOptions,
+    safeCodexDiagnostics,
+    cwd: () => process.cwd()
+  };
 }
 
 async function snapshotCommand(): Promise<void> {
@@ -718,157 +628,57 @@ async function prerequisitesCommand(parsed: ParsedArgs): Promise<void> {
 }
 
 async function codexCommand(parsed: ParsedArgs): Promise<void> {
-  const action = parsed.rest[0] ?? "status";
-  if (action === "status" || action === "recheck") {
-    const codex = await getCodexRuntimeStatus({ env: codexProbeEnv(), force: true });
-    reconcileCodexLoginFromStatus(codex);
-    if (hasFlag(parsed, "json")) {
-      console.log(JSON.stringify(codex, null, 2));
-      return;
-    }
-    printCodexStatus(codex);
-    return;
-  }
-  if (action === "install") {
-    console.log("Review before running:");
-    console.log("  curl -fsSL https://chatgpt.com/codex/install.sh | sh");
-    console.log("Hunsu does not run installer commands without explicit confirmation.");
-    return;
-  }
-  if (action === "login") {
-    if (hasFlag(parsed, "device")) {
-      await runCodexDeviceLoginCli({ json: hasFlag(parsed, "json"), background: hasFlag(parsed, "background") });
-      return;
-    }
-    if (hasFlag(parsed, "json") || hasFlag(parsed, "background")) {
-      throw new Error("codex login --json/--background requires --device.");
-    }
-    await runCodexChatGptLoginCli();
-    return;
-  }
-  if (action === "logout") {
-    runCodexCli(["logout"]);
-    return;
-  }
-  if (action === "path") {
-    const subcommand = parsed.rest[1];
-    if (subcommand === "set") {
-      const binaryPath = parsed.rest[2];
-      if (!binaryPath?.trim()) {
-        throw new Error("Usage: hunsu-bridge codex path set /path/to/codex");
-      }
-      const resolvedPath = resolve(binaryPath);
-      assertSelectedCodexBinaryName(resolvedPath);
-      const status = await getCodexRuntimeStatus({ env: { ...codexProbeEnv(), HUNSU_CODEX_BINARY_PATH: resolvedPath }, force: true });
-      if (!status.cli.installed) {
-        throw new Error(status.cli.error ?? "Custom Codex path is invalid.");
-      }
-      if (!status.cli.version) {
-        throw new Error("Selected Codex path did not respond to `codex --version`.");
-      }
-      if (!status.appServer.available) {
-        throw new Error(status.appServer.error ?? "Selected Codex path could not start `codex app-server --stdio`.");
-      }
-      const state = readAppState();
-      writeAppState({ ...state, codex: { ...state.codex, binaryPath: resolvedPath } });
-      console.log(`Codex binary path set to ${resolvedPath}`);
-      return;
-    }
-    if (subcommand === "reset") {
-      const state = readAppState();
-      writeAppState({ ...state, codex: { ...state.codex, binaryPath: undefined } });
-      console.log("Codex binary path reset to auto-detect.");
-      return;
-    }
-  }
-  if (action === "settings") {
-    const subcommand = parsed.rest[1];
-    if (subcommand === "set") {
-      const installChannel = parseCodexInstallChannel(getFlag(parsed, "install-channel"));
-      const authenticationPreference = parseCodexAuthenticationPreference(getFlag(parsed, "auth-preference"));
-      const state = readAppState();
-      writeAppState({
-        ...state,
-        codex: {
-          ...state.codex,
-          ...(installChannel ? { installChannel } : {}),
-          ...(authenticationPreference ? { authenticationPreference } : {})
-        }
-      });
-      console.log("Codex settings saved.");
-      return;
-    }
-  }
-  throw new Error("Usage: hunsu-bridge codex status|install|login [--device] [--background]|recheck|logout|path set <path>|path reset|settings set [--install-channel stable|latest|manual] [--auth-preference chatgpt|api_key|device_code]");
+  await runCodexCommand(parsed, {
+    hasFlag,
+    getFlag,
+    resolvePath: path => resolve(path),
+    getCodexStatus: getCodexRuntimeStatus,
+    codexProbeEnv,
+    reconcileCodexLoginFromStatus: codex => reconcileCodexLoginFromStatus(codex, codexCliActionContext()),
+    runCodexInstallCli,
+    providerStatusSummary,
+    runCodexApiKeyLoginCli: () => runCodexApiKeyLoginCliAction(codexCliActionContext()),
+    runCodexDeviceLoginCli: options => runCodexDeviceLoginCliAction(options, codexCliActionContext()),
+    runCodexChatGptLoginCli: () => runCodexChatGptLoginCliAction(codexCliActionContext()),
+    runCodexCli: args => runCodexCliAction(args, codexCliActionContext()),
+    readState: readAppState,
+    writeState: writeAppState,
+    parseInstallChannel: parseCodexInstallChannel,
+    parseAuthenticationPreference: parseCodexAuthenticationPreference,
+    printCodexStatus
+  });
 }
 
 async function roadmapsCommand(parsed: ParsedArgs): Promise<void> {
-  const action = parsed.rest[0] ?? "list";
-  if (action === "list") {
-    const state = readAppState();
-    const codex = await getCodexRuntimeStatus({ env: codexProbeEnv() });
-    const roadmaps = roadmapAccessSnapshots(listManagedRoadmapRegistry(roadmapRegistryOptions()), state.projectGrants, codex.ready);
-    if (hasFlag(parsed, "json")) {
-      console.log(JSON.stringify({ roadmaps }, null, 2));
-      return;
-    }
-    printManagedRoadmaps(roadmaps, codex.ready);
-    return;
-  }
-  if (action === "add") {
-    const path = parsed.rest[1];
-    if (!path?.trim()) {
-      throw new Error("Usage: hunsu-bridge roadmaps add /path/to/project");
-    }
-    const project = inspectProject({ path: resolve(path) }, roadmapRegistryOptions());
-    const state = createStudioState();
-    const options = roadmapRegistryOptions();
-    if (project.kind === "hunsu-roadmap") {
-      const result = openStudioRoadmap({ path: project.path }, state, { persist: true, roadmapRegistryPath: options.roadmapRegistryPath });
-      console.log(`Activated Roadmap: ${result.roadmap.displayName}`);
-      return;
-    }
-    if (project.kind === "git-project") {
-      const result = applyStudioPort({ path: project.path, title: basename(project.path), goal: `Port ${basename(project.path)} into Hunsu.` }, state, options);
-      console.log(`Ported and activated Roadmap: ${result.roadmap.displayName}`);
-      return;
-    }
-    if (project.kind === "new-project") {
-      const result = createStudioRoadmap({ path: project.path }, state, { persist: true, roadmapRegistryPath: options.roadmapRegistryPath });
-      console.log(`Created and activated Roadmap: ${result.roadmap.displayName}`);
-      return;
-    }
-    throw new Error(project.kind === "missing-roadmap" ? project.reason : project.reason);
-  }
-  if (action === "activate" || action === "deactivate") {
-    const roadmapId = parsed.rest[1];
-    if (!roadmapId?.trim()) {
-      throw new Error(`Usage: hunsu-bridge roadmaps ${action} <roadmapId>`);
-    }
-    const result = setRoadmapLifecycle({ roadmapId }, action === "activate" ? "active" : "inactive", roadmapRegistryOptions());
-    await publishProjectGrantsToRelay(readAppState());
-    console.log(`${action === "activate" ? "Activated" : "Deactivated"} Roadmap: ${result.roadmap?.displayName ?? roadmapId}`);
-    return;
-  }
-  if (action === "remote") {
-    const mode = parsed.rest[1];
-    const roadmapId = parsed.rest[2];
-    if ((mode !== "enable" && mode !== "disable") || !roadmapId?.trim()) {
-      throw new Error("Usage: hunsu-bridge roadmaps remote enable|disable <roadmapId> [--scopes all|remoteRelay.access,execute.start,artifactAction.run,env.read,hostAlias.expose]");
-    }
-    await setRoadmapRemoteAccessCommand(roadmapId, mode === "enable", parsed);
-    return;
-  }
-  if (action === "remove") {
-    const roadmapId = parsed.rest[1] ?? getFlag(parsed, "roadmap-id");
-    if (!roadmapId?.trim()) {
-      throw new Error("Usage: hunsu-bridge roadmaps remove <roadmapId>");
-    }
-    const result = removeRoadmapRegistryEntry({ roadmapId }, roadmapRegistryOptions());
-    console.log(result.removed ? "Removed Roadmap from Bridge App. Local files were not deleted." : "Roadmap was not registered.");
-    return;
-  }
-  throw new Error("Usage: hunsu-bridge roadmaps list|add <path>|activate <roadmapId>|deactivate <roadmapId>|remote enable|disable <roadmapId>|remove <roadmapId>");
+  await runRoadmapsCommand(parsed, workspaceCommandContext());
+}
+
+function workspaceCommandContext() {
+  return {
+    hasFlag,
+    getFlag,
+    resolvePath: (path: string) => resolve(path),
+    basename,
+    readState: readAppState,
+    writeState: writeAppState,
+    createStudioState,
+    runtimeProvidersSnapshot,
+    roadmapRegistryOptions,
+    listManagedRoadmaps: listManagedRoadmapRegistry,
+    listRecentRoadmaps: listRoadmapRegistry,
+    inspectProject,
+    openStudioRoadmap,
+    applyStudioPort,
+    createStudioRoadmap,
+    setRoadmapLifecycle,
+    removeRoadmapRegistryEntry,
+    setRoadmapRemoteAccessCommand,
+    publishProjectGrantsToRelay: (state: BridgeAppState) => publishProjectGrantsToRelay(state, remoteAccessRuntimeContext()),
+    printManagedRoadmaps,
+    normalizeGrantPath,
+    looksLikeProjectPath,
+    projectGrantScopesForCommand
+  };
 }
 
 function activateRoadmapIntentCommand(parsed: ParsedArgs): void {
@@ -888,341 +698,75 @@ function activateRoadmapIntentCommand(parsed: ParsedArgs): void {
 }
 
 function uiIntentCommand(parsed: ParsedArgs): void {
-  const tab = normalizeBridgeUiIntentTab(parsed.rest[0]);
+  const tab = canonicalBridgeUiIntentTab(parsed.rest[0]);
   if (!isBridgeUiIntentTab(tab)) {
-    throw new Error("Usage: hunsu-bridge ui-intent codex|workspaces|advanced|diagnostics|settings [codex|add-roadmap]");
+    throw new Error("Usage: hunsu-bridge ui-intent provider|workspaces|connection|advanced|diagnostics|settings [codex|add-workspace]");
   }
   const detail = parsed.rest[1];
   writeBridgeUiIntent({
     tab,
-    focus: tab === "codex" && detail === "codex" ? "codex" : undefined,
-    action: tab === "workspaces" && detail === "add-roadmap" ? "add-roadmap" : undefined
+    focus: tab === "connection" && detail === "remote" ? "remote" : tab === "provider" && detail === "codex" ? "codex" : undefined,
+    action: tab === "workspaces" && (detail === "add-roadmap" || detail === "add-workspace") ? "add-workspace" : undefined
   });
   console.log(`Bridge App intent recorded: ${tab}`);
 }
 
 function writeBridgeUiIntent(intent: Omit<BridgeUiIntent, "id" | "createdAt">): BridgeUiIntent {
-  const state = readAppState();
-  const uiIntent: BridgeUiIntent = {
-    ...intent,
-    id: `intent_${randomBytes(12).toString("base64url")}`,
-    createdAt: new Date().toISOString()
+  return recordBridgeUiIntent(intent, {
+    readState: readAppState,
+    writeState: writeAppState
+  });
+}
+
+function authCommandContext() {
+  return {
+    hasFlag,
+    getFlag,
+    numericFlag,
+    credentialPath,
+    readState: readAppState,
+    writeState: writeAppState,
+    credentialsForDevUser,
+    openBrowser: openStudioInBrowser,
+    disableAllManagedRoadmapRemoteAccess,
+    projectGrantsWithoutRemoteRelay
   };
-  writeAppState({ ...state, uiIntent });
-  return uiIntent;
-}
-
-function isBridgeUiIntentTab(value: unknown): value is BridgeUiIntent["tab"] {
-  return value === "codex"
-    || value === "workspaces"
-    || value === "advanced"
-    || value === "overview"
-    || value === "prerequisites"
-    || value === "roadmaps"
-    || value === "connection"
-    || value === "remote"
-    || value === "diagnostics"
-    || value === "settings";
-}
-
-function normalizeBridgeUiIntentTab(value: unknown): BridgeUiIntent["tab"] | undefined {
-  if (value === "prerequisites") return "codex";
-  if (value === "roadmaps") return "workspaces";
-  return isBridgeUiIntentTab(value) ? value : undefined;
-}
-
-async function buildDiagnostics(): Promise<unknown> {
-  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig(currentProcessEnv(), { cwd: process.cwd() }));
-  const health = await readBridgeHealth();
-  const state = readAppState();
-  const credentialStore = createDefaultCredentialStore({ path: credentialPath() });
-  const relayRegistry = new FileRelayRegistry(relayRegistryPath());
-  return sanitizeDiagnostics({
-    app: {
-      statePath: appStatePath(),
-      logPath: appLogPath(),
-      supervisorPid: state.supervisorPid,
-      pid: state.pid,
-      device: state.device,
-      controlTokenPresent: Boolean(state.controlToken),
-      pairing: state.pairing ? {
-        issuedAt: state.pairing.issuedAt,
-        expiresAt: state.pairing.expiresAt,
-        revokedAt: state.pairing.revokedAt
-      } : undefined,
-      account: state.account ?? { status: "signed-out" },
-      pendingAuth: state.pendingAuth ? { state: state.pendingAuth.state, startedAt: state.pendingAuth.startedAt } : undefined,
-      credentialBackend: credentialStore.backend,
-      credentialsPresent: credentialStore.read() !== undefined,
-      remoteAccess: state.remoteAccess,
-      projectGrantCount: state.projectGrants.length,
-      projectGrants: snapshotProjectGrants(state.projectGrants),
-      activeProjectGrants: activeManagedProjectGrants(state.projectGrants),
-      service: state.service,
-      codex: {
-        binaryPathConfigured: Boolean(state.codex?.binaryPath),
-        binaryPath: state.codex?.binaryPath
-      }
-    },
-    bridge: {
-      health,
-      apiUrl: endpointUrl(runtimeConfig.bridgeApi),
-      version: bridgeVersionInfo()
-    },
-    codex: await safeCodexDiagnostics(),
-    recentProjects: listManagedRoadmapRegistry(roadmapRegistryOptions()).map(project => ({
-      roadmapId: project.roadmapId,
-      displayName: project.displayName,
-      repositoryPath: project.repositoryPath,
-      lifecycle: project.lifecycle,
-      health: project.health,
-      type: project.type,
-      primaryAction: project.primaryAction
-    })),
-    relay: relayRegistry.listDevices(state.account?.status === "signed-in" ? state.account.userId : undefined).map(device => ({
-      deviceId: device.deviceId,
-      deviceName: device.deviceName,
-      status: device.status,
-      lastSeenAt: device.lastSeenAt
-    }))
-  });
-}
-
-async function loginCommand(parsed: ParsedArgs = { command: "login", rest: [], flags: new Map() }): Promise<void> {
-  const state = readAppState();
-  const credentialStore = createDefaultCredentialStore({ path: credentialPath() });
-  const devUser = nonEmptyFlagValue(currentProcessEnv().HUNSU_BRIDGE_DEV_USER);
-  if (devUser) {
-    credentialStore.write(credentialsForDevUser(devUser, state));
-    writeAppState({
-      ...state,
-      account: { status: "signed-in", userId: devUser, email: devUser.includes("@") ? devUser : undefined },
-      device: { ...state.device, registered: true }
-    });
-    console.log(`Signed in as ${devUser}.`);
-    return;
-  }
-  if (hasFlag(parsed, "gui")) {
-    const authBaseUrl = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv())).authBaseUrl;
-    const request = createPkceAuthorizationRequest({
-      authBaseUrl,
-      clientId: "hunsu-bridge-app",
-      redirectUri: "hunsu://pair",
-      scope: "bridge device relay"
-    });
-    writeAppState({
-      ...state,
-      pendingAuth: {
-        state: request.state,
-        codeVerifier: request.codeVerifier,
-        redirectUri: request.redirectUri,
-        authBaseUrl,
-        startedAt: new Date().toISOString()
-      }
-    });
-    console.log("Open this URL in your browser:");
-    console.log(request.authorizationUrl);
-    console.log("");
-    console.log("Authorization Code + PKCE is ready for the GUI Bridge App callback.");
-    if (!hasFlag(parsed, "no-open")) {
-      openStudioInBrowser(request.authorizationUrl);
-    }
-    return;
-  }
-  const configuredAuthBaseUrl = getFlag(parsed, "auth-url") ?? unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv())).authBaseUrl;
-  const localDev = configuredAuthBaseUrl === "local-dev" || hasFlag(parsed, "local-dev");
-  const localDevServer = localDev
-    ? await startLocalDevAuthServer({
-        userId: getFlag(parsed, "user") ?? "local-dev@example.test",
-        email: getFlag(parsed, "email") ?? getFlag(parsed, "user") ?? "local-dev@example.test"
-      })
-    : undefined;
-  const authBaseUrl = localDevServer?.authBaseUrl ?? configuredAuthBaseUrl;
-  try {
-    const request = await startDeviceAuthorization({
-      authBaseUrl,
-      clientId: "hunsu-bridge-headless",
-      scope: "bridge device relay",
-      deviceId: state.device.id,
-      deviceName: state.device.name
-    });
-    console.log("Open this URL on another device:");
-    console.log(request.verificationUriComplete ?? request.verificationUri);
-    console.log("");
-    console.log("Enter code:");
-    console.log(request.userCode);
-    console.log("");
-    if (localDevServer && (hasFlag(parsed, "auto-approve") || currentProcessEnv().HUNSU_BRIDGE_AUTH_LOCAL_DEV_AUTO_APPROVE === "1")) {
-      await fetch(request.verificationUriComplete ?? `${request.verificationUri}?user_code=${encodeURIComponent(request.userCode)}`);
-    }
-    const credentials = await pollDeviceAuthorization({
-      authBaseUrl,
-      clientId: "hunsu-bridge-headless",
-      deviceCode: request.deviceCode,
-      deviceId: state.device.id,
-      deviceName: state.device.name,
-      intervalSeconds: request.intervalSeconds,
-      expiresAt: request.expiresAt,
-      maxWaitMs: numericFlag(parsed, "poll-timeout-ms")
-    });
-    credentialStore.write(credentials);
-    writeAppState({
-      ...state,
-      account: { status: "signed-in", userId: credentials.userId, email: credentials.email },
-      device: { ...state.device, registered: true },
-      pendingAuth: undefined
-    });
-    console.log(`Signed in as ${credentials.email ?? credentials.userId}.`);
-  } finally {
-    await localDevServer?.close();
-  }
-}
-
-async function authCallbackCommand(parsed: ParsedArgs): Promise<void> {
-  const code = getFlag(parsed, "code") ?? parsed.rest[0];
-  const stateParam = getFlag(parsed, "state");
-  if (!code?.trim() || !stateParam?.trim()) {
-    throw new Error("Authorization callback requires code and state.");
-  }
-  const state = readAppState();
-  if (!state.pendingAuth) {
-    throw new Error("No pending Bridge App sign-in request was found.");
-  }
-  if (state.pendingAuth.state !== stateParam) {
-    throw new Error("Authorization callback state did not match the pending Bridge App sign-in.");
-  }
-  const credentials = await exchangeAuthorizationCode({
-    authBaseUrl: state.pendingAuth.authBaseUrl,
-    clientId: "hunsu-bridge-app",
-    code,
-    codeVerifier: state.pendingAuth.codeVerifier,
-    redirectUri: state.pendingAuth.redirectUri,
-    deviceId: state.device.id,
-    deviceName: state.device.name
-  });
-  createDefaultCredentialStore({ path: credentialPath() }).write(credentials);
-  writeAppState({
-    ...state,
-    pendingAuth: undefined,
-    account: { status: "signed-in", userId: credentials.userId, email: credentials.email },
-    device: { ...state.device, registered: true }
-  });
-  console.log(`Signed in as ${credentials.email ?? credentials.userId}.`);
-}
-
-function logoutCommand(): void {
-  const state = readAppState();
-  createDefaultCredentialStore({ path: credentialPath() }).clear();
-  writeAppState({
-    ...state,
-    account: { status: "signed-out" },
-    pendingAuth: undefined,
-    remoteAccess: "off"
-  });
-  console.log("Signed out. Local Bridge remains available.");
 }
 
 async function remoteCommand(parsed: ParsedArgs): Promise<void> {
-  const subcommand = parsed.rest[0] ?? "status";
-  const state = readAppState();
-  const relayRegistry = new FileRelayRegistry(relayRegistryPath());
-  if (subcommand === "status") {
-    console.log(`Remote Access: ${formatRemoteAccess(state.remoteAccess)}`);
-    console.log(`Device: ${state.device.name}${state.device.registered ? " (registered)" : ""}`);
-    console.log(`Account: ${state.account?.status === "signed-in" ? `Signed in as ${state.account.email ?? state.account.userId}` : "Signed out"}`);
-    return;
-  }
-  if (subcommand === "devices") {
-    const userId = state.account?.status === "signed-in" ? state.account.userId : undefined;
-    for (const device of relayRegistry.listDevices(userId)) {
-      console.log(`${device.deviceName}\t${device.status}\t${device.deviceId}`);
-    }
-    return;
-  }
-  if (subcommand === "attach") {
-    await attachRemoteAccessCommand();
-    return;
-  }
-  if (subcommand === "enable") {
-    if (state.account?.status !== "signed-in") {
-      writeAppState({ ...state, remoteAccess: "unavailable" });
-      console.log("Remote Access is unavailable until this device is signed in.");
-      console.log("Run `hunsu-bridge login` to start device login.");
-      return;
-    }
-    const device = {
-      deviceId: state.device.id,
-      deviceName: state.device.name,
-      userId: state.account.userId,
-      bridgeVersion: bridgeVersionInfo().bridgeVersion,
-      bridgeAppVersion: HUNSU_BRIDGE_APP_VERSION,
-      protocolVersion: bridgeVersionInfo().protocolVersion
-    };
-    const nextGrants = state.projectGrants.map(grant => ({
-      ...grant,
-      scopes: grant.scopes.includes("remoteRelay.access") ? grant.scopes : uniqueScopeList([...grant.scopes, "remoteRelay.access"])
-    }));
-    const activeGrants = activeManagedProjectGrants(nextGrants);
-    const credentials = createDefaultCredentialStore({ path: credentialPath() }).read();
-    const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
-    if (credentials && relayConfig.relayApiUrl) {
-      await registerRelayDevice({
-        relayApiUrl: relayConfig.relayApiUrl,
-        accessToken: credentials.accessToken,
-        device: {
-          ...device,
-          registeredAt: new Date().toISOString(),
-          status: "offline" as const
-        },
-        projectGrants: activeGrants
-      });
-      writeStructuredLog({ event: "relay.device.registered", relayApiUrl: relayConfig.relayApiUrl, deviceId: state.device.id });
-    } else {
-      relayRegistry.registerDevice(device);
-      writeStructuredLog({ event: "relay.device.registered-local", deviceId: state.device.id });
-    }
-    writeAppState({
-      ...state,
-      remoteAccess: "registered-offline",
-      device: { ...state.device, registered: true },
-      projectGrants: nextGrants
-    });
-    const started = startRemoteAccessProcessIfPossible(parsed);
-    console.log("Remote Access registered for this signed-in device.");
-    console.log(started
-      ? "Starting outbound Relay connection."
-      : "Remote Access is registered but offline until Bridge can connect to Relay.");
-    return;
-  }
-  if (subcommand === "disable") {
-    await revokeRunningBridgePairing();
-    relayRegistry.updateDeviceStatus(state.device.id, "offline");
-    writeAppState({ ...state, remoteAccess: "off" });
-    console.log("Remote Access disabled.");
-    return;
-  }
-  if (subcommand === "check") {
-    const command = parsed.rest[1] ?? "health";
-    if (!isRelayCommandName(command)) {
-      throw new Error(`Unknown Relay command: ${command}`);
-    }
-    const projectPath = parsed.rest[2] ? resolve(parsed.rest[2]) : undefined;
-    const decision = evaluateRelayCommand({
-      device: relayRegistry.listDevices().find(device => device.deviceId === state.device.id),
-      command: {
-        deviceId: state.device.id,
-        command,
-        projectPath
-      },
-      projectGrants: activeManagedProjectGrants(state.projectGrants)
-    });
-    if (!decision.ok) {
-      throw new Error(decision.message);
-    }
-    console.log(`Relay command allowed: ${command}`);
-    return;
-  }
-  throw new Error(`Unknown remote command: ${subcommand}`);
+  await runRemoteCommand(parsed, {
+    ...remoteAccessRuntimeContext(),
+    formatRemoteAccess: formatBridgeRemoteAccess,
+    projectGrantsWithoutRemoteRelay,
+    disableAllManagedRoadmapRemoteAccess,
+    revokeRunningBridgePairing,
+    isRelayCommandName
+  });
+}
+
+function remoteAccessRuntimeContext() {
+  return {
+    appVersion: HUNSU_BRIDGE_APP_VERSION,
+    credentialPath,
+    relayRegistryPath,
+    readState: readAppState,
+    writeState: writeAppState,
+    projectGrantsWithRemoteRelay,
+    activeManagedProjectGrants,
+    currentProviderStatus: async () => (await runtimeProvidersSnapshot()).current,
+    listManagedRoadmaps: () => listManagedRoadmapRegistry(roadmapRegistryOptions()),
+    normalizeGrantPath,
+    getFlag: (parsed: { flags: Map<string, string | boolean> }, name: string) => {
+      const value = parsed.flags.get(name);
+      return typeof value === "string" ? value : undefined;
+    },
+    hasFlag: (parsed: { flags: Map<string, string | boolean> }, name: string) => parsed.flags.has(name),
+    resolvePath: (path: string) => resolve(path),
+    waitForShutdown: (cleanup: () => void | Promise<void>) => waitForShutdown(async () => {
+      await cleanup();
+    }),
+    writeStructuredLog
+  };
 }
 
 function serviceCommand(parsed: ParsedArgs): void {
@@ -1282,19 +826,19 @@ function protocolCommand(parsed: ParsedArgs): void {
 
 async function superviseCommand(parsed: ParsedArgs): Promise<void> {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
-  const daemonNonce = newBridgeProcessNonce();
-  const supervisor = new BridgeSidecarSupervisor({
-    command: process.execPath,
-    args: [...bridgeNodeExecArgs(), process.argv[1] ?? "hunsu-bridge", "daemon", "--cwd", cwd, "--no-open"],
+  const state = readAppState();
+  const supervisor = createBridgeAppSidecarSupervisorFromProcess({
     cwd,
-    env: bridgeProcessEnvWithNonce(daemonNonce),
-    logPath: appLogPath(),
+    webUrl: getFlag(parsed, "web-url"),
+    noOpen: true,
     restartLimit: Number(getFlag(parsed, "restart-limit") ?? 3),
-    restartDelayMs: 750
+    appLogPath: appLogPath(),
+    state,
+    activeProjectGrants: activeManagedProjectGrants(state.projectGrants)
   });
   const commandIdentity = currentBridgeProcessCommandIdentity("supervise");
   writeAppState({
-    ...readAppState(),
+    ...state,
     supervisorPid: process.pid,
     supervisorProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
     processNonce: commandIdentity.nonce,
@@ -1316,110 +860,7 @@ async function superviseCommand(parsed: ParsedArgs): Promise<void> {
 }
 
 async function projectsCommand(parsed: ParsedArgs): Promise<void> {
-  const subcommand = parsed.rest[0] ?? "list";
-  if (["add", "activate", "deactivate"].includes(subcommand)) {
-    await roadmapsCommand({ ...parsed, command: "roadmaps" });
-    return;
-  }
-  if (subcommand === "list") {
-    const grants = readAppState().projectGrants;
-    if (grants.length === 0) {
-      console.log("No Project Grants.");
-      return;
-    }
-    for (const grant of grants) {
-      console.log(`${grant.path}\t${grant.scopes.join(",")}\t${grant.grantedAt}`);
-    }
-    return;
-  }
-  if (subcommand === "recent") {
-    for (const project of listRoadmapRegistry(roadmapRegistryOptions())) {
-      console.log(`${project.displayName}\t${project.health}\t${project.repositoryPath}`);
-    }
-    return;
-  }
-  if (subcommand === "remove") {
-    const target = parsed.rest[1];
-    const explicitRoadmapId = getFlag(parsed, "roadmap-id");
-    const explicitPath = getFlag(parsed, "path");
-    const inferredPath = target && looksLikeProjectPath(target) ? target : undefined;
-    const inferredRoadmapId = target && !looksLikeProjectPath(target) ? target : undefined;
-    const roadmapId = explicitRoadmapId ?? inferredRoadmapId;
-    const path = explicitPath ?? inferredPath;
-    if (!roadmapId && !path) {
-      throw new Error("Roadmap ID or project path is required.");
-    }
-    const result = removeRoadmapRegistryEntry({
-      roadmapId,
-      path: path ? resolve(path) : undefined
-    }, roadmapRegistryOptions());
-    console.log(result.removed ? "Removed from recent Roadmaps." : "No matching recent Roadmap was found.");
-    return;
-  }
-  const targetPath = parsed.rest[1] ? normalizeGrantPath(parsed.rest[1]) : undefined;
-  if (!targetPath) {
-    throw new Error("Project path is required.");
-  }
-  const state = readAppState();
-  if (subcommand === "grant") {
-    const scopes = projectGrantScopesForCommand(parsed, state);
-    const grant: ProjectGrant = {
-      path: targetPath,
-      grantedAt: new Date().toISOString(),
-      scopes
-    };
-    const nextState = {
-      ...state,
-      projectGrants: [grant, ...state.projectGrants.filter(item => item.path !== targetPath)]
-    };
-    writeAppState(nextState);
-    await publishProjectGrantsToRelay(nextState);
-    console.log(`Granted project access: ${targetPath}`);
-    return;
-  }
-  if (subcommand === "revoke") {
-    const nextState = {
-      ...state,
-      projectGrants: state.projectGrants.filter(item => item.path !== targetPath)
-    };
-    writeAppState(nextState);
-    await publishProjectGrantsToRelay(nextState);
-    console.log(`Revoked project access: ${targetPath}`);
-    return;
-  }
-  throw new Error(`Unknown projects command: ${subcommand}`);
-}
-
-async function publishProjectGrantsToRelay(state: BridgeAppState): Promise<void> {
-  if (state.account?.status !== "signed-in") {
-    return;
-  }
-  const credentials = createDefaultCredentialStore({ path: credentialPath() }).read();
-  const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
-  if (!credentials || !relayConfig.relayApiUrl) {
-    return;
-  }
-  const activeGrants = activeManagedProjectGrants(state.projectGrants);
-  try {
-    await registerRelayDevice({
-      relayApiUrl: relayConfig.relayApiUrl,
-      accessToken: credentials.accessToken,
-      device: {
-        deviceId: state.device.id,
-        deviceName: state.device.name,
-        userId: state.account.userId,
-        registeredAt: new Date().toISOString(),
-        status: "offline",
-        bridgeVersion: bridgeVersionInfo().bridgeVersion,
-        bridgeAppVersion: HUNSU_BRIDGE_APP_VERSION,
-        protocolVersion: bridgeVersionInfo().protocolVersion
-      },
-      projectGrants: activeGrants
-    });
-    writeStructuredLog({ event: "relay.project-grants.published", relayApiUrl: relayConfig.relayApiUrl, deviceId: state.device.id, projectGrantCount: activeGrants.length });
-  } catch (error) {
-    writeStructuredLog({ event: "relay.project-grants.publish-failed", error: error instanceof Error ? error.message : String(error) });
-  }
+  await runProjectsCommand(parsed, workspaceCommandContext());
 }
 
 async function setRoadmapRemoteAccessCommand(roadmapId: string, enabled: boolean, parsed: ParsedArgs): Promise<void> {
@@ -1454,7 +895,7 @@ async function setRoadmapRemoteAccessCommand(roadmapId: string, enabled: boolean
       : state.projectGrants.filter(grant => normalizeGrantPath(grant.path) !== targetPath);
   const nextState = { ...state, projectGrants: nextGrants };
   writeAppState(nextState);
-  await publishProjectGrantsToRelay(nextState);
+  await publishProjectGrantsToRelay(nextState, remoteAccessRuntimeContext());
   console.log(`${enabled ? "Enabled" : "Disabled"} Remote Access for Roadmap: ${roadmap.displayName}`);
 }
 
@@ -1467,57 +908,24 @@ function looksLikeProjectPath(value: string): boolean {
 }
 
 function activeManagedProjectGrants(projectGrants: ProjectGrant[]): ProjectGrant[] {
-  const activePaths = new Set(
-    listManagedRoadmapRegistry(roadmapRegistryOptions())
-      .filter(roadmap => roadmap.lifecycle === "active")
-      .map(roadmap => normalizeGrantPath(roadmap.repositoryPath))
+  return activeManagedProjectGrantsForRoadmaps(
+    listManagedRoadmapRegistry(roadmapRegistryOptions()),
+    projectGrants,
+    normalizeGrantPath
   );
-  return snapshotProjectGrants(projectGrants)
-    .filter(grant => grant.active !== false
-      && grant.scopes.includes("remoteRelay.access")
-      && activePaths.has(normalizeGrantPath(grant.path)));
 }
 
-function roadmapAccessSnapshots(
-  roadmaps: RoadmapRegistryEntry[],
-  projectGrants: ProjectGrant[],
-  codexReady: boolean
-): BridgeRoadmapAccessSnapshot[] {
-  return roadmaps.map(roadmap => {
-    const grant = projectGrantForRoadmap(roadmap, projectGrants);
-    const scopes = uniqueScopeList([...(grant?.scopes ?? roadmap.remoteAccess?.scopes ?? [])]);
-    const active = roadmap.lifecycle === "active";
-    const enabled = active && grant?.active !== false && scopes.includes("remoteRelay.access");
-    return {
-      ...roadmap,
-      codex: { readyForExecute: codexReady },
-      projectGrant: grant,
-      remoteAccess: {
-        available: active,
-        enabled,
-        reason: active ? undefined : remoteAccessUnavailableReason(roadmap.lifecycle),
-        scopes,
-        scopeState: scopeState(scopes)
-      }
-    };
-  });
-}
-
-function projectGrantForRoadmap(roadmap: Pick<RoadmapRegistryEntry, "repositoryPath">, projectGrants: ProjectGrant[]): ProjectGrant | undefined {
-  const targetPath = normalizeGrantPath(roadmap.repositoryPath);
-  return snapshotProjectGrants(projectGrants).find(grant => normalizeGrantPath(grant.path) === targetPath);
-}
-
-function scopeState(scopes: BridgeCommandScope[]): Record<BridgeCommandScope, boolean> {
-  return Object.fromEntries(PROJECT_GRANT_SCOPE_VALUES.map(scope => [scope, scopes.includes(scope)])) as Record<BridgeCommandScope, boolean>;
-}
-
-function remoteAccessUnavailableReason(lifecycle: RoadmapRegistryEntry["lifecycle"] | undefined): string {
-  if (lifecycle === "inactive") return "Roadmap is inactive.";
-  if (lifecycle === "missing") return "Roadmap path is missing.";
-  if (lifecycle === "needs_upgrade") return "Roadmap needs upgrade.";
-  if (lifecycle === "error") return "Roadmap is unavailable.";
-  return "Roadmap is not active.";
+function disableAllManagedRoadmapRemoteAccess(): void {
+  for (const roadmap of listManagedRoadmapRegistry(roadmapRegistryOptions())) {
+    const scopes = roadmap.remoteAccess?.scopes ?? [];
+    if (roadmap.remoteAccess?.enabled !== true && !scopes.includes("remoteRelay.access")) {
+      continue;
+    }
+    setRoadmapRemoteAccess({ roadmapId: roadmap.roadmapId }, {
+      enabled: false,
+      scopes: scopes.filter(scope => scope !== "remoteRelay.access")
+    }, roadmapRegistryOptions());
+  }
 }
 
 function normalizeGrantPath(path: string): string {
@@ -1570,7 +978,7 @@ function printAppStatus(handle: BridgeRuntimeHandle): void {
   console.log("Status:");
   console.log(`  Local Bridge: ${formatRuntimeStatus(handle.status)}`);
   console.log(`  Account: ${account}`);
-  console.log(`  Remote Access: ${formatRemoteAccess(state.remoteAccess)}`);
+  console.log(`  Remote Access: ${formatBridgeRemoteAccess(state.remoteAccess)}`);
   console.log("");
   console.log("Actions:");
   console.log(`  Open in Studio: ${handle.studioUrl ?? "Unavailable"}`);
@@ -1681,63 +1089,107 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
   const health = await readBridgeHealth(state);
   state = reconcileBridgeProcessState(state, health);
   const account = state.account?.status === "signed-in" ? `Signed in as ${state.account.email ?? state.account.userId}` : "Signed out";
-  const localBridge = localBridgeStatusFromState(state, health);
+  const localBridge = localBridgeStatusFromProcessState(state, health, {
+    processIsAlive,
+    startingGraceMs: BRIDGE_STARTING_GRACE_MS
+  });
   const codex = await getCodexRuntimeStatus({ env: codexProbeEnv() });
-  state = reconcileCodexLoginFromStatus(codex);
-  return {
-    schema: "hunsu.bridge-app-snapshot.v1",
-    status: {
-      localBridge,
-      account,
-      remoteAccess: formatRemoteAccess(state.remoteAccess),
-      device: state.device,
-      service: state.service,
-      supervisorPid: state.supervisorPid,
-      pid: state.pid,
-      bridgeApiUrl: health.ok ? health.bridgeApiUrl : state.bridgeApiUrl,
-      startedAt: state.startedAt,
-      healthError: health.ok ? undefined : health.error
-    },
+  state = reconcileCodexLoginFromStatus(codex, codexCliActionContext());
+  const runtimeProviders = await runtimeProvidersSnapshot();
+  const managedRoadmaps = roadmapAccessSnapshots(listManagedRoadmapRegistry(roadmapRegistryOptions()), state.projectGrants, runtimeProviders.current, {
+    scopeValues: PROJECT_GRANT_SCOPE_VALUES,
+    normalizeGrantPath
+  });
+  return createBridgeAppSnapshot({
+    state,
+    localBridge,
+    accountLabel: account,
+    remoteAccessLabel: formatBridgeRemoteAccess(state.remoteAccess),
+    bridgeApiUrl: health.ok ? health.bridgeApiUrl : state.bridgeApiUrl,
+    healthError: health.ok ? undefined : health.error,
+    runtimeProviders,
+    managedRoadmaps,
     projectGrants: snapshotProjectGrants(state.projectGrants),
     activeProjectGrants: activeManagedProjectGrants(state.projectGrants),
     recentProjects: listRoadmapRegistry(roadmapRegistryOptions()).slice(0, 12),
-    managedRoadmaps: roadmapAccessSnapshots(listManagedRoadmapRegistry(roadmapRegistryOptions()), state.projectGrants, codex.ready),
-    prerequisites: {
-      codex,
-      tools: {
-        git: toolStatus("git", ["--version"]),
-        node: toolStatus(process.execPath, ["--version"]),
-        packageManager: packageManagerStatus()
-      }
+    codex,
+    tools: {
+      git: toolStatus("git", ["--version"]),
+      node: toolStatus(process.execPath, ["--version"]),
+      packageManager: packageManagerStatus()
     },
     codexSettings: snapshotCodexSettings(state),
-    codexLogin: state.codexLogin,
-    diagnostics: await buildDiagnostics(),
-    logLines: readLogTail(appLogPath(), 80),
-    uiIntent: state.uiIntent
+    diagnostics: await buildDiagnostics(diagnosticsCommandContext()),
+    logLines: readLogTail(appLogPath(), 80)
+  });
+}
+
+async function runtimeProvidersSnapshot(): Promise<BridgeAppSnapshot["providers"] & BridgeAppSnapshot["runtimeProviders"]> {
+  const state = readAppState();
+  const registry = createRuntimeProviderRegistry({
+    providerState: state.runtimeProviders,
+    codex: {
+      env: codexProbeEnv
+    }
+  });
+  const providers = await Promise.all(registry.list().map(provider => provider.status()));
+  const currentProviderId = registry.current().providerId;
+  const current = providers.find(provider => provider.providerId === currentProviderId) ?? providers[0];
+  if (!current) {
+    throw new Error("No runtime providers are available.");
+  }
+  return {
+    currentProviderId,
+    current,
+    providers
   };
 }
 
-function snapshotProjectGrants(projectGrants: ProjectGrant[]): ProjectGrant[] {
-  return projectGrants.map(grant => ({
-    path: grant.path,
-    grantedAt: grant.grantedAt,
-    scopes: [...grant.scopes],
-    active: grant.active === false ? false : undefined
-  }));
+async function runCodexInstallCli(options: { confirmed: boolean; dryRun: boolean }) {
+  const state = readAppState();
+  const registry = createRuntimeProviderRegistry({
+    providerState: state.runtimeProviders,
+    codex: {
+      env: codexProbeEnv
+    }
+  });
+  const provider = registry.get("codex") ?? registry.current();
+  if (!provider.install) {
+    throw new Error("Current provider does not support installation.");
+  }
+  return provider.install({
+    confirmed: options.confirmed,
+    dryRun: options.dryRun,
+    env: codexProbeEnv()
+  });
+}
+
+function codexCliActionContext() {
+  return {
+    getCodexStatus: getCodexRuntimeStatus,
+    codexProbeEnv,
+    readState: readAppState,
+    writeState: writeAppState,
+    bridgeNodeExecArgs,
+    bridgeCommandPath: () => process.argv[1] ?? "hunsu-bridge"
+  };
 }
 
 function codexProbeEnv(): Record<string, string | undefined> {
   const state = readAppState();
+  const codexSettings = bridgeCodexProviderSettings(state);
   return {
     ...currentProcessEnv(),
-    ...(state.codex?.binaryPath ? { HUNSU_CODEX_BINARY_PATH: state.codex.binaryPath } : {})
+    ...(codexSettings.binaryPath ? {
+      HUNSU_CODEX_BINARY_PATH: codexSettings.binaryPath,
+      HUNSU_CODEX_BINARY_PATH_SOURCE: "user_config"
+    } : {})
   };
 }
 
 function snapshotCodexSettings(state: BridgeAppState): BridgeAppSnapshot["codexSettings"] {
   const env = codexProbeEnv();
-  const settings = state.codex ?? defaultCodexSettings();
+  const settings = bridgeCodexProviderSettings(state);
   return {
     ...settings,
     environment: sanitizeDiagnostics({
@@ -1746,33 +1198,6 @@ function snapshotCodexSettings(state: BridgeAppState): BridgeAppSnapshot["codexS
       HUNSU_CODEX_APP_SERVER_ARGS: env.HUNSU_CODEX_APP_SERVER_ARGS
     }) as BridgeAppSnapshot["codexSettings"]["environment"]
   };
-}
-
-function toolStatus(command: string, args: string[]): BridgeToolStatus {
-  try {
-    const result = spawnSync(command, args, {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    });
-    if (result.status === 0) {
-      const version = `${result.stdout}\n${result.stderr}`.trim().split(/\r?\n/).find(Boolean);
-      return { installed: true, binaryPath: command, version };
-    }
-    return { installed: false, binaryPath: command, error: (result.stderr || result.stdout || `Exited with status ${result.status}`).trim() };
-  } catch (error) {
-    return { installed: false, binaryPath: command, error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
-function packageManagerStatus(): BridgeToolStatus {
-  for (const command of ["pnpm", "npm", "yarn"]) {
-    const status = toolStatus(command, ["--version"]);
-    if (status.installed) {
-      return status;
-    }
-  }
-  return { installed: false, error: "No supported package manager was found on PATH." };
 }
 
 async function safeCodexDiagnostics(): Promise<unknown> {
@@ -1785,272 +1210,11 @@ async function safeCodexDiagnostics(): Promise<unknown> {
     codexAuthState: status.auth.state,
     codexAuthMethod: status.auth.method,
     codexAccessType: status.auth.access,
-    codexDiscovery: status.cli.discovery,
     rateLimitsAvailable: status.usage.rateLimitsAvailable,
     rateLimited: status.usage.rateLimited,
     lastRunUsage: status.usage.lastRunUsage,
     lastCodexError: status.cli.error ?? status.appServer.error ?? status.auth.error ?? status.usage.error
   };
-}
-
-async function runCodexDeviceLoginCli(options: { json: boolean; background: boolean }): Promise<void> {
-  const args = ["login", "--device-auth"];
-  const codex = await getCodexRuntimeStatus({ env: codexProbeEnv(), force: true });
-  const binaryPath = codex.cli.binaryPath;
-  if (!binaryPath || !codex.cli.installed) {
-    throw new Error(codex.cli.error ?? "Codex CLI was not found.");
-  }
-  if (!options.json && !options.background) {
-    const startedAt = new Date().toISOString();
-    writeCodexLoginState({ kind: "device", startedAt, status: "starting" });
-    const child = spawnSync(binaryPath, args, {
-      stdio: "inherit",
-      env: codexProbeEnv(),
-      windowsHide: false
-    });
-    if (child.status === 0) {
-      writeCodexLoginState({ kind: "device", startedAt, status: "completed" });
-      return;
-    }
-    writeCodexLoginState({
-      kind: "device",
-      startedAt,
-      status: "failed",
-      error: child.error?.message ?? `Codex device login exited with status ${child.status ?? child.signal ?? "unknown"}.`
-    });
-    if (child.status && child.status !== 0) {
-      process.exitCode = child.status;
-      return;
-    }
-    if (child.error) throw child.error;
-    return;
-  }
-
-  const child = spawn(binaryPath, args, {
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: codexProbeEnv(),
-    windowsHide: options.background || options.json ? true : false
-  });
-  const startedAt = new Date().toISOString();
-  writeCodexLoginState({ kind: "device", pid: child.pid, startedAt, status: "starting" });
-  let output = "";
-  let finalized = false;
-  const append = (chunk: Buffer | string) => {
-    if (finalized) {
-      return;
-    }
-    output = `${output}${chunk.toString()}`.slice(-64 * 1024);
-    const details = parseCodexDeviceAuthOutput(output);
-    writeCodexLoginState({
-      kind: "device",
-      pid: child.pid,
-      startedAt,
-      status: details.verificationUri || details.userCode ? "device_code" : "pending",
-      ...details,
-      lastOutput: output.trim().slice(-4096)
-    });
-  };
-  const startupTimer = setTimeout(() => {
-    const state = readAppState().codexLogin;
-    if (state?.startedAt === startedAt && state.status === "starting") {
-      writeCodexLoginState({ ...state, status: "pending" });
-    }
-  }, CODEX_DEVICE_LOGIN_STARTUP_GRACE_MS);
-  const finalize = (outcome: CodexDeviceLoginOutcome) => {
-    finalized = true;
-    clearTimeout(startupTimer);
-    const details = parseCodexDeviceAuthOutput(output);
-    const failed = outcome.kind === "error" || outcome.kind === "timeout" || outcome.code !== 0;
-    writeCodexLoginState({
-      kind: "device",
-      pid: child.pid,
-      startedAt,
-      status: failed ? "failed" : details.verificationUri || details.userCode ? "device_code" : "completed",
-      ...details,
-      lastOutput: output.trim().slice(-4096),
-      error: codexDeviceLoginError(outcome, output)
-    });
-  };
-  child.stdout?.on("data", append);
-  child.stderr?.on("data", append);
-  const outcome = await waitForCodexDeviceLoginOutcome(
-    child,
-    options.background ? CODEX_DEVICE_LOGIN_BACKGROUND_LIFECYCLE_TIMEOUT_MS : CODEX_DEVICE_LOGIN_JSON_TIMEOUT_MS
-  );
-  if (outcome.kind === "timeout") {
-    child.kill();
-  }
-  finalize(outcome);
-  const processState = readAppState().codexLogin ?? { kind: "device", pid: child.pid, startedAt, status: "pending" };
-  const result = {
-    started: outcome.kind !== "error",
-    command: binaryPath,
-    args,
-    state: processState.status,
-    verificationUri: processState.verificationUri,
-    verificationUriComplete: processState.verificationUriComplete,
-    userCode: processState.userCode,
-    lastOutput: processState.lastOutput,
-    error: processState.error,
-    message: processState.status === "failed"
-      ? processState.error ?? "Codex device login failed."
-      : outcome.kind === "error"
-        ? outcome.error.message
-        : outcome.kind === "exit" && outcome.code !== 0
-          ? `Codex device login exited with status ${outcome.code ?? outcome.signal ?? "unknown"}.`
-          : processState.verificationUri || processState.userCode
-            ? "Codex device login started. Complete authorization in your browser."
-          : processState.status === "completed"
-            ? "Codex device login completed."
-            : "Codex device login started, but no device code has been emitted yet."
-  };
-  if (options.json) {
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
-  console.log(result.message);
-  if (result.verificationUriComplete ?? result.verificationUri) {
-    console.log(`Verification URL: ${result.verificationUriComplete ?? result.verificationUri}`);
-  }
-  if (result.userCode) {
-    console.log(`Code: ${result.userCode}`);
-  }
-}
-
-async function runCodexChatGptLoginCli(): Promise<void> {
-  const args = ["login"];
-  const codex = await getCodexRuntimeStatus({ env: codexProbeEnv(), force: true });
-  const binaryPath = codex.cli.binaryPath;
-  const startedAt = new Date().toISOString();
-  if (!binaryPath || !codex.cli.installed) {
-    writeCodexLoginState({
-      kind: "chatgpt",
-      startedAt,
-      status: "failed",
-      error: codex.cli.error ?? "Codex CLI was not found.",
-      lastOutput: "Browser login failed to start."
-    });
-    throw new Error(codex.cli.error ?? "Codex CLI was not found.");
-  }
-  try {
-    const child = spawn(binaryPath, args, backgroundSpawnOptions({
-      detached: true,
-      stdio: "ignore",
-      env: codexProbeEnv()
-    }));
-    child.unref();
-    writeCodexLoginState({
-      kind: "chatgpt",
-      pid: child.pid,
-      startedAt,
-      status: "pending",
-      lastOutput: "Browser login started. Complete sign-in, then click Recheck."
-    });
-    console.log("Codex login started. Complete sign-in in your browser, then click Recheck.");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    writeCodexLoginState({
-      kind: "chatgpt",
-      startedAt,
-      status: "failed",
-      error: message,
-      lastOutput: "Browser login failed to start."
-    });
-    throw error;
-  }
-}
-
-function waitForCodexDeviceLoginOutcome(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<CodexDeviceLoginOutcome> {
-  return new Promise(resolve => {
-    let settled = false;
-    let timer: NodeJS.Timeout;
-    const finish = (outcome: CodexDeviceLoginOutcome) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      child.off("close", onClose);
-      child.off("error", onError);
-      resolve(outcome);
-    };
-    const onClose = (code: number | null, signal: NodeJS.Signals | null) => finish({ kind: "exit", code, signal });
-    const onError = (error: Error) => finish({ kind: "error", error });
-    timer = setTimeout(() => finish({ kind: "timeout" }), timeoutMs);
-    child.once("close", onClose);
-    child.once("error", onError);
-  });
-}
-
-function codexDeviceLoginError(outcome: CodexDeviceLoginOutcome, output: string): string | undefined {
-  const lastOutput = lastNonEmptyLine(output);
-  if (outcome.kind === "error") {
-    return lastOutput ? `${outcome.error.message}: ${lastOutput}` : outcome.error.message;
-  }
-  if (outcome.kind === "timeout") {
-    return lastOutput
-      ? `Codex device login timed out while waiting for Codex to finish: ${lastOutput}`
-      : "Codex device login timed out while waiting for Codex to finish.";
-  }
-  if (outcome.code === 0) {
-    return undefined;
-  }
-  const status = outcome.code ?? outcome.signal ?? "unknown";
-  return lastOutput
-    ? `Codex device login exited with status ${status}: ${lastOutput}`
-    : `Codex device login exited with status ${status}.`;
-}
-
-function lastNonEmptyLine(output: string): string | undefined {
-  return output
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean)
-    .at(-1);
-}
-
-function writeCodexLoginState(codexLogin: CodexLoginProcessState): void {
-  const state = readAppState();
-  writeAppState({ ...state, codexLogin });
-}
-
-function reconcileCodexLoginFromStatus(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus>>): BridgeAppState {
-  const state = readAppState();
-  if (!state.codexLogin) {
-    return state;
-  }
-  if (codex.auth.state === "authenticated") {
-    const next = { ...state, codexLogin: undefined };
-    writeAppState(next);
-    return next;
-  }
-  return state;
-}
-
-function runCodexCli(args: string[]): void {
-  const status = spawnSync(process.execPath, [
-    ...bridgeNodeExecArgs(),
-    process.argv[1] ?? "hunsu-bridge",
-    "codex",
-    "status",
-    "--json"
-  ], {
-    encoding: "utf8",
-    env: codexProbeEnv()
-  });
-  const codex = status.status === 0 ? JSON.parse(status.stdout) as Awaited<ReturnType<typeof getCodexRuntimeStatus>> : undefined;
-  const binaryPath = codex?.cli.binaryPath;
-  if (!binaryPath || !codex?.cli.installed) {
-    throw new Error(codex?.cli.error ?? "Codex CLI was not found.");
-  }
-  const child = spawnSync(binaryPath, args, {
-    stdio: "inherit",
-    env: codexProbeEnv()
-  });
-  if (child.status && child.status !== 0) {
-    process.exitCode = child.status;
-  }
 }
 
 function printCodexStatus(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus>>): void {
@@ -2079,12 +1243,12 @@ function printCodexStatus(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus
   if (error) console.log(`  Error: ${error}`);
 }
 
-function printManagedRoadmaps(roadmaps: BridgeRoadmapAccessSnapshot[], codexReady: boolean): void {
+function printManagedRoadmaps(roadmaps: BridgeRoadmapAccessSnapshot[], provider: RuntimeProviderStatus): void {
   const active = roadmaps.filter(roadmap => roadmap.lifecycle === "active");
   const inactive = roadmaps.filter(roadmap => roadmap.lifecycle !== "active");
-  console.log(`Codex Execute Readiness: ${codexReady ? "Ready" : "Not Ready"}`);
+  console.log(`Provider ${provider.label}: ${provider.ready ? "Ready" : "Not Ready"}`);
   console.log("");
-  console.log("Active Roadmaps:");
+  console.log("Active Workspaces:");
   for (const roadmap of active) {
     console.log(`  ${roadmap.displayName} (${roadmap.roadmapId})`);
     console.log(`    ${roadmap.repositoryPath}`);
@@ -2094,7 +1258,7 @@ function printManagedRoadmaps(roadmaps: BridgeRoadmapAccessSnapshot[], codexRead
     console.log("  None");
   }
   console.log("");
-  console.log("Inactive Roadmaps:");
+  console.log("Inactive Workspaces:");
   for (const roadmap of inactive) {
     console.log(`  ${roadmap.displayName} (${roadmap.roadmapId})`);
     console.log(`    ${roadmap.repositoryPath}`);
@@ -2107,7 +1271,7 @@ function printManagedRoadmaps(roadmaps: BridgeRoadmapAccessSnapshot[], codexRead
 
 function printRoadmapAccessDetails(roadmap: BridgeRoadmapAccessSnapshot): void {
   console.log(`    Local Access: ${roadmap.localAccess?.enabled === false || roadmap.lifecycle !== "active" ? "Unavailable" : "Active"}`);
-  console.log(`    Codex: ${roadmap.codex.readyForExecute ? "Ready" : "Not Ready"}`);
+  console.log(`    Provider: ${roadmap.provider.label} ${roadmap.provider.readyForExecute ? "Ready" : "Not Ready"}`);
   console.log(`    Remote Access: ${roadmap.remoteAccess.enabled ? "On" : roadmap.remoteAccess.available ? "Off" : `Unavailable (${roadmap.remoteAccess.reason})`}`);
   console.log("    Scopes:");
   for (const scope of PROJECT_GRANT_SCOPE_VALUES) {
@@ -2147,24 +1311,6 @@ function reconcileBridgeProcessState(
     return next;
   }
   return state;
-}
-
-function localBridgeStatusFromState(
-  state: BridgeAppState,
-  health: Awaited<ReturnType<typeof readBridgeHealth>>
-): BridgeAppSnapshot["status"]["localBridge"] {
-  if (health.ok) {
-    return "connected";
-  }
-  const pids = uniqueNumberList([state.supervisorPid, state.pid]);
-  if (pids.length === 0 || pids.every(pid => !processIsAlive(pid))) {
-    return "not-running";
-  }
-  const startedAtMs = state.startedAt ? Date.parse(state.startedAt) : Number.NaN;
-  if (Number.isFinite(startedAtMs) && Date.now() - startedAtMs <= BRIDGE_STARTING_GRACE_MS) {
-    return "starting";
-  }
-  return "error";
 }
 
 async function stopBridgeThroughControlEndpoint(state: BridgeAppState): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -2245,142 +1391,6 @@ function storedProcessMetadataForPid(pid: number, state: BridgeAppState): Bridge
   return undefined;
 }
 
-function bridgeProcessRuntimeMetadata(pid: number, commandIdentity: BridgeProcessCommandIdentity): BridgeProcessRuntimeMetadata {
-  const verifiableNonce = processNonceCanBeVerified() && processEnvironmentValue(pid, BRIDGE_PROCESS_NONCE_ENV) === commandIdentity.nonce
-    ? commandIdentity.nonce
-    : undefined;
-  return {
-    pid,
-    processNonce: verifiableNonce,
-    commandIdentity,
-    startMetadata: processStartMetadata(pid),
-    recordedAt: new Date().toISOString()
-  };
-}
-
-function processNonceCanBeVerified(): boolean {
-  return process.platform === "linux";
-}
-
-function newBridgeProcessNonce(): string {
-  return `bridge_process_${randomBytes(12).toString("base64url")}`;
-}
-
-function bridgeProcessEnvWithNonce(nonce: string): NodeJS.ProcessEnv {
-  const codex = readAppState().codex;
-  return {
-    ...currentProcessEnv(),
-    ...(codex?.binaryPath ? { HUNSU_CODEX_BINARY_PATH: codex.binaryPath } : {}),
-    [BRIDGE_PROCESS_NONCE_ENV]: nonce
-  };
-}
-
-function processEnvironmentValue(pid: number, key: string): string | undefined {
-  if (process.platform !== "linux") {
-    return undefined;
-  }
-  try {
-    const entries = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
-    const prefix = `${key}=`;
-    return entries.find(entry => entry.startsWith(prefix))?.slice(prefix.length);
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function processStartMetadata(pid: number): BridgeProcessStartMetadata | undefined {
-  if (process.platform === "linux") {
-    try {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const endCommandIndex = stat.lastIndexOf(") ");
-      if (endCommandIndex >= 0) {
-        const fieldsFromState = stat.slice(endCommandIndex + 2).trim().split(/\s+/);
-        const startTicks = fieldsFromState[19];
-        if (startTicks) {
-          return { platform: process.platform, source: "proc-stat", value: startTicks };
-        }
-      }
-    } catch (_error) {
-      // Fall back to ps below.
-    }
-  }
-  try {
-    const startedAt = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
-    return startedAt ? { platform: process.platform, source: "ps-lstart", value: startedAt } : undefined;
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function sameProcessStartMetadata(left: BridgeProcessStartMetadata, right: BridgeProcessStartMetadata): boolean {
-  return left.platform === right.platform
-    && left.source === right.source
-    && left.value === right.value;
-}
-
-function processIsAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function processCommandLine(pid: number): string | undefined {
-  if (process.platform === "linux") {
-    try {
-      const commandLine = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
-      if (commandLine) {
-        return commandLine;
-      }
-    } catch (_error) {
-      // Fall back to ps below.
-    }
-  }
-  try {
-    return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
-  } catch (_error) {
-    return undefined;
-  }
-}
-
-function commandLineLooksLikeBridgeApp(commandLine: string, expectedKinds: BridgeProcessCommandIdentity["kind"][]): boolean {
-  const normalized = commandLine.toLowerCase();
-  const hasBridgeExecutable = normalized.includes("hunsu-bridge")
-    || normalized.includes("bridge-desktop")
-    || normalized.includes("/src/main.ts")
-    || normalized.includes("\\src\\main.ts");
-  const hasExpectedCommand = expectedKinds.some(expectedKind =>
-    normalized.includes(expectedKind)
-    || (expectedKind === "remote-attach" && (normalized.includes("remote attach") || normalized.includes("daemon")))
-  );
-  return hasBridgeExecutable && hasExpectedCommand;
-}
-
-function currentBridgeProcessCommandIdentity(kind: BridgeProcessCommandIdentity["kind"]): BridgeProcessCommandIdentity {
-  const inheritedNonce = currentProcessEnv()[BRIDGE_PROCESS_NONCE_ENV]?.trim() || undefined;
-  return bridgeProcessCommandIdentityForSpawn(kind, [process.execPath, ...bridgeNodeExecArgs(), process.argv[1] ?? "hunsu-bridge", ...process.argv.slice(2)], inheritedNonce);
-}
-
-function bridgeProcessCommandIdentityForSpawn(kind: BridgeProcessCommandIdentity["kind"], argv: string[], nonce = newBridgeProcessNonce()): BridgeProcessCommandIdentity {
-  return {
-    kind,
-    executable: argv[0] ?? process.execPath,
-    argv,
-    nonce
-  };
-}
-
 function uniqueNumberList(values: Array<number | undefined>): number[] {
   return [...new Set(values.filter((value): value is number => value !== undefined && Number.isInteger(value) && value > 0))];
 }
@@ -2398,23 +1408,7 @@ function normalizeUrl(value: string): string {
 }
 
 function rememberRunningBridge(handle: BridgeRuntimeHandle, cwd: string, webUrl: string | undefined): void {
-  const state = readAppState();
-  const commandIdentity = currentBridgeProcessCommandIdentity("daemon");
-  writeAppState({
-    ...state,
-    pid: process.pid,
-    bridgeProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
-    bridgeApiUrl: handle.bridgeApiUrl,
-    processNonce: commandIdentity.nonce,
-    commandIdentity,
-    authToken: handle.authToken,
-    controlToken: handle.controlToken,
-    pairing: handle.pairing,
-    cwd,
-    webUrl,
-    startedAt: handle.startedAt,
-    remoteAccess: state.remoteAccess
-  });
+  writeAppState(handleToRuntimeState(readAppState(), handle, cwd, webUrl));
   writeStructuredLog({ event: "bridge.started", pid: process.pid, cwd, bridgeApiUrl: handle.bridgeApiUrl, startedAt: handle.startedAt });
 }
 
@@ -2453,110 +1447,8 @@ function clearManagedProcessState(): void {
   }
 }
 
-function readAppState(): BridgeAppState {
-  const statePath = appStatePath();
-  if (!existsSync(statePath)) {
-    return defaultAppState();
-  }
-  try {
-    const parsed = JSON.parse(readFileSync(statePath, "utf8")) as Partial<BridgeAppState>;
-    return {
-      ...defaultAppState(),
-      ...parsed,
-      account: parsed.account ?? { status: "signed-out" },
-      codex: parsed.codex ?? defaultCodexSettings(),
-      device: parsed.device ?? defaultDeviceState(),
-      remoteAccess: parseRemoteAccessState(parsed.remoteAccess),
-      projectGrants: Array.isArray(parsed.projectGrants) ? parsed.projectGrants : [],
-      service: parsed.service ?? defaultServiceState()
-    };
-  } catch (_error) {
-    return defaultAppState();
-  }
-}
-
-function writeAppState(state: BridgeAppState): void {
-  const statePath = appStatePath();
-  mkdirSync(dirname(statePath), { recursive: true });
-  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-}
-
-function defaultAppState(): BridgeAppState {
-  return {
-    schema: "hunsu.bridge-app-state.v1",
-    account: { status: "signed-out" },
-    codex: defaultCodexSettings(),
-    device: defaultDeviceState(),
-    remoteAccess: "off",
-    projectGrants: [],
-    service: defaultServiceState()
-  };
-}
-
-function defaultCodexSettings(): BridgeCodexSettings {
-  return {
-    installChannel: "stable",
-    authenticationPreference: "chatgpt"
-  };
-}
-
-function parseCodexInstallChannel(value: string | undefined): BridgeCodexSettings["installChannel"] | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (value === "stable" || value === "latest" || value === "manual") {
-    return value;
-  }
-  throw new Error(`Unknown Codex install channel: ${value}`);
-}
-
-function parseCodexAuthenticationPreference(value: string | undefined): BridgeCodexSettings["authenticationPreference"] | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (value === "chatgpt" || value === "api_key" || value === "device_code") {
-    return value;
-  }
-  throw new Error(`Unknown Codex authentication preference: ${value}`);
-}
-
-function assertSelectedCodexBinaryName(binaryPath: string, platformName: NodeJS.Platform = process.platform): void {
-  const expected = selectedCodexBinaryName(platformName);
-  if (basename(binaryPath).toLowerCase() !== expected) {
-    throw new Error(`Selected Codex binary must be named ${expected}.`);
-  }
-}
-
-function selectedCodexBinaryName(platformName: NodeJS.Platform): "codex" | "codex.exe" {
-  return platformName === "win32" ? "codex.exe" : "codex";
-}
-
-function defaultDeviceState(): BridgeDeviceState {
-  const name = hostname() || "Hunsu Bridge Device";
-  return {
-    name,
-    id: `device_${hashForDevice(name).slice(0, 16)}`,
-    registered: false
-  };
-}
-
-function defaultServiceState(): BridgeServiceState {
-  return {
-    installed: false,
-    manager: defaultServiceManager()
-  };
-}
-
-function defaultServiceManager(): BridgeServiceState["manager"] {
-  const os = platform();
-  if (os === "darwin") return "launchd-user";
-  if (os === "win32") return "windows-service";
-  if (os === "linux") return "systemd-user";
-  return "manual";
-}
-
 function installServiceArtifact(parsed: ParsedArgs): BridgeServiceState {
-  const manager = defaultServiceManager();
+  const manager = defaultBridgeServiceManager();
   const dryRun = hasFlag(parsed, "dry-run");
   if (manager === "systemd-user") {
     const unitPath = currentProcessEnv().HUNSU_BRIDGE_SERVICE_UNIT_PATH?.trim() || DEFAULT_SYSTEMD_USER_UNIT_PATH;
@@ -2712,41 +1604,6 @@ function windowsCommandQuote(value: string): string {
   return `"${value.replace(/"/g, "\\\"")}"`;
 }
 
-function createBridgeAppSidecarSupervisor(parsed: ParsedArgs): BridgeSidecarSupervisor {
-  const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
-  const daemonNonce = newBridgeProcessNonce();
-  return new BridgeSidecarSupervisor({
-    command: process.execPath,
-    args: [
-      ...bridgeNodeExecArgs(),
-      process.argv[1] ?? "hunsu-bridge",
-      "daemon",
-      "--cwd",
-      cwd,
-      ...(getFlag(parsed, "web-url") ? ["--web-url", getFlag(parsed, "web-url") as string] : []),
-      ...(hasFlag(parsed, "remote") ? ["--remote"] : []),
-      ...(hasFlag(parsed, "no-open") ? ["--no-open"] : [])
-    ],
-    cwd,
-    env: bridgeProcessEnvWithNonce(daemonNonce),
-    logPath: appLogPath(),
-    restartLimit: Number(getFlag(parsed, "restart-limit") ?? 3),
-    restartDelayMs: 750
-  });
-}
-
-function delayMs(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function appStatePath(): string {
-  return currentProcessEnv().HUNSU_BRIDGE_APP_STATE_PATH?.trim() || DEFAULT_APP_STATE_PATH;
-}
-
-function bridgeNodeExecArgs(): string[] {
-  return process.execArgv.filter(arg => !arg.startsWith("--inspect"));
-}
-
 function credentialPath(): string {
   return currentProcessEnv().HUNSU_BRIDGE_CREDENTIAL_PATH?.trim() || DEFAULT_CREDENTIAL_PATH;
 }
@@ -2799,22 +1656,14 @@ function readLogTail(path: string, maxLines: number): string[] {
 function credentialsForDevUser(userId: string, state: BridgeAppState): BridgeAccountCredentials {
   return {
     schema: "hunsu.bridge-credentials.v1",
-    accessToken: `dev_access_${hashForDevice(`${userId}:access`)}`,
-    refreshToken: `dev_refresh_${hashForDevice(`${userId}:refresh`)}`,
+    accessToken: `dev_access_${hashBridgeDeviceSeed(`${userId}:access`)}`,
+    refreshToken: `dev_refresh_${hashBridgeDeviceSeed(`${userId}:refresh`)}`,
     userId,
     email: userId.includes("@") ? userId : undefined,
     deviceId: state.device.id,
     deviceName: state.device.name,
     savedAt: new Date().toISOString()
   };
-}
-
-function hashForDevice(value: string): string {
-  let hash = 5381;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = ((hash << 5) + hash) ^ value.charCodeAt(index);
-  }
-  return Math.abs(hash).toString(16).padStart(8, "0");
 }
 
 async function waitForShutdown(stop: () => Promise<void>): Promise<void> {
@@ -2869,90 +1718,6 @@ function numericFlag(parsed: ParsedArgs, name: string): number | undefined {
   return parsedNumber;
 }
 
-export function normalizeBridgeAppArgv(argv: string[]): string[] {
-  const [first, ...rest] = argv;
-  if (!first?.startsWith("hunsu://")) {
-    return argv;
-  }
-  const url = new URL(first);
-  const action = url.hostname || url.pathname.replace(/^\/+/, "");
-  const pathFromUrl = decodeURIComponent(url.pathname.replace(/^\/+/, ""));
-  const nextArgs: string[] = [];
-  switch (action) {
-    case "open":
-      nextArgs.push("status");
-      break;
-    case "open-project": {
-      nextArgs.push("open-project");
-      const path = url.searchParams.get("path") ?? (pathFromUrl && pathFromUrl !== "open-project" ? pathFromUrl : undefined);
-      if (path) nextArgs.push(path);
-      break;
-    }
-    case "pair":
-      if (url.searchParams.has("code") && url.searchParams.has("state")) {
-        nextArgs.push("auth-callback", "--code", url.searchParams.get("code") ?? "", "--state", url.searchParams.get("state") ?? "");
-      } else {
-        nextArgs.push("pair");
-        if (url.searchParams.has("next")) nextArgs.push("--next", url.searchParams.get("next") ?? "/studio");
-      }
-      break;
-    case "open-roadmap":
-      if (!url.searchParams.get("roadmapId")) {
-        nextArgs.push("protocol-error", "hunsu://open-roadmap requires roadmapId.");
-        break;
-      }
-      nextArgs.push("open-roadmap", url.searchParams.get("roadmapId") ?? "");
-      break;
-    case "add-roadmap":
-      if (url.searchParams.has("path")) {
-        const path = url.searchParams.get("path") ?? "";
-        if (!path) {
-          nextArgs.push("protocol-error", "hunsu://add-roadmap path is empty.");
-          break;
-        }
-        nextArgs.push("roadmaps", "add", path);
-      } else {
-        nextArgs.push("ui-intent", "workspaces", "add-roadmap");
-      }
-      break;
-    case "roadmaps":
-    case "workspaces":
-      nextArgs.push("ui-intent", "workspaces");
-      break;
-    case "codex":
-      nextArgs.push("ui-intent", "codex", "codex");
-      break;
-    case "prerequisites":
-      if (pathFromUrl && pathFromUrl !== "codex") {
-        nextArgs.push("protocol-error", "Unsupported hunsu://prerequisites path.");
-        break;
-      }
-      nextArgs.push("ui-intent", "codex");
-      if (pathFromUrl === "codex") nextArgs.push("codex");
-      break;
-    case "activate-roadmap":
-      if (!url.searchParams.get("roadmapId")) {
-        nextArgs.push("protocol-error", "hunsu://activate-roadmap requires roadmapId.");
-        break;
-      }
-      nextArgs.push("activate-roadmap", url.searchParams.get("roadmapId") ?? "");
-      break;
-    case "remote-disable":
-      nextArgs.push("remote", "disable");
-      break;
-    case "sign-in":
-      nextArgs.push("login", "--gui");
-      break;
-    case "sign-out":
-      nextArgs.push("logout");
-      break;
-    default:
-      nextArgs.push("protocol-error", `Unsupported hunsu:// command: ${action || "(empty)"}`);
-      break;
-  }
-  return [...nextArgs, ...rest];
-}
-
 function getFlag(parsed: ParsedArgs, name: string): string | undefined {
   const value = parsed.flags.get(name);
   return typeof value === "string" ? value : undefined;
@@ -3002,7 +1767,7 @@ Headless:
   hunsu-bridge roadmaps remote enable <roadmapId> [--scopes all|remoteRelay.access,execute.start,artifactAction.run,env.read,hostAlias.expose]
   hunsu-bridge roadmaps remote disable <roadmapId>
   hunsu-bridge roadmaps remove <roadmapId>
-  hunsu-bridge ui-intent codex|workspaces|advanced|diagnostics|settings [codex|add-roadmap]
+  hunsu-bridge ui-intent <tab> [codex|add-workspace]
   hunsu-bridge projects list
   hunsu-bridge projects recent
   hunsu-bridge projects grant <path> [--scopes all|remoteRelay.access,execute.start,artifactAction.run,env.read,hostAlias.expose]
@@ -3012,13 +1777,20 @@ Headless:
 Deep links:
   hunsu://open
   hunsu://pair?next=/studio
-  hunsu://add-roadmap
-  hunsu://codex
+  hunsu://provider
+  hunsu://provider/codex
   hunsu://workspaces
+  hunsu://add-workspace
+  hunsu://connection
+  hunsu://connection/remote
+  hunsu://open-workspace?workspaceId=<id>
+  hunsu://codex
+  hunsu://add-roadmap
   hunsu://roadmaps
   hunsu://prerequisites
   hunsu://prerequisites/codex
   hunsu://activate-roadmap?roadmapId=<id>
+  hunsu://activate-workspace?workspaceId=<id>
   hunsu://open-project?path=/path/to/project
   hunsu://open-roadmap?roadmapId=<id>
 `);
@@ -3055,214 +1827,8 @@ function safeStudioNext(next: string): string {
   return next;
 }
 
-async function enableRemoteAccessIfSignedIn(): Promise<void> {
-  const state = readAppState();
-  if (state.account?.status !== "signed-in") {
-    writeAppState({ ...state, remoteAccess: "unavailable" });
-    return;
-  }
-  const nextGrants = state.projectGrants.map(grant => ({
-    ...grant,
-    scopes: grant.scopes.includes("remoteRelay.access") ? grant.scopes : uniqueScopeList([...grant.scopes, "remoteRelay.access"])
-  }));
-  const activeGrants = activeManagedProjectGrants(nextGrants);
-  const device = {
-    deviceId: state.device.id,
-    deviceName: state.device.name,
-    userId: state.account.userId,
-    bridgeVersion: bridgeVersionInfo().bridgeVersion,
-    bridgeAppVersion: HUNSU_BRIDGE_APP_VERSION,
-    protocolVersion: bridgeVersionInfo().protocolVersion
-  };
-  const credentials = createDefaultCredentialStore({ path: credentialPath() }).read();
-  const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
-  if (credentials && relayConfig.relayApiUrl) {
-    await registerRelayDevice({
-      relayApiUrl: relayConfig.relayApiUrl,
-      accessToken: credentials.accessToken,
-      device: {
-        ...device,
-        registeredAt: new Date().toISOString(),
-        status: "offline" as const
-      },
-      projectGrants: activeGrants
-    });
-    writeStructuredLog({ event: "relay.device.registered", relayApiUrl: relayConfig.relayApiUrl, deviceId: state.device.id });
-  } else {
-    const relayRegistry = new FileRelayRegistry(relayRegistryPath());
-    relayRegistry.registerDevice(device);
-    writeStructuredLog({ event: "relay.device.registered-local", deviceId: state.device.id });
-  }
-  writeAppState({
-    ...state,
-    remoteAccess: "registered-offline",
-    device: { ...state.device, registered: true },
-    projectGrants: nextGrants
-  });
-}
-
-function startRelayIfConfigured(handle: Pick<BridgeRuntimeHandle, "bridgeApiUrl" | "authToken">): RelayOutboundClient | undefined {
-  const state = readAppState();
-  const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
-  const credentials = createDefaultCredentialStore({ path: credentialPath() }).read();
-  const relayUrl = relayConfig.relayWsUrl;
-  if (!relayUrl || state.account?.status !== "signed-in" || !credentials) {
-    writeStructuredLog({ event: "relay.not-started", reason: relayUrl ? credentials ? "signed-out" : "credentials-missing" : "relay-url-missing" });
-    return undefined;
-  }
-  const device = {
-    deviceId: state.device.id,
-    deviceName: state.device.name,
-    userId: state.account.userId,
-    registeredAt: new Date().toISOString(),
-    lastSeenAt: new Date().toISOString(),
-    status: "online" as const,
-    bridgeVersion: bridgeVersionInfo().bridgeVersion,
-    bridgeAppVersion: HUNSU_BRIDGE_APP_VERSION,
-    protocolVersion: bridgeVersionInfo().protocolVersion
-  };
-  const relayClient = new RelayOutboundClient({
-    relayUrl,
-    accessToken: credentials.accessToken,
-    device,
-    projectGrants: () => activeManagedProjectGrants(readAppState().projectGrants),
-    bridgeApiUrl: handle.bridgeApiUrl,
-    bridgeAuthToken: handle.authToken
-  });
-  relayClient.start();
-  writeStructuredLog({ event: "relay.started", relayUrl, deviceId: state.device.id });
-  return relayClient;
-}
-
-async function attachRemoteAccessCommand(): Promise<void> {
-  const state = readAppState();
-  if (state.account?.status !== "signed-in") {
-    writeAppState({ ...state, remoteAccess: "unavailable" });
-    throw new Error("Remote Access is unavailable until this device is signed in.");
-  }
-  if (!state.bridgeApiUrl || !state.authToken) {
-    writeAppState({ ...state, remoteAccess: "registered-offline" });
-    throw new Error("No running managed Bridge is available for Relay attachment.");
-  }
-  const relayClient = startRelayIfConfigured({
-    bridgeApiUrl: state.bridgeApiUrl,
-    authToken: state.authToken
-  });
-  if (!relayClient) {
-    writeRemoteAccessState("registered-offline");
-    console.log("Remote Access is registered but offline because Relay is not configured.");
-    return;
-  }
-  const connected = await waitForRelayConnection(relayClient);
-  writeRemoteAccessState(connected ? "on" : "registered-offline");
-  console.log(connected ? "Remote Access is On." : "Remote Access is registered but offline.");
-  await waitForShutdown(async () => {
-    relayClient.stop();
-    new FileRelayRegistry(relayRegistryPath()).updateDeviceStatus(state.device.id, "offline");
-    writeRemoteAccessState("registered-offline");
-  });
-}
-
-function startRemoteAccessProcessIfPossible(parsed: ParsedArgs): boolean {
-  if (hasFlag(parsed, "no-start") || currentProcessEnv().HUNSU_BRIDGE_REMOTE_ENABLE_NO_START === "1") {
-    return false;
-  }
-  const state = readAppState();
-  const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
-  const credentials = createDefaultCredentialStore({ path: credentialPath() }).read();
-  if (!relayConfig.relayWsUrl || !credentials || state.account?.status !== "signed-in") {
-    return false;
-  }
-  const cwd = resolve(getFlag(parsed, "cwd") ?? state.cwd ?? process.cwd());
-  const args = state.bridgeApiUrl && state.authToken
-    ? ["remote", "attach"]
-    : [
-        "daemon",
-        "--remote",
-        "--no-open",
-        "--cwd",
-        cwd,
-        ...(getFlag(parsed, "web-url") ? ["--web-url", getFlag(parsed, "web-url") as string] : [])
-      ];
-  try {
-    const commandIdentity = bridgeProcessCommandIdentityForSpawn("remote-attach", [
-      process.execPath,
-      ...bridgeNodeExecArgs(),
-      process.argv[1] ?? "hunsu-bridge",
-      ...args
-    ]);
-    const child = spawn(process.execPath, [
-      ...bridgeNodeExecArgs(),
-      process.argv[1] ?? "hunsu-bridge",
-      ...args
-    ], backgroundSpawnOptions({
-      cwd,
-      env: bridgeProcessEnvWithNonce(commandIdentity.nonce),
-      detached: true,
-      stdio: "ignore"
-    }));
-    child.unref();
-    writeStructuredLog({ event: "relay.process.started", pid: child.pid, args });
-    writeAppState({
-      ...readAppState(),
-      pid: child.pid,
-      bridgeProcess: child.pid ? bridgeProcessRuntimeMetadata(child.pid, commandIdentity) : undefined,
-      processNonce: commandIdentity.nonce,
-      commandIdentity,
-      cwd,
-      remoteAccess: "registered-offline"
-    });
-    return true;
-  } catch (error) {
-    writeStructuredLog({ event: "relay.process.start-failed", error: error instanceof Error ? error.message : String(error) });
-    return false;
-  }
-}
-
-async function waitForRelayConnection(client: RelayOutboundClient, timeoutMs = 2_000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (client.status().status === "connected") {
-      return true;
-    }
-    if (client.status().status === "error") {
-      return false;
-    }
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
-  return client.status().status === "connected";
-}
-
-function writeRemoteAccessState(remoteAccess: BridgeAppState["remoteAccess"]): void {
-  const state = readAppState();
-  writeAppState({ ...state, remoteAccess });
-}
-
-function parseRemoteAccessState(value: unknown): BridgeAppState["remoteAccess"] {
-  return value === "on" || value === "registered-offline" || value === "unavailable" || value === "off"
-    ? value
-    : "off";
-}
-
-function formatRemoteAccess(value: BridgeAppState["remoteAccess"]): BridgeAppSnapshot["status"]["remoteAccess"] {
-  switch (value) {
-    case "on":
-      return "On";
-    case "registered-offline":
-      return "Registered but offline";
-    case "unavailable":
-      return "Unavailable";
-    case "off":
-      return "Off";
-  }
-}
-
 async function openStudioManagedUrl(url: string): Promise<void> {
   openStudioInBrowser(url);
-}
-
-function nonEmptyFlagValue(value: string | undefined): string | undefined {
-  return value?.trim() ? value.trim() : undefined;
 }
 
 function uniqueScopeList(scopes: BridgeCommandScope[]): BridgeCommandScope[] {
@@ -3276,6 +1842,7 @@ function commandAvailable(command: string): boolean {
 
 function isRelayCommandName(value: string): value is RelayCommandName {
   return [
+    "bridge.status",
     "health",
     "connection.status",
     "roadmap.registry.list",
@@ -3318,4 +1885,4 @@ function isRelayCommandName(value: string): value is RelayCommandName {
   ].includes(value);
 }
 
-export { main };
+export { main, normalizeBridgeAppArgv };

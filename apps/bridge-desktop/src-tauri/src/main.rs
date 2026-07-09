@@ -1,5 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +14,7 @@ struct FolderSelection {
 }
 
 #[derive(Serialize)]
-struct FileSelection {
+struct BinarySelection {
     path: String,
 }
 
@@ -51,28 +49,24 @@ async fn choose_project_folder(app: tauri::AppHandle) -> Result<Option<FolderSel
 }
 
 #[tauri::command]
-async fn choose_codex_binary(app: tauri::AppHandle) -> Result<Option<FileSelection>, String> {
+async fn choose_codex_binary(app: tauri::AppHandle) -> Result<Option<BinarySelection>, String> {
+    let picker = app.dialog().file();
     #[cfg(target_os = "windows")]
-    let file = app
-        .dialog()
-        .file()
+    let picker = picker
         .set_title("Select codex.exe")
-        .add_filter("codex.exe", &["exe"])
-        .blocking_pick_file();
+        .add_filter("Codex executable", &["exe"]);
     #[cfg(not(target_os = "windows"))]
-    let file = app
-        .dialog()
-        .file()
-        .set_title("Select Codex CLI")
-        .blocking_pick_file();
-    file.map(|path| {
-        path.into_path()
-            .map(|path| FileSelection {
-                path: path.to_string_lossy().to_string(),
-            })
-            .map_err(|error| error.to_string())
-    })
-    .transpose()
+    let picker = picker.set_title("Select Codex executable");
+    let binary = picker.blocking_pick_file();
+    binary
+        .map(|path| {
+            path.into_path()
+                .map(|path| BinarySelection {
+                    path: path.to_string_lossy().to_string(),
+                })
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
 }
 
 #[tauri::command]
@@ -250,7 +244,17 @@ fn validate_roadmaps_args(args: &[String]) -> bool {
 fn validate_codex_args(args: &[String]) -> bool {
     match args {
         [command, subcommand] if command == "codex" && matches!(subcommand.as_str(), "status" | "install" | "recheck" | "logout") => true,
+        [command, subcommand, flag] if command == "codex" && subcommand == "install" && matches!(flag.as_str(), "--confirm" | "--dry-run" | "--json") => true,
+        [command, subcommand, first_flag, second_flag]
+            if command == "codex"
+                && subcommand == "install"
+                && valid_codex_install_flags(&[first_flag.as_str(), second_flag.as_str()]) => true,
+        [command, subcommand, first_flag, second_flag, third_flag]
+            if command == "codex"
+                && subcommand == "install"
+                && valid_codex_install_flags(&[first_flag.as_str(), second_flag.as_str(), third_flag.as_str()]) => true,
         [command, subcommand] if command == "codex" && subcommand == "login" => true,
+        [command, subcommand, flag] if command == "codex" && subcommand == "login" && flag == "--api-key" => true,
         [command, subcommand, flag] if command == "codex" && subcommand == "login" && flag == "--device" => true,
         [command, subcommand, first_flag, second_flag]
             if command == "codex"
@@ -269,6 +273,21 @@ fn validate_codex_args(args: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+fn valid_codex_install_flags(flags: &[&str]) -> bool {
+    let mut saw_confirm = false;
+    let mut saw_dry_run = false;
+    let mut saw_json = false;
+    for flag in flags {
+        match *flag {
+            "--confirm" if !saw_confirm => saw_confirm = true,
+            "--dry-run" if !saw_dry_run => saw_dry_run = true,
+            "--json" if !saw_json => saw_json = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn valid_codex_login_flags(flags: &[&str]) -> bool {
@@ -323,9 +342,10 @@ fn validate_ui_intent_args(args: &[String]) -> bool {
         [command, tab, detail] if command == "ui-intent" && validate_ui_tab_arg(tab).is_ok() => {
             matches!(
                 (tab.as_str(), detail.as_str()),
-                ("codex", "codex")
+                ("provider", "codex")
                     | ("prerequisites", "codex")
-                    | ("workspaces", "add-roadmap")
+                    | ("connection", "remote")
+                    | ("workspaces", "add-workspace")
                     | ("roadmaps", "add-roadmap")
             )
         }
@@ -418,16 +438,16 @@ fn validate_ui_tab_arg(value: &str) -> Result<(), String> {
     validate_plain_arg(value)?;
     if matches!(
         value,
-        "codex"
+        "provider"
             | "workspaces"
+            | "connection"
             | "advanced"
+            | "diagnostics"
+            | "settings"
             | "overview"
             | "prerequisites"
             | "roadmaps"
-            | "connection"
             | "remote"
-            | "diagnostics"
-            | "settings"
     ) {
         Ok(())
     } else {
@@ -484,7 +504,7 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
     };
     let query = parse_query(query_part.unwrap_or(""));
     let args = match command {
-        "open" => vec!["status".to_string()],
+        "open" => vec!["ui-intent".to_string(), "provider".to_string()],
         "pair" => {
             if let (Some(code), Some(state)) = (query_value(&query, "code"), query_value(&query, "state")) {
                 vec![
@@ -516,23 +536,50 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
                 .ok_or_else(|| "hunsu://open-roadmap requires roadmapId.".to_string())?;
             vec!["open-roadmap".to_string(), roadmap_id]
         }
-        "add-roadmap" => {
+        "open-workspace" => {
+            let workspace_id = query_value(&query, "workspaceId")
+                .ok_or_else(|| "hunsu://open-workspace requires workspaceId.".to_string())?;
+            vec!["open-roadmap".to_string(), workspace_id]
+        }
+        "add-workspace" | "add-roadmap" => {
             if let Some(path) = query_value(&query, "path") {
                 vec!["roadmaps".to_string(), "add".to_string(), path]
             } else {
-                vec!["ui-intent".to_string(), "workspaces".to_string(), "add-roadmap".to_string()]
+                vec!["ui-intent".to_string(), "workspaces".to_string(), "add-workspace".to_string()]
             }
         }
-        "roadmaps" | "workspaces" => vec!["ui-intent".to_string(), "workspaces".to_string()],
-        "codex" => vec!["ui-intent".to_string(), "codex".to_string(), "codex".to_string()],
+        "workspaces" | "roadmaps" => vec!["ui-intent".to_string(), "workspaces".to_string()],
+        "codex" => vec!["ui-intent".to_string(), "provider".to_string(), "codex".to_string()],
+        "provider" => {
+            let decoded_path = path_part.map(percent_decode);
+            if !matches!(decoded_path.as_deref(), None | Some("codex")) {
+                return Err("Unsupported hunsu://provider path.".to_string());
+            }
+            let mut args = vec!["ui-intent".to_string(), "provider".to_string()];
+            if decoded_path.as_deref() == Some("codex") {
+                args.push("codex".to_string());
+            }
+            args
+        }
         "prerequisites" => {
             let decoded_path = path_part.map(percent_decode);
             if !matches!(decoded_path.as_deref(), None | Some("codex")) {
                 return Err("Unsupported hunsu://prerequisites path.".to_string());
             }
-            let mut args = vec!["ui-intent".to_string(), "codex".to_string()];
+            let mut args = vec!["ui-intent".to_string(), "provider".to_string()];
             if decoded_path.as_deref() == Some("codex") {
                 args.push("codex".to_string());
+            }
+            args
+        }
+        "connection" => {
+            let decoded_path = path_part.map(percent_decode);
+            if !matches!(decoded_path.as_deref(), None | Some("remote")) {
+                return Err("Unsupported hunsu://connection path.".to_string());
+            }
+            let mut args = vec!["ui-intent".to_string(), "connection".to_string()];
+            if decoded_path.as_deref() == Some("remote") {
+                args.push("remote".to_string());
             }
             args
         }
@@ -540,6 +587,11 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
             let roadmap_id = query_value(&query, "roadmapId")
                 .ok_or_else(|| "hunsu://activate-roadmap requires roadmapId.".to_string())?;
             vec!["activate-roadmap".to_string(), roadmap_id]
+        }
+        "activate-workspace" => {
+            let workspace_id = query_value(&query, "workspaceId")
+                .ok_or_else(|| "hunsu://activate-workspace requires workspaceId.".to_string())?;
+            vec!["activate-roadmap".to_string(), workspace_id]
         }
         "sign-in" => vec!["login".to_string(), "--gui".to_string()],
         "sign-out" => vec!["logout".to_string()],
@@ -609,8 +661,8 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            choose_codex_binary,
             choose_project_folder,
+            choose_codex_binary,
             open_external,
             start_bridge_sidecar,
             spawn_bridge_app_command,
@@ -637,8 +689,15 @@ mod tests {
 
     #[test]
     fn protocol_urls_and_sidecar_commands_are_allowlisted() {
-        assert_eq!(bridge_args_for_protocol_url("hunsu://open").unwrap(), vec!["status"]);
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://open").unwrap(),
+            vec!["ui-intent", "provider"]
+        );
         assert_eq!(bridge_args_for_protocol_url("hunsu://pair").unwrap(), vec!["pair"]);
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://pair?next=/studio").unwrap(),
+            vec!["pair", "--next", "/studio"]
+        );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://pair?next=/studio/roadmaps/roadmap_123").unwrap(),
             vec!["pair", "--next", "/studio/roadmaps/roadmap_123"]
@@ -648,39 +707,81 @@ mod tests {
             vec!["auth-callback", "--code", "abc123", "--state", "state123"]
         );
         assert_eq!(
+            bridge_args_for_protocol_url("hunsu://provider").unwrap(),
+            vec!["ui-intent", "provider"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://provider/codex").unwrap(),
+            vec!["ui-intent", "provider", "codex"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://codex").unwrap(),
+            vec!["ui-intent", "provider", "codex"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://workspaces").unwrap(),
+            vec!["ui-intent", "workspaces"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://add-workspace").unwrap(),
+            vec!["ui-intent", "workspaces", "add-workspace"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://add-workspace?path=/tmp/example").unwrap(),
+            vec!["roadmaps", "add", "/tmp/example"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://connection").unwrap(),
+            vec!["ui-intent", "connection"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://connection/remote").unwrap(),
+            vec!["ui-intent", "connection", "remote"]
+        );
+        assert_eq!(
             bridge_args_for_protocol_url("hunsu://add-roadmap").unwrap(),
-            vec!["ui-intent", "workspaces", "add-roadmap"]
+            vec!["ui-intent", "workspaces", "add-workspace"]
         );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://add-roadmap?path=/tmp/example").unwrap(),
             vec!["roadmaps", "add", "/tmp/example"]
         );
         assert_eq!(bridge_args_for_protocol_url("hunsu://roadmaps").unwrap(), vec!["ui-intent", "workspaces"]);
-        assert_eq!(bridge_args_for_protocol_url("hunsu://workspaces").unwrap(), vec!["ui-intent", "workspaces"]);
-        assert_eq!(bridge_args_for_protocol_url("hunsu://codex").unwrap(), vec!["ui-intent", "codex", "codex"]);
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://prerequisites").unwrap(),
-            vec!["ui-intent", "codex"]
+            vec!["ui-intent", "provider"]
         );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://prerequisites/codex").unwrap(),
-            vec!["ui-intent", "codex", "codex"]
+            vec!["ui-intent", "provider", "codex"]
         );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=roadmap_123").unwrap(),
             vec!["activate-roadmap", "roadmap_123"]
         );
         assert_eq!(
+            bridge_args_for_protocol_url("hunsu://activate-workspace?workspaceId=roadmap_123").unwrap(),
+            vec!["activate-roadmap", "roadmap_123"]
+        );
+        assert_eq!(
             bridge_args_for_protocol_url("hunsu://open-roadmap?roadmapId=roadmap_123").unwrap(),
+            vec!["open-roadmap", "roadmap_123"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://open-workspace?workspaceId=roadmap_123").unwrap(),
             vec!["open-roadmap", "roadmap_123"]
         );
         assert_eq!(bridge_args_for_protocol_url("hunsu://sign-in").unwrap(), vec!["login", "--gui"]);
         assert_eq!(bridge_args_for_protocol_url("hunsu://sign-out").unwrap(), vec!["logout"]);
         assert_eq!(bridge_args_for_protocol_url("hunsu://remote-disable").unwrap(), vec!["remote", "disable"]);
         assert!(bridge_args_for_protocol_url("hunsu://delete-everything").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://provider/other").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://prerequisites/other").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://connection/relay").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://open-roadmap").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://open-workspace").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://activate-roadmap").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://activate-workspace").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=bad/id").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://open-project?path=%00tmp").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://add-roadmap?path=").is_err());

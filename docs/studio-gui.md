@@ -38,15 +38,16 @@ Required visible states include:
 - Remote Bridge · Connected
 - Remote Bridge · Reconnecting
 - Session expired
-- Project access needed
+- Workspace access needed
 - Bridge update needed
 - Bridge error
 
 Connection Center explains missing app install, Bridge not running, missing
-pairing token, wrong allowed origin, old Bridge version, missing Project Grant,
-Remote Bridge offline, Relay unavailable, and Web/Bridge account mismatch.
-The primary recovery action is opening Hunsu Bridge App. Download and advanced
-CLI paths remain available as secondary actions.
+pairing token, wrong allowed origin, old Bridge version, missing Workspace
+access, Remote Bridge offline, Relay unavailable, and Web/Bridge account
+mismatch. The primary recovery actions open Hunsu Bridge App sections for
+Provider, Workspaces, and Connections. Download and advanced CLI paths remain
+available as secondary actions.
 
 When a paired local Bridge exposes Relay registry data, Connection Center also
 lists available Remote Bridges with online/offline state so the same panel can
