@@ -2137,7 +2137,9 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     };
     assert.deepEqual(tauriConfig.bundle.externalBin, ["../dist/hunsu-bridge-sidecar"]);
     assert.equal(tauriConfig.bundle.resources?.includes("../dist/hunsu-bridge-sidecar*"), true);
-    assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8"), /hunsu-bridge-sidecar/);
+    const tauriMain = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8");
+    assert.match(tauriMain, /windows_subsystem = "windows"/);
+    assert.match(tauriMain, /hunsu-bridge-sidecar/);
     const sidecarScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/prepare-sidecars.mjs"), "utf8");
     const buildScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/build-native-sidecars.mjs"), "utf8");
     const packageJson = JSON.parse(readFileSync(join(process.cwd(), "apps/bridge-desktop/package.json"), "utf8")) as {
@@ -2158,7 +2160,7 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(buildScript, /SHASUMS256\.txt/);
     assert.match(buildScript, /darwin-x64/);
     assert.match(buildScript, /win-arm64/);
-    assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8"), /hunsu-bridge-sidecar\.exe/);
+    assert.match(tauriMain, /hunsu-bridge-sidecar\.exe/);
 
     const launcherPath = join(root, "hunsu-bridge-sidecar-x86_64-unknown-linux-gnu");
     writeFileSync(launcherPath, [
