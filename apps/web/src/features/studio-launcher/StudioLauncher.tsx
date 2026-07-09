@@ -149,16 +149,16 @@ export function StudioLauncher({
         <div className="shrink-0">
           <p className="text-[13px] font-medium leading-5 text-muted-foreground">{modeLabel(mode)}</p>
           <h1 className="mt-1 font-[family-name:var(--apple-font-display)] text-[44px] font-semibold leading-[1.08] tracking-normal text-[color:var(--apple-ink)]">
-            Active Roadmaps
+            Active workspaces
           </h1>
           <div className="mt-5 flex flex-wrap gap-3">
             <Button type="button" size="lg" onClick={() => openBridgeLink("hunsu://add-roadmap")}>
               <ExternalLink className="size-4" />
-              Add Roadmap in Bridge App
+              Add workspace
             </Button>
-            <Button type="button" size="lg" variant="outline" onClick={() => openBridgeLink("hunsu://pair?next=/studio")}>
+            <Button type="button" size="lg" variant="outline" onClick={() => openBridgeLink("hunsu://workspaces")}>
               <ExternalLink className="size-4" />
-              Open Hunsu Bridge
+              Open Bridge App
             </Button>
           </div>
         </div>
@@ -179,7 +179,7 @@ export function StudioLauncher({
           </section>
         ) : (
           <section className="mt-6 shrink-0 rounded-[18px] border border-[color:var(--apple-hairline)] bg-white/58 px-4 py-5 text-[13px] leading-5 text-muted-foreground">
-            No active Roadmaps. Add a Roadmap in Hunsu Bridge App to start working.
+            No active workspaces. Add a workspace in Hunsu Bridge App to start.
           </section>
         )}
 
@@ -370,6 +370,6 @@ function openBridgeLink(url: string): void {
 
 function modeLabel(mode: "launcher" | "open" | "port"): string {
   if (mode === "port") return "Inspect or create from a Git project";
-  if (mode === "open") return "Open an existing Roadmap";
-  return "Open or create from a project";
+  if (mode === "open") return "Open an existing workspace";
+  return "Open or create from a workspace";
 }
