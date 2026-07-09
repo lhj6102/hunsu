@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { accessSync, constants, existsSync, readdirSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { currentProcessEnv } from "@hunsu/config";
+import { currentProcessEnv, resolveCodexAppServerConfig } from "@hunsu/config";
 
 const execFileAsync = promisify(execFile);
 export const DEFAULT_CODEX_PROBE_TIMEOUT_MS = 3_500;
@@ -42,6 +42,11 @@ export type CodexDiscoveryCandidate = {
 export type CodexAppServerProbeResult =
   | { available: true; initialized?: unknown }
   | { available: false; error: string };
+
+export type CodexAppServerLaunchCommand = {
+  command: string;
+  args: string[];
+};
 
 export type CodexDetectionOptions = {
   env?: Record<string, string | undefined>;
@@ -172,14 +177,24 @@ export async function getCodexVersion(input: {
 }
 
 export async function probeCodexAppServer(input: {
-  binaryPath: string;
+  binaryPath?: string;
+  command?: string;
+  args?: string[];
   timeoutMs?: number;
   env?: Record<string, string | undefined>;
   platform?: NodeJS.Platform;
 }): Promise<CodexAppServerProbeResult> {
-  const client = new CodexAppServerProbeClient(input.binaryPath, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
-    env: input.env,
-    platform: input.platform
+  const env = input.env ?? currentProcessEnv();
+  const launch = input.command
+    ? { ok: true as const, value: { command: input.command, args: input.args ?? ["app-server", "--stdio"] } }
+    : effectiveCodexAppServerLaunchCommand({ env, cliBinaryPath: input.binaryPath });
+  if (!launch.ok) {
+    return { available: false, error: launch.error };
+  }
+  const client = new CodexAppServerProbeClient(launch.value.command, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
+    env,
+    platform: input.platform,
+    args: launch.value.args
   });
   try {
     const initialized = await client.initialize();
@@ -189,6 +204,32 @@ export async function probeCodexAppServer(input: {
   } finally {
     client.close();
   }
+}
+
+export function effectiveCodexAppServerLaunchCommand(input: {
+  env: Record<string, string | undefined>;
+  cliBinaryPath?: string;
+}): { ok: true; value: CodexAppServerLaunchCommand } | { ok: false; error: string } {
+  const configuredCommand = input.env.HUNSU_CODEX_APP_SERVER_COMMAND?.trim();
+  if (configuredCommand && /\s/.test(configuredCommand)) {
+    return {
+      ok: false,
+      error: "HUNSU_CODEX_APP_SERVER_COMMAND must be a binary path or command name without arguments. Put arguments in HUNSU_CODEX_APP_SERVER_ARGS."
+    };
+  }
+  const resolved = resolveCodexAppServerConfig(input.env);
+  if (!resolved.ok) {
+    return { ok: false, error: resolved.error.message };
+  }
+  const cliBinaryPath = input.cliBinaryPath?.trim();
+  const command = resolved.value.command === "codex" && cliBinaryPath ? cliBinaryPath : resolved.value.command;
+  return {
+    ok: true,
+    value: {
+      command,
+      args: resolved.value.args
+    }
+  };
 }
 
 export function knownWindowsCodexInstallDirs(env: Record<string, string | undefined>, platform: NodeJS.Platform): string[] {
@@ -627,7 +668,8 @@ function processEnvForProbe(env: Record<string, string | undefined>, platform: N
 }
 
 export class CodexAppServerProbeClient {
-  private readonly binaryPath: string;
+  private readonly command: string;
+  private readonly args: string[];
   private readonly timeoutMs: number;
   private child: ChildProcessWithoutNullStreams;
   private nextId = 1;
@@ -635,18 +677,20 @@ export class CodexAppServerProbeClient {
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
 
   constructor(
-    binaryPath: string,
+    command: string,
     timeoutMs: number,
     options: {
       env?: Record<string, string | undefined>;
       platform?: NodeJS.Platform;
+      args?: string[];
     } = {}
   ) {
-    this.binaryPath = binaryPath;
+    this.command = command;
+    this.args = options.args ?? ["app-server", "--stdio"];
     this.timeoutMs = timeoutMs;
     const env = options.env ?? currentProcessEnv();
     const platform = options.platform ?? process.platform;
-    const launch = codexProbeLaunchCommand(this.binaryPath, ["app-server", "--stdio"], env, platform);
+    const launch = codexProbeLaunchCommand(this.command, this.args, env, platform);
     this.child = spawn(launch.command, launch.args, {
       env: processEnvForProbe(env, platform),
       stdio: ["pipe", "pipe", "pipe"],

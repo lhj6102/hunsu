@@ -26,12 +26,12 @@ const connectionEls = {
 };
 const selectedProject = document.querySelector("#selected-project");
 const selectedProjectAction = document.querySelector("#selected-project-action");
-const codexBinaryPath = document.querySelector("#codex-binary-path");
+const providerConfigForm = document.querySelector("#provider-config-form");
 const codexInstallChannel = document.querySelector("#codex-install-channel");
-const codexAuthPreference = document.querySelector("#codex-auth-preference");
-const codexEnvHome = document.querySelector("#codex-env-home");
-const codexEnvCommand = document.querySelector("#codex-env-command");
-const codexEnvArgs = document.querySelector("#codex-env-args");
+let codexBinaryPath = undefined;
+let codexEnvHome = undefined;
+let latestProviderConfigMetadata = undefined;
+const providerConfigFieldElements = new Map();
 let latestSnapshot = undefined;
 let selectedInspection = undefined;
 let lastHandledUiIntentId = undefined;
@@ -155,7 +155,7 @@ function renderSnapshot(snapshot) {
   projectGrants.replaceChildren(...projectGrantRows(snapshot.projectGrants ?? []));
   renderConnection(snapshot);
   renderRuntimeProviders(snapshot.providers ?? snapshot.runtimeProviders, codex);
-  renderCodexSettings(snapshot.codexSettings, snapshot.diagnostics?.app?.codex);
+  renderCodexSettings(snapshot.providerConfig, snapshot.codexSettings, snapshot.diagnostics?.app?.codex);
 }
 
 function roadmapRows(projects, lifecycle, grants, options = {}) {
@@ -443,9 +443,13 @@ function renderProviderCard(provider) {
   const meta = document.createElement("div");
   meta.className = "project-meta";
   meta.textContent = providerStatusSummary(provider);
-  body.append(title, meta, codexDeviceLoginStatus());
+  body.append(title, meta, providerStatusDetails(provider), codexDeviceLoginStatus());
   const buttons = document.createElement("div");
   buttons.className = "actions";
+  const configure = document.createElement("button");
+  configure.textContent = "Configure";
+  configure.addEventListener("click", () => selectTab("settings"));
+  buttons.append(configure);
   if (provider?.recommendedAction === "install") {
     const install = document.createElement("button");
     install.className = "primary";
@@ -487,6 +491,17 @@ function renderProviderCard(provider) {
     device.addEventListener("click", startCodexDeviceLogin);
     buttons.append(device);
   }
+  const homeDiagnostic = provider?.auth?.homeDiagnostic ?? provider?.diagnostics?.codexHome;
+  if (homeDiagnostic?.likelyHomeMismatch && homeDiagnostic?.remediation?.suggestedCodexHome) {
+    const useDefaultHome = document.createElement("button");
+    useDefaultHome.className = "primary";
+    useDefaultHome.textContent = "Use Codex Home";
+    useDefaultHome.addEventListener("click", async () => {
+      diagnostics.textContent = await run(["codex", "home", "set", homeDiagnostic.remediation.suggestedCodexHome]);
+      await refresh();
+    });
+    buttons.append(useDefaultHome);
+  }
   if (providerNeedsAttention(provider)) {
     const recheck = document.createElement("button");
     recheck.className = "primary";
@@ -514,6 +529,20 @@ function renderProviderCard(provider) {
   }
 }
 
+function providerStatusDetails(provider) {
+  const container = document.createElement("div");
+  container.className = "message";
+  const codexHome = provider?.auth?.homeDiagnostic ?? provider?.diagnostics?.codexHome;
+  const effectiveEnv = provider?.diagnostics?.effectiveEnv ?? {};
+  container.textContent = [
+    provider?.safeMessage,
+    effectiveEnv.CODEX_HOME ? `Codex Home: ${effectiveEnv.CODEX_HOME}` : codexHome?.effectiveCodexHome ? `Codex Home: ${codexHome.effectiveCodexHome}` : undefined,
+    codexHome ? `Auth file at Codex Home: ${codexHome.authFileExistsAtEffectiveHome ? "Present" : "Missing"}` : undefined,
+    codexHome?.likelyHomeMismatch ? codexHome.remediation?.message : undefined
+  ].filter(Boolean).join("\n");
+  return container;
+}
+
 function providerNeedsAttention(provider) {
   return provider
     && !provider.ready
@@ -535,6 +564,8 @@ function providerAdvancedDetails(provider) {
     provider?.install?.binaryPath ? `Binary path: ${provider.install.binaryPath}` : "Binary path: Auto-detect",
     provider?.install?.source ? `Source: ${provider.install.source}` : undefined,
     provider?.install?.version ? `Version: ${provider.install.version}` : undefined,
+    provider?.diagnostics?.effectiveEnv?.CODEX_HOME ? `Effective CODEX_HOME: ${provider.diagnostics.effectiveEnv.CODEX_HOME}` : undefined,
+    provider?.diagnostics?.effectiveEnv?.HUNSU_CODEX_APP_SERVER_COMMAND ? `App-server command: ${provider.diagnostics.effectiveEnv.HUNSU_CODEX_APP_SERVER_COMMAND}` : undefined,
     `Auth access: ${formatProviderAccess(provider)}`,
     `Rate limit summary: ${formatProviderRateLimit(provider)}`
   ].filter(Boolean).join("\n");
@@ -752,13 +783,159 @@ function formatUsage(usage) {
   return `input ${usage.inputTokens}, cached ${usage.cachedInputTokens}, output ${usage.outputTokens}, reasoning ${usage.reasoningTokens}`;
 }
 
-function renderCodexSettings(settings, legacyCodexSettings) {
-  codexBinaryPath.value = settings?.binaryPath ?? legacyCodexSettings?.binaryPath ?? "";
+function renderCodexSettings(providerConfig, settings, legacyCodexSettings) {
   codexInstallChannel.value = settings?.installChannel ?? "stable";
-  codexAuthPreference.value = settings?.authenticationPreference ?? "chatgpt";
-  codexEnvHome.value = settings?.environment?.CODEX_HOME ?? "";
-  codexEnvCommand.value = settings?.environment?.HUNSU_CODEX_APP_SERVER_COMMAND ?? "";
-  codexEnvArgs.value = settings?.environment?.HUNSU_CODEX_APP_SERVER_ARGS ?? "";
+  const metadata = providerConfig?.metadata;
+  if (!metadata?.configKeys?.length || !providerConfigForm) {
+    return;
+  }
+  latestProviderConfigMetadata = metadata;
+  const savedFields = new Map((providerConfig.fields ?? []).map(field => [field.key, field]));
+  providerConfigFieldElements.clear();
+  const sections = [];
+  const primaryKeys = metadata.configKeys.filter(key => !key.advanced);
+  const advancedKeys = metadata.configKeys.filter(key => key.advanced);
+  if (primaryKeys.length > 0) {
+    sections.push(providerConfigSection("Primary", primaryKeys, savedFields, settings, legacyCodexSettings));
+  }
+  if (advancedKeys.length > 0) {
+    sections.push(providerConfigSection("Advanced", advancedKeys, savedFields, settings, legacyCodexSettings));
+  }
+  providerConfigForm.replaceChildren(...sections);
+  codexBinaryPath = providerConfigFieldElements.get("binaryPath");
+  codexEnvHome = providerConfigFieldElements.get("codexHome");
+}
+
+function providerConfigSection(titleText, keys, savedFields, settings, legacyCodexSettings) {
+  const section = document.createElement("div");
+  section.className = "grid";
+  const title = document.createElement("h3");
+  title.textContent = titleText;
+  section.append(title, ...keys.flatMap(key => providerConfigControls(key, savedFields, settings, legacyCodexSettings)));
+  return section;
+}
+
+function providerConfigControls(key, savedFields, settings, legacyCodexSettings) {
+  const label = document.createElement("label");
+  const meta = document.createElement("span");
+  meta.className = "project-meta";
+  meta.textContent = key.envName ? `${key.label} · ${key.envName}` : key.label;
+  const control = providerConfigControl(key);
+  control.value = providerConfigFieldValue(key, savedFields, settings, legacyCodexSettings);
+  label.append(meta, control);
+  providerConfigFieldElements.set(key.name, control);
+  const controls = [label];
+  const picker = providerConfigPicker(key);
+  if (picker) {
+    controls.push(picker);
+  }
+  return controls;
+}
+
+function providerConfigControl(key) {
+  if (key.kind === "select") {
+    const select = document.createElement("select");
+    select.id = codexConfigElementId(key.name);
+    select.dataset.providerConfigKey = key.name;
+    for (const option of key.options ?? []) {
+      const item = document.createElement("option");
+      item.value = option.value;
+      item.textContent = option.label;
+      select.append(item);
+    }
+    return select;
+  }
+  const input = document.createElement("input");
+  input.id = codexConfigElementId(key.name);
+  input.dataset.providerConfigKey = key.name;
+  input.type = key.secret ? "password" : "text";
+  input.placeholder = key.placeholder ?? key.default ?? "";
+  return input;
+}
+
+function providerConfigPicker(key) {
+  if (key.kind !== "file" && key.kind !== "directory") {
+    return undefined;
+  }
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const button = document.createElement("button");
+  button.id = key.name === "binaryPath" ? "choose-codex-binary" : key.name === "codexHome" ? "choose-codex-home" : `choose-${key.name}`;
+  button.textContent = key.kind === "directory" ? `Choose ${key.label}` : `Choose ${key.label}`;
+  button.addEventListener("click", key.name === "codexHome" ? chooseCodexHome : chooseCodexBinaryForSettings);
+  actions.append(button);
+  return actions;
+}
+
+function providerConfigFieldValue(key, savedFields, settings, legacyCodexSettings) {
+  const saved = savedFields.get(key.name);
+  if (typeof saved?.value === "string") {
+    return saved.value;
+  }
+  if (typeof saved?.value === "boolean") {
+    return String(saved.value);
+  }
+  if (key.name === "binaryPath") {
+    return settings?.binaryPath ?? legacyCodexSettings?.binaryPath ?? "";
+  }
+  if (key.name === "codexHome") {
+    return settings?.codexHome ?? settings?.environment?.CODEX_HOME ?? "";
+  }
+  if (key.name === "appServerCommand") {
+    return settings?.appServerCommand ?? settings?.environment?.HUNSU_CODEX_APP_SERVER_COMMAND ?? "";
+  }
+  if (key.name === "appServerArgs") {
+    return settings?.appServerArgs ?? settings?.environment?.HUNSU_CODEX_APP_SERVER_ARGS ?? "";
+  }
+  if (key.name === "authenticationPreference") {
+    return settings?.authenticationPreference ?? key.default ?? "";
+  }
+  return key.default ?? "";
+}
+
+function codexConfigElementId(key) {
+  if (key === "binaryPath") return "codex-binary-path";
+  if (key === "codexHome") return "codex-env-home";
+  if (key === "appServerCommand") return "codex-env-command";
+  if (key === "appServerArgs") return "codex-env-args";
+  if (key === "authenticationPreference") return "codex-auth-preference";
+  return `provider-config-${key}`;
+}
+
+function codexProviderConfigFields() {
+  return (latestProviderConfigMetadata?.configKeys ?? []).map(key => {
+    const control = providerConfigFieldElements.get(key.name);
+    const raw = control?.type === "checkbox" ? control.checked : control?.value;
+    const value = String(raw ?? "").trim();
+    return {
+      key: key.name,
+      value,
+      isSet: value !== "",
+      isSecret: key.secret === true
+    };
+  });
+}
+
+async function validateCodexConfig() {
+  const stdout = await run(["provider", "config", "validate-json", JSON.stringify(codexProviderConfigFields()), "--json"]);
+  const result = parseJsonResult(stdout);
+  diagnostics.textContent = JSON.stringify(result ?? stdout, null, 2);
+  if (result && result.valid !== true) {
+    throw new Error(result.provider?.safeMessage ?? "Codex provider config is not valid.");
+  }
+}
+
+async function saveCodexConfig() {
+  const stdout = await run(["provider", "config", "save-json", JSON.stringify(codexProviderConfigFields()), "--json"]);
+  await run([
+    "codex",
+    "settings",
+    "set",
+    "--install-channel",
+    codexInstallChannel.value
+  ]);
+  diagnostics.textContent = stdout;
+  await refresh();
 }
 
 function projectGrantRows(grants) {
@@ -921,7 +1098,7 @@ async function chooseProjectFolder() {
 async function chooseCodexBinary() {
   if (!invoke) {
     selectTab("settings");
-    codexBinaryPath.focus();
+    codexBinaryPath?.focus();
     return;
   }
   const binary = await invoke("choose_codex_binary");
@@ -930,6 +1107,28 @@ async function chooseCodexBinary() {
   }
   diagnostics.textContent = await run(["codex", "path", "set", binary.path]);
   await refresh();
+}
+
+async function chooseCodexBinaryForSettings() {
+  if (!invoke) {
+    codexBinaryPath?.focus();
+    return;
+  }
+  const binary = await invoke("choose_codex_binary");
+  if (binary?.path && codexBinaryPath) {
+    codexBinaryPath.value = binary.path;
+  }
+}
+
+async function chooseCodexHome() {
+  if (!invoke) {
+    codexEnvHome?.focus();
+    return;
+  }
+  const folder = await invoke("choose_codex_home");
+  if (folder?.path && codexEnvHome) {
+    codexEnvHome.value = folder.path;
+  }
 }
 
 document.querySelector("#choose-folder").addEventListener("click", chooseProjectFolder);
@@ -951,26 +1150,10 @@ async function runConnectionAction(event) {
 document.querySelector("#copy-diagnostics").addEventListener("click", async () => {
   await navigator.clipboard.writeText(diagnostics.textContent || "{}");
 });
-document.querySelector("#save-codex-path").addEventListener("click", async () => {
-  const value = codexBinaryPath.value.trim();
-  if (value) await run(["codex", "path", "set", value]);
-  else await run(["codex", "path", "reset"]);
-  await refresh();
-});
-document.querySelector("#save-codex-settings").addEventListener("click", async () => {
-  await run([
-    "codex",
-    "settings",
-    "set",
-    "--install-channel",
-    codexInstallChannel.value,
-    "--auth-preference",
-    codexAuthPreference.value
-  ]);
-  await refresh();
-});
-document.querySelector("#reset-codex-path").addEventListener("click", async () => {
-  await run(["codex", "path", "reset"]);
+document.querySelector("#validate-codex-config").addEventListener("click", validateCodexConfig);
+document.querySelector("#save-codex-config").addEventListener("click", saveCodexConfig);
+document.querySelector("#reset-codex-config").addEventListener("click", async () => {
+  await run(["provider", "config", "reset"]);
   await refresh();
 });
 

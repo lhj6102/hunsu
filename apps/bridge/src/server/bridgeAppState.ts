@@ -2,6 +2,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { RemoteWorkspaceProjectGrant, BridgeCommandScope } from "../connections/remoteConnection.ts";
+import {
+  codexProviderEnv,
+  codexSettingsFromRecord,
+  type BridgeCodexSettings
+} from "../runtime-providers/codex.ts";
 import type { BridgeStatusAccount } from "./bridgeStatus.ts";
 
 export type BridgeAppAccountEvidence = BridgeStatusAccount & {
@@ -52,22 +57,37 @@ export function bridgeStatusProjectGrantsFromBridgeAppState(env: Record<string, 
 }
 
 export function bridgeCodexBinaryPathFromBridgeAppState(env: Record<string, string | undefined>): string | undefined {
+  return bridgeCodexSettingsFromBridgeAppState(env).binaryPath;
+}
+
+export function bridgeCodexSettingsFromBridgeAppState(env: Record<string, string | undefined>): BridgeCodexSettings {
   const state = readBridgeAppStateForStatus(env);
   const runtimeProviders = state && isRecord(state.runtimeProviders) ? state.runtimeProviders : undefined;
   const providers = runtimeProviders && isRecord(runtimeProviders.providers) ? runtimeProviders.providers : undefined;
   const codexProvider = providers && isRecord(providers.codex) ? providers.codex : undefined;
   const settings = codexProvider && isRecord(codexProvider.settings) ? codexProvider.settings : undefined;
-  const configuredBinaryPath = typeof settings?.binaryPath === "string" && settings.binaryPath.trim()
-    ? settings.binaryPath.trim()
-    : undefined;
-  if (configuredBinaryPath) {
-    return configuredBinaryPath;
-  }
+  const configured = codexSettingsFromRecord(settings);
   const codex = state && isRecord(state.codex) ? state.codex : undefined;
-  const legacyBinaryPath = typeof codex?.binaryPath === "string" && codex.binaryPath.trim()
-    ? codex.binaryPath.trim()
-    : undefined;
-  return legacyBinaryPath;
+  const legacyEnvironment = codex && isRecord(codex.environment) ? codex.environment : undefined;
+  const legacy = codexSettingsFromRecord({
+    ...(codex ?? {}),
+    ...(legacyEnvironment?.CODEX_HOME ? { codexHome: legacyEnvironment.CODEX_HOME } : {}),
+    ...(legacyEnvironment?.HUNSU_CODEX_APP_SERVER_COMMAND ? { appServerCommand: legacyEnvironment.HUNSU_CODEX_APP_SERVER_COMMAND } : {}),
+    ...(legacyEnvironment?.HUNSU_CODEX_APP_SERVER_ARGS ? { appServerArgs: legacyEnvironment.HUNSU_CODEX_APP_SERVER_ARGS } : {})
+  });
+  return {
+    ...legacy,
+    ...configured
+  };
+}
+
+export function bridgeCodexEffectiveEnvFromBridgeAppState(
+  env: Record<string, string | undefined>
+): Record<string, string | undefined> {
+  return codexProviderEnv({
+    baseEnv: env,
+    settings: bridgeCodexSettingsFromBridgeAppState(env)
+  });
 }
 
 export function parseBridgeStatusProjectGrants(value: string | undefined): RemoteWorkspaceProjectGrant[] {

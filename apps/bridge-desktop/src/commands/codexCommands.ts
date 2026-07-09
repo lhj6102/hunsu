@@ -110,7 +110,7 @@ export async function runCodexCommand(parsed: ParsedCodexArgs, context: CodexCom
         throw new Error("Usage: hunsu-bridge codex path set /path/to/codex");
       }
       const resolvedPath = context.resolvePath(binaryPath);
-      const status = await context.getCodexStatus({ env: { ...context.codexProbeEnv(), HUNSU_CODEX_BINARY_PATH: resolvedPath }, force: true });
+      const status = await context.getCodexStatus({ env: { ...context.codexProbeEnv(), HUNSU_CODEX_BINARY_PATH: resolvedPath, HUNSU_CODEX_BINARY_PATH_SOURCE: "user_config" }, force: true });
       if (!status.cli.installed || !status.cli.version || !status.appServer.available) {
         throw new Error(status.appServer.error ?? status.cli.error ?? "Selected file is not a usable Codex CLI for Hunsu.");
       }
@@ -126,21 +126,54 @@ export async function runCodexCommand(parsed: ParsedCodexArgs, context: CodexCom
       return;
     }
   }
+  if (action === "home") {
+    const subcommand = parsed.rest[1];
+    if (subcommand === "set") {
+      const codexHome = parsed.rest[2];
+      if (!codexHome?.trim()) {
+        throw new Error("Usage: hunsu-bridge codex home set /path/to/codex-home");
+      }
+      const resolvedHome = context.resolvePath(codexHome);
+      const status = await context.getCodexStatus({ env: { ...context.codexProbeEnv(), CODEX_HOME: resolvedHome }, force: true });
+      if (!status.cli.installed || !status.cli.version || !status.appServer.available) {
+        throw new Error(status.appServer.error ?? status.cli.error ?? "Codex is not usable with the selected CODEX_HOME.");
+      }
+      const state = context.readState();
+      context.writeState(withBridgeCodexProviderSettings(state, { codexHome: resolvedHome }));
+      console.log(`Codex home set to ${resolvedHome}`);
+      if (status.auth.homeDiagnostic?.authFileExistsAtEffectiveHome === false) {
+        console.log("No auth.json was found at that Codex home. Sign in, then recheck.");
+      }
+      return;
+    }
+    if (subcommand === "reset") {
+      const state = context.readState();
+      context.writeState(withBridgeCodexProviderSettings(state, { codexHome: undefined }));
+      console.log("Codex home reset to Codex default.");
+      return;
+    }
+  }
   if (action === "settings") {
     const subcommand = parsed.rest[1];
     if (subcommand === "set") {
       const installChannel = context.parseInstallChannel(context.getFlag(parsed, "install-channel"));
       const authenticationPreference = context.parseAuthenticationPreference(context.getFlag(parsed, "auth-preference"));
+      const codexHome = context.getFlag(parsed, "codex-home");
+      const appServerCommand = context.getFlag(parsed, "app-server-command");
+      const appServerArgs = context.getFlag(parsed, "app-server-args");
       const state = context.readState();
       context.writeState(withBridgeCodexProviderSettings(state, {
         ...(installChannel ? { installChannel } : {}),
-        ...(authenticationPreference ? { authenticationPreference } : {})
+        ...(authenticationPreference ? { authenticationPreference } : {}),
+        ...(codexHome !== undefined ? { codexHome: codexHome ? context.resolvePath(codexHome) : undefined } : {}),
+        ...(appServerCommand !== undefined ? { appServerCommand: appServerCommand || undefined } : {}),
+        ...(appServerArgs !== undefined ? { appServerArgs: appServerArgs || undefined } : {})
       }));
       console.log("Codex settings saved.");
       return;
     }
   }
-  throw new Error("Usage: hunsu-bridge codex status|install [--confirm] [--dry-run]|login [--device|--api-key] [--background]|recheck|logout|path set <path>|path reset|settings set [--install-channel stable|latest|manual] [--auth-preference chatgpt|api_key|device_code]");
+  throw new Error("Usage: hunsu-bridge codex status|install [--confirm] [--dry-run]|login [--device|--api-key] [--background]|recheck|logout|path set <path>|path reset|home set <path>|home reset|settings set [--install-channel stable|latest|manual] [--auth-preference chatgpt|api_key|device_code] [--codex-home path] [--app-server-command command] [--app-server-args args]");
 }
 
 export async function runCodexDeviceLoginCli(options: { json: boolean; background: boolean }, context: CodexCliActionContext): Promise<void> {

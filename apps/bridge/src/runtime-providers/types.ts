@@ -31,6 +31,59 @@ export type RuntimeProviderRecommendedAction =
   | "recheck"
   | "none";
 
+export type RuntimeProviderConfigKey = {
+  name: string;
+  label: string;
+  description?: string;
+  required: boolean;
+  secret: boolean;
+  default?: string;
+  primary: boolean;
+  advanced?: boolean;
+  kind:
+    | "text"
+    | "path"
+    | "file"
+    | "directory"
+    | "select"
+    | "boolean"
+    | "oauth"
+    | "device_code";
+  options?: Array<{
+    value: string;
+    label: string;
+  }>;
+  envName?: string;
+  placeholder?: string;
+  validation?: {
+    mustExist?: boolean;
+    executable?: boolean;
+    directory?: boolean;
+  };
+};
+
+export type RuntimeProviderMetadata = {
+  providerId: string;
+  label: string;
+  description: string;
+  configKeys: RuntimeProviderConfigKey[];
+  setupSteps?: string[];
+};
+
+export type RuntimeProviderConfigField = {
+  key: string;
+  value?: string | boolean;
+  isSet: boolean;
+  isSecret: boolean;
+  label?: string;
+};
+
+export type RuntimeProviderDiagnostics = {
+  effectiveEnv?: Record<string, string | null>;
+  codexHome?: unknown;
+  [key: string]: unknown;
+};
+
 export type RuntimeProviderCapabilities = {
   canExecute: boolean;
   canEditFiles: boolean;
@@ -66,6 +119,7 @@ export type RuntimeProviderStatus = {
       planLabel?: string;
     };
     error?: string;
+    homeDiagnostic?: unknown;
   };
   install?: {
     installed: boolean;
@@ -93,6 +147,7 @@ export type RuntimeProviderStatus = {
   };
   capabilities: RuntimeProviderCapabilities;
   recommendedAction: RuntimeProviderRecommendedAction;
+  diagnostics?: RuntimeProviderDiagnostics;
   safeMessage?: string;
 };
 
@@ -151,6 +206,15 @@ export type RuntimeProviderAdapter = {
   kind: RuntimeProviderKind;
   label: string;
   hiddenByDefault?: boolean;
+  metadata(): RuntimeProviderMetadata;
+  readConfig(): Promise<RuntimeProviderConfigField[]>;
+  saveConfig(fields: RuntimeProviderConfigField[]): Promise<RuntimeProviderStatus>;
+  deleteConfig?(keys?: string[]): Promise<RuntimeProviderStatus>;
+  validateConfig?(fields: RuntimeProviderConfigField[]): Promise<{
+    valid: boolean;
+    provider: RuntimeProviderStatus;
+    diagnostics?: RuntimeProviderDiagnostics;
+  }>;
   status(input?: {
     force?: boolean;
     env?: Record<string, string | undefined>;

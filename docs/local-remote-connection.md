@@ -42,6 +42,13 @@ device does not report provider status yet, `/api/bridge/status` returns an
 explicit unavailable remote-provider status instead of reusing the local Codex
 status.
 
+Local Bridge child processes inherit the effective runtime provider env from
+Bridge App state. That includes saved Codex `binaryPath`, `codexHome`,
+`appServerCommand`, and `appServerArgs`. The sidecar daemon, remote attach
+processes, status checks, login commands, diagnostics, and Execute runner must
+all see the same effective Codex env so a fixed Provider Setup configuration is
+recoverable after restart and during Remote Access.
+
 The Bridge App Connection tab keeps this model simple:
 
 - Local is always visible while the app is running.

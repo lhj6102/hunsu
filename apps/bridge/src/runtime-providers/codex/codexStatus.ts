@@ -1,8 +1,12 @@
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { currentProcessEnv } from "@hunsu/config";
 import {
   CodexAppServerProbeClient,
   DEFAULT_CODEX_PROBE_TIMEOUT_MS,
   detectCodexBinary,
+  effectiveCodexAppServerLaunchCommand,
   errorMessage,
   getCodexVersion,
   knownWindowsCodexInstallDirs,
@@ -15,6 +19,19 @@ import {
 } from "./codexDetection.ts";
 
 const STATUS_CACHE_TTL_MS = 5_000;
+
+export type CodexAuthHomeDiagnostic = {
+  effectiveCodexHome?: string;
+  defaultCodexHome?: string;
+  authFileExistsAtEffectiveHome: boolean;
+  authFileExistsAtDefaultHome: boolean;
+  likelyHomeMismatch: boolean;
+  remediation?: {
+    type: "set_codex_home" | "login_again";
+    message: string;
+    suggestedCodexHome?: string;
+  };
+};
 
 export type CodexRuntimeStatus = {
   runtime: "codex";
@@ -43,6 +60,7 @@ export type CodexRuntimeStatus = {
       planLabel?: string;
     };
     error?: string;
+    homeDiagnostic?: CodexAuthHomeDiagnostic;
   };
   usage: {
     rateLimitsAvailable: boolean;
@@ -85,9 +103,15 @@ export async function readCodexAccount(input: {
   env?: Record<string, string | undefined>;
   platform?: NodeJS.Platform;
 }): Promise<CodexAccountProbeResult> {
-  const client = new CodexAppServerProbeClient(input.binaryPath, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
-    env: input.env,
-    platform: input.platform
+  const env = input.env ?? currentProcessEnv();
+  const launch = effectiveCodexAppServerLaunchCommand({ env, cliBinaryPath: input.binaryPath });
+  if (!launch.ok) {
+    return { ok: false, authState: "error", error: launch.error };
+  }
+  const client = new CodexAppServerProbeClient(launch.value.command, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
+    env,
+    platform: input.platform,
+    args: launch.value.args
   });
   try {
     await client.initialize();
@@ -107,9 +131,15 @@ export async function readCodexRateLimits(input: {
   env?: Record<string, string | undefined>;
   platform?: NodeJS.Platform;
 }): Promise<CodexRateLimitProbeResult> {
-  const client = new CodexAppServerProbeClient(input.binaryPath, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
-    env: input.env,
-    platform: input.platform
+  const env = input.env ?? currentProcessEnv();
+  const launch = effectiveCodexAppServerLaunchCommand({ env, cliBinaryPath: input.binaryPath });
+  if (!launch.ok) {
+    return { ok: false, error: launch.error };
+  }
+  const client = new CodexAppServerProbeClient(launch.value.command, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
+    env,
+    platform: input.platform,
+    args: launch.value.args
   });
   try {
     await client.initialize();
@@ -132,9 +162,15 @@ export async function probeCodexRuntimeWithAppServer(input: {
   account?: CodexAccountProbeResult;
   rateLimits?: CodexRateLimitProbeResult;
 }> {
-  const client = new CodexAppServerProbeClient(input.binaryPath, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
-    env: input.env,
-    platform: input.platform
+  const env = input.env ?? currentProcessEnv();
+  const launch = effectiveCodexAppServerLaunchCommand({ env, cliBinaryPath: input.binaryPath });
+  if (!launch.ok) {
+    return { appServer: { available: false, error: launch.error } };
+  }
+  const client = new CodexAppServerProbeClient(launch.value.command, input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS, {
+    env,
+    platform: input.platform,
+    args: launch.value.args
   });
   try {
     const initialized = await client.initialize();
@@ -158,6 +194,8 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
   const cacheKey = JSON.stringify({
     customBinaryPath: options.customBinaryPath ?? env.HUNSU_CODEX_BINARY_PATH,
     envCommand: env.HUNSU_CODEX_APP_SERVER_COMMAND,
+    envArgs: env.HUNSU_CODEX_APP_SERVER_ARGS,
+    codexHome: env.CODEX_HOME,
     path: windowsAwarePath(env, platform),
     knownWindowsInstallDirs: knownWindowsCodexInstallDirs(env, platform),
     platform,
@@ -200,9 +238,13 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
 
   const account = probe.account ?? { ok: false, authState: "unknown" as const, error: "Codex account probe did not return a result." };
   const rateLimits = probe.rateLimits ?? { ok: false, error: "Codex rate limit probe did not return a result." };
-  const auth = account.ok
+  const authWithoutHomeDiagnostic = account.ok
     ? accountStatus(account.account)
     : { state: account.authState, access: "unknown" as const, error: account.error };
+  const homeDiagnostic = codexAuthHomeDiagnostic({ env, platform });
+  const auth = authWithoutHomeDiagnostic.state === "not_authenticated" || authWithoutHomeDiagnostic.state === "expired" || authWithoutHomeDiagnostic.state === "invalid"
+    ? { ...authWithoutHomeDiagnostic, homeDiagnostic }
+    : authWithoutHomeDiagnostic;
   const rateLimit = rateLimits.ok ? rateLimitStatus(rateLimits.rateLimits) : undefined;
   const usage = rateLimits.ok
     ? {
@@ -325,6 +367,79 @@ export type ExecutePreflightAction = {
 
 function preflight(error: Extract<ExecutePreflightError, { area: "codex" }>["error"], message: string, actions: ExecutePreflightAction[]): ExecutePreflightError {
   return { area: "codex", error, message, runtime: "codex", actions: [{ type: "open_bridge_app", label: "Open Bridge App", href: "hunsu://open" }, ...actions] };
+}
+
+export function codexAuthHomeDiagnostic(input: {
+  env?: Record<string, string | undefined>;
+  platform?: NodeJS.Platform;
+  homeDir?: string;
+} = {}): CodexAuthHomeDiagnostic {
+  const env = input.env ?? currentProcessEnv();
+  const platform = input.platform ?? process.platform;
+  const defaultCodexHome = defaultCodexHomePath(env, platform, input.homeDir ?? homedir());
+  const effectiveCodexHome = env.CODEX_HOME?.trim() || defaultCodexHome;
+  const authFileExistsAtEffectiveHome = authJsonExists(effectiveCodexHome);
+  const authFileExistsAtDefaultHome = authJsonExists(defaultCodexHome);
+  const likelyHomeMismatch = Boolean(
+    effectiveCodexHome
+      && defaultCodexHome
+      && !authFileExistsAtEffectiveHome
+      && authFileExistsAtDefaultHome
+      && normalizeCodexHomeForComparison(effectiveCodexHome, platform) !== normalizeCodexHomeForComparison(defaultCodexHome, platform)
+  );
+  return {
+    effectiveCodexHome,
+    defaultCodexHome,
+    authFileExistsAtEffectiveHome,
+    authFileExistsAtDefaultHome,
+    likelyHomeMismatch,
+    remediation: likelyHomeMismatch
+      ? {
+          type: "set_codex_home",
+          message: `Codex auth was not found for CODEX_HOME=${effectiveCodexHome}. Default Codex auth appears to exist at ${defaultCodexHome}. Set Codex Home to this path or sign in again for the current Codex Home.`,
+          suggestedCodexHome: defaultCodexHome
+        }
+      : authFileExistsAtEffectiveHome
+        ? undefined
+        : {
+            type: "login_again",
+            message: `Codex auth was not found for CODEX_HOME=${effectiveCodexHome}. Sign in again for this Codex Home.`
+          }
+  };
+}
+
+export function defaultCodexHomePath(
+  env: Record<string, string | undefined>,
+  platform: NodeJS.Platform,
+  fallbackHomeDir = homedir()
+): string {
+  if (platform === "win32") {
+    const userProfile = firstNonEmpty(env, ["USERPROFILE", "UserProfile", "userprofile"]);
+    const homeDrive = firstNonEmpty(env, ["HOMEDRIVE", "HomeDrive", "homedrive"]);
+    const homePath = firstNonEmpty(env, ["HOMEPATH", "HomePath", "homepath"]);
+    const home = userProfile ?? (homeDrive && homePath ? `${homeDrive}${homePath}` : undefined) ?? firstNonEmpty(env, ["HOME", "Home", "home"]) ?? fallbackHomeDir;
+    return join(home, ".codex");
+  }
+  return join(firstNonEmpty(env, ["HOME"]) ?? fallbackHomeDir, ".codex");
+}
+
+function authJsonExists(codexHome: string | undefined): boolean {
+  return Boolean(codexHome && existsSync(join(codexHome, "auth.json")));
+}
+
+function normalizeCodexHomeForComparison(value: string, platform: NodeJS.Platform): string {
+  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+  return platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function firstNonEmpty(env: Record<string, string | undefined>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = env[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
 }
 
 function accountStatus(account: unknown): CodexRuntimeStatus["auth"] {

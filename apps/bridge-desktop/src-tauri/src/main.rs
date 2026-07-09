@@ -70,6 +70,24 @@ async fn choose_codex_binary(app: tauri::AppHandle) -> Result<Option<BinarySelec
 }
 
 #[tauri::command]
+async fn choose_codex_home(app: tauri::AppHandle) -> Result<Option<FolderSelection>, String> {
+    let folder = app
+        .dialog()
+        .file()
+        .set_title("Select Codex Home")
+        .blocking_pick_folder();
+    folder
+        .map(|path| {
+            path.into_path()
+                .map(|path| FolderSelection {
+                    path: path.to_string_lossy().to_string(),
+                })
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+#[tauri::command]
 async fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
     validate_external_url(&url)?;
     app.opener()
@@ -201,6 +219,7 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
         "projects" => validate_projects_args(args),
         "roadmaps" => validate_roadmaps_args(args),
         "codex" => validate_codex_args(args),
+        "provider" => validate_provider_args(args),
         "auth-callback" => validate_auth_callback_args(args),
         _ => false,
     };
@@ -268,6 +287,10 @@ fn validate_codex_args(args: &[String]) -> bool {
         [command, subcommand, action, path] if command == "codex" && subcommand == "path" && action == "set" => {
             validate_path_arg(path).is_ok()
         }
+        [command, subcommand, action] if command == "codex" && subcommand == "home" && action == "reset" => true,
+        [command, subcommand, action, path] if command == "codex" && subcommand == "home" && action == "set" => {
+            validate_path_arg(path).is_ok()
+        }
         [command, subcommand, action, ..] if command == "codex" && subcommand == "settings" && action == "set" => {
             validate_codex_settings_set_args(args)
         }
@@ -312,6 +335,9 @@ fn validate_codex_settings_set_args(args: &[String]) -> bool {
     let mut index = 3;
     let mut saw_install_channel = false;
     let mut saw_auth_preference = false;
+    let mut saw_codex_home = false;
+    let mut saw_app_server_command = false;
+    let mut saw_app_server_args = false;
     while index < args.len() {
         if index + 1 >= args.len() {
             return false;
@@ -329,11 +355,62 @@ fn validate_codex_settings_set_args(args: &[String]) -> bool {
                 }
                 saw_auth_preference = true;
             }
+            "--codex-home" if !saw_codex_home => {
+                if validate_path_arg(&args[index + 1]).is_err() {
+                    return false;
+                }
+                saw_codex_home = true;
+            }
+            "--app-server-command" if !saw_app_server_command => {
+                if validate_plain_arg(&args[index + 1]).is_err() {
+                    return false;
+                }
+                saw_app_server_command = true;
+            }
+            "--app-server-args" if !saw_app_server_args => {
+                if validate_plain_arg(&args[index + 1]).is_err() {
+                    return false;
+                }
+                saw_app_server_args = true;
+            }
             _ => return false,
         }
         index += 2;
     }
     true
+}
+
+fn validate_provider_args(args: &[String]) -> bool {
+    let compact: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "--json").collect();
+    match compact.as_slice() {
+        [command, subcommand] if command.as_str() == "provider" && matches!(subcommand.as_str(), "status" | "metadata") => true,
+        [command, subcommand, flag] if command.as_str() == "provider" && subcommand.as_str() == "status" && flag.as_str() == "--recheck" => true,
+        [command, subcommand, action]
+            if command.as_str() == "provider"
+                && subcommand.as_str() == "config"
+                && matches!(action.as_str(), "get" | "reset" | "validate") => true,
+        [command, subcommand, action, value]
+            if command.as_str() == "provider"
+                && subcommand.as_str() == "config"
+                && matches!(action.as_str(), "save-json" | "validate-json") =>
+        {
+            validate_plain_arg(value).is_ok()
+        }
+        [command, subcommand, action, key, value]
+            if command.as_str() == "provider"
+                && subcommand.as_str() == "config"
+                && matches!(action.as_str(), "set" | "validate") =>
+        {
+            validate_plain_arg(key).is_ok() && validate_plain_arg(value).is_ok()
+        }
+        [command, subcommand] if command.as_str() == "provider" && matches!(subcommand.as_str(), "authenticate" | "login") => true,
+        [command, subcommand, method]
+            if command.as_str() == "provider" && matches!(subcommand.as_str(), "authenticate" | "login") =>
+        {
+            matches!(method.as_str(), "default" | "chatgpt" | "device" | "device_code" | "api_key")
+        }
+        _ => false,
+    }
 }
 
 fn validate_ui_intent_args(args: &[String]) -> bool {
@@ -663,6 +740,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             choose_project_folder,
             choose_codex_binary,
+            choose_codex_home,
             open_external,
             start_bridge_sidecar,
             spawn_bridge_app_command,
@@ -799,5 +877,28 @@ mod tests {
         assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--background".into(), "--json".into()]).is_err());
         assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--danger".into()]).is_err());
         assert!(validate_bridge_command_args(&["codex".into(), "exec".into(), "rm -rf /".into()]).is_err());
+        assert!(validate_bridge_command_args(&["codex".into(), "home".into(), "set".into(), "/tmp/codex-home".into()]).is_ok());
+        assert!(validate_bridge_command_args(&["codex".into(), "home".into(), "reset".into()]).is_ok());
+        assert!(validate_bridge_command_args(&[
+            "provider".into(),
+            "metadata".into(),
+            "--json".into()
+        ]).is_ok());
+        assert!(validate_bridge_command_args(&[
+            "provider".into(),
+            "config".into(),
+            "validate-json".into(),
+            r#"[{"key":"codexHome","value":"/tmp/codex-home","isSet":true,"isSecret":false}]"#.into(),
+            "--json".into()
+        ]).is_ok());
+        assert!(validate_bridge_command_args(&[
+            "provider".into(),
+            "config".into(),
+            "save-json".into(),
+            r#"[{"key":"binaryPath","value":"/tmp/codex","isSet":true,"isSecret":false}]"#.into()
+        ]).is_ok());
+        assert!(validate_bridge_command_args(&["provider".into(), "config".into(), "reset".into()]).is_ok());
+        assert!(validate_bridge_command_args(&["provider".into(), "config".into(), "save-json".into(), "\0".into()]).is_err());
+        assert!(validate_bridge_command_args(&["provider".into(), "shell".into(), "rm -rf /".into()]).is_err());
     }
 }

@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, normalize, relative, resolve } fro
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createDefaultCodexRunner, GOAL_EVALUATION_SCHEMA, type AppServerUsage, type CodexProviderStatus, type TeamRunEvent, type HunsuDraftConversationMessage, type HunsuDraftSessionInput, type HunsuDraftSourceSnapshot, type HunsuDraftTurnInput, type JsonRpcMessage, type MoveFinalizerInput, type MemberPathRunInput, type ResumeRunInput, type Runner, type RunnerAppServerCommandAction, type RunnerAppServerItem, type RunnerRun, type StartRunInput } from "@hunsu/codex-runner";
-import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
+import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, resolveCodexAppServerConfig, resolveStudioLauncherConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
 import {
   createFinalizedMoveCommit,
   createMoveCommitFromWorktree,
@@ -108,7 +108,9 @@ import {
 import { createRuntimeProviderRegistry } from "./runtime-providers/registry.ts";
 import { createBridgeAppRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
 import {
+  codexProviderEnv,
   codexRuntimeStatusForResponse,
+  type BridgeCodexSettings,
   type CodexLoginProcessState
 } from "./runtime-providers/codex.ts";
 import { handleProviderRoute } from "./providers/providerRoutes.ts";
@@ -134,7 +136,7 @@ import {
   createBridgeStatusForRequest,
   currentRuntimeProviderStatus
 } from "./server/bridgeStatus.ts";
-import { bridgeCodexBinaryPathFromBridgeAppState } from "./server/bridgeAppState.ts";
+import { bridgeCodexSettingsFromBridgeAppState } from "./server/bridgeAppState.ts";
 import { createStudioHttpServer, studioRequestUrl } from "./server/createStudioServer.ts";
 import { handleRemoteBridgeRoute, handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
 import { baseCorsHeaders, createResponseSecurityHeaderStore } from "./server/security.ts";
@@ -148,8 +150,25 @@ export {
 } from "./runtimes/codex.ts";
 export type { CodexCliStatus, CodexDiscoveryCandidate, CodexRuntimeStatus } from "./runtimes/codex.ts";
 export { createRuntimeProviderRegistry, placeholderProvider } from "./runtime-providers/registry.ts";
-export { normalizeCodexRuntimeStatus, parseCodexDeviceAuthOutput } from "./runtime-providers/codex.ts";
-export type { CodexLoginProcessState } from "./runtime-providers/codex.ts";
+export {
+  codexAuthHomeDiagnostic,
+  codexEffectiveEnvSummary,
+  codexProviderEnv,
+  codexSettingsFromRecord,
+  normalizeCodexRuntimeStatus,
+  parseCodexDeviceAuthOutput
+} from "./runtime-providers/codex.ts";
+export type {
+  BridgeCodexSettings,
+  CodexAuthHomeDiagnostic,
+  CodexLoginProcessState
+} from "./runtime-providers/codex.ts";
+export type {
+  RuntimeProviderConfigField,
+  RuntimeProviderConfigKey,
+  RuntimeProviderDiagnostics,
+  RuntimeProviderMetadata
+} from "./runtime-providers/types.ts";
 export type {
   RuntimeProviderAdapter,
   RuntimeProviderRegistry,
@@ -2421,11 +2440,13 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     cwd: repositoryPath,
     roadmapRegistryPath: options.roadmapRegistryPath
   }));
-  const bridgeAppCodexBinaryPath = bridgeCodexBinaryPathFromBridgeAppState(runtimeConfig.processEnv);
-  if (bridgeAppCodexBinaryPath && !runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH?.trim()) {
-    runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH = bridgeAppCodexBinaryPath;
-    runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH_SOURCE = "user_config";
-  }
+  const baseRuntimeProcessEnv = { ...runtimeConfig.processEnv };
+  const baseCodexAppServer = {
+    ...runtimeConfig.codexAppServer,
+    environment: { ...runtimeConfig.codexAppServer.environment }
+  };
+  let codexProviderSettings = bridgeCodexSettingsFromBridgeAppState(baseRuntimeProcessEnv);
+  applyCodexProviderSettings(runtimeConfig, baseRuntimeProcessEnv, baseCodexAppServer, codexProviderSettings);
   const roadmapRegistryPath = options.roadmapRegistryPath ?? runtimeConfig.roadmapRegistryPath;
   let runner = options.runner ?? createConfiguredRunner(runtimeConfig);
   const ownsRunner = options.runner === undefined;
@@ -2437,11 +2458,8 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       env: () => runtimeConfig.processEnv,
       loginState: state,
       onConfigure(configuration) {
-        if (configuration.binaryPath) {
-          runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH = configuration.binaryPath;
-        } else {
-          delete runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH;
-        }
+        codexProviderSettings = configuration;
+        applyCodexProviderSettings(runtimeConfig, baseRuntimeProcessEnv, baseCodexAppServer, codexProviderSettings);
         if (ownsRunner) {
           runner = createConfiguredRunner(runtimeConfig);
         }
@@ -2778,6 +2796,40 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     }
   });
   return server;
+}
+
+function applyCodexProviderSettings(
+  runtimeConfig: BridgeRuntimeConfig,
+  baseProcessEnv: Record<string, string | undefined>,
+  baseCodexAppServer: BridgeRuntimeConfig["codexAppServer"],
+  settings: BridgeCodexSettings
+): void {
+  replaceRuntimeProcessEnv(runtimeConfig.processEnv, codexProviderEnv({
+    baseEnv: baseProcessEnv,
+    settings
+  }));
+  runtimeConfig.codexAppServer = unwrapConfigResult(resolveCodexAppServerConfig(runtimeConfig.processEnv, {
+    ...(settings.appServerCommand ? {} : { command: baseCodexAppServer.command }),
+    ...(settings.appServerArgs ? {} : { args: baseCodexAppServer.args }),
+    environment: {
+      ...baseCodexAppServer.environment,
+      ...runtimeConfig.processEnv
+    }
+  }));
+}
+
+function replaceRuntimeProcessEnv(
+  target: Record<string, string>,
+  source: Record<string, string | undefined>
+): void {
+  for (const key of Object.keys(target)) {
+    delete target[key];
+  }
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined) {
+      target[key] = value;
+    }
+  }
 }
 
 function addStudioWorkspace(
