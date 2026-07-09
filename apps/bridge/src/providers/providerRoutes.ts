@@ -7,7 +7,12 @@ import {
   spawnCodexDeviceLogin,
   type CodexLoginStateHost
 } from "../runtime-providers/codex.ts";
-import type { RuntimeProviderConfigurationInput, RuntimeProviderRegistry } from "../runtime-providers/types.ts";
+import type {
+  RuntimeProviderAdapter,
+  RuntimeProviderConfigField,
+  RuntimeProviderConfigurationInput,
+  RuntimeProviderRegistry
+} from "../runtime-providers/types.ts";
 
 type ProviderRouteContext = {
   providerRegistry: RuntimeProviderRegistry;
@@ -44,14 +49,16 @@ export async function handleProviderRoute(
   }
 
   if (request.method === "GET" && pathname === "/api/runtimes/codex/status") {
-    context.sendJson(response, 200, await codexRuntimeStatusForResponse(context.env, context.codexLoginState ?? {}, {
+    const env = codexEffectiveEnvForRequest(context);
+    context.sendJson(response, 200, await codexRuntimeStatusForResponse(env, context.codexLoginState ?? {}, {
       lastRunUsage: context.latestCodexRunUsage?.()
     }));
     return true;
   }
 
   if (request.method === "POST" && pathname === "/api/runtimes/codex/recheck") {
-    context.sendJson(response, 202, await codexRuntimeStatusForResponse(context.env, context.codexLoginState ?? {}, {
+    const env = codexEffectiveEnvForRequest(context);
+    context.sendJson(response, 202, await codexRuntimeStatusForResponse(env, context.codexLoginState ?? {}, {
       force: true,
       lastRunUsage: context.latestCodexRunUsage?.()
     }));
@@ -71,12 +78,15 @@ export async function handleProviderRoute(
     const provider = context.providerRegistry.get("codex") ?? context.providerRegistry.current();
     context.sendJson(response, 202, provider.login
       ? await provider.login({ method: "chatgpt" })
-      : await spawnCodexChatGptLogin(context.codexLoginState ?? {}, context.env));
+      : await spawnCodexChatGptLogin(context.codexLoginState ?? {}, codexEffectiveEnvForRequest(context)));
     return true;
   }
 
   if (request.method === "POST" && pathname === "/api/runtimes/codex/login/device") {
-    context.sendJson(response, 202, await spawnCodexDeviceLogin(context.codexLoginState ?? {}, context.env));
+    const provider = context.providerRegistry.get("codex") ?? context.providerRegistry.current();
+    context.sendJson(response, 202, provider.login
+      ? await provider.login({ method: "device" })
+      : await spawnCodexDeviceLogin(context.codexLoginState ?? {}, codexEffectiveEnvForRequest(context)));
     return true;
   }
 
@@ -84,17 +94,57 @@ export async function handleProviderRoute(
     const provider = context.providerRegistry.get("codex") ?? context.providerRegistry.current();
     context.sendJson(response, 202, provider.login
       ? await provider.login({ method: "api_key" })
-      : await spawnCodexAction(["login", "--api-key"], context.env));
+      : await spawnCodexAction(["login", "--api-key"], codexEffectiveEnvForRequest(context)));
     return true;
   }
 
   if (request.method === "POST" && pathname === "/api/runtimes/codex/logout") {
-    context.sendJson(response, 202, await spawnCodexAction(["logout"], context.env));
+    context.sendJson(response, 202, await spawnCodexAction(["logout"], codexEffectiveEnvForRequest(context)));
     return true;
   }
 
   if (request.method === "GET" && pathname === "/api/providers/current") {
     context.sendJson(response, 200, await context.providerRegistry.current().status({ env: context.env }));
+    return true;
+  }
+
+  if (request.method === "GET" && pathname === "/api/providers/current/metadata") {
+    context.sendJson(response, 200, context.providerRegistry.current().metadata());
+    return true;
+  }
+
+  if (request.method === "GET" && pathname === "/api/providers/current/config") {
+    context.sendJson(response, 200, await providerConfigResponse(context.providerRegistry.current(), context));
+    return true;
+  }
+
+  if (request.method === "POST" && pathname === "/api/providers/current/validate") {
+    const body = await readProviderConfigBody(request, context.readJson);
+    const provider = context.providerRegistry.current();
+    if (!provider.validateConfig) {
+      context.sendJson(response, 501, { error: "Current provider does not support configuration validation yet." });
+      return true;
+    }
+    context.sendJson(response, 200, await provider.validateConfig(body.fields));
+    return true;
+  }
+
+  if (request.method === "POST" && pathname === "/api/providers/current/config") {
+    const body = await readProviderConfigBody(request, context.readJson);
+    const provider = context.providerRegistry.current();
+    await provider.saveConfig(body.fields);
+    context.sendJson(response, 202, await providerConfigResponse(provider, context));
+    return true;
+  }
+
+  if (request.method === "DELETE" && (pathname === "/api/providers/current/config" || pathname.startsWith("/api/providers/current/config/"))) {
+    const provider = context.providerRegistry.current();
+    if (!provider.deleteConfig) {
+      context.sendJson(response, 501, { error: "Current provider does not support configuration reset yet." });
+      return true;
+    }
+    await provider.deleteConfig(providerConfigResetKeys(pathname, url));
+    context.sendJson(response, 202, await providerConfigResponse(provider, context));
     return true;
   }
 
@@ -129,6 +179,17 @@ export async function handleProviderRoute(
     return true;
   }
 
+  if (request.method === "POST" && pathname === "/api/providers/current/authenticate") {
+    const body = await context.readJson<{ method?: "default" | "chatgpt" | "device" | "api_key" }>(request);
+    const provider = context.providerRegistry.current();
+    if (!provider.login) {
+      context.sendJson(response, 501, { error: "Current provider does not support authentication yet." });
+      return true;
+    }
+    context.sendJson(response, 202, await provider.login({ method: body.method ?? "default" }));
+    return true;
+  }
+
   if (request.method === "POST" && pathname === "/api/providers/current/configure") {
     const body = await context.readJson<RuntimeProviderConfigurationInput>(request);
     const provider = context.providerRegistry.current();
@@ -141,6 +202,54 @@ export async function handleProviderRoute(
   }
 
   return false;
+}
+
+function providerConfigResetKeys(pathname: string, url: URL): string[] | undefined {
+  const prefix = "/api/providers/current/config/";
+  if (pathname.startsWith(prefix)) {
+    const key = decodeURIComponent(pathname.slice(prefix.length)).trim();
+    return key ? [key] : undefined;
+  }
+  const keys = url.searchParams.getAll("key").map(key => key.trim()).filter(Boolean);
+  return keys.length > 0 ? keys : undefined;
+}
+
+function codexEffectiveEnvForRequest(context: ProviderRouteContext): Record<string, string | undefined> {
+  const provider = context.providerRegistry.get("codex");
+  const withEffectiveEnv = provider as (RuntimeProviderAdapter & {
+    effectiveEnv?: (env?: Record<string, string | undefined>) => Record<string, string | undefined>;
+  }) | undefined;
+  return withEffectiveEnv?.effectiveEnv ? withEffectiveEnv.effectiveEnv(context.env) : context.env;
+}
+
+async function providerConfigResponse(
+  provider: RuntimeProviderAdapter,
+  context: ProviderRouteContext
+): Promise<{
+  providerId: string;
+  metadata: ReturnType<RuntimeProviderAdapter["metadata"]>;
+  fields: RuntimeProviderConfigField[];
+  status: Awaited<ReturnType<RuntimeProviderAdapter["status"]>>;
+  diagnostics: Awaited<ReturnType<RuntimeProviderAdapter["status"]>>["diagnostics"];
+}> {
+  const status = await provider.status({ env: context.env, force: true });
+  return {
+    providerId: provider.providerId,
+    metadata: provider.metadata(),
+    fields: await provider.readConfig(),
+    status,
+    diagnostics: status.diagnostics
+  };
+}
+
+async function readProviderConfigBody(
+  request: IncomingMessage,
+  readJson: <T>(request: IncomingMessage) => Promise<T>
+): Promise<{ fields: RuntimeProviderConfigField[] }> {
+  const body = await readJson<{ fields?: RuntimeProviderConfigField[] } | RuntimeProviderConfigField[]>(request);
+  return {
+    fields: Array.isArray(body) ? body : body.fields ?? []
+  };
 }
 
 async function readOptionalJson<T>(

@@ -6,6 +6,8 @@ import { currentProcessEnv } from "@hunsu/config";
 import type {
   BridgePairingSession,
   RoadmapRegistryEntry,
+  RuntimeProviderConfigField,
+  RuntimeProviderMetadata,
   RuntimeProviderStatus
 } from "@hunsu/bridge";
 import type { BridgeCommandScope, ProjectGrant } from "../relay.ts";
@@ -80,6 +82,9 @@ export type BridgeServiceState = {
 
 export type BridgeCodexSettings = {
   binaryPath?: string;
+  codexHome?: string;
+  appServerCommand?: string;
+  appServerArgs?: string;
   installChannel?: "stable" | "latest" | "manual";
   authenticationPreference?: "chatgpt" | "api_key" | "device_code";
 };
@@ -164,6 +169,11 @@ export type BridgeAppSnapshot = {
     current: RuntimeProviderStatus;
     providers: RuntimeProviderStatus[];
   };
+  providerConfig: {
+    providerId: string;
+    metadata: RuntimeProviderMetadata;
+    fields: RuntimeProviderConfigField[];
+  };
   workspaces: {
     active: BridgeRoadmapAccessSnapshot[];
     inactive: BridgeRoadmapAccessSnapshot[];
@@ -194,9 +204,10 @@ export type BridgeAppSnapshot = {
   };
   codexSettings: BridgeCodexSettings & {
     environment: {
-      CODEX_HOME?: string;
-      HUNSU_CODEX_APP_SERVER_COMMAND?: string;
-      HUNSU_CODEX_APP_SERVER_ARGS?: string;
+      HUNSU_CODEX_BINARY_PATH?: string | null;
+      CODEX_HOME?: string | null;
+      HUNSU_CODEX_APP_SERVER_COMMAND?: string | null;
+      HUNSU_CODEX_APP_SERVER_ARGS?: string | null;
     };
   };
   codexLogin?: CodexLoginProcessState;
@@ -272,6 +283,7 @@ export function createBridgeAppSnapshot(input: {
   bridgeApiUrl?: string;
   healthError?: string;
   runtimeProviders: BridgeAppSnapshot["providers"] & BridgeAppSnapshot["runtimeProviders"];
+  providerConfig: BridgeAppSnapshot["providerConfig"];
   managedRoadmaps: BridgeRoadmapAccessSnapshot[];
   projectGrants: ProjectGrant[];
   activeProjectGrants: ProjectGrant[];
@@ -297,6 +309,7 @@ export function createBridgeAppSnapshot(input: {
       healthError: input.healthError
     },
     providers: input.runtimeProviders,
+    providerConfig: input.providerConfig,
     workspaces: {
       active: input.managedRoadmaps.filter(roadmap => roadmap.lifecycle === "active"),
       inactive: input.managedRoadmaps.filter(roadmap => roadmap.lifecycle !== "active"),
@@ -332,20 +345,32 @@ export function createBridgeAppSnapshot(input: {
 
 export function normalizeBridgeAppState(parsed: Partial<BridgeAppState>): BridgeAppState {
   const runtimeProviders = normalizeBridgeRuntimeProviderState(parsed.runtimeProviders);
-  const legacyBinaryPath = typeof parsed.codex?.binaryPath === "string" && parsed.codex.binaryPath.trim()
-    ? parsed.codex.binaryPath.trim()
+  const legacyCodex = parsed.codex as (BridgeCodexSettings & { environment?: unknown }) | undefined;
+  const legacyBinaryPath = typeof legacyCodex?.binaryPath === "string" && legacyCodex.binaryPath.trim()
+    ? legacyCodex.binaryPath.trim()
     : undefined;
-  const migratedRuntimeProviders = legacyBinaryPath && typeof runtimeProviders.providers.codex?.settings.binaryPath !== "string"
-    ? withBridgeCodexProviderSettings({
-        ...defaultBridgeAppState(),
-        runtimeProviders
-      }, { binaryPath: legacyBinaryPath }).runtimeProviders
-    : runtimeProviders;
+  const legacyEnvironment = typeof legacyCodex?.environment === "object" && legacyCodex.environment !== null && !Array.isArray(legacyCodex.environment)
+    ? legacyCodex.environment as Record<string, unknown>
+    : undefined;
+  const currentSettings = codexSettingsFromRecord(runtimeProviders.providers.codex?.settings ?? {});
+  const migratedRuntimeProviders = withBridgeCodexProviderSettings({
+    ...defaultBridgeAppState(),
+    runtimeProviders
+  }, {
+    ...(legacyBinaryPath && !currentSettings.binaryPath ? { binaryPath: legacyBinaryPath } : {}),
+    ...legacyCodexEnvironmentSettings(legacyEnvironment, currentSettings),
+    ...(legacyCodex?.installChannel === "stable" || legacyCodex?.installChannel === "latest" || legacyCodex?.installChannel === "manual"
+      ? { installChannel: legacyCodex.installChannel }
+      : {}),
+    ...(legacyCodex?.authenticationPreference === "chatgpt" || legacyCodex?.authenticationPreference === "api_key" || legacyCodex?.authenticationPreference === "device_code"
+      ? { authenticationPreference: legacyCodex.authenticationPreference }
+      : {})
+  }).runtimeProviders;
   return {
     ...defaultBridgeAppState(),
     ...parsed,
     account: parsed.account ?? { status: "signed-out" },
-    codex: parsed.codex ?? defaultBridgeCodexSettings(),
+    codex: stripLegacyCodexSettings(parsed.codex ?? defaultBridgeCodexSettings()),
     runtimeProviders: migratedRuntimeProviders,
     device: parsed.device ?? defaultBridgeDeviceState(),
     remoteAccess: parseBridgeRemoteAccessState(parsed.remoteAccess),
@@ -376,6 +401,15 @@ export function withBridgeCodexProviderSettings(state: BridgeAppState, patch: Pa
   if ("binaryPath" in patch) {
     setOptionalStringSetting(nextSettings, "binaryPath", patch.binaryPath);
   }
+  if ("codexHome" in patch) {
+    setOptionalStringSetting(nextSettings, "codexHome", patch.codexHome);
+  }
+  if ("appServerCommand" in patch) {
+    setOptionalStringSetting(nextSettings, "appServerCommand", patch.appServerCommand);
+  }
+  if ("appServerArgs" in patch) {
+    setOptionalStringSetting(nextSettings, "appServerArgs", patch.appServerArgs);
+  }
   if ("installChannel" in patch) {
     setOptionalStringSetting(nextSettings, "installChannel", patch.installChannel);
   }
@@ -384,6 +418,12 @@ export function withBridgeCodexProviderSettings(state: BridgeAppState, patch: Pa
   }
   const legacyCodex = { ...(state.codex ?? defaultBridgeCodexSettings()) };
   delete legacyCodex.binaryPath;
+  delete legacyCodex.codexHome;
+  delete legacyCodex.appServerCommand;
+  delete legacyCodex.appServerArgs;
+  delete (legacyCodex as BridgeCodexSettings & { environment?: unknown }).environment;
+  delete legacyCodex.installChannel;
+  delete legacyCodex.authenticationPreference;
   return {
     ...state,
     codex: legacyCodex,
@@ -446,6 +486,9 @@ export function normalizeBridgeRuntimeProviderState(value: unknown): BridgeRunti
 
 function codexSettingsFromRecord(record: Record<string, unknown>): Partial<BridgeCodexSettings> {
   const binaryPath = typeof record.binaryPath === "string" && record.binaryPath.trim() ? record.binaryPath.trim() : undefined;
+  const codexHome = typeof record.codexHome === "string" && record.codexHome.trim() ? record.codexHome.trim() : undefined;
+  const appServerCommand = typeof record.appServerCommand === "string" && record.appServerCommand.trim() ? record.appServerCommand.trim() : undefined;
+  const appServerArgs = typeof record.appServerArgs === "string" && record.appServerArgs.trim() ? record.appServerArgs.trim() : undefined;
   const installChannel = record.installChannel === "stable" || record.installChannel === "latest" || record.installChannel === "manual"
     ? record.installChannel
     : undefined;
@@ -454,9 +497,48 @@ function codexSettingsFromRecord(record: Record<string, unknown>): Partial<Bridg
     : undefined;
   return {
     ...(binaryPath ? { binaryPath } : {}),
+    ...(codexHome ? { codexHome } : {}),
+    ...(appServerCommand ? { appServerCommand } : {}),
+    ...(appServerArgs ? { appServerArgs } : {}),
     ...(installChannel ? { installChannel } : {}),
     ...(authenticationPreference ? { authenticationPreference } : {})
   };
+}
+
+function legacyCodexEnvironmentSettings(
+  environment: Record<string, unknown> | undefined,
+  current: Partial<BridgeCodexSettings>
+): Partial<BridgeCodexSettings> {
+  const codexHome = typeof environment?.CODEX_HOME === "string" && environment.CODEX_HOME.trim() && !current.codexHome
+    ? environment.CODEX_HOME.trim()
+    : undefined;
+  const appServerCommand = typeof environment?.HUNSU_CODEX_APP_SERVER_COMMAND === "string"
+    && environment.HUNSU_CODEX_APP_SERVER_COMMAND.trim()
+    && !current.appServerCommand
+    ? environment.HUNSU_CODEX_APP_SERVER_COMMAND.trim()
+    : undefined;
+  const appServerArgs = typeof environment?.HUNSU_CODEX_APP_SERVER_ARGS === "string"
+    && environment.HUNSU_CODEX_APP_SERVER_ARGS.trim()
+    && !current.appServerArgs
+    ? environment.HUNSU_CODEX_APP_SERVER_ARGS.trim()
+    : undefined;
+  return {
+    ...(codexHome ? { codexHome } : {}),
+    ...(appServerCommand ? { appServerCommand } : {}),
+    ...(appServerArgs ? { appServerArgs } : {})
+  };
+}
+
+function stripLegacyCodexSettings(settings: BridgeCodexSettings): BridgeCodexSettings {
+  const next = { ...settings } as BridgeCodexSettings & { environment?: unknown };
+  delete next.binaryPath;
+  delete next.codexHome;
+  delete next.appServerCommand;
+  delete next.appServerArgs;
+  delete next.installChannel;
+  delete next.authenticationPreference;
+  delete next.environment;
+  return next;
 }
 
 function setOptionalStringSetting(settings: Record<string, unknown>, key: string, value: unknown): void {

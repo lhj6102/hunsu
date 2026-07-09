@@ -22,6 +22,7 @@ import {
 } from "../apps/bridge-desktop/src/auth.ts";
 import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts";
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
+import { currentBridgeCommandInvocation } from "../apps/bridge-desktop/src/processes/backgroundSpawn.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
 import { createStudioRoadmap, createStudioServer, createStudioState, listManagedRoadmapRegistry, setRoadmapLifecycle } from "../apps/bridge/src/index.ts";
@@ -406,7 +407,9 @@ test("Bridge App Codex ChatGPT login command records failed state when Codex is 
 test("Bridge App Codex path command persists provider settings instead of legacy Codex state", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-path-settings-test-"));
   const fakeCodex = join(root, "codex");
+  const codexHome = join(root, "codex-home");
   const statePath = join(root, "state.json");
+  mkdirSync(codexHome, { recursive: true });
   writeFileSync(fakeCodex, [
     `#!${process.execPath}`,
     "const readline = require('node:readline');",
@@ -433,12 +436,31 @@ test("Bridge App Codex path command persists provider settings instead of legacy
     process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
     process.env.PATH = "";
     assert.equal(await main(["codex", "path", "set", fakeCodex]), 0);
+    assert.equal(await main(["codex", "home", "set", codexHome]), 0);
+    const fields = JSON.stringify([
+      { key: "binaryPath", value: fakeCodex, isSet: true, isSecret: false },
+      { key: "codexHome", value: codexHome, isSet: true, isSecret: false },
+      { key: "authenticationPreference", value: "device_code", isSet: true, isSecret: false }
+    ]);
+    assert.equal(await main(["provider", "config", "validate-json", fields, "--json"]), 0);
+    assert.equal(await main(["provider", "config", "save-json", fields]), 0);
     const state = JSON.parse(readFileSync(statePath, "utf8")) as {
-      codex?: { binaryPath?: string };
-      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string } } } };
+      codex?: { binaryPath?: string; codexHome?: string };
+      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string; authenticationPreference?: string } } } };
     };
     assert.equal(state.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
+    assert.equal(state.runtimeProviders?.providers?.codex?.settings?.codexHome, codexHome);
+    assert.equal(state.runtimeProviders?.providers?.codex?.settings?.authenticationPreference, "device_code");
     assert.equal(state.codex?.binaryPath, undefined);
+    assert.equal(state.codex?.codexHome, undefined);
+
+    assert.equal(await main(["provider", "config", "reset", "codexHome"]), 0);
+    const resetState = JSON.parse(readFileSync(statePath, "utf8")) as {
+      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string; authenticationPreference?: string } } } };
+    };
+    assert.equal(resetState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
+    assert.equal(resetState.runtimeProviders?.providers?.codex?.settings?.codexHome, undefined);
+    assert.equal(resetState.runtimeProviders?.providers?.codex?.settings?.authenticationPreference, "device_code");
   } finally {
     console.log = previousLog;
     restoreEnv(previousEnv);
@@ -517,10 +539,13 @@ test("Bridge App desktop UI keeps Local/Remote connection primary and provider p
   const providerPanel = html.match(/<section data-panel="provider">([\s\S]*?)<\/section>/)?.[1] ?? "";
   assert.match(providerPanel, /<dt>Provider<\/dt>[\s\S]*<dt>Workspaces<\/dt>[\s\S]*<dt>Connection<\/dt>/);
   assert.doesNotMatch(providerPanel, /Account|Remote Access|Device|Service/);
+  assert.match(html, /id="provider-config-form"/);
+  assert.doesNotMatch(html, /id="codex-env-command"/);
   const appSource = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/app.js"), "utf8");
   assert.doesNotMatch(appSource, /Copy Install Command/);
   assert.match(appSource, /\["codex", "install", "--confirm"\]/);
   assert.match(appSource, /\["codex", "login", "--api-key"\]/);
+  assert.match(appSource, /metadata\.configKeys/);
 
   const ui = loadBridgeDesktopUiForTest();
   ui.renderSnapshot({
@@ -553,6 +578,39 @@ test("Bridge App desktop UI keeps Local/Remote connection primary and provider p
         { providerId: "claude_code", label: "Claude Code", ready: false, recommendedAction: "configure", safeMessage: "Coming later" }
       ]
     },
+    providerConfig: {
+      providerId: "codex",
+      metadata: {
+        providerId: "codex",
+        label: "Codex",
+        description: "Codex provider",
+        configKeys: [
+          { name: "binaryPath", label: "Codex binary", kind: "file", required: false, secret: false, primary: true },
+          { name: "codexHome", label: "Codex home", kind: "directory", required: false, secret: false, primary: true },
+          {
+            name: "authenticationPreference",
+            label: "Authentication method",
+            kind: "select",
+            required: false,
+            secret: false,
+            primary: false,
+            default: "chatgpt",
+            options: [
+              { value: "chatgpt", label: "ChatGPT" },
+              { value: "device_code", label: "Device code" }
+            ]
+          },
+          { name: "appServerCommand", label: "App-server command", kind: "text", required: false, secret: false, primary: false, advanced: true }
+        ]
+      },
+      fields: [
+        { key: "binaryPath", value: "/opt/codex/bin/codex", isSet: true, isSecret: false },
+        { key: "codexHome", value: "/home/dev/.codex", isSet: true, isSecret: false },
+        { key: "authenticationPreference", value: "device_code", isSet: true, isSecret: false },
+        { key: "appServerCommand", value: "/opt/codex/bin/codex", isSet: true, isSecret: false }
+      ]
+    },
+    codexSettings: { installChannel: "manual" },
     managedRoadmaps: [{
       roadmapId: "roadmap_ui",
       displayName: "UI Workspace",
@@ -605,6 +663,10 @@ test("Bridge App desktop UI keeps Local/Remote connection primary and provider p
   assert.match(textForTestElement(codexCard?.children[1]), /Rate limit summary: Available, plenty/);
   assert.match(textForTestElement(ui.elements.get("#runtime-provider-list")), /Claude Code/);
   assert.match(textForTestElement(ui.elements.get("#runtime-provider-list")), /Coming later/);
+  assert.match(textForTestElement(ui.elements.get("#provider-config-form")), /Codex binary/);
+  assert.match(textForTestElement(ui.elements.get("#provider-config-form")), /Codex home/);
+  assert.match(textForTestElement(ui.elements.get("#provider-config-form")), /Authentication method/);
+  assert.match(textForTestElement(ui.elements.get("#provider-config-form")), /App-server command/);
   assert.doesNotMatch(textForTestElement(ui.elements.get("#active-roadmap-list")), /remoteRelay\.access|\/tmp\/hunsu-ui-workspace/);
   assert.match(textForTestElement(ui.elements.get("#remote-roadmap-list")), /remoteRelay\.access/);
 
@@ -800,7 +862,7 @@ test("Bridge App headless commands persist device, Remote Access, Project Grant,
     assert.equal(state.service.installed, true);
     assert.match(state.service.manager, /systemd-user|launchd-user|windows-service|manual/);
     if (process.platform === "linux") {
-      assert.match(readFileSync(serviceUnitPath, "utf8"), /ExecStart=.*supervise --cwd/);
+      assert.match(readFileSync(serviceUnitPath, "utf8"), /ExecStart=.*"?supervise"? "?--cwd"?/);
     }
     assert.equal(logs.some(line => line.includes("Remote Access: Registered but offline")), true);
     assert.equal(logs.some(line => line.includes("Provider:")), true);
@@ -1404,7 +1466,7 @@ test("Bridge App systemd service artifact escapes special paths", async () => {
     assert.match(text, /project with spaces/);
     assert.match(text, /\\"quote\\"/);
     assert.match(text, /100%%/);
-    assert.match(text, /ExecStart=".*" ".*" supervise --cwd "/);
+    assert.match(text, /ExecStart=".*" ".*" "supervise" "--cwd" "/);
     assert.match(text, /Environment="HUNSU_BRIDGE_HEADLESS=1"/);
   } finally {
     if (previousStatePath === undefined) delete process.env.HUNSU_BRIDGE_APP_STATE_PATH;
@@ -2604,6 +2666,34 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
   try {
     const plan = protocolRegistrationPlan("/tmp/hunsu-bridge-app");
     assert.equal(plan.protocol, "hunsu");
+    const devProtocolPlan = protocolRegistrationPlan("/usr/bin/node", ["/opt/hunsu/bridge/main.js"]);
+    assert.match(devProtocolPlan.notes.join("\n"), /\/usr\/bin\/node \/opt\/hunsu\/bridge\/main\.js %u/);
+    const packagedInvocation = currentBridgeCommandInvocation({
+      execPath: join(root, "hunsu-bridge-sidecar.exe"),
+      argv: [join(root, "hunsu-bridge-sidecar.exe"), "daemon"],
+      packaged: true,
+      commandArgs: ["daemon"]
+    });
+    assert.equal(packagedInvocation.command, join(root, "hunsu-bridge-sidecar.exe"));
+    assert.deepEqual(packagedInvocation.args, ["daemon"]);
+    assert.equal(packagedInvocation.args.includes(join(root, "hunsu-bridge-sidecar.exe")), false);
+    const packagedBasenameInvocation = currentBridgeCommandInvocation({
+      execPath: join(root, "node.exe"),
+      argv: [join(root, "node.exe"), join(root, "hunsu-bridge-sidecar.exe"), "daemon"],
+      commandArgs: ["daemon"]
+    });
+    assert.equal(packagedBasenameInvocation.command, join(root, "node.exe"));
+    assert.deepEqual(packagedBasenameInvocation.args, ["daemon"]);
+    assert.equal(packagedBasenameInvocation.args.includes(join(root, "hunsu-bridge-sidecar.exe")), false);
+    const devInvocation = currentBridgeCommandInvocation({
+      execPath: process.execPath,
+      argv: [process.execPath, "/opt/hunsu/bridge/main.js", "start"],
+      packaged: false,
+      commandArgs: ["daemon"]
+    });
+    assert.equal(devInvocation.command, process.execPath);
+    assert.equal(devInvocation.args.includes("/opt/hunsu/bridge/main.js"), true);
+    assert.equal(devInvocation.args.at(-1), "daemon");
     assert.equal(plan.supported, process.platform === "darwin" || process.platform === "win32" || process.platform === "linux");
     assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/Info.plist"), "utf8"), /CFBundleURLSchemes/);
     assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/windows/hunsu-protocol.wxs"), "utf8"), /Software\\Classes\\hunsu/);

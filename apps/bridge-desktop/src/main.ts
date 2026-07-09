@@ -18,7 +18,8 @@ import { normalizeBridgeAppArgv } from "./ui-intents/deepLinks.ts";
 import {
   parseCodexAuthenticationPreference,
   parseCodexInstallChannel,
-  providerStatusSummary
+  providerStatusSummary,
+  runProviderCommand
 } from "./commands/providerCommands.ts";
 import {
   reconcileCodexLoginFromStatus,
@@ -54,6 +55,7 @@ import {
   bridgeProcessRuntimeMetadata,
   commandLineLooksLikeBridgeApp,
   createBridgeAppSidecarSupervisor as createBridgeAppSidecarSupervisorFromProcess,
+  currentBridgeCommandInvocation,
   currentBridgeProcessCommandIdentity,
   handleToRuntimeState,
   processCommandLine,
@@ -93,6 +95,8 @@ import {
   createRuntimeProviderRegistry,
   createStudioRoadmap,
   createStudioState,
+  codexEffectiveEnvSummary,
+  codexProviderEnv,
   getCodexRuntimeStatus,
   inspectProject,
   listManagedRoadmapRegistry,
@@ -174,6 +178,9 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
         return 0;
       case "codex":
         await codexCommand(parsed);
+        return 0;
+      case "provider":
+        await providerCommand(parsed);
         return 0;
       case "login":
         await runLoginCommand(parsed, authCommandContext());
@@ -649,6 +656,14 @@ async function codexCommand(parsed: ParsedArgs): Promise<void> {
   });
 }
 
+async function providerCommand(parsed: ParsedArgs): Promise<void> {
+  await runProviderCommand(parsed, {
+    hasFlag,
+    getFlag,
+    providerRegistry: createBridgeDesktopRuntimeProviderRegistry
+  });
+}
+
 async function roadmapsCommand(parsed: ParsedArgs): Promise<void> {
   await runRoadmapsCommand(parsed, workspaceCommandContext());
 }
@@ -811,13 +826,13 @@ function serviceCommand(parsed: ParsedArgs): void {
 
 function protocolCommand(parsed: ParsedArgs): void {
   const subcommand = parsed.rest[0] ?? "status";
-  const commandPath = process.argv[1] ? resolve(process.argv[1]) : "hunsu-bridge";
+  const invocation = currentBridgeCommandInvocation();
   if (subcommand === "status") {
-    console.log(JSON.stringify(protocolRegistrationPlan(commandPath), null, 2));
+    console.log(JSON.stringify(protocolRegistrationPlan(invocation.command, invocation.args), null, 2));
     return;
   }
   if (subcommand === "install") {
-    const plan = installLinuxProtocolHandler(commandPath);
+    const plan = installLinuxProtocolHandler(invocation.command, invocation.args);
     console.log(JSON.stringify(plan, null, 2));
     return;
   }
@@ -1096,6 +1111,7 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
   const codex = await getCodexRuntimeStatus({ env: codexProbeEnv() });
   state = reconcileCodexLoginFromStatus(codex, codexCliActionContext());
   const runtimeProviders = await runtimeProvidersSnapshot();
+  const providerConfig = await providerConfigSnapshot();
   const managedRoadmaps = roadmapAccessSnapshots(listManagedRoadmapRegistry(roadmapRegistryOptions()), state.projectGrants, runtimeProviders.current, {
     scopeValues: PROJECT_GRANT_SCOPE_VALUES,
     normalizeGrantPath
@@ -1108,6 +1124,7 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
     bridgeApiUrl: health.ok ? health.bridgeApiUrl : state.bridgeApiUrl,
     healthError: health.ok ? undefined : health.error,
     runtimeProviders,
+    providerConfig,
     managedRoadmaps,
     projectGrants: snapshotProjectGrants(state.projectGrants),
     activeProjectGrants: activeManagedProjectGrants(state.projectGrants),
@@ -1124,14 +1141,18 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
   });
 }
 
+async function providerConfigSnapshot(): Promise<BridgeAppSnapshot["providerConfig"]> {
+  const registry = createBridgeDesktopRuntimeProviderRegistry();
+  const provider = registry.current();
+  return {
+    providerId: provider.providerId,
+    metadata: provider.metadata(),
+    fields: await provider.readConfig()
+  };
+}
+
 async function runtimeProvidersSnapshot(): Promise<BridgeAppSnapshot["providers"] & BridgeAppSnapshot["runtimeProviders"]> {
-  const state = readAppState();
-  const registry = createRuntimeProviderRegistry({
-    providerState: state.runtimeProviders,
-    codex: {
-      env: codexProbeEnv
-    }
-  });
+  const registry = createBridgeDesktopRuntimeProviderRegistry();
   const providers = await Promise.all(registry.list().map(provider => provider.status()));
   const currentProviderId = registry.current().providerId;
   const current = providers.find(provider => provider.providerId === currentProviderId) ?? providers[0];
@@ -1145,14 +1166,23 @@ async function runtimeProvidersSnapshot(): Promise<BridgeAppSnapshot["providers"
   };
 }
 
-async function runCodexInstallCli(options: { confirmed: boolean; dryRun: boolean }) {
-  const state = readAppState();
-  const registry = createRuntimeProviderRegistry({
-    providerState: state.runtimeProviders,
+function createBridgeDesktopRuntimeProviderRegistry() {
+  return createRuntimeProviderRegistry({
+    providerStateStore: {
+      read: () => readAppState().runtimeProviders,
+      write: runtimeProviders => {
+        const state = readAppState();
+        writeAppState({ ...state, runtimeProviders });
+      }
+    },
     codex: {
       env: codexProbeEnv
     }
   });
+}
+
+async function runCodexInstallCli(options: { confirmed: boolean; dryRun: boolean }) {
+  const registry = createBridgeDesktopRuntimeProviderRegistry();
   const provider = registry.get("codex") ?? registry.current();
   if (!provider.install) {
     throw new Error("Current provider does not support installation.");
@@ -1177,14 +1207,10 @@ function codexCliActionContext() {
 
 function codexProbeEnv(): Record<string, string | undefined> {
   const state = readAppState();
-  const codexSettings = bridgeCodexProviderSettings(state);
-  return {
-    ...currentProcessEnv(),
-    ...(codexSettings.binaryPath ? {
-      HUNSU_CODEX_BINARY_PATH: codexSettings.binaryPath,
-      HUNSU_CODEX_BINARY_PATH_SOURCE: "user_config"
-    } : {})
-  };
+  return codexProviderEnv({
+    baseEnv: currentProcessEnv(),
+    settings: bridgeCodexProviderSettings(state)
+  });
 }
 
 function snapshotCodexSettings(state: BridgeAppState): BridgeAppSnapshot["codexSettings"] {
@@ -1192,16 +1218,13 @@ function snapshotCodexSettings(state: BridgeAppState): BridgeAppSnapshot["codexS
   const settings = bridgeCodexProviderSettings(state);
   return {
     ...settings,
-    environment: sanitizeDiagnostics({
-      CODEX_HOME: env.CODEX_HOME,
-      HUNSU_CODEX_APP_SERVER_COMMAND: env.HUNSU_CODEX_APP_SERVER_COMMAND,
-      HUNSU_CODEX_APP_SERVER_ARGS: env.HUNSU_CODEX_APP_SERVER_ARGS
-    }) as BridgeAppSnapshot["codexSettings"]["environment"]
+    environment: sanitizeDiagnostics(codexEffectiveEnvSummary(env)) as BridgeAppSnapshot["codexSettings"]["environment"]
   };
 }
 
 async function safeCodexDiagnostics(): Promise<unknown> {
-  const status = await getCodexRuntimeStatus({ env: codexProbeEnv() });
+  const env = codexProbeEnv();
+  const status = await getCodexRuntimeStatus({ env });
   return {
     codexInstalled: status.cli.installed,
     codexVersion: status.cli.version,
@@ -1213,6 +1236,8 @@ async function safeCodexDiagnostics(): Promise<unknown> {
     rateLimitsAvailable: status.usage.rateLimitsAvailable,
     rateLimited: status.usage.rateLimited,
     lastRunUsage: status.usage.lastRunUsage,
+    effectiveEnv: codexEffectiveEnvSummary(env),
+    codexHome: status.auth.homeDiagnostic,
     lastCodexError: status.cli.error ?? status.appServer.error ?? status.auth.error ?? status.usage.error
   };
 }
@@ -1224,6 +1249,13 @@ function printCodexStatus(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus
   if (codex.cli.version) console.log(`  Version: ${codex.cli.version}`);
   console.log(`  App Server: ${codex.appServer.available ? "Available" : "Unavailable"}`);
   console.log(`  Auth: ${codex.auth.state}`);
+  if (codex.auth.homeDiagnostic?.effectiveCodexHome) console.log(`  Codex Home: ${codex.auth.homeDiagnostic.effectiveCodexHome}`);
+  if (codex.auth.homeDiagnostic) {
+    console.log(`  Auth File: ${codex.auth.homeDiagnostic.authFileExistsAtEffectiveHome ? "Present" : "Missing"} at effective Codex Home`);
+    if (codex.auth.homeDiagnostic.likelyHomeMismatch) {
+      console.log(`  Home Mismatch: ${codex.auth.homeDiagnostic.remediation?.message ?? "Saved CODEX_HOME does not match the Codex home that has auth.json."}`);
+    }
+  }
   if (codex.auth.method) console.log(`  Method: ${codex.auth.method}`);
   if (codex.auth.access) console.log(`  Access: ${codex.auth.access}`);
   if (codex.usage.rateLimitsAvailable) {
@@ -1522,7 +1554,7 @@ function runServiceManagerCommand(action: "start" | "stop", service: BridgeServi
 }
 
 function systemdUserUnitText(cwd: string): string {
-  const command = process.argv[1] ? resolve(process.argv[1]) : "hunsu-bridge";
+  const invocation = currentBridgeCommandInvocation({ commandArgs: ["supervise", "--cwd", cwd] });
   return [
     "[Unit]",
     "Description=Hunsu Bridge daemon",
@@ -1531,7 +1563,7 @@ function systemdUserUnitText(cwd: string): string {
     "[Service]",
     "Type=simple",
     `WorkingDirectory=${systemdQuote(cwd)}`,
-    `ExecStart=${systemdQuote(process.execPath)} ${systemdQuote(command)} supervise --cwd ${systemdQuote(cwd)}`,
+    `ExecStart=${[invocation.command, ...invocation.args].map(systemdQuote).join(" ")}`,
     "Restart=on-failure",
     "RestartSec=2",
     `Environment=${systemdQuote("HUNSU_BRIDGE_HEADLESS=1")}`,
@@ -1543,7 +1575,7 @@ function systemdUserUnitText(cwd: string): string {
 }
 
 function launchdUserPlistText(cwd: string): string {
-  const command = process.argv[1] ? resolve(process.argv[1]) : "hunsu-bridge";
+  const invocation = currentBridgeCommandInvocation({ commandArgs: ["supervise", "--cwd", cwd] });
   return [
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
     "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
@@ -1553,11 +1585,7 @@ function launchdUserPlistText(cwd: string): string {
     "  <string>app.hunsu.bridge</string>",
     "  <key>ProgramArguments</key>",
     "  <array>",
-    `    <string>${xmlEscape(process.execPath)}</string>`,
-    `    <string>${xmlEscape(command)}</string>`,
-    "    <string>supervise</string>",
-    "    <string>--cwd</string>",
-    `    <string>${xmlEscape(cwd)}</string>`,
+    ...[invocation.command, ...invocation.args].map(arg => `    <string>${xmlEscape(arg)}</string>`),
     "  </array>",
     "  <key>WorkingDirectory</key>",
     `  <string>${xmlEscape(cwd)}</string>`,
@@ -1575,11 +1603,11 @@ function launchdUserPlistText(cwd: string): string {
 }
 
 function windowsServiceInstallCommand(cwd: string): string {
-  const command = process.argv[1] ? resolve(process.argv[1]) : "hunsu-bridge";
+  const invocation = currentBridgeCommandInvocation({ commandArgs: ["supervise", "--cwd", cwd] });
   return [
     "Use the Hunsu Bridge installer-managed Windows service when available.",
     "Manual fallback:",
-    `  ${windowsCommandQuote(process.execPath)} ${windowsCommandQuote(command)} supervise --cwd ${windowsCommandQuote(cwd)}`
+    `  ${[invocation.command, ...invocation.args].map(windowsCommandQuote).join(" ")}`
   ].join("\n");
 }
 

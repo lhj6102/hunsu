@@ -48,6 +48,8 @@ import {
   inspectStudioPort,
   createRuntimeProviderRegistry,
   getCodexRuntimeStatus,
+  codexAuthHomeDiagnostic,
+  codexProviderEnv,
   detectCodexBinary,
   listManagedRoadmapRegistry,
   normalizeCodexRuntimeStatus,
@@ -447,6 +449,44 @@ test("Bridge runtime provider facade maps Codex status and registry placeholders
   assert.equal(connectionExecutePreflightError({
     localBridgeConnected: false
   })?.error, "BRIDGE_NOT_CONNECTED");
+});
+
+test("Bridge Codex provider env and auth-home diagnostics are explicit and secret-safe", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-provider-env-test-"));
+  const defaultHome = join(root, "default-home", ".codex");
+  const configuredHome = join(root, "configured-codex-home");
+  mkdirSync(defaultHome, { recursive: true });
+  mkdirSync(configuredHome, { recursive: true });
+  writeFileSync(join(defaultHome, "auth.json"), "{\"refresh_token\":\"do-not-read\"}\n", "utf8");
+  try {
+    const env = codexProviderEnv({
+      baseEnv: {
+        HOME: join(root, "default-home"),
+        PATH: "/usr/bin"
+      },
+      settings: {
+        binaryPath: "/opt/codex/bin/codex",
+        codexHome: configuredHome,
+        appServerCommand: "/opt/codex/bin/codex",
+        appServerArgs: "[\"app-server\",\"--stdio\"]"
+      }
+    });
+    assert.equal(env.HUNSU_CODEX_BINARY_PATH, "/opt/codex/bin/codex");
+    assert.equal(env.HUNSU_CODEX_BINARY_PATH_SOURCE, "user_config");
+    assert.equal(env.CODEX_HOME, configuredHome);
+    assert.equal(env.HUNSU_CODEX_APP_SERVER_COMMAND, "/opt/codex/bin/codex");
+    assert.equal(env.HUNSU_CODEX_APP_SERVER_ARGS, "[\"app-server\",\"--stdio\"]");
+
+    const diagnostic = codexAuthHomeDiagnostic({ env, platform: "linux", homeDir: join(root, "default-home") });
+    assert.equal(diagnostic.authFileExistsAtEffectiveHome, false);
+    assert.equal(diagnostic.authFileExistsAtDefaultHome, true);
+    assert.equal(diagnostic.likelyHomeMismatch, true);
+    assert.equal(diagnostic.remediation?.type, "set_codex_home");
+    assert.equal(diagnostic.remediation?.suggestedCodexHome, defaultHome);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /refresh_token|do-not-read/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Bridge status and workspace APIs expose provider, local backend, and remote workspaces", async () => {
@@ -1097,12 +1137,16 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
   const root = mkdtempSync(join(tmpdir(), "hunsu-provider-facade-test-"));
   const fakeCodex = join(root, "codex");
   const bridgeAppStatePath = join(root, "bridge-app-state.json");
+  const codexHome = join(root, "codex-home");
+  const loginEnvPath = join(root, "codex-login-env.json");
+  mkdirSync(codexHome, { recursive: true });
   writeFileSync(fakeCodex, [
     `#!${process.execPath}`,
     "const readline = require('node:readline');",
+    "const fs = require('node:fs');",
     "const args = process.argv.slice(2);",
     "if (args.includes('--version')) { console.log('codex 2.0.0'); process.exit(0); }",
-    "if (args[0] === 'login') { process.exit(0); }",
+    `if (args[0] === 'login') { fs.writeFileSync(${JSON.stringify(loginEnvPath)}, JSON.stringify({ args, CODEX_HOME: process.env.CODEX_HOME })); process.exit(0); }`,
     "if (args[0] === 'app-server') {",
     "  const rl = readline.createInterface({ input: process.stdin });",
     "  rl.on('line', line => {",
@@ -1125,6 +1169,16 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
     const state = createStudioState();
     const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
 
+    const metadata = await requestStudioServerJson(server, "GET", "/api/providers/current/metadata");
+    assert.equal(metadata.status, 200);
+    assert.deepEqual(metadata.body.configKeys.map((key: { name: string }) => key.name), [
+      "binaryPath",
+      "codexHome",
+      "appServerCommand",
+      "appServerArgs",
+      "authenticationPreference"
+    ]);
+
     const configure = await requestStudioServerJson(server, "POST", "/api/providers/current/configure", { binaryPath: fakeCodex });
     assert.equal(configure.status, 202);
     assert.equal(configure.body.providerId, "codex");
@@ -1134,12 +1188,41 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
     const current = await requestStudioServerJson(server, "GET", "/api/providers/current");
     assert.equal(current.body.ready, true);
     assert.equal(current.body.install.binaryPath, fakeCodex);
+    assert.equal(current.body.diagnostics.effectiveEnv.HUNSU_CODEX_BINARY_PATH, fakeCodex);
     const persistedState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
-      codex?: { binaryPath?: string };
-      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string } } } };
+      codex?: { binaryPath?: string; codexHome?: string };
+      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string } } } };
     };
     assert.equal(persistedState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
     assert.equal(persistedState.codex?.binaryPath, undefined);
+
+    const config = await requestStudioServerJson(server, "GET", "/api/providers/current/config");
+    assert.equal(config.status, 200);
+    assert.equal(config.body.fields.some((field: { key: string; value?: string }) => field.key === "binaryPath" && field.value === fakeCodex), true);
+
+    const configFields = [
+      { key: "binaryPath", value: fakeCodex, isSet: true, isSecret: false },
+      { key: "codexHome", value: codexHome, isSet: true, isSecret: false },
+      { key: "authenticationPreference", value: "device_code", isSet: true, isSecret: false }
+    ];
+    const validation = await requestStudioServerJson(server, "POST", "/api/providers/current/validate", { fields: configFields });
+    assert.equal(validation.status, 200);
+    assert.equal(validation.body.valid, true);
+    assert.equal(validation.body.diagnostics.effectiveEnv.CODEX_HOME, codexHome);
+
+    const saved = await requestStudioServerJson(server, "POST", "/api/providers/current/config", { fields: configFields });
+    assert.equal(saved.status, 202);
+    assert.equal(saved.body.status.ready, true);
+    assert.equal(saved.body.status.diagnostics.effectiveEnv.CODEX_HOME, codexHome);
+    const savedState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
+      codex?: { binaryPath?: string; codexHome?: string };
+      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string; authenticationPreference?: string } } } };
+    };
+    assert.equal(savedState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
+    assert.equal(savedState.runtimeProviders?.providers?.codex?.settings?.codexHome, codexHome);
+    assert.equal(savedState.runtimeProviders?.providers?.codex?.settings?.authenticationPreference, "device_code");
+    assert.equal(savedState.codex?.binaryPath, undefined);
+    assert.equal(savedState.codex?.codexHome, undefined);
 
     const login = await requestStudioServerJson(server, "POST", "/api/providers/current/login", { method: "chatgpt" });
     assert.equal(login.status, 202);
@@ -1148,7 +1231,7 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
     assert.deepEqual(login.body.args, ["login"]);
     assert.equal(state.codexLogin?.kind, "chatgpt");
 
-    const apiKeyLogin = await requestStudioServerJson(server, "POST", "/api/providers/current/login", { method: "api_key" });
+    const apiKeyLogin = await requestStudioServerJson(server, "POST", "/api/providers/current/authenticate", { method: "api_key" });
     assert.equal(apiKeyLogin.status, 202);
     assert.equal(apiKeyLogin.body.providerId, "codex");
     assert.equal(apiKeyLogin.body.method, "api_key");
@@ -1157,6 +1240,90 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
     const legacyApiKeyLogin = await requestStudioServerJson(server, "POST", "/api/runtimes/codex/login/api-key");
     assert.equal(legacyApiKeyLogin.status, 202);
     assert.deepEqual(legacyApiKeyLogin.body.args, ["login", "--api-key"]);
+    await waitFor(() => existsSync(loginEnvPath));
+    const loginEnv = JSON.parse(readFileSync(loginEnvPath, "utf8")) as { CODEX_HOME?: string };
+    assert.equal(loginEnv.CODEX_HOME, codexHome);
+
+    const keyReset = await requestStudioServerJson(server, "DELETE", "/api/providers/current/config/codexHome");
+    assert.equal(keyReset.status, 202);
+    const keyResetState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
+      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string; authenticationPreference?: string } } } };
+    };
+    assert.equal(keyResetState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
+    assert.equal(keyResetState.runtimeProviders?.providers?.codex?.settings?.codexHome, undefined);
+    assert.equal(keyResetState.runtimeProviders?.providers?.codex?.settings?.authenticationPreference, "device_code");
+
+    const deleted = await requestStudioServerJson(server, "DELETE", "/api/providers/current/config");
+    assert.equal(deleted.status, 202);
+    const resetState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
+      runtimeProviders?: { providers?: { codex?: { settings?: Record<string, unknown> } } };
+    };
+    assert.deepEqual(resetState.runtimeProviders?.providers?.codex?.settings, {});
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge provider config validation probes saved app-server command and parsed args", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-provider-app-server-config-test-"));
+  const binaryPath = join(root, "codex-binary");
+  const appServerCommand = join(root, "codex-app-server");
+  const binaryAppServerLog = join(root, "binary-app-server.log");
+  const appServerLog = join(root, "app-server.log");
+  const bridgeAppStatePath = join(root, "bridge-app-state.json");
+  writeFileSync(binaryPath, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex binary 1.0.0'); process.exit(0); }",
+    `if (args[0] === 'app-server') { fs.appendFileSync(${JSON.stringify(binaryAppServerLog)}, args.join(' ') + '\\n'); process.exit(7); }`,
+    "process.exit(2);",
+    ""
+  ].join("\n"), "utf8");
+  writeFileSync(appServerCommand, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex app-server 2.0.0'); process.exit(0); }",
+    `fs.appendFileSync(${JSON.stringify(appServerLog)}, args.join(' ') + '\\n');`,
+    "if (args[0] !== 'serve' || args[1] !== '--stdio') process.exit(8);",
+    "const rl = readline.createInterface({ input: process.stdin });",
+    "rl.on('line', line => {",
+    "  const msg = JSON.parse(line);",
+    "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'advanced@example.test' } }));",
+    "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "});",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(binaryPath, 0o755);
+  chmodSync(appServerCommand, 0o755);
+  try {
+    const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: "",
+      HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+    }, { cwd: root }));
+    const server = createStudioServer({ cwd: root, persist: false, runner: new FakeRunner(), runtimeConfig });
+    const fields = [
+      { key: "binaryPath", value: binaryPath, isSet: true, isSecret: false },
+      { key: "appServerCommand", value: appServerCommand, isSet: true, isSecret: false },
+      { key: "appServerArgs", value: JSON.stringify(["serve", "--stdio"]), isSet: true, isSecret: false }
+    ];
+
+    const validation = await requestStudioServerJson(server, "POST", "/api/providers/current/validate", { fields });
+    assert.equal(validation.status, 200);
+    assert.equal(validation.body.valid, true);
+    assert.equal(validation.body.provider.ready, true);
+    assert.equal(validation.body.provider.install.binaryPath, binaryPath);
+    assert.equal(existsSync(binaryAppServerLog), false);
+    assert.equal(readFileSync(appServerLog, "utf8").trim().split(/\r?\n/).every(line => line === "serve --stdio"), true);
+
+    const saved = await requestStudioServerJson(server, "POST", "/api/providers/current/config", { fields });
+    assert.equal(saved.status, 202, JSON.stringify(saved.body));
+    assert.equal(saved.body.status.ready, true);
+    assert.equal(existsSync(binaryAppServerLog), false);
+    assert.equal(readFileSync(appServerLog, "utf8").includes("app-server --stdio"), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

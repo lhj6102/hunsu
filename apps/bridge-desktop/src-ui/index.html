@@ -316,10 +316,6 @@
         <h2>Settings</h2>
         <div class="grid">
           <label>
-            <span class="project-meta">Codex binary path</span>
-            <input id="codex-binary-path" placeholder="Auto-detect from PATH" />
-          </label>
-          <label>
             <span class="project-meta">Install channel</span>
             <select id="codex-install-channel">
               <option value="stable">Stable</option>
@@ -327,30 +323,11 @@
               <option value="manual">Manual</option>
             </select>
           </label>
-          <label>
-            <span class="project-meta">Authentication preference</span>
-            <select id="codex-auth-preference">
-              <option value="chatgpt">ChatGPT</option>
-              <option value="device_code">Device code</option>
-              <option value="api_key">API key</option>
-            </select>
-          </label>
-          <label>
-            <span class="project-meta">CODEX_HOME</span>
-            <input id="codex-env-home" readonly />
-          </label>
-          <label>
-            <span class="project-meta">HUNSU_CODEX_APP_SERVER_COMMAND</span>
-            <input id="codex-env-command" readonly />
-          </label>
-          <label>
-            <span class="project-meta">HUNSU_CODEX_APP_SERVER_ARGS</span>
-            <input id="codex-env-args" readonly />
-          </label>
+          <div id="provider-config-form" class="grid"></div>
           <div class="actions">
-            <button id="save-codex-path" class="primary">Save Codex Path</button>
-            <button id="save-codex-settings">Save Codex Settings</button>
-            <button id="reset-codex-path">Reset to Auto-Detect</button>
+            <button id="validate-codex-config">Validate</button>
+            <button id="save-codex-config" class="primary">Save</button>
+            <button id="reset-codex-config">Reset</button>
           </div>
         </div>
       </section>

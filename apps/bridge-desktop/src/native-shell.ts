@@ -59,8 +59,9 @@ export type ProtocolRegistrationPlan = {
   notes: string[];
 };
 
-export function protocolRegistrationPlan(commandPath: string): ProtocolRegistrationPlan {
+export function protocolRegistrationPlan(commandPath: string, args: string[] = []): ProtocolRegistrationPlan {
   const resolvedCommand = resolve(commandPath);
+  const execLine = commandLine([resolvedCommand, ...args, "%u"]);
   const os = platform();
   if (os === "linux") {
     const desktopFile = join(homedir(), ".local", "share", "applications", "hunsu-bridge.desktop");
@@ -73,7 +74,7 @@ export function protocolRegistrationPlan(commandPath: string): ProtocolRegistrat
         `write ${desktopFile}`,
         `xdg-mime default hunsu-bridge.desktop x-scheme-handler/hunsu`
       ],
-      notes: [`Exec=${resolvedCommand} %u`]
+      notes: [`Exec=${execLine}`]
     };
   }
   if (os === "darwin") {
@@ -93,7 +94,7 @@ export function protocolRegistrationPlan(commandPath: string): ProtocolRegistrat
       supported: true,
       installerManaged: true,
       commands: ["Register HKCU\\Software\\Classes\\hunsu\\shell\\open\\command in the Windows installer."],
-      notes: [`Default command: "${resolvedCommand}" "%1"`]
+      notes: [`Default command: ${commandLine([resolvedCommand, ...args, "%1"])}`]
     };
   }
   return {
@@ -106,8 +107,8 @@ export function protocolRegistrationPlan(commandPath: string): ProtocolRegistrat
   };
 }
 
-export function installLinuxProtocolHandler(commandPath: string): ProtocolRegistrationPlan {
-  const plan = protocolRegistrationPlan(commandPath);
+export function installLinuxProtocolHandler(commandPath: string, args: string[] = []): ProtocolRegistrationPlan {
+  const plan = protocolRegistrationPlan(commandPath, args);
   if (plan.platform !== "linux" || !plan.supported) {
     return plan;
   }
@@ -117,7 +118,7 @@ export function installLinuxProtocolHandler(commandPath: string): ProtocolRegist
     "[Desktop Entry]",
     "Type=Application",
     "Name=Hunsu Bridge",
-    `Exec=${resolve(commandPath)} %u`,
+    `Exec=${commandLine([resolve(commandPath), ...args, "%u"])}`,
     "Terminal=false",
     "MimeType=x-scheme-handler/hunsu;",
     "NoDisplay=true",
@@ -132,6 +133,10 @@ export function installLinuxProtocolHandler(commandPath: string): ProtocolRegist
     plan.notes.push("xdg-mime was not available; run `xdg-mime default hunsu-bridge.desktop x-scheme-handler/hunsu` after install.");
   }
   return plan;
+}
+
+function commandLine(args: string[]): string {
+  return args.map(arg => /\s/.test(arg) ? `"${arg.replace(/"/g, "\\\"")}"` : arg).join(" ");
 }
 
 async function runPicker(

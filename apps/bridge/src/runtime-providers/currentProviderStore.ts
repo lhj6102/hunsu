@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { currentProcessEnv } from "@hunsu/config";
+import { codexSettingsFromRecord, type BridgeCodexSettings } from "./codex/codexConfig.ts";
 
 export type BridgeRuntimeProviderState = {
   currentProviderId: string;
@@ -81,7 +82,9 @@ export function createBridgeAppRuntimeProviderStore(
     read: () => readBridgeRuntimeProviderState(env),
     write: state => {
       const existing = readRawBridgeAppState(path);
-      const existingCodex = isRecord(existing.codex) ? omitRecordKey(existing.codex, "binaryPath") : existing.codex;
+      const existingCodex = isRecord(existing.codex)
+        ? omitRecordKeys(existing.codex, ["binaryPath", "codexHome", "appServerCommand", "appServerArgs", "environment", "installChannel", "authenticationPreference"])
+        : existing.codex;
       const next = {
         ...existing,
         ...(existingCodex && isRecord(existingCodex) ? { codex: existingCodex } : {}),
@@ -95,35 +98,68 @@ export function createBridgeAppRuntimeProviderStore(
 }
 
 function migrateLegacyCodexSettings(state: BridgeRuntimeProviderState, rawState: Record<string, unknown>): BridgeRuntimeProviderState {
-  const settings = state.providers.codex?.settings ?? {};
-  if (typeof settings.binaryPath === "string" && settings.binaryPath.trim()) {
-    return state;
-  }
+  const settings = codexSettingsFromRecord(state.providers.codex?.settings);
   const legacyCodex = isRecord(rawState.codex) ? rawState.codex : undefined;
+  const legacyEnvironment = isRecord(legacyCodex?.environment) ? legacyCodex.environment : undefined;
   const legacyBinaryPath = typeof legacyCodex?.binaryPath === "string" && legacyCodex.binaryPath.trim()
     ? legacyCodex.binaryPath.trim()
     : undefined;
-  if (!legacyBinaryPath) {
-    return state;
-  }
+  const legacySettings: BridgeCodexSettings = {
+    ...(legacyBinaryPath && !settings.binaryPath ? { binaryPath: legacyBinaryPath } : {}),
+    ...legacyCodexEnvironmentSettings(legacyEnvironment, settings),
+    ...(legacyCodex?.installChannel === "stable" || legacyCodex?.installChannel === "latest" || legacyCodex?.installChannel === "manual"
+      ? { installChannel: legacyCodex.installChannel }
+      : {}),
+    ...(legacyCodex?.authenticationPreference === "chatgpt" || legacyCodex?.authenticationPreference === "api_key" || legacyCodex?.authenticationPreference === "device_code"
+      ? { authenticationPreference: legacyCodex.authenticationPreference }
+      : {})
+  };
+  const nextSettings = {
+    ...state.providers.codex?.settings,
+    ...legacySettings,
+    ...settings
+  };
   return normalizeBridgeRuntimeProviderState({
     ...state,
     providers: {
       ...state.providers,
       codex: {
         enabled: true,
-        settings: {
-          ...settings,
-          binaryPath: legacyBinaryPath
-        }
+        settings: nextSettings
       }
     }
   });
 }
 
-function omitRecordKey(record: Record<string, unknown>, key: string): Record<string, unknown> {
+function legacyCodexEnvironmentSettings(
+  environment: Record<string, unknown> | undefined,
+  current: BridgeCodexSettings
+): BridgeCodexSettings {
+  const codexHome = typeof environment?.CODEX_HOME === "string" && environment.CODEX_HOME.trim() && !current.codexHome
+    ? environment.CODEX_HOME.trim()
+    : undefined;
+  const appServerCommand = typeof environment?.HUNSU_CODEX_APP_SERVER_COMMAND === "string"
+    && environment.HUNSU_CODEX_APP_SERVER_COMMAND.trim()
+    && !current.appServerCommand
+    ? environment.HUNSU_CODEX_APP_SERVER_COMMAND.trim()
+    : undefined;
+  const appServerArgs = typeof environment?.HUNSU_CODEX_APP_SERVER_ARGS === "string"
+    && environment.HUNSU_CODEX_APP_SERVER_ARGS.trim()
+    && !current.appServerArgs
+    ? environment.HUNSU_CODEX_APP_SERVER_ARGS.trim()
+    : undefined;
+  return {
+    ...(codexHome ? { codexHome } : {}),
+    ...(appServerCommand ? { appServerCommand } : {}),
+    ...(appServerArgs ? { appServerArgs } : {})
+  };
+}
+
+function omitRecordKeys(record: Record<string, unknown>, keys: string[]): Record<string, unknown> {
   const next = { ...record };
-  delete next[key];
+  for (const key of keys) {
+    delete next[key];
+  }
   return next;
 }
 

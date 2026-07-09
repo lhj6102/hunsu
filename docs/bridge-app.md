@@ -142,11 +142,24 @@ activation, Hub, and non-Execute Studio flows still work.
 
 Codex resolution order is:
 
-1. saved custom `HUNSU_CODEX_BINARY_PATH`
-2. `HUNSU_CODEX_APP_SERVER_COMMAND`
+1. saved provider `binaryPath`
+2. saved provider `appServerCommand`
 3. `codex` on `PATH`
 4. Windows known OpenAI Codex install directories
 5. missing
+
+Codex provider setup saves all Codex config under
+`runtimeProviders.providers.codex.settings`:
+
+- `binaryPath`
+- `codexHome`
+- `appServerCommand`
+- `appServerArgs`
+- `authenticationPreference`
+
+Legacy `codex.binaryPath` and `codex.environment` fields are read as migration
+inputs only. Bridge App writes the canonical provider settings object after
+configuration.
 
 On Windows, Bridge checks the process `PATH`, Windows `Path`, and captured User
 PATH and Machine PATH snapshots when available, then known OpenAI Codex install
@@ -154,11 +167,20 @@ directories such as LocalAppData OpenAI Codex and roaming npm locations.
 WindowsApps execution aliases are treated as "select an existing binary"
 because they can launch a Store prompt instead of a usable Codex executable.
 
+`codexHome` is the Bridge App setting for `CODEX_HOME`. On Windows this is the
+main recovery path when Codex is detected but remains Login Required because
+Bridge was launched with a different home than the one that contains
+`auth.json`. Bridge App can suggest the default Codex home when the effective
+home has no `auth.json` and the default home does. This diagnostic checks only
+file existence and paths; it never reads `auth.json` or credential contents.
+
 Bridge App may run `codex --version`, `codex app-server --stdio`, and Codex
 app-server account/rate-limit requests. It must not read `~/.codex/auth.json`,
 token files, OpenAI API keys, or credential stores directly. Diagnostics include
 safe readiness fields such as installed/version/source/app-server/auth/access
-state, and redact token-like values.
+state, the effective provider env summary, and Codex Home auth-file existence
+booleans. Diagnostics redact token-like values and must not include credential
+contents.
 
 Codex UI states:
 
@@ -170,6 +192,13 @@ Codex UI states:
   and Recheck.
 - Ready: show auth method/access where safely detectable.
 - Error: show Recheck and diagnostics without credential material.
+
+Provider Configure opens metadata-like fields for Codex binary, Codex Home,
+app-server command, app-server args, and authentication preference. Native file
+and directory pickers should fill the binary and Codex Home fields. Validate
+and Save use the provider config API/CLI. Save may succeed when auth is missing
+as long as the binary and app-server are usable, so users can fix Codex Home
+before signing in again.
 
 Advanced Runtime Providers lists the current Codex provider plus future
 providers such as Claude Code, Gemini CLI, OpenHands Agent Server, ACP Agent,

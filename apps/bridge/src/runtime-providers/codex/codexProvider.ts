@@ -1,5 +1,14 @@
 import { isAbsolute, resolve } from "node:path";
 import { currentProcessEnv } from "@hunsu/config";
+import {
+  codexConfigFieldsFromSettings,
+  codexEffectiveEnvSummary,
+  codexProviderEnv,
+  codexProviderMetadata,
+  codexSettingsFromRecord,
+  settingsWithCodexConfigFields,
+  type BridgeCodexSettings
+} from "./codexConfig.ts";
 import { codexInstallPlan, runDefaultCodexInstaller, type CodexInstaller } from "./codexInstall.ts";
 import {
   clearCodexLoginState,
@@ -17,6 +26,8 @@ import type {
   RuntimeProviderAdapter,
   RuntimeProviderAuthKind,
   RuntimeProviderCapabilities,
+  RuntimeProviderConfigField,
+  RuntimeProviderMetadata,
   RuntimeProviderConfigurationInput,
   RuntimeProviderInstallPlan,
   RuntimeProviderInstallResult,
@@ -43,7 +54,7 @@ export type CodexRuntimeProviderOptions = {
   env?: () => Record<string, string | undefined>;
   settings?: Record<string, unknown>;
   loginState?: CodexLoginStateHost;
-  onConfigure?: (configuration: { binaryPath?: string }) => void;
+  onConfigure?: (settings: BridgeCodexSettings) => void;
   installer?: CodexInstaller;
 };
 
@@ -51,21 +62,67 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
   providerId = "codex";
   kind = "codex" as const;
   label = "Codex";
-  private binaryPathOverride: string | undefined;
+  private settings: BridgeCodexSettings;
   private readonly internalLoginState: CodexLoginStateHost = {};
   private readonly options: CodexRuntimeProviderOptions;
 
   constructor(options: CodexRuntimeProviderOptions = {}) {
     this.options = options;
-    this.binaryPathOverride = stringSetting(options.settings, "binaryPath");
+    this.settings = codexSettingsFromRecord(options.settings);
+  }
+
+  metadata(): RuntimeProviderMetadata {
+    return codexProviderMetadata;
+  }
+
+  async readConfig(): Promise<RuntimeProviderConfigField[]> {
+    return codexConfigFieldsFromSettings(this.settings);
+  }
+
+  async validateConfig(fields: RuntimeProviderConfigField[]): Promise<{
+    valid: boolean;
+    provider: RuntimeProviderStatus;
+    diagnostics: NonNullable<RuntimeProviderStatus["diagnostics"]>;
+  }> {
+    const settings = settingsWithCodexConfigFields(this.settings, fields);
+    return this.validateSettings(settings);
+  }
+
+  async saveConfig(fields: RuntimeProviderConfigField[]): Promise<RuntimeProviderStatus> {
+    const settings = settingsWithCodexConfigFields(this.settings, fields);
+    const validation = await this.validateSettings(settings);
+    if (!validation.valid) {
+      throw new Error(validation.provider.safeMessage ?? validation.provider.auth.error ?? validation.provider.install?.error ?? "Codex provider configuration is invalid.");
+    }
+    this.settings = settings;
+    this.options.onConfigure?.(this.settings);
+    return validation.provider;
+  }
+
+  async deleteConfig(keys?: string[]): Promise<RuntimeProviderStatus> {
+    this.settings = keys && keys.length > 0
+      ? settingsWithCodexConfigFields(this.settings, keys.map(key => ({
+          key,
+          value: "",
+          isSet: false,
+          isSecret: false
+        })))
+      : {};
+    this.options.onConfigure?.(this.settings);
+    return this.status({ force: true });
+  }
+
+  effectiveEnv(inputEnv: Record<string, string | undefined> = {}): Record<string, string | undefined> {
+    return this.statusEnv(inputEnv);
   }
 
   async status(input: { force?: boolean; env?: Record<string, string | undefined> } = {}): Promise<RuntimeProviderStatus> {
+    const env = this.statusEnv(input.env);
     const codex = await getCodexRuntimeStatus({
       force: input.force,
-      env: this.statusEnv(input.env)
+      env
     });
-    return normalizeCodexRuntimeStatus(codex);
+    return normalizeCodexRuntimeStatus(codex, { effectiveEnv: codexEffectiveEnvSummary(env) });
   }
 
   async recheck(): Promise<RuntimeProviderStatus> {
@@ -130,7 +187,7 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
   }
 
   async login(input: { method: "default" | "chatgpt" | "device" | "api_key" }): Promise<RuntimeProviderLoginResult> {
-    const method = input.method === "default" ? "chatgpt" : input.method;
+    const method = input.method === "default" ? loginMethodFromPreference(this.settings.authenticationPreference) : input.method;
     const env = this.statusEnv();
     const state = this.options.loginState ?? this.internalLoginState;
     if (method === "device") {
@@ -163,8 +220,10 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
       return this.configureApiKey(input);
     }
     if (input.clearBinaryPath) {
-      this.binaryPathOverride = undefined;
-      this.options.onConfigure?.({ binaryPath: undefined });
+      const next = { ...this.settings };
+      delete next.binaryPath;
+      this.settings = next;
+      this.options.onConfigure?.(this.settings);
       return this.status({ force: true, env: input.env });
     }
     const requestedPath = input.binaryPath?.trim() || input.selectBinaryPath?.trim();
@@ -172,17 +231,7 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
       return this.status({ force: true, env: input.env });
     }
     const binaryPath = isAbsolute(requestedPath) ? requestedPath : resolve(requestedPath);
-    const env = this.baseEnv({ ...input.env, HUNSU_CODEX_BINARY_PATH: binaryPath });
-    const codex = await getCodexRuntimeStatus({
-      force: true,
-      env,
-      customBinaryPath: binaryPath
-    });
-    if (codex.cli.installed && codex.cli.version && codex.appServer.available) {
-      this.binaryPathOverride = binaryPath;
-      this.options.onConfigure?.({ binaryPath });
-    }
-    return normalizeCodexRuntimeStatus(codex);
+    return this.saveConfig([{ key: "binaryPath", value: binaryPath, isSet: true, isSecret: false }]);
   }
 
   private async configureApiKey(input: RuntimeProviderConfigurationInput): Promise<RuntimeProviderStatus> {
@@ -194,10 +243,10 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
   }
 
   private statusEnv(inputEnv: Record<string, string | undefined> = {}): Record<string, string | undefined> {
-    return {
-      ...this.baseEnv(inputEnv),
-      ...(this.binaryPathOverride ? { HUNSU_CODEX_BINARY_PATH: this.binaryPathOverride } : {})
-    };
+    return codexProviderEnv({
+      baseEnv: this.baseEnv(inputEnv),
+      settings: this.settings
+    });
   }
 
   private baseEnv(inputEnv: Record<string, string | undefined> = {}): Record<string, string | undefined> {
@@ -207,9 +256,32 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
       ...inputEnv
     };
   }
+
+  private async validateSettings(settings: BridgeCodexSettings): Promise<{
+    valid: boolean;
+    provider: RuntimeProviderStatus;
+    diagnostics: NonNullable<RuntimeProviderStatus["diagnostics"]>;
+  }> {
+    const env = codexProviderEnv({ baseEnv: this.baseEnv(), settings });
+    const codex = await getCodexRuntimeStatus({
+      force: true,
+      env,
+      customBinaryPath: settings.binaryPath
+    });
+    const provider = normalizeCodexRuntimeStatus(codex, { effectiveEnv: codexEffectiveEnvSummary(env) });
+    const valid = codex.cli.installed === true && Boolean(codex.cli.version) && codex.appServer.available === true;
+    return {
+      valid,
+      provider,
+      diagnostics: provider.diagnostics ?? { effectiveEnv: codexEffectiveEnvSummary(env) }
+    };
+  }
 }
 
-export function normalizeCodexRuntimeStatus(codex: CodexRuntimeStatus): RuntimeProviderStatus {
+export function normalizeCodexRuntimeStatus(
+  codex: CodexRuntimeStatus,
+  options: { effectiveEnv?: Record<string, string | null> } = {}
+): RuntimeProviderStatus {
   const installed = codex.cli.installed;
   const configured = installed && codex.appServer.available;
   const authenticated = codex.auth.state === "authenticated"
@@ -232,7 +304,8 @@ export function normalizeCodexRuntimeStatus(codex: CodexRuntimeStatus): RuntimeP
       state: codex.auth.state,
       access: codex.auth.access,
       accountSummary: codex.auth.accountSummary,
-      error: codex.auth.error
+      error: codex.auth.error,
+      homeDiagnostic: codex.auth.homeDiagnostic
     },
     install: {
       installed,
@@ -251,6 +324,10 @@ export function normalizeCodexRuntimeStatus(codex: CodexRuntimeStatus): RuntimeP
     },
     capabilities: codexProviderCapabilities,
     recommendedAction: codexRecommendedAction(codex),
+    diagnostics: {
+      ...(options.effectiveEnv ? { effectiveEnv: options.effectiveEnv } : {}),
+      ...(codex.auth.homeDiagnostic ? { codexHome: codex.auth.homeDiagnostic } : {})
+    },
     safeMessage: codexSafeMessage(codex)
   };
 }
@@ -286,6 +363,7 @@ function codexSafeMessage(codex: CodexRuntimeStatus): string {
   if (codex.recommendedAction === "select_binary") return "Select the real Codex binary path. WindowsApps aliases cannot be used for Execute.";
   if (!codex.cli.installed) return "Codex was not found by Hunsu Bridge.";
   if (!codex.appServer.available) return "Codex is installed, but the app-server is not available.";
+  if (codex.auth.homeDiagnostic?.likelyHomeMismatch && codex.auth.homeDiagnostic.remediation?.message) return codex.auth.homeDiagnostic.remediation.message;
   if (codex.auth.state === "not_authenticated") return "Sign in to Codex to enable Execute.";
   if (codex.auth.state === "expired" || codex.auth.state === "invalid") return "Codex sign-in needs to be refreshed.";
   if (codex.usage.rateLimited) return "Codex is temporarily rate limited.";
@@ -293,7 +371,8 @@ function codexSafeMessage(codex: CodexRuntimeStatus): string {
   return "Codex needs attention.";
 }
 
-function stringSetting(settings: Record<string, unknown> | undefined, key: string): string | undefined {
-  const value = settings?.[key];
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+function loginMethodFromPreference(preference: BridgeCodexSettings["authenticationPreference"]): "chatgpt" | "device" | "api_key" {
+  if (preference === "device_code") return "device";
+  if (preference === "api_key") return "api_key";
+  return "chatgpt";
 }

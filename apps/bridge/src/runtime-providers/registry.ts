@@ -1,4 +1,5 @@
 import { CodexRuntimeProvider, type CodexRuntimeProviderOptions } from "./codex/codexProvider.ts";
+import { codexSettingsFromRecord, type BridgeCodexSettings } from "./codex/codexConfig.ts";
 import {
   defaultBridgeRuntimeProviderState,
   normalizeBridgeRuntimeProviderState,
@@ -81,15 +82,9 @@ export function createRuntimeProviderRegistry(input: {
 
 function nextRuntimeProviderStateWithCodexSettings(
   state: BridgeRuntimeProviderState,
-  configuration: { binaryPath?: string }
+  configuration: BridgeCodexSettings
 ): BridgeRuntimeProviderState {
-  const codexProvider = state.providers.codex ?? { enabled: true, settings: {} };
-  const settings = { ...(codexProvider.settings ?? {}) };
-  if (configuration.binaryPath?.trim()) {
-    settings.binaryPath = configuration.binaryPath.trim();
-  } else {
-    delete settings.binaryPath;
-  }
+  const settings = codexSettingsToRecord(configuration);
   return normalizeBridgeRuntimeProviderState({
     ...state,
     providers: {
@@ -102,6 +97,17 @@ function nextRuntimeProviderStateWithCodexSettings(
   });
 }
 
+function codexSettingsToRecord(settings: BridgeCodexSettings): Record<string, unknown> {
+  const normalized = codexSettingsFromRecord(settings as Record<string, unknown>);
+  const record: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(normalized)) {
+    if (value !== undefined) {
+      record[key] = value;
+    }
+  }
+  return record;
+}
+
 export function placeholderProvider(kind: Exclude<RuntimeProviderKind, "codex" | "custom">): RuntimeProviderAdapter {
   const label = providerLabels[kind];
   return {
@@ -109,6 +115,20 @@ export function placeholderProvider(kind: Exclude<RuntimeProviderKind, "codex" |
     kind,
     label,
     hiddenByDefault: true,
+    metadata() {
+      return {
+        providerId: kind,
+        label,
+        description: "Future runtime provider.",
+        configKeys: []
+      };
+    },
+    async readConfig() {
+      return [];
+    },
+    async saveConfig(): Promise<RuntimeProviderStatus> {
+      throw new Error(`${label} does not support configuration yet.`);
+    },
     async status(): Promise<RuntimeProviderStatus> {
       return {
         providerId: kind,

@@ -1,7 +1,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
-import type { BridgeRuntimeHandle } from "@hunsu/bridge";
+import { basename, resolve } from "node:path";
+import { isSea } from "node:sea";
+import { codexProviderEnv, type BridgeRuntimeHandle } from "@hunsu/bridge";
 import { currentProcessEnv } from "@hunsu/config";
 import { BridgeSidecarSupervisor } from "./sidecarSupervisor.ts";
 import type {
@@ -15,13 +17,56 @@ import type { ProjectGrant } from "../relay.ts";
 
 export const BRIDGE_PROCESS_NONCE_ENV = "HUNSU_BRIDGE_PROCESS_NONCE";
 
+export type BridgeCommandInvocation = {
+  command: string;
+  args: string[];
+};
+
 export function bridgeNodeExecArgs(): string[] {
   return process.execArgv.filter(arg => !arg.startsWith("--inspect"));
 }
 
+export function currentBridgeCommandInvocation(input: {
+  commandArgs?: string[];
+  env?: Record<string, string | undefined>;
+  argv?: string[];
+  execPath?: string;
+  packaged?: boolean;
+} = {}): BridgeCommandInvocation {
+  const env = input.env ?? currentProcessEnv();
+  const commandArgs = input.commandArgs ?? [];
+  const overrideCommand = env.HUNSU_BRIDGE_SIDECAR_COMMAND?.trim();
+  if (overrideCommand) {
+    return {
+      command: overrideCommand,
+      args: [...bridgeInvocationOverrideArgs(env.HUNSU_BRIDGE_SIDECAR_ARGS), ...commandArgs]
+    };
+  }
+  const argv = input.argv ?? process.argv;
+  const execPath = input.execPath ?? process.execPath;
+  const entrypoint = currentBridgeEntrypointArg(argv, execPath);
+  if (input.packaged === true || input.packaged === undefined && isPackagedBridgeExecutable(argv, execPath)) {
+    return { command: execPath, args: commandArgs };
+  }
+  return {
+    command: execPath,
+    args: [
+      ...bridgeNodeExecArgs(),
+      entrypoint ?? "hunsu-bridge",
+      ...commandArgs
+    ]
+  };
+}
+
+export function isPackagedBridgeExecutable(argv = process.argv, execPath = process.execPath): boolean {
+  const entrypoint = currentBridgeEntrypointArg(argv, execPath);
+  return isSea() || entrypoint === undefined || isPackagedBridgeExecutablePath(entrypoint);
+}
+
 export function currentBridgeProcessCommandIdentity(kind: BridgeProcessCommandIdentity["kind"]): BridgeProcessCommandIdentity {
   const inheritedNonce = currentProcessEnv()[BRIDGE_PROCESS_NONCE_ENV]?.trim() || undefined;
-  return bridgeProcessCommandIdentityForSpawn(kind, [process.execPath, ...bridgeNodeExecArgs(), process.argv[1] ?? "hunsu-bridge", ...process.argv.slice(2)], inheritedNonce);
+  const invocation = currentBridgeCommandInvocation({ commandArgs: currentBridgeRuntimeArgs() });
+  return bridgeProcessCommandIdentityForSpawn(kind, [invocation.command, ...invocation.args], inheritedNonce);
 }
 
 export function bridgeProcessCommandIdentityForSpawn(kind: BridgeProcessCommandIdentity["kind"], argv: string[], nonce = newBridgeProcessNonce()): BridgeProcessCommandIdentity {
@@ -57,18 +102,19 @@ export function createBridgeAppSidecarSupervisor(input: {
   activeProjectGrants: ProjectGrant[];
 }): BridgeSidecarSupervisor {
   const daemonNonce = newBridgeProcessNonce();
-  return new BridgeSidecarSupervisor({
-    command: process.execPath,
-    args: [
-      ...bridgeNodeExecArgs(),
-      process.argv[1] ?? "hunsu-bridge",
+  const invocation = currentBridgeCommandInvocation({
+    commandArgs: [
       "daemon",
       "--cwd",
       input.cwd,
       ...(input.webUrl ? ["--web-url", input.webUrl] : []),
       ...(input.remote ? ["--remote"] : []),
       ...(input.noOpen ? ["--no-open"] : [])
-    ],
+    ]
+  });
+  return new BridgeSidecarSupervisor({
+    command: invocation.command,
+    args: invocation.args,
     cwd: input.cwd,
     env: bridgeProcessEnvWithNonce({
       state: input.state,
@@ -90,17 +136,9 @@ export function startDetachedRemoteAccessProcess(input: {
   writeStructuredLog: (value: Record<string, unknown>) => void;
 }): boolean {
   try {
-    const commandIdentity = bridgeProcessCommandIdentityForSpawn("remote-attach", [
-      process.execPath,
-      ...bridgeNodeExecArgs(),
-      process.argv[1] ?? "hunsu-bridge",
-      ...input.args
-    ]);
-    const child = spawn(process.execPath, [
-      ...bridgeNodeExecArgs(),
-      process.argv[1] ?? "hunsu-bridge",
-      ...input.args
-    ], {
+    const invocation = currentBridgeCommandInvocation({ commandArgs: input.args });
+    const commandIdentity = bridgeProcessCommandIdentityForSpawn("remote-attach", [invocation.command, ...invocation.args]);
+    const child = spawn(invocation.command, invocation.args, {
       cwd: input.cwd,
       env: bridgeProcessEnvWithNonce({
         state: input.state,
@@ -136,8 +174,10 @@ export function bridgeProcessEnvWithNonce(input: {
 }): NodeJS.ProcessEnv {
   const codex = bridgeCodexProviderSettings(input.state);
   return {
-    ...currentProcessEnv(),
-    ...(codex?.binaryPath ? { HUNSU_CODEX_BINARY_PATH: codex.binaryPath } : {}),
+    ...codexProviderEnv({
+      baseEnv: currentProcessEnv(),
+      settings: codex
+    }),
     ...bridgeAppPersistedStatusEnv(input.state, input.activeProjectGrants),
     [BRIDGE_PROCESS_NONCE_ENV]: input.nonce
   };
@@ -265,6 +305,44 @@ function bridgeAppPersistedStatusEnv(state: BridgeAppState, activeProjectGrants:
 
 function processNonceCanBeVerified(): boolean {
   return process.platform === "linux";
+}
+
+function currentBridgeRuntimeArgs(): string[] {
+  return currentBridgeEntrypointArg() === undefined ? process.argv.slice(1) : process.argv.slice(2);
+}
+
+function currentBridgeEntrypointArg(argv = process.argv, execPath = process.execPath): string | undefined {
+  const entrypoint = argv[1];
+  if (!entrypoint?.trim()) {
+    return undefined;
+  }
+  try {
+    if (resolve(entrypoint) === resolve(execPath)) {
+      return undefined;
+    }
+  } catch (_error) {
+    return entrypoint;
+  }
+  return entrypoint;
+}
+
+function isPackagedBridgeExecutablePath(value: string): boolean {
+  return /\.exe$/i.test(value) && basename(value).toLowerCase().startsWith("hunsu-bridge");
+}
+
+function bridgeInvocationOverrideArgs(value: string | undefined): string[] {
+  if (!value?.trim()) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed) && parsed.every(item => typeof item === "string")) {
+      return parsed;
+    }
+  } catch (_error) {
+    // Fall back to shell-like whitespace splitting for simple overrides.
+  }
+  return value.match(/"([^"]*)"|'([^']*)'|\S+/g)?.map(item => item.replace(/^["']|["']$/g, "")) ?? [];
 }
 
 function newBridgeProcessNonce(): string {
