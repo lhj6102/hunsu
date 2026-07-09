@@ -6,14 +6,13 @@ import {
   createRemoteBackendStatus,
   relayRequestConfig,
   remoteProviderStatusFromDevice,
+  remoteWorkspaceSnapshotsFromDevice,
   safeListRemoteBridgeDevicesForRequest,
   type RemoteBridgeDeviceSummary,
   type RemoteWorkspaceProjectGrant
 } from "../connections/remoteConnection.ts";
 import {
   workspaceSummariesFromRoadmaps,
-  workspaceSummaryFromRoadmap,
-  workspaceLifecycle,
   type ConnectedWorkspaceSummary,
   type RoadmapRegistryWorkspaceEntry
 } from "../workspaces/workspaceRegistry.ts";
@@ -140,21 +139,14 @@ export async function createBridgeStatus(input: {
   ];
 
   if (input.account.signedIn) {
-    const remoteRoadmaps = input.managedRoadmaps.filter(roadmap =>
-      workspaceLifecycle(roadmap.lifecycle) === "active"
-      && roadmap.remoteAccess?.enabled === true
-    );
     const devices = await input.listRemoteDevices(input.account.userId);
     for (const device of devices) {
-      const backendId = `remote:${device.deviceId}`;
       const remoteProvider = remoteProviderStatusFromDevice(device);
       const deviceProjectGrants = device.projectGrants?.length ? device.projectGrants : input.projectGrants;
-      const remoteWorkspaces = remoteRoadmaps.map(roadmap => workspaceSummaryFromRoadmap(roadmap, {
+      const remoteWorkspaces = remoteWorkspaceSnapshotsFromDevice(device, {
         provider: remoteProvider,
-        backendId,
-        connectionMode: "remote",
-        redactPath: !remoteWorkspacePathGranted(roadmap.repositoryPath, deviceProjectGrants)
-      }));
+        projectGrants: deviceProjectGrants
+      });
       connections.push(createRemoteBackendStatus({
         device,
         provider: remoteProvider,
@@ -173,19 +165,6 @@ export async function createBridgeStatus(input: {
     },
     account: input.account
   };
-}
-
-export function remoteWorkspacePathGranted(path: string, projectGrants: RemoteWorkspaceProjectGrant[]): boolean {
-  const normalized = normalizeRepositoryPath(path);
-  return projectGrants.some(grant =>
-    grant.active !== false
-    && normalizeRepositoryPath(grant.path) === normalized
-    && grant.scopes.includes("remoteRelay.access")
-  );
-}
-
-function normalizeRepositoryPath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
 function accountStatusFromProcessEnv(env: Record<string, string | undefined>): BridgeStatusResponse["account"] {

@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import type { BridgeAppState, BridgeCodexSettings } from "../state/appState.ts";
+import { withBridgeCodexProviderSettings, type BridgeAppState, type BridgeCodexSettings } from "../state/appState.ts";
 import { parseCodexDeviceAuthOutput, type CodexRuntimeStatus, type RuntimeProviderStatus } from "@hunsu/bridge";
 
 type ParsedCodexArgs = {
@@ -111,17 +111,17 @@ export async function runCodexCommand(parsed: ParsedCodexArgs, context: CodexCom
       }
       const resolvedPath = context.resolvePath(binaryPath);
       const status = await context.getCodexStatus({ env: { ...context.codexProbeEnv(), HUNSU_CODEX_BINARY_PATH: resolvedPath }, force: true });
-      if (!status.cli.installed) {
-        throw new Error(status.cli.error ?? "Custom Codex path is invalid.");
+      if (!status.cli.installed || !status.cli.version || !status.appServer.available) {
+        throw new Error(status.appServer.error ?? status.cli.error ?? "Selected file is not a usable Codex CLI for Hunsu.");
       }
       const state = context.readState();
-      context.writeState({ ...state, codex: { ...state.codex, binaryPath: resolvedPath } });
+      context.writeState(withBridgeCodexProviderSettings(state, { binaryPath: resolvedPath }));
       console.log(`Codex binary path set to ${resolvedPath}`);
       return;
     }
     if (subcommand === "reset") {
       const state = context.readState();
-      context.writeState({ ...state, codex: { ...state.codex, binaryPath: undefined } });
+      context.writeState(withBridgeCodexProviderSettings(state, { binaryPath: undefined }));
       console.log("Codex binary path reset to auto-detect.");
       return;
     }
@@ -132,14 +132,10 @@ export async function runCodexCommand(parsed: ParsedCodexArgs, context: CodexCom
       const installChannel = context.parseInstallChannel(context.getFlag(parsed, "install-channel"));
       const authenticationPreference = context.parseAuthenticationPreference(context.getFlag(parsed, "auth-preference"));
       const state = context.readState();
-      context.writeState({
-        ...state,
-        codex: {
-          ...state.codex,
-          ...(installChannel ? { installChannel } : {}),
-          ...(authenticationPreference ? { authenticationPreference } : {})
-        }
-      });
+      context.writeState(withBridgeCodexProviderSettings(state, {
+        ...(installChannel ? { installChannel } : {}),
+        ...(authenticationPreference ? { authenticationPreference } : {})
+      }));
       console.log("Codex settings saved.");
       return;
     }

@@ -84,6 +84,14 @@ export type BridgeCodexSettings = {
   authenticationPreference?: "chatgpt" | "api_key" | "device_code";
 };
 
+export type BridgeRuntimeProviderState = {
+  currentProviderId: string;
+  providers: Record<string, {
+    enabled: boolean;
+    settings: Record<string, unknown>;
+  }>;
+};
+
 export type BridgeToolStatus = {
   installed: boolean;
   binaryPath?: string;
@@ -110,6 +118,7 @@ export type BridgeAppState = {
   pendingAuth?: BridgePendingAuthState;
   codex?: BridgeCodexSettings;
   codexLogin?: CodexLoginProcessState;
+  runtimeProviders: BridgeRuntimeProviderState;
   device: BridgeDeviceState;
   remoteAccess: "off" | "on" | "registered-offline" | "unavailable";
   projectGrants: ProjectGrant[];
@@ -205,6 +214,7 @@ export function defaultBridgeAppState(): BridgeAppState {
     schema: "hunsu.bridge-app-state.v1",
     account: { status: "signed-out" },
     codex: defaultBridgeCodexSettings(),
+    runtimeProviders: defaultBridgeRuntimeProviderState(),
     device: defaultBridgeDeviceState(),
     remoteAccess: "off",
     projectGrants: [],
@@ -321,11 +331,22 @@ export function createBridgeAppSnapshot(input: {
 }
 
 export function normalizeBridgeAppState(parsed: Partial<BridgeAppState>): BridgeAppState {
+  const runtimeProviders = normalizeBridgeRuntimeProviderState(parsed.runtimeProviders);
+  const legacyBinaryPath = typeof parsed.codex?.binaryPath === "string" && parsed.codex.binaryPath.trim()
+    ? parsed.codex.binaryPath.trim()
+    : undefined;
+  const migratedRuntimeProviders = legacyBinaryPath && typeof runtimeProviders.providers.codex?.settings.binaryPath !== "string"
+    ? withBridgeCodexProviderSettings({
+        ...defaultBridgeAppState(),
+        runtimeProviders
+      }, { binaryPath: legacyBinaryPath }).runtimeProviders
+    : runtimeProviders;
   return {
     ...defaultBridgeAppState(),
     ...parsed,
     account: parsed.account ?? { status: "signed-out" },
     codex: parsed.codex ?? defaultBridgeCodexSettings(),
+    runtimeProviders: migratedRuntimeProviders,
     device: parsed.device ?? defaultBridgeDeviceState(),
     remoteAccess: parseBridgeRemoteAccessState(parsed.remoteAccess),
     projectGrants: Array.isArray(parsed.projectGrants) ? parsed.projectGrants : [],
@@ -338,6 +359,114 @@ export function defaultBridgeCodexSettings(): BridgeCodexSettings {
     installChannel: "stable",
     authenticationPreference: "chatgpt"
   };
+}
+
+export function bridgeCodexProviderSettings(state: BridgeAppState): BridgeCodexSettings {
+  const providerSettings = state.runtimeProviders.providers.codex?.settings ?? {};
+  return {
+    ...defaultBridgeCodexSettings(),
+    ...state.codex,
+    ...codexSettingsFromRecord(providerSettings)
+  };
+}
+
+export function withBridgeCodexProviderSettings(state: BridgeAppState, patch: Partial<BridgeCodexSettings>): BridgeAppState {
+  const currentSettings = state.runtimeProviders.providers.codex?.settings ?? {};
+  const nextSettings: Record<string, unknown> = { ...currentSettings };
+  if ("binaryPath" in patch) {
+    setOptionalStringSetting(nextSettings, "binaryPath", patch.binaryPath);
+  }
+  if ("installChannel" in patch) {
+    setOptionalStringSetting(nextSettings, "installChannel", patch.installChannel);
+  }
+  if ("authenticationPreference" in patch) {
+    setOptionalStringSetting(nextSettings, "authenticationPreference", patch.authenticationPreference);
+  }
+  const legacyCodex = { ...(state.codex ?? defaultBridgeCodexSettings()) };
+  delete legacyCodex.binaryPath;
+  return {
+    ...state,
+    codex: legacyCodex,
+    runtimeProviders: normalizeBridgeRuntimeProviderState({
+      ...state.runtimeProviders,
+      providers: {
+        ...state.runtimeProviders.providers,
+        codex: {
+          enabled: true,
+          settings: nextSettings
+        }
+      }
+    })
+  };
+}
+
+export function defaultBridgeRuntimeProviderState(): BridgeRuntimeProviderState {
+  return {
+    currentProviderId: "codex",
+    providers: {
+      codex: {
+        enabled: true,
+        settings: {}
+      }
+    }
+  };
+}
+
+export function normalizeBridgeRuntimeProviderState(value: unknown): BridgeRuntimeProviderState {
+  const defaults = defaultBridgeRuntimeProviderState();
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return defaults;
+  }
+  const object = value as Partial<BridgeRuntimeProviderState>;
+  const providers = typeof object.providers === "object" && object.providers !== null && !Array.isArray(object.providers)
+    ? Object.fromEntries(Object.entries(object.providers).map(([providerId, provider]) => {
+        const providerObject = typeof provider === "object" && provider !== null && !Array.isArray(provider)
+          ? provider as { enabled?: unknown; settings?: unknown }
+          : {};
+        const settings = typeof providerObject.settings === "object" && providerObject.settings !== null && !Array.isArray(providerObject.settings)
+          ? providerObject.settings as Record<string, unknown>
+          : {};
+        return [providerId, {
+          enabled: providerObject.enabled === false ? false : providerId === "codex",
+          settings
+        }];
+      }))
+    : {};
+  providers.codex = {
+    enabled: true,
+    settings: typeof providers.codex?.settings === "object" ? providers.codex.settings : {}
+  };
+  return {
+    currentProviderId: typeof object.currentProviderId === "string" && object.currentProviderId.trim()
+      ? object.currentProviderId.trim()
+      : defaults.currentProviderId,
+    providers
+  };
+}
+
+function codexSettingsFromRecord(record: Record<string, unknown>): Partial<BridgeCodexSettings> {
+  const binaryPath = typeof record.binaryPath === "string" && record.binaryPath.trim() ? record.binaryPath.trim() : undefined;
+  const installChannel = record.installChannel === "stable" || record.installChannel === "latest" || record.installChannel === "manual"
+    ? record.installChannel
+    : undefined;
+  const authenticationPreference = record.authenticationPreference === "chatgpt" || record.authenticationPreference === "api_key" || record.authenticationPreference === "device_code"
+    ? record.authenticationPreference
+    : undefined;
+  return {
+    ...(binaryPath ? { binaryPath } : {}),
+    ...(installChannel ? { installChannel } : {}),
+    ...(authenticationPreference ? { authenticationPreference } : {})
+  };
+}
+
+function setOptionalStringSetting(settings: Record<string, unknown>, key: string, value: unknown): void {
+  if (typeof value === "string" && value.trim()) {
+    settings[key] = value.trim();
+    return;
+  }
+  if (value === undefined) {
+    delete settings[key];
+  }
 }
 
 export function defaultBridgeDeviceState(): BridgeDeviceState {

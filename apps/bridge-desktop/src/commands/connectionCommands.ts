@@ -1,5 +1,11 @@
 import type { BridgeAppSnapshot, BridgeAppState } from "../state/appState.ts";
-import { bridgeVersionInfo, type BridgeRuntimeHandle } from "@hunsu/bridge";
+import {
+  bridgeVersionInfo,
+  createRemoteWorkspacePublication,
+  type BridgeRuntimeHandle,
+  type RoadmapRegistryEntry,
+  type RuntimeProviderStatus
+} from "@hunsu/bridge";
 import { currentProcessEnv, resolveRelayClientConfig, unwrapConfigResult } from "@hunsu/config";
 import { createDefaultCredentialStore } from "../auth.ts";
 import { startDetachedRemoteAccessProcess } from "../processes/backgroundSpawn.ts";
@@ -25,6 +31,9 @@ export type RemoteAccessRuntimeContext = {
   writeState: (state: BridgeAppState) => void;
   projectGrantsWithRemoteRelay: (projectGrants: ProjectGrant[]) => ProjectGrant[];
   activeManagedProjectGrants: (projectGrants: ProjectGrant[]) => ProjectGrant[];
+  currentProviderStatus: () => Promise<RuntimeProviderStatus>;
+  listManagedRoadmaps: () => RoadmapRegistryEntry[];
+  normalizeGrantPath: (path: string) => string;
   getFlag: (parsed: ParsedConnectionArgs, name: string) => string | undefined;
   hasFlag: (parsed: ParsedConnectionArgs, name: string) => boolean;
   resolvePath: (path: string) => string;
@@ -98,30 +107,32 @@ export async function runRemoteCommand(parsed: ParsedConnectionArgs, context: Re
       console.log("Run `hunsu-bridge login` to start device login.");
       return;
     }
-    const version = bridgeVersionInfo();
-    const device = {
-      deviceId: state.device.id,
-      deviceName: state.device.name,
-      userId: state.account.userId,
-      remoteAccess: "enabled" as const,
-      bridgeVersion: version.bridgeVersion,
-      bridgeAppVersion: context.appVersion,
-      protocolVersion: version.protocolVersion
-    };
-    const nextGrants = context.projectGrantsWithRemoteRelay(state.projectGrants);
-    const activeGrants = context.activeManagedProjectGrants(nextGrants);
+    const publication = await createDesktopRemotePublication(context);
+    const publicationGrants = projectGrantsFromPublication(publication);
+    const nextGrants = mergeProjectGrantsForPublication(
+      context.projectGrantsWithRemoteRelay(state.projectGrants),
+      publicationGrants,
+      context.normalizeGrantPath
+    );
+    const nextPublication = { ...publication, projectGrants: projectGrantsForPublication(nextGrants, publicationGrants, context.normalizeGrantPath) };
+    const device = remoteBridgeDeviceForState(state, context, {
+      status: "offline",
+      remoteAccess: "enabled",
+      provider: nextPublication.provider,
+      workspaces: nextPublication.workspaces,
+      projectGrants: nextPublication.projectGrants,
+      lastSnapshotAt: nextPublication.lastSnapshotAt
+    });
     const credentials = createDefaultCredentialStore({ path: context.credentialPath() }).read();
     const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
     if (credentials && relayConfig.relayApiUrl) {
       await registerRelayDevice({
         relayApiUrl: relayConfig.relayApiUrl,
         accessToken: credentials.accessToken,
-        device: {
-          ...device,
-          registeredAt: new Date().toISOString(),
-          status: "offline" as const
-        },
-        projectGrants: activeGrants
+        device,
+        projectGrants: nextPublication.projectGrants,
+        workspaces: nextPublication.workspaces,
+        lastSnapshotAt: nextPublication.lastSnapshotAt
       });
       context.writeStructuredLog({ event: "relay.device.registered", relayApiUrl: relayConfig.relayApiUrl, deviceId: state.device.id });
     } else {
@@ -184,24 +195,27 @@ export async function publishProjectGrantsToRelay(state: BridgeAppState, context
   if (!credentials || !relayConfig.relayApiUrl) {
     return;
   }
-  const activeGrants = context.activeManagedProjectGrants(state.projectGrants);
-  const version = bridgeVersionInfo();
+  const enabled = state.remoteAccess !== "off" && state.remoteAccess !== "unavailable";
+  const publication = enabled ? await createDesktopRemotePublication(context) : undefined;
+  const activeGrants = enabled
+    ? context.activeManagedProjectGrants(state.projectGrants)
+    : [];
+  const lastSnapshotAt = publication?.lastSnapshotAt ?? new Date().toISOString();
   try {
     await registerRelayDevice({
       relayApiUrl: relayConfig.relayApiUrl,
       accessToken: credentials.accessToken,
-      device: {
-        deviceId: state.device.id,
-        deviceName: state.device.name,
-        userId: state.account.userId,
-        registeredAt: new Date().toISOString(),
+      device: remoteBridgeDeviceForState(state, context, {
         status: "offline",
-        remoteAccess: "enabled",
-        bridgeVersion: version.bridgeVersion,
-        bridgeAppVersion: context.appVersion,
-        protocolVersion: version.protocolVersion
-      },
-      projectGrants: activeGrants
+        remoteAccess: enabled ? "enabled" : "disabled",
+        provider: publication?.provider,
+        workspaces: enabled ? publication?.workspaces ?? [] : [],
+        projectGrants: activeGrants,
+        lastSnapshotAt
+      }),
+      projectGrants: activeGrants,
+      workspaces: enabled ? publication?.workspaces ?? [] : [],
+      lastSnapshotAt
     });
     context.writeStructuredLog({ event: "relay.project-grants.published", relayApiUrl: relayConfig.relayApiUrl, deviceId: state.device.id, projectGrantCount: activeGrants.length });
   } catch (error) {
@@ -215,30 +229,32 @@ export async function enableRemoteAccessIfSignedIn(context: RemoteAccessRuntimeC
     context.writeState({ ...state, remoteAccess: "unavailable" });
     return;
   }
-  const nextGrants = context.projectGrantsWithRemoteRelay(state.projectGrants);
-  const activeGrants = context.activeManagedProjectGrants(nextGrants);
-  const version = bridgeVersionInfo();
-  const device = {
-    deviceId: state.device.id,
-    deviceName: state.device.name,
-    userId: state.account.userId,
-    remoteAccess: "enabled" as const,
-    bridgeVersion: version.bridgeVersion,
-    bridgeAppVersion: context.appVersion,
-    protocolVersion: version.protocolVersion
-  };
+  const publication = await createDesktopRemotePublication(context);
+  const publicationGrants = projectGrantsFromPublication(publication);
+  const nextGrants = mergeProjectGrantsForPublication(
+    context.projectGrantsWithRemoteRelay(state.projectGrants),
+    publicationGrants,
+    context.normalizeGrantPath
+  );
+  const nextPublication = { ...publication, projectGrants: projectGrantsForPublication(nextGrants, publicationGrants, context.normalizeGrantPath) };
+  const device = remoteBridgeDeviceForState(state, context, {
+    status: "offline",
+    remoteAccess: "enabled",
+    provider: nextPublication.provider,
+    workspaces: nextPublication.workspaces,
+    projectGrants: nextPublication.projectGrants,
+    lastSnapshotAt: nextPublication.lastSnapshotAt
+  });
   const credentials = createDefaultCredentialStore({ path: context.credentialPath() }).read();
   const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
   if (credentials && relayConfig.relayApiUrl) {
     await registerRelayDevice({
       relayApiUrl: relayConfig.relayApiUrl,
       accessToken: credentials.accessToken,
-      device: {
-        ...device,
-        registeredAt: new Date().toISOString(),
-        status: "offline" as const
-      },
-      projectGrants: activeGrants
+      device,
+      projectGrants: nextPublication.projectGrants,
+      workspaces: nextPublication.workspaces,
+      lastSnapshotAt: nextPublication.lastSnapshotAt
     });
     context.writeStructuredLog({ event: "relay.device.registered", relayApiUrl: relayConfig.relayApiUrl, deviceId: state.device.id });
   } else {
@@ -257,39 +273,36 @@ export async function enableRemoteAccessIfSignedIn(context: RemoteAccessRuntimeC
 export function startRelayIfConfigured(
   handle: Pick<BridgeRuntimeHandle, "bridgeApiUrl" | "authToken">,
   context: RemoteAccessRuntimeContext
-): RelayOutboundClient | undefined {
+): Promise<RelayOutboundClient | undefined> {
   const state = context.readState();
   const relayConfig = unwrapConfigResult(resolveRelayClientConfig(currentProcessEnv()));
   const credentials = createDefaultCredentialStore({ path: context.credentialPath() }).read();
   const relayUrl = relayConfig.relayWsUrl;
   if (!relayUrl || state.account?.status !== "signed-in" || !credentials) {
     context.writeStructuredLog({ event: "relay.not-started", reason: relayUrl ? credentials ? "signed-out" : "credentials-missing" : "relay-url-missing" });
-    return undefined;
+    return Promise.resolve(undefined);
   }
-  const version = bridgeVersionInfo();
-  const device = {
-    deviceId: state.device.id,
-    deviceName: state.device.name,
-    userId: state.account.userId,
-    registeredAt: new Date().toISOString(),
-    lastSeenAt: new Date().toISOString(),
-    status: "online" as const,
-    remoteAccess: "enabled" as const,
-    bridgeVersion: version.bridgeVersion,
-    bridgeAppVersion: context.appVersion,
-    protocolVersion: version.protocolVersion
-  };
-  const relayClient = new RelayOutboundClient({
-    relayUrl,
-    accessToken: credentials.accessToken,
-    device,
-    projectGrants: () => context.activeManagedProjectGrants(context.readState().projectGrants),
-    bridgeApiUrl: handle.bridgeApiUrl,
-    bridgeAuthToken: handle.authToken
+  return createDesktopRemotePublication(context).then(publication => {
+    const activeGrants = context.activeManagedProjectGrants(state.projectGrants);
+    const relayClient = new RelayOutboundClient({
+      relayUrl,
+      accessToken: credentials.accessToken,
+      device: remoteBridgeDeviceForState(state, context, {
+        status: "online",
+        remoteAccess: "enabled",
+        provider: publication.provider,
+        workspaces: publication.workspaces,
+        projectGrants: activeGrants,
+        lastSnapshotAt: publication.lastSnapshotAt
+      }),
+      projectGrants: () => context.activeManagedProjectGrants(context.readState().projectGrants),
+      bridgeApiUrl: handle.bridgeApiUrl,
+      bridgeAuthToken: handle.authToken
+    });
+    relayClient.start();
+    context.writeStructuredLog({ event: "relay.started", relayUrl, deviceId: state.device.id });
+    return relayClient;
   });
-  relayClient.start();
-  context.writeStructuredLog({ event: "relay.started", relayUrl, deviceId: state.device.id });
-  return relayClient;
 }
 
 export async function attachRemoteAccessCommand(context: RemoteAccessRuntimeContext): Promise<void> {
@@ -302,7 +315,7 @@ export async function attachRemoteAccessCommand(context: RemoteAccessRuntimeCont
     context.writeState({ ...state, remoteAccess: "registered-offline" });
     throw new Error("No running managed Bridge is available for Relay attachment.");
   }
-  const relayClient = startRelayIfConfigured({
+  const relayClient = await startRelayIfConfigured({
     bridgeApiUrl: state.bridgeApiUrl,
     authToken: state.authToken
   }, context);
@@ -377,4 +390,90 @@ export function writeRemoteAccessState(remoteAccess: BridgeAppState["remoteAcces
 
 function uniqueNumberList(values: Array<number | undefined>): number[] {
   return [...new Set(values.filter((value): value is number => Number.isInteger(value)))];
+}
+
+async function createDesktopRemotePublication(
+  context: RemoteAccessRuntimeContext
+): Promise<ReturnType<typeof createRemoteWorkspacePublication> & { provider: RuntimeProviderStatus }> {
+  const provider = await context.currentProviderStatus();
+  const publication = createRemoteWorkspacePublication(context.listManagedRoadmaps(), { provider });
+  return {
+    ...publication,
+    provider
+  };
+}
+
+function remoteBridgeDeviceForState(
+  state: BridgeAppState,
+  context: RemoteAccessRuntimeContext,
+  snapshot: {
+    status: "online" | "offline";
+    remoteAccess: "enabled" | "disabled";
+    provider?: RuntimeProviderStatus;
+    workspaces?: ReturnType<typeof createRemoteWorkspacePublication>["workspaces"];
+    projectGrants?: ProjectGrant[];
+    lastSnapshotAt?: string;
+  }
+) {
+  const version = bridgeVersionInfo();
+  return {
+    deviceId: state.device.id,
+    deviceName: state.device.name,
+    userId: state.account?.status === "signed-in" ? state.account.userId : "signed-out",
+    registeredAt: new Date().toISOString(),
+    lastSeenAt: snapshot.status === "online" ? new Date().toISOString() : undefined,
+    status: snapshot.status,
+    remoteAccess: snapshot.remoteAccess,
+    provider: snapshot.provider,
+    workspaces: snapshot.workspaces ?? [],
+    projectGrants: snapshot.projectGrants ?? [],
+    lastSnapshotAt: snapshot.lastSnapshotAt,
+    bridgeVersion: version.bridgeVersion,
+    bridgeAppVersion: context.appVersion,
+    protocolVersion: version.protocolVersion
+  };
+}
+
+function mergeProjectGrantsForPublication(
+  existingProjectGrants: ProjectGrant[],
+  publicationProjectGrants: ProjectGrant[],
+  normalizeGrantPath: (path: string) => string
+): ProjectGrant[] {
+  const publicationPaths = new Set(publicationProjectGrants.map(grant => normalizeGrantPath(grant.path)));
+  return [
+    ...projectGrantsForPublication(existingProjectGrants, publicationProjectGrants, normalizeGrantPath),
+    ...existingProjectGrants.filter(grant => !publicationPaths.has(normalizeGrantPath(grant.path)))
+  ];
+}
+
+function projectGrantsForPublication(
+  existingProjectGrants: ProjectGrant[],
+  publicationProjectGrants: ProjectGrant[],
+  normalizeGrantPath: (path: string) => string
+): ProjectGrant[] {
+  const existingByPath = new Map(existingProjectGrants.map(grant => [normalizeGrantPath(grant.path), grant]));
+  return publicationProjectGrants.map(grant => {
+    const existing = existingByPath.get(normalizeGrantPath(grant.path));
+    return {
+      ...grant,
+      grantedAt: existing?.grantedAt ?? grant.grantedAt,
+      scopes: uniqueScopeList([...(existing?.scopes ?? []), ...grant.scopes]),
+      active: true
+    };
+  });
+}
+
+function uniqueScopeList(scopes: ProjectGrant["scopes"]): ProjectGrant["scopes"] {
+  return [...new Set(scopes)];
+}
+
+function projectGrantsFromPublication(
+  publication: ReturnType<typeof createRemoteWorkspacePublication>
+): ProjectGrant[] {
+  return publication.projectGrants.map(grant => ({
+    path: grant.path,
+    grantedAt: grant.grantedAt ?? publication.lastSnapshotAt,
+    scopes: uniqueScopeList(grant.scopes as ProjectGrant["scopes"]),
+    active: grant.active === false ? false : true
+  }));
 }

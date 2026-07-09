@@ -14,6 +14,11 @@ struct FolderSelection {
 }
 
 #[derive(Serialize)]
+struct BinarySelection {
+    path: String,
+}
+
+#[derive(Serialize)]
 struct BridgeCommandOutput {
     status: i32,
     stdout: String,
@@ -36,6 +41,27 @@ async fn choose_project_folder(app: tauri::AppHandle) -> Result<Option<FolderSel
         .map(|path| {
             path.into_path()
                 .map(|path| FolderSelection {
+                    path: path.to_string_lossy().to_string(),
+                })
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+#[tauri::command]
+async fn choose_codex_binary(app: tauri::AppHandle) -> Result<Option<BinarySelection>, String> {
+    let picker = app.dialog().file();
+    #[cfg(target_os = "windows")]
+    let picker = picker
+        .set_title("Select codex.exe")
+        .add_filter("Codex executable", &["exe"]);
+    #[cfg(not(target_os = "windows"))]
+    let picker = picker.set_title("Select Codex executable");
+    let binary = picker.blocking_pick_file();
+    binary
+        .map(|path| {
+            path.into_path()
+                .map(|path| BinarySelection {
                     path: path.to_string_lossy().to_string(),
                 })
                 .map_err(|error| error.to_string())
@@ -562,6 +588,11 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
                 .ok_or_else(|| "hunsu://activate-roadmap requires roadmapId.".to_string())?;
             vec!["activate-roadmap".to_string(), roadmap_id]
         }
+        "activate-workspace" => {
+            let workspace_id = query_value(&query, "workspaceId")
+                .ok_or_else(|| "hunsu://activate-workspace requires workspaceId.".to_string())?;
+            vec!["activate-roadmap".to_string(), workspace_id]
+        }
         "sign-in" => vec!["login".to_string(), "--gui".to_string()],
         "sign-out" => vec!["logout".to_string()],
         "remote-disable" => vec!["remote".to_string(), "disable".to_string()],
@@ -631,6 +662,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_project_folder,
+            choose_codex_binary,
             open_external,
             start_bridge_sidecar,
             spawn_bridge_app_command,
@@ -728,6 +760,10 @@ mod tests {
             vec!["activate-roadmap", "roadmap_123"]
         );
         assert_eq!(
+            bridge_args_for_protocol_url("hunsu://activate-workspace?workspaceId=roadmap_123").unwrap(),
+            vec!["activate-roadmap", "roadmap_123"]
+        );
+        assert_eq!(
             bridge_args_for_protocol_url("hunsu://open-roadmap?roadmapId=roadmap_123").unwrap(),
             vec!["open-roadmap", "roadmap_123"]
         );
@@ -745,6 +781,7 @@ mod tests {
         assert!(bridge_args_for_protocol_url("hunsu://open-roadmap").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://open-workspace").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://activate-roadmap").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://activate-workspace").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=bad/id").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://open-project?path=%00tmp").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://add-roadmap?path=").is_err());

@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import type { ConnectedWorkspaceSummary, RuntimeProviderStatus } from "@hunsu/bridge";
 
 export type RelayCommandName =
   | "health"
@@ -65,7 +66,10 @@ export type RemoteBridgeDevice = {
   lastSeenAt?: string;
   status: "online" | "offline";
   remoteAccess?: "enabled" | "disabled";
-  provider?: unknown;
+  provider?: RuntimeProviderStatus;
+  workspaces?: ConnectedWorkspaceSummary[];
+  projectGrants?: ProjectGrant[];
+  lastSnapshotAt?: string;
   bridgeVersion?: string;
   bridgeAppVersion?: string;
   protocolVersion?: string;
@@ -109,7 +113,7 @@ export type RelayCommandEnvelope = {
 };
 
 export type RelayClientMessage =
-  | { type: "device.register"; device: RemoteBridgeDevice; projectGrants?: ProjectGrant[] }
+  | { type: "device.register"; device: RemoteBridgeDevice; projectGrants?: ProjectGrant[]; workspaces?: ConnectedWorkspaceSummary[]; lastSnapshotAt?: string }
   | { type: "device.heartbeat"; deviceId: string; at: string }
   | { type: "command.stream.event"; commandId: string; event?: string; data?: string }
   | { type: "command.result"; commandId: string; result: RelayCommandForwardResult | RelayCommandDecision };
@@ -356,9 +360,10 @@ export class RelayOutboundClient {
   }
 
   private sendHeartbeat(): void {
+    const device = this.options.device;
     this.send({
       type: "device.heartbeat",
-      deviceId: this.options.device.deviceId,
+      deviceId: device.deviceId,
       at: new Date().toISOString()
     });
   }
@@ -432,10 +437,19 @@ export class RelayOutboundClient {
   }
 
   private sendDeviceRegistration(): void {
+    const projectGrants = this.currentProjectGrants();
+    const device: RemoteBridgeDevice = {
+      ...this.options.device,
+      status: "online",
+      lastSeenAt: new Date().toISOString(),
+      projectGrants
+    };
     this.send({
       type: "device.register",
-      device: { ...this.options.device, status: "online", lastSeenAt: new Date().toISOString() },
-      projectGrants: this.currentProjectGrants()
+      device,
+      projectGrants,
+      workspaces: device.workspaces ?? [],
+      lastSnapshotAt: device.lastSnapshotAt
     });
   }
 
@@ -449,9 +463,14 @@ export async function registerRelayDevice(input: {
   accessToken: string;
   device: RemoteBridgeDevice;
   projectGrants?: ProjectGrant[];
+  workspaces?: ConnectedWorkspaceSummary[];
+  lastSnapshotAt?: string;
   fetchImpl?: typeof fetch;
 }): Promise<RemoteBridgeDevice> {
   const fetcher = input.fetchImpl ?? fetch;
+  const projectGrants = input.projectGrants ?? input.device.projectGrants ?? [];
+  const workspaces = input.workspaces ?? input.device.workspaces ?? [];
+  const lastSnapshotAt = input.lastSnapshotAt ?? input.device.lastSnapshotAt;
   const response = await fetcher(new URL("/v1/devices", input.relayApiUrl), {
     method: "POST",
     headers: {
@@ -459,8 +478,15 @@ export async function registerRelayDevice(input: {
       "content-type": "application/json"
     },
     body: JSON.stringify({
-      device: input.device,
-      projectGrants: input.projectGrants ?? []
+      device: {
+        ...input.device,
+        projectGrants,
+        workspaces,
+        lastSnapshotAt
+      },
+      projectGrants,
+      workspaces,
+      lastSnapshotAt
     })
   });
   const body = await response.json().catch(() => undefined) as { device?: RemoteBridgeDevice; error?: string } | undefined;

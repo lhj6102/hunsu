@@ -10,6 +10,7 @@ import type {
   BridgeProcessRuntimeMetadata,
   BridgeProcessStartMetadata
 } from "../state/appState.ts";
+import { bridgeCodexProviderSettings } from "../state/appState.ts";
 import type { ProjectGrant } from "../relay.ts";
 
 export const BRIDGE_PROCESS_NONCE_ENV = "HUNSU_BRIDGE_PROCESS_NONCE";
@@ -133,7 +134,7 @@ export function bridgeProcessEnvWithNonce(input: {
   nonce: string;
   activeProjectGrants: ProjectGrant[];
 }): NodeJS.ProcessEnv {
-  const codex = input.state.codex;
+  const codex = bridgeCodexProviderSettings(input.state);
   return {
     ...currentProcessEnv(),
     ...(codex?.binaryPath ? { HUNSU_CODEX_BINARY_PATH: codex.binaryPath } : {}),

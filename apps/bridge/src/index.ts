@@ -106,6 +106,7 @@ import {
   type CodexRuntimeStatus
 } from "./runtimes/codex.ts";
 import { createRuntimeProviderRegistry } from "./runtime-providers/registry.ts";
+import { createBridgeAppRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
 import {
   codexRuntimeStatusForResponse,
   type CodexLoginProcessState
@@ -133,6 +134,7 @@ import {
   createBridgeStatusForRequest,
   currentRuntimeProviderStatus
 } from "./server/bridgeStatus.ts";
+import { bridgeCodexBinaryPathFromBridgeAppState } from "./server/bridgeAppState.ts";
 import { createStudioHttpServer, studioRequestUrl } from "./server/createStudioServer.ts";
 import { handleRemoteBridgeRoute, handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
 import { baseCorsHeaders, createResponseSecurityHeaderStore } from "./server/security.ts";
@@ -144,7 +146,7 @@ export {
   getCodexRuntimeStatus,
   sanitizeDiagnostics
 } from "./runtimes/codex.ts";
-export type { CodexCliStatus, CodexRuntimeStatus } from "./runtimes/codex.ts";
+export type { CodexCliStatus, CodexDiscoveryCandidate, CodexRuntimeStatus } from "./runtimes/codex.ts";
 export { createRuntimeProviderRegistry, placeholderProvider } from "./runtime-providers/registry.ts";
 export { normalizeCodexRuntimeStatus, parseCodexDeviceAuthOutput } from "./runtime-providers/codex.ts";
 export type { CodexLoginProcessState } from "./runtime-providers/codex.ts";
@@ -164,6 +166,7 @@ export {
   connectRemoteBridge,
   connectRemoteBridgeForRequest,
   createRemoteBackendStatus,
+  createRemoteWorkspacePublication,
   listRemoteBridgeDevices,
   listRemoteBridgeDevicesForRequest,
   routeRemoteBridgeCommand,
@@ -2418,12 +2421,18 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     cwd: repositoryPath,
     roadmapRegistryPath: options.roadmapRegistryPath
   }));
+  const bridgeAppCodexBinaryPath = bridgeCodexBinaryPathFromBridgeAppState(runtimeConfig.processEnv);
+  if (bridgeAppCodexBinaryPath && !runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH?.trim()) {
+    runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH = bridgeAppCodexBinaryPath;
+    runtimeConfig.processEnv.HUNSU_CODEX_BINARY_PATH_SOURCE = "user_config";
+  }
   const roadmapRegistryPath = options.roadmapRegistryPath ?? runtimeConfig.roadmapRegistryPath;
   let runner = options.runner ?? createConfiguredRunner(runtimeConfig);
   const ownsRunner = options.runner === undefined;
   const actionRunner = options.actionRunner;
   const security = createStudioServerSecurity(options.security, runtimeConfig);
   const providerRegistry = createRuntimeProviderRegistry({
+    providerStateStore: createBridgeAppRuntimeProviderStore(runtimeConfig.processEnv),
     codex: {
       env: () => runtimeConfig.processEnv,
       loginState: state,

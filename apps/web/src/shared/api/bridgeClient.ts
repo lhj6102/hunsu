@@ -243,10 +243,6 @@ export async function fetchBridgeStatus(): Promise<BridgeStatusResponse> {
   if (!session || !status.connections.some(connection => connection.mode === "local")) {
     return status;
   }
-  const remoteBackendId = `remote:${session.deviceId}`;
-  if (status.connections.some(connection => connection.backendId === remoteBackendId)) {
-    return status;
-  }
   const command = remoteBridgeCommandForRequest("/api/bridge/status", "GET", undefined, session);
   if (!command) {
     return status;
@@ -264,12 +260,19 @@ function mergeBridgeStatuses(localStatus: BridgeStatusResponse, remoteStatus: Br
   if (remoteConnections.length === 0) {
     return localStatus;
   }
+  const remoteBackendIds = new Set(remoteConnections.map(connection => connection.backendId));
   return {
     ...localStatus,
-    connections: mergeBy(localStatus.connections, remoteConnections, connection => connection.backendId),
+    connections: mergeByReplacing(localStatus.connections, remoteConnections, connection => connection.backendId),
     workspaces: {
-      active: mergeBy(localStatus.workspaces.active, remoteStatus.workspaces.active, workspace => `${workspace.backendId}:${workspace.workspaceId}`),
-      managed: mergeBy(localStatus.workspaces.managed, remoteStatus.workspaces.managed, workspace => `${workspace.backendId}:${workspace.workspaceId}`)
+      active: [
+        ...localStatus.workspaces.active.filter(workspace => !remoteBackendIds.has(workspace.backendId)),
+        ...remoteStatus.workspaces.active
+      ],
+      managed: [
+        ...localStatus.workspaces.managed.filter(workspace => !remoteBackendIds.has(workspace.backendId)),
+        ...remoteStatus.workspaces.managed
+      ]
     },
     account: {
       signedIn: localStatus.account.signedIn || remoteStatus.account.signedIn,
@@ -279,9 +282,15 @@ function mergeBridgeStatuses(localStatus: BridgeStatusResponse, remoteStatus: Br
   };
 }
 
-function mergeBy<T>(left: T[], right: T[], key: (value: T) => string): T[] {
-  const seen = new Set(left.map(key));
-  const merged = [...left];
+function mergeByReplacing<T>(left: T[], right: T[], key: (value: T) => string): T[] {
+  const replacements = new Map(right.map(item => [key(item), item]));
+  const seen = new Set<string>();
+  const merged = left.map(item => {
+    const itemKey = key(item);
+    const replacement = replacements.get(itemKey);
+    seen.add(itemKey);
+    return replacement ?? item;
+  });
   for (const item of right) {
     const itemKey = key(item);
     if (!seen.has(itemKey)) {

@@ -66,7 +66,6 @@ import {
   canonicalBridgeUiIntentTab,
   bridgeAppStatePath as appStatePath,
   createBridgeAppSnapshot,
-  defaultBridgeCodexSettings,
   defaultBridgeServiceManager,
   formatBridgeRemoteAccess,
   hashBridgeDeviceSeed,
@@ -80,7 +79,8 @@ import {
   type BridgeProcessRuntimeMetadata,
   type BridgeRoadmapAccessSnapshot,
   type BridgeServiceState,
-  type BridgeUiIntent
+  type BridgeUiIntent,
+  bridgeCodexProviderSettings
 } from "./state/appState.ts";
 import {
   type BridgeCommandScope,
@@ -277,11 +277,11 @@ async function daemonCommand(parsed: ParsedArgs): Promise<void> {
     noOpen: hasFlag(parsed, "no-open"),
     mode: remote ? "remote-ready" : "local"
   });
-  let relayClient: ReturnType<typeof startRelayIfConfigured> | undefined;
+  let relayClient: Awaited<ReturnType<typeof startRelayIfConfigured>> | undefined;
   if (remote) {
     const remoteContext = remoteAccessRuntimeContext();
     await enableRemoteAccessIfSignedIn(remoteContext);
-    relayClient = startRelayIfConfigured(handle, remoteContext);
+    relayClient = await startRelayIfConfigured(handle, remoteContext);
     writeRemoteAccessState(relayClient && await waitForRelayConnection(relayClient) ? "on" : "registered-offline", remoteContext);
   }
   rememberRunningBridge(handle, cwd, getFlag(parsed, "web-url"));
@@ -753,6 +753,9 @@ function remoteAccessRuntimeContext() {
     writeState: writeAppState,
     projectGrantsWithRemoteRelay,
     activeManagedProjectGrants,
+    currentProviderStatus: async () => (await runtimeProvidersSnapshot()).current,
+    listManagedRoadmaps: () => listManagedRoadmapRegistry(roadmapRegistryOptions()),
+    normalizeGrantPath,
     getFlag: (parsed: { flags: Map<string, string | boolean> }, name: string) => {
       const value = parsed.flags.get(name);
       return typeof value === "string" ? value : undefined;
@@ -1122,7 +1125,9 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
 }
 
 async function runtimeProvidersSnapshot(): Promise<BridgeAppSnapshot["providers"] & BridgeAppSnapshot["runtimeProviders"]> {
+  const state = readAppState();
   const registry = createRuntimeProviderRegistry({
+    providerState: state.runtimeProviders,
     codex: {
       env: codexProbeEnv
     }
@@ -1141,7 +1146,9 @@ async function runtimeProvidersSnapshot(): Promise<BridgeAppSnapshot["providers"
 }
 
 async function runCodexInstallCli(options: { confirmed: boolean; dryRun: boolean }) {
+  const state = readAppState();
   const registry = createRuntimeProviderRegistry({
+    providerState: state.runtimeProviders,
     codex: {
       env: codexProbeEnv
     }
@@ -1170,15 +1177,19 @@ function codexCliActionContext() {
 
 function codexProbeEnv(): Record<string, string | undefined> {
   const state = readAppState();
+  const codexSettings = bridgeCodexProviderSettings(state);
   return {
     ...currentProcessEnv(),
-    ...(state.codex?.binaryPath ? { HUNSU_CODEX_BINARY_PATH: state.codex.binaryPath } : {})
+    ...(codexSettings.binaryPath ? {
+      HUNSU_CODEX_BINARY_PATH: codexSettings.binaryPath,
+      HUNSU_CODEX_BINARY_PATH_SOURCE: "user_config"
+    } : {})
   };
 }
 
 function snapshotCodexSettings(state: BridgeAppState): BridgeAppSnapshot["codexSettings"] {
   const env = codexProbeEnv();
-  const settings = state.codex ?? defaultBridgeCodexSettings();
+  const settings = bridgeCodexProviderSettings(state);
   return {
     ...settings,
     environment: sanitizeDiagnostics({
@@ -1779,6 +1790,7 @@ Deep links:
   hunsu://prerequisites
   hunsu://prerequisites/codex
   hunsu://activate-roadmap?roadmapId=<id>
+  hunsu://activate-workspace?workspaceId=<id>
   hunsu://open-project?path=/path/to/project
   hunsu://open-roadmap?roadmapId=<id>
 `);

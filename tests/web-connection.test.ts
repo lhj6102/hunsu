@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { BridgeConnectionState } from "../apps/web/src/shared/api/bridgeConnection.ts";
-import type { StudioConnectionStatus } from "../apps/web/src/shared/api/bridgeTypes.ts";
+import type { BridgeStatusResponse, StudioConnectionStatus } from "../apps/web/src/shared/api/bridgeTypes.ts";
 
 const TEST_ROOT = dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = resolve(TEST_ROOT, "../apps/web");
@@ -75,7 +75,7 @@ test("Roadmap workspace preflight actions map to Bridge App destinations", async
     assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex" }), "hunsu://provider");
     assert.equal(module.bridgeActionHref({ type: "login_provider", label: "Sign In" }), "hunsu://provider");
     assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Open Workspaces" }), "hunsu://workspaces");
-    assert.equal(module.bridgeActionHref({ type: "activate_workspace", label: "Activate Workspace", workspaceId: "workspace 123" }), "hunsu://open-workspace?workspaceId=workspace%20123");
+    assert.equal(module.bridgeActionHref({ type: "activate_workspace", label: "Activate Workspace", workspaceId: "workspace 123" }), "hunsu://activate-workspace?workspaceId=workspace%20123");
     assert.equal(module.bridgeActionHref({ type: "open_bridge_app", label: "Open Bridge App" }), "hunsu://open");
     assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Server href", href: "hunsu://workspaces" }), "hunsu://workspaces");
     assert.equal(module.bridgeActionHref({ type: "open_connection", label: "Open Connection" }), "hunsu://connection");
@@ -115,7 +115,7 @@ test("Roadmap workspace renders multiple server-provided preflight actions", asy
         workspaceId: "roadmap_123",
         actions: [
           { type: "open_workspaces", label: "Open Workspaces", href: "hunsu://workspaces" },
-          { type: "activate_workspace", label: "Activate Workspace", href: "hunsu://open-workspace?workspaceId=roadmap_123" }
+          { type: "activate_workspace", label: "Activate Workspace", href: "hunsu://activate-workspace?workspaceId=roadmap_123" }
         ]
       },
       open: () => undefined
@@ -348,10 +348,12 @@ test("Connection footer surfaces selected remote provider readiness", async () =
       }
     }));
 
-    assert.match(html, /Remote Bridge/);
-    assert.match(html, /Remote Devbox · Codex login required/);
-    assert.match(html, /Remote Provider/);
-    assert.match(html, /Codex · Login required/);
+    assert.match(html, /Local Bridge/);
+    assert.match(html, /This computer · Codex ready/);
+    assert.match(html, /Provider/);
+    assert.match(html, /Codex · Ready/);
+    assert.match(html, /Remote/);
+    assert.match(html, /Codex login required/);
     assert.match(html, /Remote Workspace/);
   } finally {
     await close();
@@ -1006,6 +1008,109 @@ test("Web Bridge status keeps local and selected remote workspaces together", as
   }
 });
 
+test("Web Bridge status refreshes selected remote status over stale relay snapshot", async () => {
+  const calls: Array<{ origin: string; pathname: string; command?: string }> = [];
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>([
+    ["hunsu.bridgeApiToken", "local-token"],
+    ["hunsu.remoteBridgeSession", JSON.stringify({
+      deviceId: "device_1",
+      deviceName: "Remote Devbox",
+      projectPath: "/tmp/hunsu-project",
+      webUserId: "user_1",
+      relayAccessToken: "relay-token"
+    })]
+  ]);
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio",
+      origin: "https://studio.example.test"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url, init) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    if (requestUrl.pathname === "/api/bridge/status") {
+      calls.push({ origin: requestUrl.origin, pathname: requestUrl.pathname });
+      const staleWorkspace = {
+        workspaceId: "roadmap_stale",
+        roadmapId: "roadmap_stale",
+        displayName: "Stale Relay Workspace",
+        lifecycle: "active",
+        health: "ok",
+        backendId: "remote:device_1",
+        connectionMode: "remote",
+        provider: { providerId: "codex", label: "Codex", readyForExecute: false },
+        actions: ["open_studio"]
+      };
+      return new Response(JSON.stringify({
+        provider: providerFixture(),
+        connections: [
+          {
+            backendId: "local",
+            mode: "local",
+            label: "This computer",
+            provider: providerFixture(),
+            connection: { state: "connected" },
+            workspaces: []
+          },
+          {
+            backendId: "remote:device_1",
+            mode: "remote",
+            label: "Remote Devbox",
+            provider: providerFixture({ ready: false, recommendedAction: "recheck" }),
+            connection: { state: "connected" },
+            workspaces: [staleWorkspace]
+          }
+        ],
+        workspaces: {
+          active: [staleWorkspace],
+          managed: [staleWorkspace]
+        },
+        account: { signedIn: true, userId: "user_1" }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    const command = JSON.parse(String(init?.body ?? "{}")) as { command: string };
+    calls.push({ origin: requestUrl.origin, pathname: requestUrl.pathname, command: command.command });
+    return new Response(JSON.stringify({
+      ok: true,
+      status: 200,
+      body: remoteCommandBody(command.command)
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  const { module, close } = await loadBridgeClientModule();
+  try {
+    const status = await module.fetchBridgeStatus();
+    const remoteConnection = status.connections.find(connection => connection.backendId === "remote:device_1");
+    assert.equal(remoteConnection?.workspaces.length, 1);
+    assert.equal(remoteConnection?.workspaces[0]?.displayName, "Remote Workspace");
+    assert.deepEqual(status.workspaces.active.map(workspace => workspace.displayName), ["Remote Workspace"]);
+    assert.deepEqual(calls, [
+      { origin: "https://studio.example.test", pathname: "/api/bridge/status" },
+      { origin: "https://relay.example.test", pathname: "/v1/commands", command: "bridge.status" }
+    ]);
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+  }
+});
+
 test("Web Roadmap workspace APIs prefer local Bridge when local and remote sessions both exist", async () => {
   const fetches: Array<{ method: string; pathname: string; authorization?: string }> = [];
   const eventSourceUrls: string[] = [];
@@ -1583,10 +1688,7 @@ async function loadBridgeClientModule(): Promise<{
   module: {
     fetchRemoteBridgeDevices: () => Promise<Array<{ deviceName: string }>>;
     postRemoteBridgeConnect: (input: { deviceId: string; webUserId?: string; projectPath?: string }) => Promise<{ connection: StudioConnectionStatus }>;
-    fetchBridgeStatus: () => Promise<{
-      connections: Array<{ mode: string; label: string; workspaces: Array<{ displayName: string; path?: string; pathRedacted?: boolean }> }>;
-      workspaces: { active: Array<{ displayName: string; path?: string; pathRedacted?: boolean }> };
-    }>;
+    fetchBridgeStatus: () => Promise<BridgeStatusResponse>;
     fetchRoadmapRegistry: () => Promise<unknown[]>;
     fetchBoard: (roadmapId: string) => Promise<unknown>;
     fetchWorktree: (roadmapId: string) => Promise<unknown>;

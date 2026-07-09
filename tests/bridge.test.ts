@@ -94,6 +94,11 @@ test("Bridge server exposes named modular HTTP boundaries", () => {
   assert.match(readFileSync(join(root, "apps/bridge/src/server/createStudioServer.ts"), "utf8"), /createStudioHttpServer/);
   const routesSource = readFileSync(join(root, "apps/bridge/src/server/routes.ts"), "utf8");
   const providerRoutesSource = readFileSync(join(root, "apps/bridge/src/providers/providerRoutes.ts"), "utf8");
+  const legacyCodexRuntimeSource = readFileSync(join(root, "apps/bridge/src/runtimes/codex.ts"), "utf8");
+  const codexDetectionSource = readFileSync(join(root, "apps/bridge/src/runtime-providers/codex/codexDetection.ts"), "utf8");
+  const codexStatusSource = readFileSync(join(root, "apps/bridge/src/runtime-providers/codex/codexStatus.ts"), "utf8");
+  const codexLoginSource = readFileSync(join(root, "apps/bridge/src/runtime-providers/codex/codexLogin.ts"), "utf8");
+  const codexInstallSource = readFileSync(join(root, "apps/bridge/src/runtime-providers/codex/codexInstall.ts"), "utf8");
   const connectionRoutesSource = readFileSync(join(root, "apps/bridge/src/connections/connectionRoutes.ts"), "utf8");
   const workspaceRoutesSource = readFileSync(join(root, "apps/bridge/src/workspaces/workspaceRoutes.ts"), "utf8");
   const executePreflightSource = readFileSync(join(root, "apps/bridge/src/executes/executePreflight.ts"), "utf8");
@@ -117,6 +122,12 @@ test("Bridge server exposes named modular HTTP boundaries", () => {
   assert.match(routesSource, /\/api\/artifact-actions/);
   assert.match(providerRoutesSource, /\/api\/runtimes\/codex\/login\/device/);
   assert.match(providerRoutesSource, /\/api\/providers\/current/);
+  assert.doesNotMatch(legacyCodexRuntimeSource, /execFile|spawn|function detectCodexBinary|function getCodexRuntimeStatus/);
+  assert.match(codexDetectionSource, /async function windowsRegistryPath/);
+  assert.match(codexDetectionSource, /powershellCodexCandidates/);
+  assert.match(codexStatusSource, /export async function getCodexRuntimeStatus/);
+  assert.match(codexLoginSource, /export async function spawnCodexDeviceLogin/);
+  assert.match(codexInstallSource, /runDefaultCodexInstaller/);
   assert.match(connectionRoutesSource, /\/api\/connections\/remote\/enable/);
   assert.match(workspaceRoutesSource, /\/api\/workspaces\/active/);
   assert.match(workspaceRoutesSource, /\/api\/roadmaps\/recent/);
@@ -341,7 +352,7 @@ test("Bridge Execute preflight separates Roadmap readiness from Codex readiness"
   assert.equal(inactiveResponse.body.error, "WORKSPACE_INACTIVE");
   assert.equal(inactiveResponse.body.runtime, undefined);
   assert.deepEqual(inactiveResponse.body.actions.map((action: { type: string }) => action.type), ["open_workspaces", "activate_workspace"]);
-  assert.match(inactiveResponse.body.actions.find((action: { type: string; href?: string }) => action.type === "activate_workspace")?.href ?? "", /^hunsu:\/\/open-workspace\?workspaceId=/);
+  assert.match(inactiveResponse.body.actions.find((action: { type: string; href?: string }) => action.type === "activate_workspace")?.href ?? "", /^hunsu:\/\/activate-workspace\?workspaceId=/);
 
   const unhealthyServer = createStudioServer({ cwd: repoUnhealthyPlainGit, state, persist: true, roadmapRegistryPath: registryPath });
   const unhealthyResponse = await requestStudioServerJson(unhealthyServer, "POST", "/api/runs/start", body);
@@ -378,7 +389,7 @@ test("Bridge runtime provider facade maps Codex status and registry placeholders
     cli: {
       installed: true,
       binaryPath: "/usr/local/bin/codex",
-      source: "path",
+      source: "process_path",
       version: "codex 1.2.3",
       installActionAvailable: false
     },
@@ -461,7 +472,24 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
       userId: "user_1",
       registeredAt: "2026-07-09T00:00:00.000Z",
       lastSeenAt: "2026-07-09T00:01:00.000Z",
-      status: "online"
+      status: "online",
+      lastSnapshotAt: "2026-07-09T00:01:00.000Z",
+      workspaces: [{
+        workspaceId: "remote_workspace_1",
+        roadmapId: "remote_workspace_1",
+        displayName: "remote-workspace",
+        path: "/remote/active-workspace",
+        lifecycle: "active",
+        health: "ok",
+        backendId: "local",
+        connectionMode: "local",
+        provider: {
+          providerId: "codex",
+          label: "Codex",
+          readyForExecute: false
+        },
+        actions: ["open_studio"]
+      }]
     }]
   }, null, 2)}\n`, "utf8");
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
@@ -498,7 +526,7 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
   assert.equal(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.provider.providerId, "remote:device_1:provider");
   assert.match(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.provider.safeMessage ?? "", /Remote provider status is not available/);
   const remoteWorkspace = status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.workspaces[0];
-  assert.equal(remoteWorkspace?.displayName, "active-workspace");
+  assert.equal(remoteWorkspace?.displayName, "remote-workspace");
   assert.equal(remoteWorkspace?.path, undefined);
   assert.equal(remoteWorkspace?.pathRedacted, true);
 
@@ -506,7 +534,7 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
     schema: "hunsu.bridge-app-state.v1",
     account: { status: "signed-in", userId: "user_1", email: "user_1@example.test" },
     projectGrants: [{
-      path: active.repository.root,
+      path: "/remote/active-workspace",
       grantedAt: "2026-07-09T00:02:00.000Z",
       scopes: ["remoteRelay.access"]
     }]
@@ -516,18 +544,18 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
   const persistedRemoteWorkspace = persistedStatus.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.workspaces[0];
   assert.equal(persistedStatus.body.account.signedIn, true);
   assert.equal(persistedStatus.body.account.email, "user_1@example.test");
-  assert.equal(persistedRemoteWorkspace?.path, active.repository.root);
+  assert.equal(persistedRemoteWorkspace?.path, "/remote/active-workspace");
   assert.equal(persistedRemoteWorkspace?.pathRedacted, undefined);
 
   runtimeConfig.processEnv.HUNSU_BRIDGE_ACCOUNT_USER_ID = "user_1";
   runtimeConfig.processEnv.HUNSU_BRIDGE_PROJECT_GRANTS_JSON = JSON.stringify([{
-    path: active.repository.root,
+    path: "/remote/active-workspace",
     scopes: ["remoteRelay.access"]
   }]);
   const grantedStatus = await requestStudioServerJson(server, "GET", "/api/bridge/status");
   const grantedRemoteWorkspace = grantedStatus.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.workspaces[0];
   assert.equal(grantedStatus.body.account.signedIn, true);
-  assert.equal(grantedRemoteWorkspace?.path, active.repository.root);
+  assert.equal(grantedRemoteWorkspace?.path, "/remote/active-workspace");
   assert.equal(grantedRemoteWorkspace?.pathRedacted, undefined);
 
   const activeWorkspaces = await requestStudioServerJson(server, "GET", "/api/workspaces/active");
@@ -708,6 +736,11 @@ test("Bridge remote enable publishes active workspaces and project grants", asyn
     assert.deepEqual(enabled.body.device.projectGrants.map((grant: { path: string }) => grant.path), [active.repository.root]);
     assert.equal(enabled.body.device.projectGrants[0].scopes.includes("remoteRelay.access"), true);
     assert.equal(enabled.body.device.projectGrants[0].scopes.includes("execute.start"), true);
+    assert.deepEqual(enabled.body.device.workspaces.map((workspace: { workspaceId: string }) => workspace.workspaceId), [active.roadmap.roadmapId]);
+    assert.equal(enabled.body.device.workspaces[0].displayName, "active-workspace");
+    assert.equal(enabled.body.device.workspaces[0].path, undefined);
+    assert.equal(enabled.body.device.workspaces[0].pathRedacted, true);
+    assert.equal(typeof enabled.body.device.lastSnapshotAt, "string");
 
     const managed = listManagedRoadmapRegistry({ roadmapRegistryPath: registryPath });
     const activeEntry = managed.find(entry => entry.roadmapId === active.roadmap.roadmapId);
@@ -719,11 +752,15 @@ test("Bridge remote enable publishes active workspaces and project grants", asyn
 
     const remoteConnections = await requestStudioServerJson(server, "GET", "/api/connections/remote");
     assert.equal(remoteConnections.body.connections[0]?.workspaces[0]?.workspaceId, active.roadmap.roadmapId);
+    assert.equal(remoteConnections.body.connections[0]?.workspaces[0]?.path, undefined);
+    assert.equal(remoteConnections.body.connections[0]?.workspaces[0]?.pathRedacted, true);
     assert.equal(remoteConnections.body.connections[0]?.workspaces.some((workspace: { workspaceId: string }) => workspace.workspaceId === inactive.roadmap.roadmapId), false);
 
     const device = listRemoteBridgeDevices({ relayRegistryPath, userId: "user_publish" })[0];
     assert.equal(device?.deviceId, "device_publish");
     assert.equal(device?.projectGrants?.[0]?.path, active.repository.root);
+    assert.equal(device?.workspaces?.[0]?.workspaceId, active.roadmap.roadmapId);
+    assert.equal(device?.workspaces?.[0]?.pathRedacted, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -815,16 +852,16 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
 
     const pathReady = await getCodexRuntimeStatus({ env: { PATH: root }, force: true });
     assert.equal(pathReady.cli.installed, true);
-    assert.equal(pathReady.cli.source, "path");
+    assert.equal(pathReady.cli.source, "process_path");
 
     rmSync(countFile, { force: true });
     const counted = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: fakeCodex }, force: true });
     assert.equal(counted.ready, true);
-    assert.equal(readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 1);
+    assert.equal(readFileSync(countFile, "utf8").trim().split(/\r?\n/).length, 2);
 
     const ready = await getCodexRuntimeStatus({ env: { PATH: "", HUNSU_CODEX_BINARY_PATH: fakeCodex }, force: true });
     assert.equal(ready.cli.installed, true);
-    assert.equal(ready.cli.source, "custom");
+    assert.equal(ready.cli.source, "env");
     assert.equal(ready.cli.version, "codex 1.2.3");
     assert.equal(ready.appServer.available, true);
     assert.equal(ready.auth.state, "authenticated");
@@ -967,7 +1004,17 @@ test("Bridge runtime Codex device login endpoint returns device-code details", a
   const fakeCodex = join(root, "codex");
   writeFileSync(fakeCodex, [
     `#!${process.execPath}`,
+    "const readline = require('node:readline');",
     "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] === 'app-server') {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "  });",
+    "  return;",
+    "}",
     "if (args[0] === 'login' && args[1] === '--device-auth') {",
     "  console.log('Open https://auth.openai.com/activate?user_code=HUNSU-1234');",
     "  console.log('Code: HUNSU-1234');",
@@ -1049,6 +1096,7 @@ test("Bridge runtime Codex ChatGPT login endpoint records pending state and auth
 test("Bridge provider facade login and configure endpoints use the Codex adapter", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-provider-facade-test-"));
   const fakeCodex = join(root, "codex");
+  const bridgeAppStatePath = join(root, "bridge-app-state.json");
   writeFileSync(fakeCodex, [
     `#!${process.execPath}`,
     "const readline = require('node:readline');",
@@ -1071,7 +1119,8 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
   chmodSync(fakeCodex, 0o755);
   try {
     const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
-      PATH: ""
+      PATH: "",
+      HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
     }, { cwd: root }));
     const state = createStudioState();
     const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
@@ -1085,6 +1134,12 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
     const current = await requestStudioServerJson(server, "GET", "/api/providers/current");
     assert.equal(current.body.ready, true);
     assert.equal(current.body.install.binaryPath, fakeCodex);
+    const persistedState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
+      codex?: { binaryPath?: string };
+      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string } } } };
+    };
+    assert.equal(persistedState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
+    assert.equal(persistedState.codex?.binaryPath, undefined);
 
     const login = await requestStudioServerJson(server, "POST", "/api/providers/current/login", { method: "chatgpt" });
     assert.equal(login.status, 202);
@@ -1141,73 +1196,196 @@ test("Bridge provider install endpoint requires confirmation and supports dry-ru
 
 test("Bridge Codex Windows detection checks process, user, machine PATH, known install dirs, and WindowsApps aliases", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-windows-path-test-"));
+  const customPath = join(root, "custom", "codex.exe");
+  const envPath = join(root, "env", "codex.exe");
   const processPath = join(root, "process-path");
-  const pathKeyPath = join(root, "path-key");
   const userPath = join(root, "user-path");
   const machinePath = join(root, "machine-path");
+  const whereToolsPath = join(root, "where-tools");
+  const whereTargetPath = join(root, "where-target");
+  const powershellToolsPath = join(root, "powershell-tools");
+  const powershellTargetPath = join(root, "powershell-target");
   const localAppData = join(root, "local-app-data");
-  const knownInstallPath = join(localAppData, "Programs", "OpenAI Codex");
-  const windowsAppsPath = join(root, "WindowsApps");
-  for (const dir of [processPath, pathKeyPath, userPath, machinePath, knownInstallPath, windowsAppsPath]) {
+  const aliasLocalAppData = join(root, "alias-local-app-data");
+  const knownInstallPath = join(localAppData, "OpenAI", "Codex", "bin", "1.2.3");
+  const windowsAppsPath = join(aliasLocalAppData, "Microsoft", "WindowsApps");
+  for (const dir of [processPath, userPath, machinePath, whereToolsPath, whereTargetPath, powershellToolsPath, powershellTargetPath, knownInstallPath, windowsAppsPath, join(root, "custom"), join(root, "env")]) {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "codex.EXE"), "fake windows executable", "utf8");
   }
+  const writeFakeCodex = (path: string) => {
+    writeFileSync(path, [
+      `#!${process.execPath}`,
+      "const readline = require('node:readline');",
+      "const args = process.argv.slice(2);",
+      "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+      "if (args[0] === 'app-server' && args[1] === '--stdio') {",
+      "  const rl = readline.createInterface({ input: process.stdin });",
+      "  rl.on('line', line => {",
+      "    const msg = JSON.parse(line);",
+      "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+      "  });",
+      "  return;",
+      "}",
+      "process.exit(2);",
+      ""
+    ].join("\n"), "utf8");
+    chmodSync(path, 0o755);
+  };
+  writeFakeCodex(customPath);
+  writeFakeCodex(envPath);
+  writeFakeCodex(join(processPath, "codex.EXE"));
+  writeFakeCodex(join(userPath, "codex.EXE"));
+  writeFakeCodex(join(machinePath, "codex.EXE"));
+  writeFakeCodex(join(whereTargetPath, "codex.exe"));
+  writeFakeCodex(join(powershellTargetPath, "codex.exe"));
+  writeFakeCodex(join(knownInstallPath, "codex.exe"));
+  writeFileSync(join(windowsAppsPath, "codex.exe"), "WindowsApps alias placeholder", "utf8");
+  writeFileSync(join(whereToolsPath, "where.exe"), [
+    `#!${process.execPath}`,
+    `console.log(${JSON.stringify(join(whereTargetPath, "codex.exe"))});`,
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(join(whereToolsPath, "where.exe"), 0o755);
+  writeFileSync(join(powershellToolsPath, "powershell.exe"), [
+    `#!${process.execPath}`,
+    `console.log(${JSON.stringify(join(powershellTargetPath, "codex.exe"))});`,
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(join(powershellToolsPath, "powershell.exe"), 0o755);
   try {
+    const fromCustomPath = await detectCodexBinary({
+      customBinaryPath: customPath,
+      env: { PATH: processPath, HUNSU_CODEX_BINARY_PATH: envPath, PATHEXT: ".EXE;.CMD" },
+      platform: "win32"
+    });
+    assert.equal(fromCustomPath.installed, true);
+    assert.equal(fromCustomPath.binaryPath, customPath);
+    assert.equal(fromCustomPath.source, "custom");
+
+    const fromEnvPath = await detectCodexBinary({
+      env: { PATH: "", HUNSU_CODEX_BINARY_PATH: envPath, PATHEXT: ".EXE;.CMD" },
+      platform: "win32"
+    });
+    assert.equal(fromEnvPath.installed, true);
+    assert.equal(fromEnvPath.binaryPath, envPath);
+    assert.equal(fromEnvPath.source, "env");
+
     const fromProcessPath = await detectCodexBinary({
       env: { PATH: processPath, PATHEXT: ".EXE;.CMD" },
-      platform: "win32",
-      force: true
+      platform: "win32"
     });
     assert.equal(fromProcessPath.installed, true);
     assert.equal(fromProcessPath.binaryPath, join(processPath, "codex.EXE"));
-
-    const fromWindowsPathKey = await detectCodexBinary({
-      env: { Path: pathKeyPath, PATHEXT: ".EXE" },
-      platform: "win32",
-      force: true
-    });
-    assert.equal(fromWindowsPathKey.installed, true);
-    assert.equal(fromWindowsPathKey.binaryPath, join(pathKeyPath, "codex.EXE"));
+    assert.equal(fromProcessPath.source, "process_path");
 
     const fromUserPath = await detectCodexBinary({
-      env: { PATH: "", HUNSU_WINDOWS_USER_PATH: userPath, PATHEXT: ".EXE" },
-      platform: "win32",
-      force: true
+      env: { PATH: "", HUNSU_WINDOWS_USER_PATH: "%HUNSU_FAKE_USER_PATH%", HUNSU_FAKE_USER_PATH: userPath, PATHEXT: ".EXE" },
+      platform: "win32"
     });
     assert.equal(fromUserPath.installed, true);
     assert.equal(fromUserPath.binaryPath, join(userPath, "codex.EXE"));
+    assert.equal(fromUserPath.source, "registry_user_path");
 
     const fromMachinePath = await detectCodexBinary({
-      env: { PATH: "", HUNSU_WINDOWS_MACHINE_PATH: machinePath, PATHEXT: ".EXE" },
-      platform: "win32",
-      force: true
+      env: { PATH: "", HUNSU_WINDOWS_MACHINE_PATH: "%HUNSU_FAKE_MACHINE_PATH%", HUNSU_FAKE_MACHINE_PATH: machinePath, PATHEXT: ".EXE" },
+      platform: "win32"
     });
     assert.equal(fromMachinePath.installed, true);
     assert.equal(fromMachinePath.binaryPath, join(machinePath, "codex.EXE"));
+    assert.equal(fromMachinePath.source, "registry_machine_path");
+
+    const fromWhere = await detectCodexBinary({
+      env: { PATH: whereToolsPath, PATHEXT: ".EXE" },
+      platform: "win32"
+    });
+    assert.equal(fromWhere.installed, true);
+    assert.equal(fromWhere.binaryPath, join(whereTargetPath, "codex.exe"));
+    assert.equal(fromWhere.source, "where");
+
+    const fromPowerShell = await detectCodexBinary({
+      env: { PATH: powershellToolsPath, PATHEXT: ".EXE" },
+      platform: "win32"
+    });
+    assert.equal(fromPowerShell.installed, true);
+    assert.equal(fromPowerShell.binaryPath, join(powershellTargetPath, "codex.exe"));
+    assert.equal(fromPowerShell.source, "powershell_get_command");
 
     const fromKnownInstallDir = await detectCodexBinary({
       env: { PATH: "", LOCALAPPDATA: localAppData, PATHEXT: ".EXE" },
-      platform: "win32",
-      force: true
+      platform: "win32"
     });
     assert.equal(fromKnownInstallDir.installed, true);
-    assert.equal(fromKnownInstallDir.binaryPath, join(knownInstallPath, "codex.EXE"));
+    assert.equal(fromKnownInstallDir.binaryPath, join(knownInstallPath, "codex.exe"));
     assert.equal(fromKnownInstallDir.source, "known_install_dir");
+    assert.deepEqual(fromKnownInstallDir.discovery?.map(candidate => candidate.source), ["known_install_dir"]);
 
     const alias = await detectCodexBinary({
-      env: { PATH: windowsAppsPath, PATHEXT: ".EXE" },
-      platform: "win32",
-      force: true
+      env: { PATH: "", LOCALAPPDATA: aliasLocalAppData, PATHEXT: ".EXE" },
+      platform: "win32"
     });
     assert.equal(alias.installed, false);
+    assert.equal(alias.source, "windows_apps_alias");
     assert.match(alias.error ?? "", /WindowsApps/i);
 
     const aliasStatus = await getCodexRuntimeStatus({
-      env: { PATH: windowsAppsPath, PATHEXT: ".EXE" },
+      env: { PATH: "", LOCALAPPDATA: aliasLocalAppData, PATHEXT: ".EXE" },
       platform: "win32",
       force: true
     });
     assert.equal(aliasStatus.recommendedAction, "select_binary");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge Codex Windows validation launches npm .cmd shims through cmd.exe", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-windows-cmd-test-"));
+  const codexCmd = join(root, "codex.cmd");
+  const fakeComspec = join(root, "cmd.exe");
+  const invocationLog = join(root, "cmd-invocations.log");
+  writeFileSync(codexCmd, "@echo off\r\n", "utf8");
+  writeFileSync(fakeComspec, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    `fs.appendFileSync(${JSON.stringify(invocationLog)}, args.join(' ') + '\\n');`,
+    "const commandLine = args.join(' ');",
+    "if (commandLine.includes('--version')) { console.log('codex 4.5.6'); process.exit(0); }",
+    "if (commandLine.includes('app-server') && commandLine.includes('--stdio')) {",
+    "  const rl = readline.createInterface({ input: process.stdin });",
+    "  rl.on('line', line => {",
+    "    const msg = JSON.parse(line);",
+    "    if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "    else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'cmd@example.test' } }));",
+    "    else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
+    "  });",
+    "  return;",
+    "}",
+    "process.exit(9);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeComspec, 0o755);
+  try {
+    const env = {
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: codexCmd,
+      COMSPEC: fakeComspec,
+      PATHEXT: ".EXE;.CMD;.BAT"
+    };
+    const detected = await detectCodexBinary({ env, platform: "win32", timeoutMs: 500 });
+    assert.equal(detected.installed, true);
+    assert.equal(detected.binaryPath, codexCmd);
+    assert.equal(detected.version, "codex 4.5.6");
+    assert.equal(detected.appServerAvailable, true);
+
+    rmSync(invocationLog, { force: true });
+    const status = await getCodexRuntimeStatus({ env, platform: "win32", force: true, timeoutMs: 500 });
+    assert.equal(status.ready, true);
+    assert.equal(status.cli.binaryPath, codexCmd);
+    const invocations = readFileSync(invocationLog, "utf8").trim().split(/\r?\n/);
+    assert.equal(invocations.some(line => line.includes("/c") && line.includes("codex.cmd") && line.includes("--version")), true);
+    assert.equal(invocations.filter(line => line.includes("/c") && line.includes("codex.cmd") && line.includes("app-server")).length >= 2, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1316,7 +1494,7 @@ test("Bridge runtime Codex device login tracker captures later output and failur
     assert.equal(started.status, 202);
     assert.equal(started.body.state, "pending");
 
-    await delay(1200);
+    await delay(2500);
     const prerequisites = await requestStudioServerJson(server, "GET", "/api/prerequisites");
     assert.equal(prerequisites.body.codexLogin.status, "device_code");
     assert.equal(prerequisites.body.codexLogin.userCode, "HUNSU-LATE");

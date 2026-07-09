@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createDefaultCredentialStore } from "../auth.ts";
 import { FileRelayRegistry, type ProjectGrant } from "../relay.ts";
-import type { BridgeAppState, BridgeToolStatus } from "../state/appState.ts";
+import { bridgeCodexProviderSettings, type BridgeAppState, type BridgeToolStatus } from "../state/appState.ts";
 import { bridgeVersionInfo, listManagedRoadmapRegistry, sanitizeDiagnostics } from "@hunsu/bridge";
 import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, unwrapConfigResult } from "@hunsu/config";
 
@@ -56,6 +56,7 @@ export async function buildDiagnostics(context: DiagnosticsCommandContext): Prom
   }));
   const health = await context.readBridgeHealth();
   const state = context.readState();
+  const codexSettings = bridgeCodexProviderSettings(state);
   const credentialStore = createDefaultCredentialStore({ path: context.credentialPath() });
   const relayRegistry = new FileRelayRegistry(context.relayRegistryPath());
   return sanitizeDiagnostics({
@@ -81,8 +82,8 @@ export async function buildDiagnostics(context: DiagnosticsCommandContext): Prom
       activeProjectGrants: context.activeManagedProjectGrants(state.projectGrants),
       service: state.service,
       codex: {
-        binaryPathConfigured: Boolean(state.codex?.binaryPath),
-        binaryPath: state.codex?.binaryPath
+        binaryPathConfigured: Boolean(codexSettings.binaryPath),
+        binaryPath: codexSettings.binaryPath
       }
     },
     bridge: {

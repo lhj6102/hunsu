@@ -470,6 +470,7 @@ export type RuntimeProviderStatus = {
     source?: string;
     version?: string;
     error?: string;
+    discovery?: unknown;
   };
   usage?: {
     available: boolean;
@@ -707,12 +708,14 @@ export type RemoteBridgeDevice = {
   status: "online" | "offline";
   remoteAccess?: "enabled" | "disabled";
   provider?: RuntimeProviderStatus;
+  workspaces?: ConnectedWorkspaceSummary[];
   projectGrants?: Array<{
     path: string;
     grantedAt?: string;
     scopes: Array<"execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose" | "remoteRelay.access">;
     active?: boolean;
   }>;
+  lastSnapshotAt?: string;
   bridgeVersion?: string;
   bridgeAppVersion?: string;
   protocolVersion?: string;

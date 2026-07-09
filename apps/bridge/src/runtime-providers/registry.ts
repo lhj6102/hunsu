@@ -1,4 +1,10 @@
-import { CodexRuntimeProvider, type CodexRuntimeProviderOptions } from "./codex.ts";
+import { CodexRuntimeProvider, type CodexRuntimeProviderOptions } from "./codex/codexProvider.ts";
+import {
+  defaultBridgeRuntimeProviderState,
+  normalizeBridgeRuntimeProviderState,
+  type BridgeRuntimeProviderState,
+  type RuntimeProviderStateStore
+} from "./currentProviderStore.ts";
 import {
   unavailableProviderCapabilities,
   type RuntimeProviderAdapter,
@@ -20,12 +26,30 @@ const providerLabels: Record<RuntimeProviderKind, string> = {
 
 export function createRuntimeProviderRegistry(input: {
   currentProviderId?: string;
+  providerState?: BridgeRuntimeProviderState;
+  providerStateStore?: RuntimeProviderStateStore;
   providers?: RuntimeProviderAdapter[];
   codex?: CodexRuntimeProviderOptions;
 } = {}): RuntimeProviderRegistry {
-  let currentProviderId = input.currentProviderId ?? "codex";
+  let runtimeProviderState = normalizeBridgeRuntimeProviderState(
+    input.providerState ?? input.providerStateStore?.read() ?? {
+      ...defaultBridgeRuntimeProviderState(),
+      currentProviderId: input.currentProviderId ?? "codex"
+    }
+  );
+  let currentProviderId = runtimeProviderState.providers[runtimeProviderState.currentProviderId]?.enabled
+    ? runtimeProviderState.currentProviderId
+    : "codex";
   const providers = input.providers ?? [
-    new CodexRuntimeProvider(input.codex),
+    new CodexRuntimeProvider({
+      ...input.codex,
+      settings: runtimeProviderState.providers.codex?.settings ?? {},
+      onConfigure(configuration) {
+        runtimeProviderState = nextRuntimeProviderStateWithCodexSettings(runtimeProviderState, configuration);
+        input.providerStateStore?.write(runtimeProviderState);
+        input.codex?.onConfigure?.(configuration);
+      }
+    }),
     placeholderProvider("claude_code"),
     placeholderProvider("gemini_cli"),
     placeholderProvider("openhands"),
@@ -42,9 +66,40 @@ export function createRuntimeProviderRegistry(input: {
       if (!next) {
         throw new Error(`Unknown runtime provider: ${providerId}`);
       }
+      if (next.providerId !== "codex" || runtimeProviderState.providers[next.providerId]?.enabled !== true) {
+        throw new Error(`${next.label} is not an enabled runtime provider yet.`);
+      }
       currentProviderId = next.providerId;
+      runtimeProviderState = normalizeBridgeRuntimeProviderState({
+        ...runtimeProviderState,
+        currentProviderId
+      });
+      input.providerStateStore?.write(runtimeProviderState);
     }
   };
+}
+
+function nextRuntimeProviderStateWithCodexSettings(
+  state: BridgeRuntimeProviderState,
+  configuration: { binaryPath?: string }
+): BridgeRuntimeProviderState {
+  const codexProvider = state.providers.codex ?? { enabled: true, settings: {} };
+  const settings = { ...(codexProvider.settings ?? {}) };
+  if (configuration.binaryPath?.trim()) {
+    settings.binaryPath = configuration.binaryPath.trim();
+  } else {
+    delete settings.binaryPath;
+  }
+  return normalizeBridgeRuntimeProviderState({
+    ...state,
+    providers: {
+      ...state.providers,
+      codex: {
+        enabled: true,
+        settings
+      }
+    }
+  });
 }
 
 export function placeholderProvider(kind: Exclude<RuntimeProviderKind, "codex" | "custom">): RuntimeProviderAdapter {

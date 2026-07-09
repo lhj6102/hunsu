@@ -51,6 +51,25 @@ export function bridgeStatusProjectGrantsFromBridgeAppState(env: Record<string, 
   });
 }
 
+export function bridgeCodexBinaryPathFromBridgeAppState(env: Record<string, string | undefined>): string | undefined {
+  const state = readBridgeAppStateForStatus(env);
+  const runtimeProviders = state && isRecord(state.runtimeProviders) ? state.runtimeProviders : undefined;
+  const providers = runtimeProviders && isRecord(runtimeProviders.providers) ? runtimeProviders.providers : undefined;
+  const codexProvider = providers && isRecord(providers.codex) ? providers.codex : undefined;
+  const settings = codexProvider && isRecord(codexProvider.settings) ? codexProvider.settings : undefined;
+  const configuredBinaryPath = typeof settings?.binaryPath === "string" && settings.binaryPath.trim()
+    ? settings.binaryPath.trim()
+    : undefined;
+  if (configuredBinaryPath) {
+    return configuredBinaryPath;
+  }
+  const codex = state && isRecord(state.codex) ? state.codex : undefined;
+  const legacyBinaryPath = typeof codex?.binaryPath === "string" && codex.binaryPath.trim()
+    ? codex.binaryPath.trim()
+    : undefined;
+  return legacyBinaryPath;
+}
+
 export function parseBridgeStatusProjectGrants(value: string | undefined): RemoteWorkspaceProjectGrant[] {
   if (!value?.trim()) {
     return [];

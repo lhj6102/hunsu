@@ -90,6 +90,13 @@ export function normalizeBridgeAppArgv(argv: string[]): string[] {
       }
       nextArgs.push("activate-roadmap", url.searchParams.get("roadmapId") ?? "");
       break;
+    case "activate-workspace":
+      if (!url.searchParams.get("workspaceId")) {
+        nextArgs.push("protocol-error", "hunsu://activate-workspace requires workspaceId.");
+        break;
+      }
+      nextArgs.push("activate-roadmap", url.searchParams.get("workspaceId") ?? "");
+      break;
     case "remote-disable":
       nextArgs.push("remote", "disable");
       break;

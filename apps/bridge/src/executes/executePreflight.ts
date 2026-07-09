@@ -347,7 +347,7 @@ function workspaceError(
     message,
     actions: [
       { type: "open_workspaces", label: "Open Workspaces", href: "hunsu://workspaces" },
-      ...(workspaceId ? [{ type: "activate_workspace" as const, label: "Activate Workspace", href: `hunsu://open-workspace?workspaceId=${encodeURIComponent(workspaceId)}`, workspaceId }] : [])
+      ...(workspaceId ? [{ type: "activate_workspace" as const, label: "Activate Workspace", href: `hunsu://activate-workspace?workspaceId=${encodeURIComponent(workspaceId)}`, workspaceId }] : [])
     ]
   };
 }

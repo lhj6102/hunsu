@@ -23,12 +23,12 @@ export function ConnectionFooter({
   const connected = bridgeStatusState === "online" && bridgeStatus !== undefined;
   const local = bridgeStatus?.connections.find(connection => connection.mode === "local");
   const remote = bridgeStatus?.connections.find(connection => connection.mode === "remote" && connection.connection.state === "connected");
-  const activeBackend = remote ?? local ?? bridgeStatus?.connections.find(connection => connection.connection.state === "connected");
-  const activeProvider = activeBackend?.provider ?? bridgeStatus?.provider;
+  const activeBackend = local ?? bridgeStatus?.connections.find(connection => connection.connection.state === "connected") ?? remote;
+  const activeProvider = local?.provider ?? bridgeStatus?.provider ?? activeBackend?.provider;
   const hasRemote = bridgeStatus?.connections.some(connection => connection.mode === "remote") === true;
   const providerReady = activeProvider?.ready === true;
   const title = connected
-    ? remote ? "Remote Bridge" : "Local Bridge"
+    ? "Local Bridge"
     : fallbackConnection.status === "checking" ? "Hunsu Bridge" : "Hunsu Bridge";
   const subtitle = connected
     ? activeProvider
@@ -65,7 +65,7 @@ export function ConnectionFooter({
 
       {!collapsed && connected && bridgeStatus ? (
         <div className="mt-2 grid gap-2 rounded-[8px] border border-[color:var(--apple-hairline)] bg-white/42 p-2">
-          <ProviderStatusCard provider={activeProvider} compact title={remote ? "Remote Provider" : "Provider"} />
+          <ProviderStatusCard provider={activeProvider} compact title="Provider" />
           <WorkspaceConnectionList connections={bridgeStatus.connections} compact maxItems={3} />
           {!bridgeStatus.account.signedIn && !hasRemote ? (
             <div className="rounded-[8px] border border-[color:var(--apple-hairline)] bg-white/62 px-2 py-1.5">

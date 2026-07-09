@@ -12,7 +12,7 @@ export function bridgeActionHref(action: ExecutePreflightAction): string {
       return "hunsu://workspaces";
     case "activate_workspace":
       return action.workspaceId
-        ? `hunsu://open-workspace?workspaceId=${encodeURIComponent(action.workspaceId)}`
+        ? `hunsu://activate-workspace?workspaceId=${encodeURIComponent(action.workspaceId)}`
         : "hunsu://workspaces";
     case "open_connection":
       return "hunsu://connection";

@@ -7,7 +7,12 @@ import { dirname } from "node:path";
 import { resolveRelayClientConfig, unwrapConfigResult, type BridgeRuntimeConfig } from "@hunsu/config";
 import { unavailableProviderCapabilities, type RuntimeProviderStatus } from "../runtime-providers/types.ts";
 import type { BridgeBackendStatus } from "./localConnection.ts";
-import { workspaceLifecycle, type ConnectedWorkspaceSummary, type RoadmapRegistryWorkspaceEntry } from "../workspaces/workspaceRegistry.ts";
+import {
+  workspaceLifecycle,
+  workspaceSummaryFromRoadmap,
+  type ConnectedWorkspaceSummary,
+  type RoadmapRegistryWorkspaceEntry
+} from "../workspaces/workspaceRegistry.ts";
 import {
   DEFAULT_STUDIO_BRIDGE_REQUIREMENT,
   bridgeVersionInfo,
@@ -116,7 +121,9 @@ export type RemoteBridgeDeviceSummary = {
   userId?: string;
   provider?: RuntimeProviderStatus;
   providerStatus?: RuntimeProviderStatus;
+  workspaces?: ConnectedWorkspaceSummary[];
   projectGrants?: RemoteWorkspaceProjectGrant[];
+  lastSnapshotAt?: string;
 };
 
 export type RemoteBridgeDeviceRecord = RemoteBridgeDeviceSummary & {
@@ -496,6 +503,36 @@ export function createRemoteBackendStatus(input: {
   };
 }
 
+export function remoteWorkspaceSnapshotsFromDevice(
+  device: RemoteBridgeDeviceSummary,
+  input: {
+    provider?: RuntimeProviderStatus;
+    projectGrants?: RemoteWorkspaceProjectGrant[];
+  } = {}
+): ConnectedWorkspaceSummary[] {
+  const provider = input.provider ?? remoteProviderStatusFromDevice(device);
+  const backendId = `remote:${device.deviceId}`;
+  const grants = input.projectGrants ?? device.projectGrants ?? [];
+  const snapshots = Array.isArray(device.workspaces) ? device.workspaces : [];
+  return snapshots.filter(isConnectedWorkspaceSummary).map(workspace => {
+    const path = typeof workspace.path === "string" && remoteWorkspacePathGranted(workspace.path, grants)
+      ? workspace.path
+      : undefined;
+    return {
+      ...workspace,
+      backendId,
+      connectionMode: "remote" as const,
+      path,
+      pathRedacted: workspace.path ? (path === undefined ? true : undefined) : workspace.pathRedacted,
+      provider: {
+        providerId: provider.providerId,
+        label: provider.label,
+        readyForExecute: provider.ready
+      }
+    };
+  });
+}
+
 export function remoteProviderStatusFromDevice(device: RemoteBridgeDeviceSummary): RuntimeProviderStatus {
   if (isRuntimeProviderStatus(device.provider)) {
     return device.provider;
@@ -537,22 +574,35 @@ export function remoteProviderStatusFromDevice(device: RemoteBridgeDeviceSummary
 export function createRemoteWorkspacePublication(
   roadmaps: RoadmapRegistryWorkspaceEntry[],
   input: {
+    provider?: RuntimeProviderStatus;
     grantedAt?: string;
     scopes?: BridgeCommandScope[];
   } = {}
-): { roadmapIds: string[]; projectGrants: RemoteWorkspaceProjectGrant[]; scopes: BridgeCommandScope[] } {
+): { roadmapIds: string[]; workspaces: ConnectedWorkspaceSummary[]; projectGrants: RemoteWorkspaceProjectGrant[]; scopes: BridgeCommandScope[]; lastSnapshotAt: string } {
   const scopes = uniqueScopes(input.scopes ?? defaultRemoteWorkspaceScopes);
   const grantedAt = input.grantedAt ?? new Date().toISOString();
   const activeRoadmaps = roadmaps.filter(roadmap => workspaceLifecycle(roadmap.lifecycle) === "active");
+  const provider = input.provider ?? remoteProviderStatusFromDevice({
+    deviceId: "local",
+    deviceName: "This computer",
+    provider: undefined
+  });
   return {
     roadmapIds: activeRoadmaps.map(roadmap => roadmap.roadmapId),
+    workspaces: activeRoadmaps.map(roadmap => workspaceSummaryFromRoadmap(roadmap, {
+      provider,
+      backendId: "local",
+      connectionMode: "local",
+      redactPath: true
+    })),
     projectGrants: activeRoadmaps.map(roadmap => ({
       path: roadmap.repositoryPath,
       grantedAt,
       scopes,
       active: true
     })),
-    scopes
+    scopes,
+    lastSnapshotAt: grantedAt
   };
 }
 
@@ -566,9 +616,17 @@ export async function enableRemoteBridgePublication(input: {
   store?: RemoteBridgeDeviceStoreAccess;
   publishWorkspaceAccess: (publication: ReturnType<typeof createRemoteWorkspacePublication>) => void;
 }): Promise<RemoteBridgeDeviceRecord> {
-  const publication = createRemoteWorkspacePublication(input.roadmaps);
+  const publication = createRemoteWorkspacePublication(input.roadmaps, {
+    provider: input.device.provider
+  });
+  const deviceWithSnapshot: RemoteBridgeDeviceRecord = {
+    ...input.device,
+    workspaces: publication.workspaces,
+    projectGrants: publication.projectGrants,
+    lastSnapshotAt: publication.lastSnapshotAt
+  };
   if (input.relay) {
-    const registered = await registerRemoteBridgeDeviceThroughRelay(input.relay, input.device, publication.projectGrants);
+    const registered = await registerRemoteBridgeDeviceThroughRelay(input.relay, deviceWithSnapshot, publication);
     input.publishWorkspaceAccess(publication);
     return registered;
   }
@@ -579,12 +637,14 @@ export async function enableRemoteBridgePublication(input: {
   const devices = input.store.read();
   const existing = devices.find(candidate => candidate.deviceId === input.device.deviceId);
   const registered: RemoteBridgeDeviceRecord = {
-    ...input.device,
+    ...deviceWithSnapshot,
     registeredAt: existing?.registeredAt ?? input.device.registeredAt,
     lastSeenAt: new Date().toISOString(),
     status: "online",
     remoteAccess: "enabled",
-    projectGrants: publication.projectGrants
+    projectGrants: publication.projectGrants,
+    workspaces: publication.workspaces,
+    lastSnapshotAt: publication.lastSnapshotAt
   };
   input.store.write([registered, ...devices.filter(candidate => candidate.deviceId !== registered.deviceId)]);
   input.publishWorkspaceAccess(publication);
@@ -604,7 +664,9 @@ export async function disableRemoteBridgePublication(input: {
     ...input.device,
     status: "offline",
     remoteAccess: "disabled",
-    projectGrants: []
+    projectGrants: [],
+    workspaces: [],
+    lastSnapshotAt: new Date().toISOString()
   };
   if (input.relay) {
     await disableRemoteBridgeDeviceThroughRelay(input.relay, disabledDevice);
@@ -626,7 +688,9 @@ export async function disableRemoteBridgePublication(input: {
       ...candidate,
       status: "offline",
       remoteAccess: "disabled",
-      projectGrants: []
+      projectGrants: [],
+      workspaces: [],
+      lastSnapshotAt: new Date().toISOString()
     };
     return updated;
   });
@@ -642,7 +706,7 @@ export async function disableRemoteBridgePublication(input: {
 async function registerRemoteBridgeDeviceThroughRelay(
   relay: { relayApiUrl: string; accessToken: string },
   device: RemoteBridgeDeviceRecord,
-  projectGrants: RemoteWorkspaceProjectGrant[]
+  publication: ReturnType<typeof createRemoteWorkspacePublication>
 ): Promise<RemoteBridgeDeviceRecord> {
   const response = await fetch(new URL("/v1/devices", relay.relayApiUrl), {
     method: "POST",
@@ -650,13 +714,31 @@ async function registerRemoteBridgeDeviceThroughRelay(
       "authorization": `Bearer ${relay.accessToken}`,
       "content-type": "application/json"
     },
-    body: JSON.stringify({ device, projectGrants })
+    body: JSON.stringify({
+      device,
+      projectGrants: publication.projectGrants,
+      workspaces: publication.workspaces,
+      lastSnapshotAt: publication.lastSnapshotAt
+    })
   });
   const body = await response.json().catch(() => undefined) as { device?: RemoteBridgeDeviceRecord; error?: string; message?: string } | undefined;
   if (!response.ok || !body?.device) {
     throw new Error(body?.error ?? body?.message ?? `Remote Bridge registration failed with HTTP ${response.status}.`);
   }
   return body.device;
+}
+
+function remoteWorkspacePathGranted(path: string, projectGrants: RemoteWorkspaceProjectGrant[]): boolean {
+  const normalized = normalizeRepositoryPath(path);
+  return projectGrants.some(grant =>
+    grant.active !== false
+    && normalizeRepositoryPath(grant.path) === normalized
+    && grant.scopes.includes("remoteRelay.access")
+  );
+}
+
+function normalizeRepositoryPath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
 async function disableRemoteBridgeDeviceThroughRelay(
@@ -861,6 +943,35 @@ function isRuntimeProviderStatus(value: unknown): value is RuntimeProviderStatus
     && candidate.auth !== null
     && typeof candidate.capabilities === "object"
     && candidate.capabilities !== null;
+}
+
+function isConnectedWorkspaceSummary(value: unknown): value is ConnectedWorkspaceSummary {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Partial<ConnectedWorkspaceSummary>;
+  return typeof candidate.workspaceId === "string"
+    && typeof candidate.roadmapId === "string"
+    && typeof candidate.displayName === "string"
+    && (candidate.path === undefined || typeof candidate.path === "string")
+    && (candidate.lifecycle === "active"
+      || candidate.lifecycle === "inactive"
+      || candidate.lifecycle === "missing"
+      || candidate.lifecycle === "needs_upgrade"
+      || candidate.lifecycle === "error")
+    && (candidate.health === "ok"
+      || candidate.health === "missing"
+      || candidate.health === "needs_upgrade"
+      || candidate.health === "error"
+      || candidate.health === "unknown")
+    && typeof candidate.backendId === "string"
+    && (candidate.connectionMode === "local" || candidate.connectionMode === "remote")
+    && typeof candidate.provider === "object"
+    && candidate.provider !== null
+    && typeof candidate.provider.providerId === "string"
+    && typeof candidate.provider.label === "string"
+    && typeof candidate.provider.readyForExecute === "boolean"
+    && Array.isArray(candidate.actions);
 }
 
 function uniqueScopes(scopes: BridgeCommandScope[]): BridgeCommandScope[] {

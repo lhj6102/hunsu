@@ -260,11 +260,12 @@ function renderConnection(snapshot) {
     return;
   }
   if (remoteOn) {
+    const publishedCount = publishedWorkspaceCount(snapshot);
     connectionEls.remoteStatus.textContent = `Remote · ${remoteAccess === "On" ? "On" : "Registered but offline"}`;
     connectionEls.remoteStatus.className = remoteAccess === "On" ? "project-meta status-connected" : "project-meta status-warning";
     connectionEls.remoteDetail.textContent = [
       `Device: ${status.device?.name ?? "This computer"}`,
-      `Status: ${remoteAccess === "On" ? "Online" : "Offline"}`
+      `Published workspaces: ${publishedCount}`
     ].join("\n");
     configureConnectionButton(connectionEls.primaryAction, "Disable Remote Access", "disable-remote", true);
     configureConnectionButton(connectionEls.secondaryAction, "Sign out", "sign-out", true);
@@ -275,6 +276,13 @@ function renderConnection(snapshot) {
   connectionEls.remoteDetail.textContent = "Use this computer from Hunsu Web when away.";
   configureConnectionButton(connectionEls.primaryAction, "Enable Remote Access", "enable-remote", true);
   configureConnectionButton(connectionEls.secondaryAction, "Sign out", "sign-out", true);
+}
+
+function publishedWorkspaceCount(snapshot) {
+  const activeWorkspaces = snapshot.workspaces?.active
+    ?? (snapshot.managedRoadmaps ?? []).filter(project => project.lifecycle === "active")
+    ?? [];
+  return activeWorkspaces.length;
 }
 
 function configureConnectionButton(button, label, action, visible) {
@@ -293,7 +301,7 @@ function renderRuntimeProviders(runtimeProviders, codex) {
     recommendedAction: providerRecommendedActionFromCodex(codex),
     safeMessage: codexSummary(codex)
   }]).map(provider => ({
-    group: provider.providerId === currentProviderId ? "Current" : "Available later",
+    group: provider.providerId === currentProviderId ? "Current" : "Coming later",
     label: provider.label,
     status: provider.providerId === currentProviderId
       ? providerStatusSummary(provider)
@@ -434,32 +442,10 @@ function renderProviderCard(provider) {
   title.textContent = provider?.label ?? "Provider";
   const meta = document.createElement("div");
   meta.className = "project-meta";
-  meta.textContent = [
-    providerStatusSummary(provider),
-    provider?.install?.version,
-    provider?.auth?.access ? `Access: ${formatProviderAccess(provider)}` : undefined,
-    provider?.auth?.accountSummary?.email,
-    provider?.auth?.accountSummary?.planLabel,
-    provider?.usage?.summary?.label
-  ].filter(Boolean).join(" · ");
+  meta.textContent = providerStatusSummary(provider);
   body.append(title, meta, codexDeviceLoginStatus());
   const buttons = document.createElement("div");
   buttons.className = "actions";
-  const recheck = document.createElement("button");
-  recheck.textContent = "Recheck";
-  recheck.addEventListener("click", async () => {
-    await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
-    await refresh();
-  });
-  buttons.append(recheck);
-  if (provider?.ready) {
-    const changeProvider = document.createElement("button");
-    changeProvider.textContent = "Change provider";
-    changeProvider.addEventListener("click", () => {
-      selectTab("advanced");
-    });
-    buttons.append(changeProvider);
-  }
   if (provider?.recommendedAction === "install") {
     const install = document.createElement("button");
     install.className = "primary";
@@ -479,21 +465,15 @@ function renderProviderCard(provider) {
     });
     buttons.append(install);
     const existing = document.createElement("button");
-    existing.textContent = `Use Existing ${provider.label}`;
-    existing.addEventListener("click", () => {
-      selectTab("settings");
-      codexBinaryPath.focus();
-    });
+    existing.textContent = `Select Existing ${provider.label}`;
+    existing.addEventListener("click", chooseCodexBinary);
     buttons.append(existing);
   }
   if (provider?.recommendedAction === "select_binary") {
     const existing = document.createElement("button");
     existing.className = "primary";
     existing.textContent = `Select Existing ${provider.label}`;
-    existing.addEventListener("click", () => {
-      selectTab("settings");
-      codexBinaryPath.focus();
-    });
+    existing.addEventListener("click", chooseCodexBinary);
     buttons.append(existing);
   }
   if (provider?.recommendedAction === "login" && provider.providerId === "codex") {
@@ -508,22 +488,23 @@ function renderProviderCard(provider) {
     buttons.append(device);
   }
   if (providerNeedsAttention(provider)) {
-    if (provider?.providerId === "codex") {
-      const existing = document.createElement("button");
-      existing.textContent = `Select Existing ${provider.label}`;
-      existing.addEventListener("click", () => {
-        selectTab("settings");
-        codexBinaryPath.focus();
-      });
-      buttons.append(existing);
-    }
-    const details = document.createElement("button");
-    details.textContent = "Show details";
-    details.addEventListener("click", () => {
-      diagnostics.textContent = JSON.stringify({ provider }, null, 2);
-      selectTab("diagnostics");
+    const recheck = document.createElement("button");
+    recheck.className = "primary";
+    recheck.textContent = "Recheck";
+    recheck.addEventListener("click", async () => {
+      await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
+      await refresh();
     });
-    buttons.append(details);
+    buttons.append(recheck);
+  }
+  if (provider?.recommendedAction === "none") {
+    const recheck = document.createElement("button");
+    recheck.textContent = "Recheck";
+    recheck.addEventListener("click", async () => {
+      await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
+      await refresh();
+    });
+    buttons.append(recheck);
   }
   row.append(body, buttons);
   codexCard.append(row);
@@ -548,6 +529,15 @@ function providerAdvancedDetails(provider) {
   const details = document.createElement("details");
   const summary = document.createElement("summary");
   summary.textContent = "Advanced provider details";
+  const detailRows = document.createElement("div");
+  detailRows.className = "project-meta";
+  detailRows.textContent = [
+    provider?.install?.binaryPath ? `Binary path: ${provider.install.binaryPath}` : "Binary path: Auto-detect",
+    provider?.install?.source ? `Source: ${provider.install.source}` : undefined,
+    provider?.install?.version ? `Version: ${provider.install.version}` : undefined,
+    `Auth access: ${formatProviderAccess(provider)}`,
+    `Rate limit summary: ${formatProviderRateLimit(provider)}`
+  ].filter(Boolean).join("\n");
   const actions = document.createElement("div");
   actions.className = "actions";
   actions.setAttribute("style", "margin-top: 10px;");
@@ -555,7 +545,7 @@ function providerAdvancedDetails(provider) {
   apiKey.textContent = "Use API Key - Advanced";
   apiKey.addEventListener("click", startCodexApiKeyLogin);
   actions.append(apiKey);
-  details.append(summary, actions);
+  details.append(summary, detailRows, actions);
   return details;
 }
 
@@ -738,6 +728,16 @@ function formatProviderAccess(provider) {
   return "Unknown";
 }
 
+function formatProviderRateLimit(provider) {
+  const summary = provider?.usage?.summary;
+  if (!provider?.usage?.available && !summary) return "Unavailable";
+  return [
+    summary?.label ?? "Available",
+    summary?.remainingLabel,
+    summary?.resetAt ? `Reset ${summary.resetAt}` : undefined
+  ].filter(Boolean).join(", ");
+}
+
 function formatRateLimit(codex) {
   const summary = codex?.usage?.rateLimitSummary;
   if (!summary) return codex?.usage?.rateLimitsAvailable ? "Available" : "Unavailable";
@@ -916,6 +916,20 @@ async function chooseProjectFolder() {
   if (folder?.path) {
     await inspectSelectedFolder(folder.path);
   }
+}
+
+async function chooseCodexBinary() {
+  if (!invoke) {
+    selectTab("settings");
+    codexBinaryPath.focus();
+    return;
+  }
+  const binary = await invoke("choose_codex_binary");
+  if (!binary?.path) {
+    return;
+  }
+  diagnostics.textContent = await run(["codex", "path", "set", binary.path]);
+  await refresh();
 }
 
 document.querySelector("#choose-folder").addEventListener("click", chooseProjectFolder);
