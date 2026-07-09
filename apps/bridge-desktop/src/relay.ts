@@ -6,6 +6,9 @@ export type RelayCommandName =
   | "health"
   | "bridge.status"
   | "connection.status"
+  | "provider.inventory"
+  | "modelAlias.validate"
+  | "modelAlias.resolve"
   | "roadmap.registry.list"
   | "roadmap.registry.remove"
   | "roadmap.open"
@@ -835,6 +838,12 @@ export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequ
       return { method: "GET", path: "/api/bridge/status" };
     case "connection.status":
       return { method: "GET", path: "/api/connection/status" };
+    case "provider.inventory":
+      return { method: "GET", path: "/api/providers/inventory" };
+    case "modelAlias.validate":
+      return { method: "POST", path: "/api/model-aliases/validate", body: command.payload ?? {} };
+    case "modelAlias.resolve":
+      return { method: "POST", path: "/api/model-aliases/resolve", body: command.payload ?? {} };
     case "roadmap.registry.list":
       return { method: "GET", path: "/api/roadmaps/recent" };
     case "roadmap.registry.remove":
@@ -1066,6 +1075,10 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "execute.stop":
     case "execute.completeMove":
       return ["execute.start", "remoteRelay.access"];
+    case "provider.inventory":
+    case "modelAlias.validate":
+    case "modelAlias.resolve":
+      return [];
     case "execute.status":
     case "roadmap.board":
     case "roadmap.worktree":
@@ -1288,6 +1301,9 @@ function isRelayCommandName(value: string): value is RelayCommandName {
     "health",
     "bridge.status",
     "connection.status",
+    "provider.inventory",
+    "modelAlias.validate",
+    "modelAlias.resolve",
     "roadmap.registry.list",
     "roadmap.registry.remove",
     "roadmap.open",

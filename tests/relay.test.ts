@@ -162,6 +162,13 @@ test("Relay service authenticates device flow, registers WebSocket devices, and 
     }, 202) as { ok: true; body: { routed: string } };
     assert.equal(board.body.routed, "roadmap.board");
 
+    const providerInventory = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
+      deviceId: "device_123",
+      command: "provider.inventory",
+      payload: { backendId: "remote-device" }
+    }, 202) as { ok: true; body: { routed: string } };
+    assert.equal(providerInventory.body.routed, "provider.inventory");
+
     socket.send(JSON.stringify({
       type: "device.register",
       device: {
@@ -211,6 +218,13 @@ test("Relay service authenticates device flow, registers WebSocket devices, and 
       requestedScopes: ["remoteRelay.access"]
     }) as { projectAccess: string };
     assert.equal(revokedStatus.projectAccess, "needs_grant");
+
+    const aliasValidation = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
+      deviceId: "device_123",
+      command: "modelAlias.validate",
+      payload: { modelSelection: { kind: "alias", aliasId: "PrimaryModel" }, aliases: [] }
+    }, 202) as { ok: true; body: { routed: string } };
+    assert.equal(aliasValidation.body.routed, "modelAlias.validate");
 
     const revokedCommand = await relayJson(`${urls.apiUrl}/v1/commands`, token.access_token, {
       deviceId: "device_123",

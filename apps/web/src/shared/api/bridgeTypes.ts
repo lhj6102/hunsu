@@ -1,4 +1,33 @@
-import type { ArtifactActionDefinition, BoardProjection, HubPackageLock, ExecutionPlan, ManagerConfig, SkillBinding } from "@hunsu/protocol";
+import type {
+  ArtifactActionDefinition,
+  BoardProjection,
+  DirectModelSelection,
+  DirectProviderModelSelection,
+  ExecutorEntity,
+  HubPackageLock,
+  ExecutionPlan,
+  ManagerConfig,
+  MemberConfig,
+  ModelAlias,
+  ModelSelection,
+  ProviderInventory,
+  ProviderModelDescriptor,
+  ProviderModelInventory,
+  SkillBinding
+} from "@hunsu/protocol";
+
+export type {
+  DirectProviderModelSelection,
+  DirectModelSelection,
+  ExecutorEntity,
+  ManagerConfig,
+  ModelAlias,
+  MemberConfig,
+  ModelSelection,
+  ProviderInventory,
+  ProviderModelDescriptor,
+  ProviderModelInventory
+} from "@hunsu/protocol";
 
 export type ConnectionState = "connecting" | "live" | "empty" | "offline" | "saving";
 export type CommandResult = { acceptedEvents: unknown[]; board: BoardProjection };
@@ -387,6 +416,7 @@ export type StudioHunsuDraftSession = {
   currentArtifactId: string;
   managerLock?: HubPackageLock;
   manager: ManagerConfig;
+  aliases?: ModelAlias[];
   confirmedHunsuId?: string;
   confirmedNodeId?: string;
   providerThreadId?: string;
@@ -567,7 +597,8 @@ export type ExecutePreflightAction = {
     | "install_provider"
     | "login_provider"
     | "recheck_provider"
-    | "activate_workspace";
+    | "activate_workspace"
+    | "edit_model_alias";
   label: string;
   href?: string;
   workspaceId?: string;
@@ -592,6 +623,51 @@ export type ExecutePreflightError = {
   error: "BRIDGE_NOT_CONNECTED" | "REMOTE_NOT_CONNECTED" | "REMOTE_LOGIN_REQUIRED";
   message: string;
   actions: ExecutePreflightAction[];
+} | {
+  area: "model";
+  providerId?: string;
+  aliasId?: string;
+  model?: string;
+  error:
+    | "MODEL_ALIAS_NOT_FOUND"
+    | "PROVIDER_NOT_READY"
+    | "PROVIDER_LOGIN_REQUIRED"
+    | "MODEL_UNSUPPORTED"
+    | "REASONING_UNSUPPORTED"
+    | "SERVICE_TIER_UNSUPPORTED";
+  message: string;
+  actions: ExecutePreflightAction[];
+};
+
+export type ModelAliasInventoryResult = ProviderInventory;
+
+export type ModelAliasResolutionResult =
+  | {
+      ok: true;
+      backendId: string;
+      resolved: DirectProviderModelSelection;
+      provider: {
+        providerId: string;
+        ready: boolean;
+      };
+    }
+  | {
+      ok: false;
+      error:
+        | "MODEL_ALIAS_NOT_FOUND"
+        | "PROVIDER_NOT_READY"
+        | "PROVIDER_LOGIN_REQUIRED"
+        | "MODEL_UNSUPPORTED"
+        | "REASONING_UNSUPPORTED"
+        | "SERVICE_TIER_UNSUPPORTED";
+      message: string;
+      actions: ExecutePreflightAction[];
+    };
+
+export type ModelAliasResolveRequest = {
+  backendId: string;
+  modelSelection: ModelSelection;
+  aliases?: ModelAlias[];
 };
 
 export type RoadmapListResult = { roadmaps: RoadmapRegistryEntry[] };

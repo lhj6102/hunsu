@@ -15,7 +15,8 @@
         "title": "Hunsu Bridge",
         "width": 860,
         "height": 640,
-        "resizable": true
+        "resizable": true,
+        "visible": false
       }
     ],
     "security": {
@@ -24,7 +25,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
     "category": "DeveloperTool",
     "icon": [
       "icons/32x32.png",
@@ -39,7 +42,6 @@
       "../dist/hunsu-bridge-sidecar"
     ],
     "resources": [
-      "../dist/hunsu-bridge-sidecar*",
       "../dist/sidecar-manifest.json"
     ],
     "macOS": {

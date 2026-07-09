@@ -60,6 +60,7 @@ import {
   createDefaultManagerConfig,
   createDefaultMemberConfig,
   getHarnessExecutor,
+  getHarnessMemberConfig,
   harnessEntityFromSnapshot,
   harnessSnapshotForTeam,
   rootHarnessSnapshot,
@@ -83,7 +84,7 @@ import {
   validateManagerConfig,
   validateExecutableHarness
 } from "@hunsu/protocol";
-import type { ExecutorEntity, Harness, ManagerConfig } from "@hunsu/protocol";
+import type { DirectProviderModelSelection, ExecutorEntity, Harness, ManagerConfig, ModelAlias, ModelSelection, ProviderModelInventory } from "@hunsu/protocol";
 import { err, ok, type Result } from "@hunsu/protocol";
 import {
   hydrateTeamPackage,
@@ -141,7 +142,17 @@ import { createStudioHttpServer, studioRequestUrl } from "./server/createStudioS
 import { handleRemoteBridgeRoute, handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
 import { baseCorsHeaders, createResponseSecurityHeaderStore } from "./server/security.ts";
 import { handleExecuteRoute, handleRoadmapExecuteRoute } from "./executes/executeRoutes.ts";
+import type { ProviderAwareExecutePreflightError } from "./executes/executePreflight.ts";
 import { handleFilesystemRoute } from "./filesystem/filesystemRoutes.ts";
+import {
+  defaultLocalProviderModelInventories,
+  defaultModelAliases,
+  executePreflightErrorFromModelError,
+  providerInventoryForBridgeStatus,
+  providerInventoriesForBridgeStatus,
+  resolveModelSelection,
+  type ModelSelectionResolution
+} from "./model-aliases/modelAliasStore.ts";
 
 export {
   detectCodexBinary,
@@ -219,11 +230,23 @@ export type {
 export type { BridgeStatusResponse } from "./server/bridgeStatus.ts";
 export {
   connectionExecutePreflightError,
+  modelExecutePreflightErrorForSelection,
   providerExecutePreflightError,
   workspaceExecutePreflightError,
   workspaceExecutePreflightErrorFromRoadmap
 } from "./executes/executePreflight.ts";
 export type { ProviderAwareExecutePreflightError as ExecutePreflightError, ProviderAwareExecutePreflightError } from "./executes/executePreflight.ts";
+export type { DirectProviderModelSelection, ModelAlias, ModelAliasOverride, ModelSelection, ProviderInventory, ProviderModelInventory } from "@hunsu/protocol";
+export {
+  defaultLocalProviderInventory,
+  defaultLocalProviderModelInventories,
+  defaultModelAliases,
+  providerInventoryForBridgeStatus,
+  providerInventoriesForBridgeStatus,
+  resolveModelSelection,
+  validateDirectModelSelection
+} from "./model-aliases/modelAliasStore.ts";
+export type { ModelAliasValidationError, ModelSelectionResolution } from "./model-aliases/modelAliasStore.ts";
 import type {
   AgentConversationRef,
   ArtifactActionDefinition,
@@ -370,7 +393,13 @@ export type StudioRunState = {
   requestId: string;
   lineId: string;
   repositoryPath?: string;
+  backendId?: string;
+  connectionMode?: "local" | "remote";
+  workspace?: ModelSelectionWorkspace;
   provider: "codex";
+  modelSelection?: ModelSelection;
+  aliases?: ModelAlias[];
+  resolvedModelSelection?: DirectProviderModelSelection;
   source?: "live" | "rehydrated";
   status: StudioRunStatus;
   selectedDestinationIds: string[];
@@ -705,6 +734,12 @@ type StudioRequestSecurity = {
   corsHeaders: Record<string, string>;
 };
 
+type ProviderModelInventoriesSource = ProviderModelInventory[] | (() => Promise<ProviderModelInventory[]> | ProviderModelInventory[]);
+
+async function providerModelInventoriesFromSource(source: ProviderModelInventoriesSource): Promise<ProviderModelInventory[]> {
+  return typeof source === "function" ? await source() : source;
+}
+
 export type StudioServerOptions = {
   state?: StudioServerState;
   cwd?: string;
@@ -714,6 +749,7 @@ export type StudioServerOptions = {
   apmSkillRegistryClient?: ApmSkillRegistryClient;
   roadmapRegistryPath?: string;
   runtimeConfig?: BridgeRuntimeConfig;
+  modelInventories?: ProviderModelInventoriesSource;
   security?: StudioServerSecurityOptions;
 };
 
@@ -1009,11 +1045,15 @@ export type StudioRunStartRequest = {
   selectedDestinationIds?: string[];
   backendId?: string;
   connectionMode?: "local" | "remote";
-  workspace?: {
-    workspaceId?: string;
-    backendId?: string;
-    connectionMode?: "local" | "remote";
-  };
+  modelSelection?: ModelSelection;
+  aliases?: ModelAlias[];
+  workspace?: ModelSelectionWorkspace;
+};
+
+type ModelSelectionWorkspace = {
+  workspaceId?: string;
+  backendId?: string;
+  connectionMode?: "local" | "remote";
 };
 
 export type StudioRunActionRequest = {
@@ -1136,6 +1176,7 @@ export type StudioHunsuDraftSession = {
   currentArtifactId: string;
   managerLock?: HubPackageLock;
   manager: ManagerConfig;
+  aliases?: ModelAlias[];
   confirmedHunsuId?: string;
   confirmedNodeId?: string;
   providerThreadId?: string;
@@ -1154,6 +1195,7 @@ export type StudioHunsuDraftStartRequest = {
   sourceMoveId?: string;
   sourceLineId?: string;
   managerLock?: HubPackageLock;
+  aliases?: ModelAlias[];
   message?: string;
 };
 
@@ -1214,6 +1256,7 @@ export type HunsuDraftRouteRuntimeFile = {
   currentArtifactId: string;
   managerLock?: HubPackageLock;
   manager: ManagerConfig;
+  aliases?: ModelAlias[];
   confirmedHunsuId?: string;
   confirmedNodeId?: string;
   status: StudioHunsuDraftStatus;
@@ -2466,6 +2509,17 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       }
     }
   });
+  const modelInventoriesForRequest = async (request: IncomingMessage) => {
+    if (options.modelInventories) {
+      return providerModelInventoriesFromSource(options.modelInventories);
+    }
+    return providerInventoriesForBridgeStatus(await createBridgeStatusForRequest({
+      request,
+      runtimeConfig,
+      providerRegistry,
+      managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
+    }));
+  };
 
   const server = createStudioHttpServer(async (request, response) => {
     try {
@@ -2556,6 +2610,61 @@ export function createStudioServer(options: StudioServerOptions = {}) {
 
       if (request.method === "GET" && pathname === "/api/prerequisites") {
         sendJson(response, 200, await prerequisiteStatus(runtimeConfig.processEnv, state));
+        return;
+      }
+
+      if (request.method === "GET" && pathname === "/api/providers/inventory") {
+        const status = await createBridgeStatusForRequest({
+          request,
+          runtimeConfig,
+          providerRegistry,
+          managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
+        });
+        sendJson(response, 200, providerInventoryForBridgeStatus({
+          provider: status.provider,
+          connections: status.connections,
+          backendId: url.searchParams.get("backendId") ?? undefined
+        }));
+        return;
+      }
+
+      if (request.method === "POST" && (pathname === "/api/model-aliases/validate" || pathname === "/api/model-aliases/resolve")) {
+        const body = await readJson<{
+          backendId: string;
+          modelSelection: ModelSelection;
+          aliases?: ModelAlias[];
+        }>(request);
+        const status = await createBridgeStatusForRequest({
+          request,
+          runtimeConfig,
+          providerRegistry,
+          managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
+        });
+        const resolution = resolveModelSelection({
+          selection: body.modelSelection,
+          aliases: body.aliases,
+          backendId: body.backendId ?? "local",
+          inventories: options.modelInventories
+            ? await modelInventoriesForRequest(request)
+            : providerInventoryForBridgeStatus({
+                provider: status.provider,
+                connections: status.connections,
+                backendId: body.backendId
+              }).providers
+        });
+        sendJson(response, 200, resolution.ok
+          ? {
+              ok: true,
+              backendId: resolution.backendId,
+              resolved: resolution.resolved,
+              provider: resolution.provider
+            }
+          : {
+              ok: false,
+              error: resolution.error.error,
+              message: resolution.error.message,
+              actions: resolution.error.actions
+            });
         return;
       }
 
@@ -2707,7 +2816,8 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           bridgeApiBaseUrl: endpointUrl(runtimeConfig.bridgeApi),
           bridgeApiAuthToken: security.authToken,
           apmSkillRegistryClient: options.apmSkillRegistryClient,
-          routeWorktreeRoot: runtimeConfig.routeWorktreeRoot
+          routeWorktreeRoot: runtimeConfig.routeWorktreeRoot,
+          modelInventories: () => modelInventoriesForRequest(request)
         }),
         executes: (suffix, roadmapId, cwd) => handleRoadmapExecuteRoute(request, response, suffix, {
           repositoryPath: cwd,
@@ -2724,20 +2834,27 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           localBridgeTokenPresent: () => Boolean(requestHeader(request, BRIDGE_API_TOKEN_HEADER)),
           runSummaries: () => runsForRepository(state, cwd).filter(run => !run.roadmapId || run.roadmapId === roadmapId).map(toStudioRunSummary),
           executeView: run => toStudioExecuteView(run as StudioRunSummary),
+          modelPreflight: body => executeModelPreflightErrorForStudioRun(body as StudioRunStartRequest, state, {
+            cwd,
+            persist,
+            modelInventories: () => modelInventoriesForRequest(request)
+          }),
           startRun: body => startStudioRun(body as StudioRunStartRequest, state, {
             cwd,
             persist,
             roadmapId,
             runner,
             apmSkillRegistryClient: options.apmSkillRegistryClient,
-            routeWorktreeRoot: runtimeConfig.routeWorktreeRoot
+            routeWorktreeRoot: runtimeConfig.routeWorktreeRoot,
+            modelInventories: () => modelInventoriesForRequest(request)
           }),
           pauseRun: body => pauseStudioRun(body as StudioRunActionRequest, state, { cwd, persist, runner }),
           resumeRun: body => resumeStudioRun(body as StudioRunActionRequest, state, {
             cwd,
             persist,
             runner,
-            apmSkillRegistryClient: options.apmSkillRegistryClient
+            apmSkillRegistryClient: options.apmSkillRegistryClient,
+            modelInventories: () => modelInventoriesForRequest(request)
           }),
           stopRun: body => stopStudioRun(body as StudioRunActionRequest, state, { cwd, persist, runner }),
           completeMove: body => completeStudioMove(body as StudioMoveCompletionRequest, state, { cwd, persist }),
@@ -2774,9 +2891,27 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         localBridgeTokenPresent: () => Boolean(requestHeader(request, BRIDGE_API_TOKEN_HEADER)),
         runSummaries: () => runsForRepository(state, repositoryPath).map(toStudioRunSummary),
         executeView: run => toStudioExecuteView(run as StudioRunSummary),
-        startRun: body => startStudioRun(body as StudioRunStartRequest, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient, routeWorktreeRoot: runtimeConfig.routeWorktreeRoot }),
+        modelPreflight: body => executeModelPreflightErrorForStudioRun(body as StudioRunStartRequest, state, {
+          cwd: repositoryPath,
+          persist,
+          modelInventories: () => modelInventoriesForRequest(request)
+        }),
+        startRun: body => startStudioRun(body as StudioRunStartRequest, state, {
+          cwd: repositoryPath,
+          persist,
+          runner,
+          apmSkillRegistryClient: options.apmSkillRegistryClient,
+          routeWorktreeRoot: runtimeConfig.routeWorktreeRoot,
+          modelInventories: () => modelInventoriesForRequest(request)
+        }),
         pauseRun: body => pauseStudioRun(body as StudioRunActionRequest, state, { cwd: repositoryPath, persist, runner }),
-        resumeRun: body => resumeStudioRun(body as StudioRunActionRequest, state, { cwd: repositoryPath, persist, runner, apmSkillRegistryClient: options.apmSkillRegistryClient }),
+        resumeRun: body => resumeStudioRun(body as StudioRunActionRequest, state, {
+          cwd: repositoryPath,
+          persist,
+          runner,
+          apmSkillRegistryClient: options.apmSkillRegistryClient,
+          modelInventories: () => modelInventoriesForRequest(request)
+        }),
         stopRun: body => stopStudioRun(body as StudioRunActionRequest, state, { cwd: repositoryPath, persist, runner }),
         completeMove: body => completeStudioMove(body as StudioMoveCompletionRequest, state, { cwd: repositoryPath, persist }),
         streamLiveEvents: () => streamStudioLiveEvents(request, response, state, { cwd: repositoryPath }),
@@ -2880,6 +3015,7 @@ type HunsuDraftApiOptions = {
   bridgeApiAuthToken?: string;
   apmSkillRegistryClient?: ApmSkillRegistryClient;
   routeWorktreeRoot?: string;
+  modelInventories?: ProviderModelInventoriesSource;
 };
 
 async function handleHunsuDraftApiRequest(
@@ -3004,6 +3140,22 @@ function cloneManagerConfigForRuntime(value: ManagerConfig): ManagerConfig {
   return result.value;
 }
 
+async function resolveManagerModelSelection(
+  manager: ManagerConfig,
+  options: Pick<HunsuDraftApiOptions, "modelInventories">,
+  aliases?: ModelAlias[]
+): Promise<{ provider: DirectProviderModelSelection } | undefined> {
+  if (!manager.modelSelection) {
+    return undefined;
+  }
+  return resolveRunModelSelection({
+    modelSelection: manager.modelSelection,
+    aliases
+  }, {
+    modelInventories: options.modelInventories
+  }, manager.modelSelection);
+}
+
 async function startHunsuDraft(
   request: StudioHunsuDraftStartRequest,
   state: StudioServerState,
@@ -3043,6 +3195,7 @@ async function startHunsuDraft(
     currentArtifactId: sourceArtifact.artifactId,
     managerLock: resolvedManager.managerLock,
     manager: resolvedManager.manager,
+    aliases: request.aliases,
     messages: [],
     diffArtifacts: {},
     status: "draft",
@@ -3059,6 +3212,7 @@ async function startHunsuDraft(
     bumpAgentSession(session, now);
     publishAgentSessionUpdated(state, session);
     try {
+      const managerModelResolution = await resolveManagerModelSelection(draft.manager, options, draft.aliases);
       const requestRecord = board.requests.find(candidate => candidate.id === source.line.requestId) ?? board.requests[0];
       const result = await options.runner.prepareHunsuDraftSession({
         runId: `hunsu-draft:${draft.draftSessionId}`,
@@ -3068,6 +3222,7 @@ async function startHunsuDraft(
         selectedDestinationIds: selectedDestinationIdsForPrompt(source.node.destinations),
         harness: source.node.harness,
         board,
+        resolvedModelSelection: managerModelResolution?.provider,
         draftSessionId: draft.draftSessionId,
         manager: draft.manager,
         sourceArtifactId: draft.sourceArtifactId,
@@ -3112,6 +3267,7 @@ async function sendHunsuDraftMessage(
   try {
     const runId = `hunsu-draft:${draft.draftSessionId}`;
     await prepareManagerCodexEnvironmentForHunsuDraft(draft, options);
+    const managerModelResolution = await resolveManagerModelSelection(draft.manager, options, draft.aliases);
     const result = await withHunsuDraftRunnerEventCollection(options.runner, runId, state, draft, () => options.runner.runHunsuDraftTurn({
       runId,
       repositoryPath: hunsuDraftRepositoryPath(draft, options),
@@ -3120,6 +3276,7 @@ async function sendHunsuDraftMessage(
       selectedDestinationIds: selectedDestinationIdsForPrompt(source.node.destinations),
       harness: source.node.harness,
       board,
+      resolvedModelSelection: managerModelResolution?.provider,
       draftSessionId: draft.draftSessionId,
       manager: draft.manager,
       sourceArtifactId: draft.sourceArtifactId,
@@ -4049,6 +4206,7 @@ function hunsuDraftRouteRuntimeFile(draft: StudioHunsuDraftSession): HunsuDraftR
     currentArtifactId: draft.currentArtifactId,
     managerLock: draft.managerLock,
     manager: draft.manager,
+    aliases: draft.aliases,
     confirmedHunsuId: draft.confirmedHunsuId,
     confirmedNodeId: draft.confirmedNodeId,
     status: draft.status,
@@ -4075,6 +4233,7 @@ function hunsuDraftSessionFromRuntime(file: HunsuDraftRouteRuntimeFile): StudioH
     currentArtifactId: file.currentArtifactId,
     managerLock: file.managerLock,
     manager: cloneManagerConfigForRuntime(file.manager),
+    aliases: file.aliases,
     confirmedHunsuId: file.confirmedHunsuId,
     confirmedNodeId: file.confirmedNodeId,
     messages: [],
@@ -6319,6 +6478,7 @@ function memberEntityFromPackage(member: MemberConfig, packageLock: HubPackageLo
       }))
     ],
     runtimePolicy: {
+      ...(member.modelSelection ? { modelSelection: member.modelSelection } : {}),
       model: member.model,
       reasoningEffort: member.reasoningEffort,
       serviceTier: member.serviceTier,
@@ -6329,10 +6489,135 @@ function memberEntityFromPackage(member: MemberConfig, packageLock: HubPackageLo
   };
 }
 
+type ModelSelectionRequest = Pick<StudioRunStartRequest, "backendId" | "connectionMode" | "modelSelection" | "aliases" | "workspace">;
+
+function modelSelectionRequestFromRun(run: StudioRunState, selection?: ModelSelection): ModelSelectionRequest {
+  return {
+    backendId: run.backendId,
+    connectionMode: run.connectionMode,
+    workspace: run.workspace,
+    modelSelection: selection ?? run.modelSelection,
+    aliases: run.aliases
+  };
+}
+
+async function resolveRunModelSelectionResult(
+  request: ModelSelectionRequest,
+  options: { modelInventories?: ProviderModelInventoriesSource },
+  selectionOverride?: ModelSelection
+): Promise<ModelSelectionResolution | undefined> {
+  const aliases = request.aliases;
+  const selection = selectionOverride ?? request.modelSelection;
+  if (!selection && !aliases?.length) {
+    return undefined;
+  }
+  const inventories = options.modelInventories
+    ? await providerModelInventoriesFromSource(options.modelInventories)
+    : defaultLocalProviderModelInventories();
+  return resolveModelSelection({
+    selection,
+    aliases,
+    backendId: request.backendId ?? request.workspace?.backendId,
+    inventories
+  });
+}
+
+async function resolveRunModelSelection(
+  request: ModelSelectionRequest,
+  options: { modelInventories?: ProviderModelInventoriesSource },
+  selectionOverride?: ModelSelection
+): Promise<{ provider: DirectProviderModelSelection } | undefined> {
+  const resolution = await resolveRunModelSelectionResult(request, options, selectionOverride);
+  if (!resolution) {
+    return undefined;
+  }
+  if (!resolution.ok) {
+    throw new Error(executePreflightErrorFromModelError(resolution.error).message);
+  }
+  return { provider: resolution.resolved };
+}
+
+async function executeModelPreflightErrorForStudioRun(
+  request: StudioRunStartRequest,
+  state: StudioServerState,
+  options: {
+    cwd: string;
+    persist: boolean;
+    modelInventories?: ProviderModelInventoriesSource;
+  }
+): Promise<ProviderAwareExecutePreflightError | undefined> {
+  let harnessInput: ResolvedHarnessInput;
+  try {
+    const board = currentBoard(state, options);
+    const requestRecord = selectRequest(board, request.requestId);
+    const line = selectLine(board, requestRecord.id, request.lineId);
+    const lineNode = nodeForLine(board, line.id);
+    const activeDestinations = destinationsForLine(board, line.id).filter(isOpenDestination);
+    const startPlan = unwrapExecuteResult(planExecuteStart({
+      board,
+      line,
+      lineNode,
+      existingRuns: runsForRepository(state, options.cwd),
+      activeDestinations,
+      selectedDestinationIds: request.selectedDestinationIds,
+      formatMovePosition
+    }));
+    harnessInput = await resolveHarnessInputForRun(startPlan.lineNode, {
+      origins: board.origins
+    });
+  } catch (_error) {
+    return undefined;
+  }
+  const selections = modelSelectionsForHarnessPreflight(harnessInput.harness, harnessInput.harnessGraph);
+  for (const selection of selections) {
+    const resolution = await resolveRunModelSelectionResult({
+      ...request,
+      modelSelection: selection
+    }, {
+      modelInventories: options.modelInventories
+    }, selection);
+    if (resolution && !resolution.ok) {
+      return executePreflightErrorFromModelError(resolution.error);
+    }
+  }
+  return undefined;
+}
+
+function modelSelectionsForHarnessPreflight(protocol: HarnessSnapshot, graph: Harness): ModelSelection[] {
+  const selections: ModelSelection[] = [];
+  const seen = new Set<string>();
+  const add = (selection: ModelSelection | undefined) => {
+    if (!selection) return;
+    const key = JSON.stringify(selection);
+    if (seen.has(key)) return;
+    seen.add(key);
+    selections.push(selection);
+  };
+  if (protocol.kind === "team_execution_plan") {
+    for (const member of protocol.members) {
+      add(member.modelSelection);
+    }
+  }
+  for (const executor of graph.executors) {
+    if (executor.kind === "member") {
+      add(executor.runtimePolicy.modelSelection);
+    }
+  }
+  return selections;
+}
+
 export async function startStudioRun(
   request: StudioRunStartRequest,
   state: StudioServerState,
-  options: { cwd?: string; persist?: boolean; runner?: Runner; apmSkillRegistryClient?: ApmSkillRegistryClient; routeWorktreeRoot?: string; roadmapId?: string } = {}
+  options: {
+    cwd?: string;
+    persist?: boolean;
+    runner?: Runner;
+    apmSkillRegistryClient?: ApmSkillRegistryClient;
+    routeWorktreeRoot?: string;
+    roadmapId?: string;
+    modelInventories?: ProviderModelInventoriesSource;
+  } = {}
 ): Promise<StudioRunResult> {
   const persist = options.persist ?? true;
   const cwd = options.cwd ?? process.cwd();
@@ -6369,6 +6654,8 @@ export async function startStudioRun(
     worktreeHash: worktree.worktreeHash,
     startedAt: now
   };
+  const modelResolution = await resolveRunModelSelection(request, options);
+  const aliases = request.aliases;
   const runId = studioRunId({ lineId: line.id, executeId, roadmapId: options.roadmapId });
   const run: StudioRunState = {
     runId,
@@ -6377,7 +6664,13 @@ export async function startStudioRun(
     requestId: requestRecord.id,
     lineId: line.id,
     repositoryPath: cwd,
+    backendId: request.backendId,
+    connectionMode: request.connectionMode,
+    workspace: request.workspace,
     provider: "codex",
+    modelSelection: request.modelSelection,
+    aliases,
+    resolvedModelSelection: modelResolution?.provider,
     source: "live",
     status: "running",
     selectedDestinationIds,
@@ -6425,10 +6718,16 @@ export async function startStudioRun(
     maxAttemptCount: run.maxAttemptCount,
     futureConstraints: board.futureConstraints.filter(constraint => constraint.lineId === line.id).map(constraint => constraint.constraint),
     conversationRef,
+    resolvedModelSelection: modelResolution?.provider,
     board
   };
 
-  void runExecuteLoop(input, runner, state, { cwd, persist, apmSkillRegistryClient: options.apmSkillRegistryClient }).catch(error => accidentRunnerRun(run.runId, error, state, { cwd, persist }));
+  void runExecuteLoop(input, runner, state, {
+    cwd,
+    persist,
+    apmSkillRegistryClient: options.apmSkillRegistryClient,
+    modelInventories: options.modelInventories
+  }).catch(error => accidentRunnerRun(run.runId, error, state, { cwd, persist }));
   return { run: toStudioRunSummary(run), execute: toStudioExecuteView(run), board };
 }
 
@@ -6449,7 +6748,7 @@ export async function pauseStudioRun(
 export async function resumeStudioRun(
   request: StudioRunActionRequest,
   state: StudioServerState,
-  options: { cwd?: string; persist?: boolean; runner?: Runner; apmSkillRegistryClient?: ApmSkillRegistryClient } = {}
+  options: { cwd?: string; persist?: boolean; runner?: Runner; apmSkillRegistryClient?: ApmSkillRegistryClient; modelInventories?: ProviderModelInventoriesSource } = {}
 ): Promise<StudioRunResult> {
   const persist = options.persist ?? true;
   const cwd = options.cwd ?? process.cwd();
@@ -6494,12 +6793,14 @@ export async function resumeStudioRun(
       previousMemberOutputs: run.memberEvaluations?.map(formatMemberEvaluation),
       futureConstraints: board.futureConstraints.filter(constraint => constraint.lineId === run.lineId).map(constraint => constraint.constraint),
       conversationRef: run.conversationRef,
+      resolvedModelSelection: run.resolvedModelSelection,
       board
     }, runner, state, {
       cwd,
       persist,
       resumeProviderThreadId: run.providerTeamThreadId ?? run.providerThreadId,
-      apmSkillRegistryClient: options.apmSkillRegistryClient
+      apmSkillRegistryClient: options.apmSkillRegistryClient,
+      modelInventories: options.modelInventories
     }).catch(error => accidentRunnerRun(run.runId, error, state, { cwd, persist }));
   }
   return { run: toStudioRunSummary(run), execute: toStudioExecuteView(run), board: result.board };
@@ -8138,7 +8439,13 @@ async function runExecuteLoop(
   baseInput: StartRunInput,
   runner: Runner,
   state: StudioServerState,
-  options: { cwd: string; persist: boolean; resumeProviderThreadId?: string; apmSkillRegistryClient?: ApmSkillRegistryClient }
+  options: {
+    cwd: string;
+    persist: boolean;
+    resumeProviderThreadId?: string;
+    apmSkillRegistryClient?: ApmSkillRegistryClient;
+    modelInventories?: ProviderModelInventoriesSource;
+  }
 ): Promise<void> {
   const run = state.runs[baseInput.runId];
   if (!run || run.status === "stopped") {
@@ -8340,7 +8647,12 @@ type ExecutionPlanRunContext = {
   state: StudioServerState;
   run: StudioRunState;
   worktreeCwd: string;
-  options: { cwd: string; persist: boolean; apmSkillRegistryClient?: ApmSkillRegistryClient };
+  options: {
+    cwd: string;
+    persist: boolean;
+    apmSkillRegistryClient?: ApmSkillRegistryClient;
+    modelInventories?: ProviderModelInventoriesSource;
+  };
 };
 
 async function runExecutionPlanStep(
@@ -8683,10 +8995,19 @@ async function runMemberPathTurn(
   publishRunUpdated(context.state, context.run);
 
   const scopedHarness = scopedHarnessForCurrentTeam(context);
+  const memberConfig = scopedHarness ? getHarnessMemberConfig(scopedHarness, memberPath.executorId) : undefined;
+  const memberModelResolution = memberConfig?.modelSelection
+    ? await resolveRunModelSelection(
+        modelSelectionRequestFromRun(context.run, memberConfig.modelSelection),
+        { modelInventories: context.options.modelInventories },
+        memberConfig.modelSelection
+      )
+    : undefined;
   const memberInput: MemberPathRunInput = {
     ...context.attemptInput,
     board: currentBoard(context.state, { cwd: context.options.cwd, persist: context.options.persist }),
     harness: scopedHarness,
+    resolvedModelSelection: memberModelResolution?.provider ?? context.attemptInput.resolvedModelSelection,
     memberPath,
     dependencyOutputs,
     worktreeStatus: formatWorktreeStatus(context.worktreeCwd),

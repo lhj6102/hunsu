@@ -54,6 +54,9 @@ export type RelayCommandName =
   | "health"
   | "bridge.status"
   | "connection.status"
+  | "provider.inventory"
+  | "modelAlias.validate"
+  | "modelAlias.resolve"
   | "roadmap.registry.list"
   | "roadmap.registry.remove"
   | "roadmap.open"
@@ -890,6 +893,9 @@ function isRelayCommandName(value: string): value is RelayCommandName {
     "health",
     "bridge.status",
     "connection.status",
+    "provider.inventory",
+    "modelAlias.validate",
+    "modelAlias.resolve",
     "roadmap.registry.list",
     "roadmap.registry.remove",
     "roadmap.open",

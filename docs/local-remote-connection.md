@@ -42,6 +42,13 @@ device does not report provider status yet, `/api/bridge/status` returns an
 explicit unavailable remote-provider status instead of reusing the local Codex
 status.
 
+Web model-alias validation follows the selected backend. Local validation calls
+`/api/providers/inventory` and `/api/model-aliases/validate` on the local
+Bridge; the inventory response names the backend with `backendId`. Remote
+validation uses the Relay command path for `provider.inventory`,
+`modelAlias.validate`, and `modelAlias.resolve`, and successful resolution
+returns the backend id that actually validated the model.
+
 Local Bridge child processes inherit the effective runtime provider env from
 Bridge App state. That includes saved Codex `binaryPath`, `codexHome`,
 `appServerCommand`, and `appServerArgs`. The sidecar daemon, remote attach

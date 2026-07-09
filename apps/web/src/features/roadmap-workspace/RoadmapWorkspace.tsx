@@ -1,13 +1,16 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { BridgeRequestError, fetchHunsuDraftDiffArtifact, postArtifactActionRun, postHunsuDraftApprove, postHunsuDraftDiscard, postHunsuDraftMessage, postHunsuDraftStart, postRunAction } from "@/shared/api/bridgeClient";
-import type { ExecutePreflightAction, ExecutePreflightError, StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
+import { Settings2 } from "lucide-react";
+import { pushStudioPath } from "@/app/routes";
+import { BridgeRequestError, fetchHunsuDraftDiffArtifact, fetchModelInventory, postArtifactActionRun, postHunsuDraftApprove, postHunsuDraftDiscard, postHunsuDraftMessage, postHunsuDraftStart, postRunAction } from "@/shared/api/bridgeClient";
+import type { DirectProviderModelSelection, ExecutePreflightAction, ExecutePreflightError, ModelAlias, ModelSelection, ProviderInventory, StudioHunsuDraftDiffArtifact, StudioHunsuDraftSession } from "@/shared/api/bridgeTypes";
 import { useRoadmapWorkspace } from "@/shared/api/useStudioData";
 import { Button } from "@/shared/ui/button";
 import type { RoadmapActionModel, RoadmapDetailPanel, RoadmapSelection } from "@/shared/domain/roadmapViewModel";
 import { NodeDetailPanel } from "@/features/inspector/NodeDetailPanel";
 import { RoadmapGraph } from "@/features/roadmap-graph/RoadmapGraph";
 import { bridgeActionHref } from "./preflightActions.js";
+import { readWebModelAliases } from "@/features/model-aliases/modelAliasStorage";
 
 type ExecuteActionState = {
   status: "idle" | "starting" | "started" | "error";
@@ -32,6 +35,12 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
   const [activePanel, setActivePanel] = useState<RoadmapDetailPanel>(panelFromQuery(params.get("panel")));
   const [expandedConnections, setExpandedConnections] = useState<string[]>(() => expandedConnectionsFromQuery(params));
   const [executeAction, setExecuteAction] = useState<ExecuteActionState>({ status: "idle" });
+  const [modelPanelOpen, setModelPanelOpen] = useState(false);
+  const [modelAliases, setModelAliases] = useState<ModelAlias[]>(() => readWebModelAliases());
+  const [executeModelMode, setExecuteModelMode] = useState<"alias" | "direct">(() => modelAliases.length ? "alias" : "direct");
+  const [executeAliasId, setExecuteAliasId] = useState<string>(() => modelAliases[0]?.aliasId ?? "PrimaryModel");
+  const [modelInventory, setModelInventory] = useState<ProviderInventory | undefined>();
+  const [directProvider, setDirectProvider] = useState<DirectProviderModelSelection>(() => directProviderFromAlias(modelAliases[0]));
   const [artifactAction, setArtifactAction] = useState<ArtifactActionState>({ status: "idle" });
   const [hunsuDraft, setHunsuDraft] = useState<StudioHunsuDraftSession | undefined>();
   const [hunsuDraftDiffArtifacts, setHunsuDraftDiffArtifacts] = useState<Record<string, StudioHunsuDraftDiffArtifact>>({});
@@ -51,6 +60,10 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
   const selectedHunsuDraft = selectCurrentHunsuDraft(hunsuDraft, inspectorHunsuDraft);
   const subtitle = model.repositoryPath ?? model.worktree?.root ?? `/studio/roadmaps/${model.roadmapId}`;
   const selectedInspector = selection !== undefined && selection.kind !== "none" ? model.inspector : undefined;
+  const codexInventory = modelInventory?.providers.find(provider => provider.providerId === "codex");
+  const directModel = codexInventory?.models.find(item => item.model === directProvider.model);
+  const directReasoningOptions = optionSet(directModel?.capabilities.reasoningEfforts, directProvider.reasoningEffort);
+  const directServiceTierOptions = optionSet(directModel?.capabilities.serviceTiers, directProvider.serviceTier);
   const hunsuDraftMessageMutation = useMutation({
     mutationFn: ({ draft, message }: { draft: StudioHunsuDraftSession; message: string }) =>
       postHunsuDraftMessage(roadmapId, draft.draftSessionId, message),
@@ -71,6 +84,29 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
       setHunsuDraftAction({ status: "error", message: errorMessage(nextError, "HUNSU Draft message failed.") });
     }
   });
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchModelInventory()
+      .then(result => {
+        if (cancelled) return;
+        setModelInventory(result);
+        setDirectProvider(current => {
+          const models = result.providers.find(provider => provider.providerId === "codex")?.models ?? [];
+          return models.some(item => item.model === current.model)
+            ? current
+            : defaultDirectProvider(models[0]?.defaultConfig ?? current);
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModelInventory(undefined);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function select(nextSelection: RoadmapSelection) {
     setSelection(nextSelection);
@@ -133,7 +169,13 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
       await postRunAction(roadmapId, "start", {
         requestId: action.requestId,
         lineId: action.lineId,
-        selectedDestinationIds: action.destinationIds
+        selectedDestinationIds: action.destinationIds,
+        ...executeModelSelectionPayload({
+          mode: executeModelMode,
+          aliasId: executeAliasId,
+          directProvider,
+          aliases: readWebModelAliases()
+        })
       });
       setExecuteAction({ status: "started", message: "Execute started. Waiting for live run events." });
       refresh();
@@ -169,7 +211,8 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
       const result = await postHunsuDraftStart(roadmapId, {
         sourceNodeId: model.inspector.node.id,
         sourceMoveId: model.inspector.move?.id,
-        sourceLineId: model.inspector.action.lineId
+        sourceLineId: model.inspector.action.lineId,
+        aliases: modelAliases
       });
       setHunsuDraft(result.draft);
       mergeHunsuDraftDiffArtifacts(result.draft.diffArtifacts);
@@ -248,6 +291,50 @@ export function RoadmapWorkspace({ roadmapId }: { roadmapId: string }) {
           </p>
         </div>
       </div>
+      <div className="pointer-events-none absolute right-5 top-5 z-30">
+        <Button
+          type="button"
+          size="icon"
+          variant="outline"
+          className="apple-glass pointer-events-auto size-10"
+          aria-label="Choose execute model"
+          onClick={() => {
+            setModelAliases(readWebModelAliases());
+            setModelPanelOpen(open => !open);
+          }}
+        >
+          <Settings2 className="size-4" />
+        </Button>
+        {modelPanelOpen ? (
+          <div className="apple-glass pointer-events-auto mt-3 grid w-[320px] max-w-[calc(100vw-2.5rem)] gap-3 rounded-[8px] p-3">
+            <div className="grid grid-cols-2 gap-2">
+              <Button type="button" size="sm" variant={executeModelMode === "alias" ? "default" : "outline"} onClick={() => setExecuteModelMode("alias")}>Use alias</Button>
+              <Button type="button" size="sm" variant={executeModelMode === "direct" ? "default" : "outline"} onClick={() => setExecuteModelMode("direct")}>Direct provider</Button>
+            </div>
+            {executeModelMode === "alias" ? (
+              <div className="grid gap-2">
+                <select className="h-9 rounded-md border bg-background px-2 text-sm" value={executeAliasId} onChange={event => setExecuteAliasId(event.target.value)}>
+                  {modelAliases.map(alias => <option key={alias.aliasId} value={alias.aliasId}>{alias.displayName}</option>)}
+                </select>
+                <Button type="button" size="sm" variant="outline" onClick={() => pushStudioPath("/studio/settings/model-aliases")}>Edit aliases</Button>
+              </div>
+            ) : (
+              <div className="grid gap-2">
+                <select className="h-9 rounded-md border bg-background px-2 text-sm" value={directProvider.model} onChange={event => selectDirectModel(event.target.value, codexInventory?.models, setDirectProvider)}>
+                  {(codexInventory?.models ?? []).map(item => <option key={item.model} value={item.model}>{item.label}</option>)}
+                  {!codexInventory?.models.some(item => item.model === directProvider.model) ? <option value={directProvider.model}>{directProvider.model}</option> : null}
+                </select>
+                <select className="h-9 rounded-md border bg-background px-2 text-sm" value={directProvider.reasoningEffort ?? ""} onChange={event => setDirectProvider(current => ({ ...current, reasoningEffort: event.target.value as DirectProviderModelSelection["reasoningEffort"] } as DirectProviderModelSelection))}>
+                  {directReasoningOptions.map(value => <option key={value} value={value}>{value}</option>)}
+                </select>
+                <select className="h-9 rounded-md border bg-background px-2 text-sm" value={directProvider.serviceTier ?? ""} onChange={event => setDirectProvider(current => ({ ...current, serviceTier: event.target.value as DirectProviderModelSelection["serviceTier"] } as DirectProviderModelSelection))}>
+                  {directServiceTierOptions.map(value => <option key={value} value={value}>{value}</option>)}
+                </select>
+              </div>
+            )}
+          </div>
+        ) : null}
+      </div>
       {executeAction.status === "error" && executeAction.message ? (
         <div className="pointer-events-none absolute left-5 right-5 top-[92px] z-30 flex justify-center">
           <div className="apple-glass pointer-events-auto flex max-w-[720px] flex-wrap items-center justify-center gap-3 rounded-[14px] px-4 py-3 text-center">
@@ -316,11 +403,57 @@ function executePreflightError(error: unknown): ExecutePreflightError | undefine
     return undefined;
   }
   const body = error.body as Partial<ExecutePreflightError>;
-  return (body.area === "provider" || body.area === "workspace" || body.area === "connection")
+  return (body.area === "provider" || body.area === "workspace" || body.area === "connection" || body.area === "model")
     && typeof body.error === "string"
     && typeof body.message === "string"
     ? body as ExecutePreflightError
     : undefined;
+}
+
+function executeModelSelectionPayload(input: {
+  mode: "alias" | "direct";
+  aliasId: string;
+  directProvider: DirectProviderModelSelection;
+  aliases: ModelAlias[];
+}): { modelSelection: ModelSelection; aliases: ModelAlias[] } {
+  return {
+    modelSelection: input.mode === "alias"
+      ? { kind: "alias", aliasId: input.aliasId as Extract<ModelSelection, { kind: "alias" }>["aliasId"] }
+      : { kind: "direct", provider: input.directProvider },
+    aliases: input.aliases
+  };
+}
+
+function directProviderFromAlias(alias: ModelAlias | undefined): DirectProviderModelSelection {
+  return defaultDirectProvider(alias?.selection.provider);
+}
+
+function defaultDirectProvider(provider: DirectProviderModelSelection | undefined): DirectProviderModelSelection {
+  return provider ?? {
+    providerId: "codex",
+    model: "codex-default",
+    reasoningEffort: "default",
+    serviceTier: "default",
+    experimental: true
+  } as DirectProviderModelSelection;
+}
+
+function selectDirectModel(
+  modelName: string,
+  models: ProviderInventory["providers"][number]["models"] | undefined,
+  setDirectProvider: (update: (current: DirectProviderModelSelection) => DirectProviderModelSelection) => void
+): void {
+  const descriptor = models?.find(model => model.model === modelName);
+  setDirectProvider(current => defaultDirectProvider({
+    ...current,
+    ...(descriptor?.defaultConfig ?? {}),
+    providerId: "codex",
+    model: modelName as DirectProviderModelSelection["model"]
+  } as DirectProviderModelSelection));
+}
+
+function optionSet(values: string[] | undefined, selected: string | undefined): string[] {
+  return [...new Set([...(values ?? []), selected].filter((value): value is string => Boolean(value)))];
 }
 
 export function RoadmapWorkspacePreflightActions({ preflight, open = openBridgeLink }: { preflight: ExecutePreflightError | undefined; open?: (href: string) => void }) {
@@ -348,6 +481,9 @@ function fallbackPreflightActions(preflight: ExecutePreflightError | undefined):
   if (preflight?.area === "connection") {
     return [{ type: "open_connection", label: "Open Connection" }];
   }
+  if (preflight?.area === "model") {
+    return [{ type: "edit_model_alias", label: "Edit Model Alias" }];
+  }
   return [{ type: "open_provider_setup", label: "Open Provider Setup" }];
 }
 
@@ -357,7 +493,8 @@ function primaryAction(action: ExecutePreflightAction): boolean {
     || action.type === "login_provider"
     || action.type === "open_workspaces"
     || action.type === "activate_workspace"
-    || action.type === "open_connection";
+    || action.type === "open_connection"
+    || action.type === "edit_model_alias";
 }
 
 function openBridgeLink(url: string): void {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isSea } from "node:sea";
 import { fileURLToPath } from "node:url";
@@ -72,12 +72,14 @@ import {
   formatBridgeRemoteAccess,
   hashBridgeDeviceSeed,
   isBridgeUiIntentTab,
+  parseBridgeQuitBehavior,
   readBridgeAppState as readAppState,
   recordBridgeUiIntent,
   writeBridgeAppState as writeAppState,
   type BridgeAppSnapshot,
   type BridgeAppState,
   type BridgeProcessCommandIdentity,
+  type BridgeQuitBehavior,
   type BridgeProcessRuntimeMetadata,
   type BridgeRoadmapAccessSnapshot,
   type BridgeServiceState,
@@ -98,6 +100,10 @@ import {
   codexEffectiveEnvSummary,
   codexProviderEnv,
   getCodexRuntimeStatus,
+  defaultModelAliases,
+  defaultLocalProviderModelInventories,
+  providerInventoriesForBridgeStatus,
+  resolveModelSelection,
   inspectProject,
   listManagedRoadmapRegistry,
   listRoadmapRegistry,
@@ -110,9 +116,12 @@ import {
   setRoadmapLifecycle,
   setRoadmapRemoteAccess,
   type BridgePairingSession,
+  type DirectProviderModelSelection,
   type RuntimeProviderStatus,
   type BridgeRuntimeHandle,
-  type ProjectInspection
+  type ProjectInspection,
+  type ModelAlias,
+  type ModelAliasOverride
 } from "@hunsu/bridge";
 import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, unwrapConfigResult } from "@hunsu/config";
 
@@ -127,6 +136,7 @@ const DEFAULT_RELAY_REGISTRY_PATH = join(homedir(), ".config", "hunsu", "relay-d
 const DEFAULT_APP_LOG_PATH = join(homedir(), ".cache", "hunsu", "bridge-app.log");
 const DEFAULT_SYSTEMD_USER_UNIT_PATH = join(homedir(), ".config", "systemd", "user", "hunsu-bridge.service");
 const DEFAULT_LAUNCHD_USER_PLIST_PATH = join(homedir(), "Library", "LaunchAgents", "app.hunsu.bridge.plist");
+const WINDOWS_USER_TASK_NAME = "Hunsu Bridge";
 const PROJECT_GRANT_SCOPE_VALUES = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"] as const satisfies readonly BridgeCommandScope[];
 const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose"];
 const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
@@ -197,8 +207,14 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
       case "protocol":
         protocolCommand(parsed);
         return 0;
+      case "settings":
+        settingsCommand(parsed);
+        return 0;
       case "service":
         serviceCommand(parsed);
+        return 0;
+      case "model-alias":
+        await modelAliasCommand(parsed);
         return 0;
       case "supervise":
         await superviseCommand(parsed);
@@ -502,6 +518,7 @@ async function statusCommand(): Promise<void> {
   console.log(`  Remote Access: ${snapshot.status.remoteAccess}`);
   console.log(`  Device: ${snapshot.status.device.name}${snapshot.status.device.registered ? " (registered)" : ""}`);
   console.log(`  Service: ${snapshot.status.service.installed ? `Installed (${snapshot.status.service.manager})` : "Not installed"}`);
+  console.log(`  Quit Behavior: ${formatQuitBehavior(snapshot.status.quitBehavior)}`);
   console.log("");
   console.log("Provider:");
   console.log(`  ${snapshot.providers.current.label}: ${providerStatusSummary(snapshot.providers.current)}`);
@@ -664,6 +681,175 @@ async function providerCommand(parsed: ParsedArgs): Promise<void> {
   });
 }
 
+async function modelAliasCommand(parsed: ParsedArgs): Promise<void> {
+  const subcommand = parsed.rest[0] ?? "list";
+  const state = readAppState();
+  const aliases = modelAliasesForState(state);
+  if (subcommand === "list") {
+    printModelAliases(aliases, hasFlag(parsed, "json"));
+    return;
+  }
+  if (subcommand === "get") {
+    const aliasId = requiredModelAliasId(parsed, 1);
+    const alias = aliases.find(candidate => candidate.aliasId === aliasId);
+    if (!alias) {
+      throw new Error(`Unknown model alias: ${aliasId}`);
+    }
+    console.log(JSON.stringify(alias, null, 2));
+    return;
+  }
+  if (subcommand === "set") {
+    const aliasId = requiredModelAliasId(parsed, 1);
+    const now = new Date().toISOString();
+    const existing = aliases.find(alias => alias.aliasId === aliasId);
+    const nextAlias = modelAliasFromArgs(parsed, existing, aliasId, now);
+    const nextAliases = [...aliases.filter(alias => alias.aliasId !== aliasId), nextAlias].sort(compareModelAlias);
+    writeAppState({ ...state, modelAliases: nextAliases });
+    console.log(`Saved model alias ${aliasId}.`);
+    return;
+  }
+  if (subcommand === "delete") {
+    const aliasId = requiredModelAliasId(parsed, 1);
+    writeAppState({ ...state, modelAliases: aliases.filter(alias => alias.aliasId !== aliasId) });
+    console.log(`Deleted model alias ${aliasId}.`);
+    return;
+  }
+  if (subcommand === "validate") {
+    const aliasId = parsed.rest[1];
+    const selection = aliasId ? { kind: "alias" as const, aliasId: aliasId as ModelAlias["aliasId"] } : undefined;
+    const result = await validateModelAliasSelection(selection, aliases, state.modelAliasOverrides);
+    if (!result.ok) {
+      throw new Error(result.error.message);
+    }
+    console.log(`Valid: ${result.resolved.providerId}/${result.resolved.model}`);
+    return;
+  }
+  if (subcommand === "override") {
+    const aliasId = requiredModelAliasId(parsed, 1);
+    const backendId = getFlag(parsed, "backend") ?? getFlag(parsed, "backend-id");
+    if (!backendId) {
+      throw new Error("Usage: hunsu-bridge model-alias override <aliasId> --backend <backendId> --model <model> [--reasoning <effort>] [--service-tier default|fast]");
+    }
+    const now = new Date().toISOString();
+    const alias = aliases.find(candidate => candidate.aliasId === aliasId);
+    if (!alias) {
+      throw new Error(`Unknown model alias: ${aliasId}`);
+    }
+    const override: ModelAliasOverride = {
+      aliasId: aliasId as ModelAliasOverride["aliasId"],
+      backendId: backendId as ModelAliasOverride["backendId"],
+      selection: modelAliasFromArgs(parsed, alias, aliasId, now).selection,
+      reason: getFlag(parsed, "reason") as ModelAliasOverride["reason"],
+      updatedAt: now
+    };
+    writeAppState({
+      ...state,
+      modelAliases: aliases,
+      modelAliasOverrides: [
+        ...(state.modelAliasOverrides ?? []).filter(candidate => candidate.aliasId !== aliasId || candidate.backendId !== backendId),
+        override
+      ]
+    });
+    console.log(`Saved ${aliasId} override for ${backendId}.`);
+    return;
+  }
+  throw new Error(`Unknown model-alias command: ${subcommand}`);
+}
+
+function modelAliasesForState(state: BridgeAppState): ModelAlias[] {
+  const aliases = state.modelAliases.length
+    ? state.modelAliases
+    : defaultModelAliases(new Date().toISOString()).map(localScopedModelAlias);
+  return aliases.map(normalizeModelAliasScope);
+}
+
+function normalizeModelAliasScope(alias: ModelAlias): ModelAlias {
+  if (typeof alias.scope === "object" && alias.scope !== null && "kind" in alias.scope) {
+    return alias;
+  }
+  return { ...alias, scope: { kind: "local" } };
+}
+
+function localScopedModelAlias(alias: ModelAlias): ModelAlias {
+  return { ...alias, scope: { kind: "local" } };
+}
+
+function requiredModelAliasId(parsed: ParsedArgs, index: number): string {
+  const aliasId = parsed.rest[index]?.trim();
+  if (!aliasId) {
+    throw new Error("Usage: hunsu-bridge model-alias list|get|set|delete|validate|override");
+  }
+  return aliasId;
+}
+
+function modelAliasFromArgs(parsed: ParsedArgs, existing: ModelAlias | undefined, aliasId: string, now: string): ModelAlias {
+  const model = getFlag(parsed, "model") ?? existing?.selection.provider.model;
+  if (!model) {
+    throw new Error("Missing --model for model alias.");
+  }
+  const displayName = getFlag(parsed, "display-name") ?? existing?.displayName ?? aliasId;
+  const experimental = hasFlag(parsed, "experimental")
+    ? true
+    : existing?.selection.provider.experimental === true
+      ? true
+      : undefined;
+  return {
+    aliasId: aliasId as ModelAlias["aliasId"],
+    displayName: displayName as ModelAlias["displayName"],
+    description: getFlag(parsed, "description") as ModelAlias["description"],
+    selection: {
+      kind: "direct",
+      provider: {
+        providerId: "codex",
+        model: model as ModelAlias["aliasId"],
+        reasoningEffort: (getFlag(parsed, "reasoning") ?? getFlag(parsed, "reasoning-effort") ?? existing?.selection.provider.reasoningEffort ?? "default") as ModelAlias["selection"]["provider"]["reasoningEffort"],
+        serviceTier: (getFlag(parsed, "service-tier") ?? existing?.selection.provider.serviceTier ?? "default") as ModelAlias["selection"]["provider"]["serviceTier"],
+        ...(experimental ? { experimental } : {})
+      } as DirectProviderModelSelection
+    },
+    scope: { kind: "local" },
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now
+  };
+}
+
+async function validateModelAliasSelection(
+  selection: { kind: "alias"; aliasId: ModelAlias["aliasId"] } | undefined,
+  aliases: ModelAlias[],
+  overrides: ModelAliasOverride[] | undefined
+) {
+  let inventories = defaultLocalProviderModelInventories();
+  try {
+    const snapshot = await runtimeProvidersSnapshot();
+    inventories = providerInventoriesForBridgeStatus({ provider: snapshot.current });
+  } catch (_error) {
+    // The static Codex inventory still gives useful schema validation when provider probing is unavailable.
+  }
+  return resolveModelSelection({
+    selection,
+    aliases,
+    overrides,
+    inventories
+  });
+}
+
+function printModelAliases(aliases: ModelAlias[], json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify({ aliases }, null, 2));
+    return;
+  }
+  for (const alias of aliases) {
+    const provider = alias.selection.provider;
+    console.log(`${alias.aliasId}: ${alias.displayName}`);
+    console.log(`  ${provider.providerId}/${provider.model} reasoning=${provider.reasoningEffort ?? "default"} serviceTier=${provider.serviceTier ?? "default"}`);
+    console.log(`  scope=${alias.scope.kind}${alias.selection.provider.experimental ? " experimental" : ""}`);
+  }
+}
+
+function compareModelAlias(left: ModelAlias, right: ModelAlias): number {
+  return String(left.aliasId).localeCompare(String(right.aliasId));
+}
+
 async function roadmapsCommand(parsed: ParsedArgs): Promise<void> {
   await runRoadmapsCommand(parsed, workspaceCommandContext());
 }
@@ -788,10 +974,7 @@ function serviceCommand(parsed: ParsedArgs): void {
   const subcommand = parsed.rest[0] ?? "status";
   const state = readAppState();
   if (subcommand === "status") {
-    console.log(`Service: ${state.service.installed ? `Installed (${state.service.manager})` : "Not installed"}`);
-    if (state.service.unitPath) {
-      console.log(`Unit: ${state.service.unitPath}`);
-    }
+    printServiceStatus(state.service);
     return;
   }
   if (subcommand === "install") {
@@ -811,6 +994,25 @@ function serviceCommand(parsed: ParsedArgs): void {
     if (service.unitPath) {
       console.log(`Unit: ${service.unitPath}`);
     }
+    return;
+  }
+  if (subcommand === "uninstall") {
+    const dryRun = hasFlag(parsed, "dry-run");
+    uninstallServiceArtifact(state.service, dryRun);
+    if (state.service.unitPath) {
+      if (dryRun) {
+        console.log(`Dry run: would remove Hunsu Bridge service artifact at ${state.service.unitPath}.`);
+      } else if (existsSync(state.service.unitPath)) {
+        rmSync(state.service.unitPath, { force: true });
+      }
+    }
+    if (!dryRun) {
+      writeAppState({
+        ...state,
+        service: { installed: false, manager: defaultBridgeServiceManager(), updatedAt: new Date().toISOString() }
+      });
+    }
+    console.log("Hunsu Bridge service artifact uninstalled.");
     return;
   }
   if (subcommand === "start") {
@@ -837,6 +1039,33 @@ function protocolCommand(parsed: ParsedArgs): void {
     return;
   }
   throw new Error(`Unknown protocol command: ${subcommand}`);
+}
+
+function settingsCommand(parsed: ParsedArgs): void {
+  const setting = parsed.rest[0];
+  if (setting !== "quit-behavior") {
+    throw new Error("Usage: hunsu-bridge settings quit-behavior get|set keep-background|stop-background");
+  }
+  const action = parsed.rest[1] ?? "get";
+  const state = readAppState();
+  if (action === "get") {
+    console.log(state.quitBehavior);
+    return;
+  }
+  if (action === "set") {
+    const behavior = parseBridgeQuitBehavior(parsed.rest[2]);
+    if (behavior !== parsed.rest[2]) {
+      throw new Error("Quit behavior must be keep-background or stop-background.");
+    }
+    writeAppState({ ...state, quitBehavior: behavior });
+    console.log(`Saved quit behavior: ${formatQuitBehavior(behavior)}.`);
+    return;
+  }
+  throw new Error("Usage: hunsu-bridge settings quit-behavior get|set keep-background|stop-background");
+}
+
+function formatQuitBehavior(value: BridgeQuitBehavior): string {
+  return value === "stop-background" ? "Stop background service on quit" : "Keep background service running";
 }
 
 async function superviseCommand(parsed: ParsedArgs): Promise<void> {
@@ -1480,12 +1709,14 @@ function clearManagedProcessState(): void {
 }
 
 function installServiceArtifact(parsed: ParsedArgs): BridgeServiceState {
-  const manager = defaultBridgeServiceManager();
+  const manager = hasFlag(parsed, "system") ? "manual" : defaultBridgeServiceManager();
+  const state = readAppState();
+  const serviceEnv = serviceEnvironmentSnapshot(state);
   const dryRun = hasFlag(parsed, "dry-run");
   if (manager === "systemd-user") {
     const unitPath = currentProcessEnv().HUNSU_BRIDGE_SERVICE_UNIT_PATH?.trim() || DEFAULT_SYSTEMD_USER_UNIT_PATH;
-    const cwd = resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd());
-    const text = systemdUserUnitText(cwd);
+    const cwd = resolve(getFlag(parsed, "cwd") ?? state.cwd ?? process.cwd());
+    const text = systemdUserUnitText(cwd, serviceEnv);
     if (dryRun) {
       console.log(`Dry run: would write Hunsu Bridge systemd user service artifact to ${unitPath}.`);
       console.log(text);
@@ -1494,13 +1725,13 @@ function installServiceArtifact(parsed: ParsedArgs): BridgeServiceState {
     mkdirSync(dirname(unitPath), { recursive: true });
     writeFileSync(unitPath, text, "utf8");
     writeStructuredLog({ event: "service.installed", manager, unitPath, cwd });
-    console.log("Run `systemctl --user daemon-reload` if your desktop session does not pick up the new unit automatically.");
+    runServiceManagerReload(manager);
     return { installed: true, manager, unitPath };
   }
   if (manager === "launchd-user") {
     const unitPath = currentProcessEnv().HUNSU_BRIDGE_SERVICE_UNIT_PATH?.trim() || DEFAULT_LAUNCHD_USER_PLIST_PATH;
-    const cwd = resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd());
-    const text = launchdUserPlistText(cwd);
+    const cwd = resolve(getFlag(parsed, "cwd") ?? state.cwd ?? process.cwd());
+    const text = launchdUserPlistText(cwd, serviceEnv);
     if (dryRun) {
       console.log(`Dry run: would write Hunsu Bridge launchd user service artifact to ${unitPath}.`);
       console.log(text);
@@ -1509,17 +1740,32 @@ function installServiceArtifact(parsed: ParsedArgs): BridgeServiceState {
     mkdirSync(dirname(unitPath), { recursive: true });
     writeFileSync(unitPath, text, "utf8");
     writeStructuredLog({ event: "service.installed", manager, unitPath, cwd });
-    console.log("Run `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/app.hunsu.bridge.plist` after reviewing the service artifact.");
+    runServiceManagerCommand("start", { installed: true, manager, unitPath });
     return { installed: true, manager, unitPath };
   }
-  if (manager === "windows-service") {
-    const command = windowsServiceInstallCommand(resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd()));
+  if (manager === "windows-startup-user") {
+    const unitPath = currentProcessEnv().HUNSU_BRIDGE_SERVICE_UNIT_PATH?.trim() || defaultWindowsUserStartupScriptPath();
+    const cwd = resolve(getFlag(parsed, "cwd") ?? state.cwd ?? process.cwd());
+    const text = windowsUserStartupScriptText(cwd, serviceEnv);
+    const command = windowsScheduledTaskInstallCommand(unitPath);
     if (dryRun) {
-      console.log("Dry run: would use the following Hunsu Bridge Windows service command.");
+      console.log(`Dry run: would write Hunsu Bridge Windows user startup script to ${unitPath}.`);
+      console.log(text);
+      console.log(command.join(" "));
+      return { installed: false, manager, unitPath };
     }
+    mkdirSync(dirname(unitPath), { recursive: true });
+    writeFileSync(unitPath, text, "utf8");
+    runServiceCommand(command, { event: "service.installed", manager, dryRun: false });
+    writeStructuredLog({ event: "service.installed", manager, unitPath, cwd });
+    return { installed: true, manager, unitPath };
+  }
+  if (hasFlag(parsed, "system")) {
+    const command = systemServiceInstallCommand(resolve(getFlag(parsed, "cwd") ?? state.cwd ?? process.cwd()));
+    console.log("Advanced system service command:");
     console.log(command);
-    writeStructuredLog({ event: "service.install-intent", manager, command });
-    return { installed: !dryRun, manager };
+    writeStructuredLog({ event: "service.install-intent.system", manager: "manual", command });
+    return { installed: !dryRun, manager: "manual" };
   }
   if (dryRun) {
     console.log(`Dry run: no automatic service artifact is available for ${manager}.`);
@@ -1533,27 +1779,134 @@ function installServiceArtifact(parsed: ParsedArgs): BridgeServiceState {
 function runServiceManagerCommand(action: "start" | "stop", service: BridgeServiceState): void {
   if (service.manager === "systemd-user") {
     const command = ["systemctl", "--user", action, "hunsu-bridge.service"];
-    if (currentProcessEnv().HUNSU_BRIDGE_SERVICE_DRY_RUN === "1" || !commandAvailable("systemctl")) {
-      console.log(`Run: ${command.join(" ")}`);
-      writeStructuredLog({ event: `service.${action}.dry-run`, manager: service.manager, command: command.join(" ") });
-      return;
+    runServiceCommand(command, { event: `service.${action}`, manager: service.manager });
+    console.log(`Hunsu Bridge service ${action} requested through systemd user service.`);
+    return;
+  }
+  if (service.manager === "launchd-user") {
+    const target = `gui/${currentUid()}/app.hunsu.bridge`;
+    const command = action === "start"
+      ? ["launchctl", "bootstrap", `gui/${currentUid()}`, service.unitPath ?? DEFAULT_LAUNCHD_USER_PLIST_PATH]
+      : ["launchctl", "bootout", target];
+    runServiceCommand(command, { event: `service.${action}`, manager: service.manager, allowFailure: action === "start" });
+    if (action === "start") {
+      runServiceCommand(["launchctl", "kickstart", "-k", target], { event: "service.start.kickstart", manager: service.manager });
     }
-    try {
-      const output = execFileSync(command[0], command.slice(1), { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-      console.log(`Hunsu Bridge service ${action} requested through systemd user service.`);
-      writeStructuredLog({ event: `service.${action}.completed`, manager: service.manager, command: command.join(" "), output: output.trim() || undefined });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : `Unable to ${action} systemd user service.`;
-      writeStructuredLog({ event: `service.${action}.failed`, manager: service.manager, command: command.join(" "), error: message });
-      throw new Error(message);
-    }
+    console.log(`Hunsu Bridge service ${action} requested through launchd user agent.`);
+    return;
+  }
+  if (service.manager === "windows-startup-user") {
+    const command = action === "start"
+      ? powershellCommand(`Start-ScheduledTask -TaskName ${powerShellQuote(WINDOWS_USER_TASK_NAME)}`)
+      : powershellCommand(`Stop-ScheduledTask -TaskName ${powerShellQuote(WINDOWS_USER_TASK_NAME)}`);
+    runServiceCommand(command, { event: `service.${action}`, manager: service.manager });
+    console.log(`Hunsu Bridge service ${action} requested through Windows scheduled task.`);
     return;
   }
   console.log(`Use your OS service manager to ${action} Hunsu Bridge, or run \`hunsu-bridge ${action === "start" ? "start --remote" : "stop"}\`.`);
   writeStructuredLog({ event: `service.${action}.requested`, manager: service.manager });
 }
 
-function systemdUserUnitText(cwd: string): string {
+function runServiceManagerReload(manager: BridgeServiceState["manager"]): void {
+  if (manager === "systemd-user") {
+    runServiceCommand(["systemctl", "--user", "daemon-reload"], { event: "service.reload", manager, allowFailure: true });
+  }
+}
+
+function printServiceStatus(service: BridgeServiceState): void {
+  console.log(`Service: ${service.installed ? `Installed (${service.manager})` : "Not installed"}`);
+  if (service.unitPath) {
+    console.log(`Unit: ${service.unitPath}`);
+  }
+  if (service.manager === "systemd-user") {
+    runServiceCommand(["systemctl", "--user", "is-active", "hunsu-bridge.service"], { event: "service.status", manager: service.manager, allowFailure: true });
+    return;
+  }
+  if (service.manager === "launchd-user") {
+    runServiceCommand(["launchctl", "print", `gui/${currentUid()}/app.hunsu.bridge`], { event: "service.status", manager: service.manager, allowFailure: true });
+    return;
+  }
+  if (service.manager === "windows-startup-user") {
+    runServiceCommand(powershellCommand(`Get-ScheduledTask -TaskName ${powerShellQuote(WINDOWS_USER_TASK_NAME)} | Select-Object TaskName,State | Format-List`), {
+      event: "service.status",
+      manager: service.manager,
+      allowFailure: true
+    });
+  }
+}
+
+function uninstallServiceArtifact(service: BridgeServiceState, dryRun: boolean): void {
+  if (service.manager === "systemd-user") {
+    const command = ["systemctl", "--user", "disable", "--now", "hunsu-bridge.service"];
+    runServiceCommand(command, { event: "service.uninstall.disable", manager: service.manager, dryRun, allowFailure: true });
+    return;
+  }
+  if (service.manager === "launchd-user") {
+    runServiceCommand(["launchctl", "bootout", `gui/${currentUid()}/app.hunsu.bridge`], {
+      event: "service.uninstall.bootout",
+      manager: service.manager,
+      dryRun,
+      allowFailure: true
+    });
+    return;
+  }
+  if (service.manager === "windows-startup-user") {
+    runServiceCommand(powershellCommand(`Unregister-ScheduledTask -TaskName ${powerShellQuote(WINDOWS_USER_TASK_NAME)} -Confirm:$false`), {
+      event: "service.uninstall.unregister",
+      manager: service.manager,
+      dryRun,
+      allowFailure: true
+    });
+  }
+}
+
+function runServiceCommand(command: string[], options: {
+  event: string;
+  manager: BridgeServiceState["manager"];
+  dryRun?: boolean;
+  allowFailure?: boolean;
+}): void {
+  const [program, ...args] = command;
+  const commandLine = command.join(" ");
+  if (options.dryRun || currentProcessEnv().HUNSU_BRIDGE_SERVICE_DRY_RUN === "1" || !program || !commandAvailable(program)) {
+    console.log(`Run: ${commandLine}`);
+    writeStructuredLog({ event: `${options.event}.dry-run`, manager: options.manager, command: commandLine });
+    return;
+  }
+  try {
+    const output = execFileSync(program, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    if (output.trim()) {
+      console.log(output.trim());
+    }
+    writeStructuredLog({ event: `${options.event}.completed`, manager: options.manager, command: commandLine, output: output.trim() || undefined });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : `Unable to run ${commandLine}.`;
+    writeStructuredLog({ event: `${options.event}.failed`, manager: options.manager, command: commandLine, error: message });
+    if (!options.allowFailure) {
+      throw new Error(message);
+    }
+    console.log(`Run: ${commandLine}`);
+  }
+}
+
+function serviceEnvironmentSnapshot(state: BridgeAppState): Record<string, string> {
+  const env = codexProviderEnv({
+    baseEnv: {
+      HUNSU_BRIDGE_HEADLESS: "1",
+      HUNSU_BRIDGE_APP_STATE_PATH: appStatePath(),
+      HUNSU_ROADMAP_REGISTRY_PATH: roadmapRegistryOptions().roadmapRegistryPath,
+      HUNSU_BRIDGE_APP_LOG_PATH: appLogPath()
+    },
+    settings: bridgeCodexProviderSettings(state)
+  });
+  return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim() !== ""));
+}
+
+function defaultWindowsUserStartupScriptPath(env: Record<string, string | undefined> = currentProcessEnv()): string {
+  return join(env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "Hunsu", "Bridge", "hunsu-bridge-startup.cmd");
+}
+
+function systemdUserUnitText(cwd: string, env: Record<string, string> = { HUNSU_BRIDGE_HEADLESS: "1" }): string {
   const invocation = currentBridgeCommandInvocation({ commandArgs: ["supervise", "--cwd", cwd] });
   return [
     "[Unit]",
@@ -1566,7 +1919,7 @@ function systemdUserUnitText(cwd: string): string {
     `ExecStart=${[invocation.command, ...invocation.args].map(systemdQuote).join(" ")}`,
     "Restart=on-failure",
     "RestartSec=2",
-    `Environment=${systemdQuote("HUNSU_BRIDGE_HEADLESS=1")}`,
+    ...Object.entries(env).map(([key, value]) => `Environment=${systemdQuote(`${key}=${value}`)}`),
     "",
     "[Install]",
     "WantedBy=default.target",
@@ -1574,7 +1927,7 @@ function systemdUserUnitText(cwd: string): string {
   ].join("\n");
 }
 
-function launchdUserPlistText(cwd: string): string {
+function launchdUserPlistText(cwd: string, env: Record<string, string> = { HUNSU_BRIDGE_HEADLESS: "1" }): string {
   const invocation = currentBridgeCommandInvocation({ commandArgs: ["supervise", "--cwd", cwd] });
   return [
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
@@ -1591,8 +1944,10 @@ function launchdUserPlistText(cwd: string): string {
     `  <string>${xmlEscape(cwd)}</string>`,
     "  <key>EnvironmentVariables</key>",
     "  <dict>",
-    "    <key>HUNSU_BRIDGE_HEADLESS</key>",
-    "    <string>1</string>",
+    ...Object.entries(env).flatMap(([key, value]) => [
+      `    <key>${xmlEscape(key)}</key>`,
+      `    <string>${xmlEscape(value)}</string>`
+    ]),
     "  </dict>",
     "  <key>KeepAlive</key>",
     "  <true/>",
@@ -1602,11 +1957,31 @@ function launchdUserPlistText(cwd: string): string {
   ].join("\n");
 }
 
-function windowsServiceInstallCommand(cwd: string): string {
+function windowsUserStartupScriptText(cwd: string, env: Record<string, string> = { HUNSU_BRIDGE_HEADLESS: "1" }): string {
   const invocation = currentBridgeCommandInvocation({ commandArgs: ["supervise", "--cwd", cwd] });
   return [
-    "Use the Hunsu Bridge installer-managed Windows service when available.",
-    "Manual fallback:",
+    "@echo off",
+    "chcp 65001 >NUL",
+    `cd /d ${windowsCommandQuote(cwd)}`,
+    ...Object.entries(env).map(([key, value]) => `set "${key}=${windowsBatchValue(value)}"`),
+    [invocation.command, ...invocation.args].map(windowsCommandQuote).join(" "),
+    ""
+  ].join("\r\n");
+}
+
+function windowsScheduledTaskInstallCommand(scriptPath: string): string[] {
+  return powershellCommand([
+    `$Action = New-ScheduledTaskAction -Execute ${powerShellQuote(scriptPath)}`,
+    "$Trigger = New-ScheduledTaskTrigger -AtLogOn",
+    `Register-ScheduledTask -TaskName ${powerShellQuote(WINDOWS_USER_TASK_NAME)} -Action $Action -Trigger $Trigger -Description ${powerShellQuote("Starts Hunsu Bridge for the signed-in user.")} -Force | Out-Null`
+  ].join("; "));
+}
+
+function systemServiceInstallCommand(cwd: string): string {
+  const invocation = currentBridgeCommandInvocation({ commandArgs: ["supervise", "--cwd", cwd] });
+  return [
+    "System services are advanced because Bridge provider credentials and CODEX_HOME are user-scoped.",
+    "Manual fallback in the target user context:",
     `  ${[invocation.command, ...invocation.args].map(windowsCommandQuote).join(" ")}`
   ].join("\n");
 }
@@ -1630,6 +2005,23 @@ function xmlEscape(value: string): string {
 
 function windowsCommandQuote(value: string): string {
   return `"${value.replace(/"/g, "\\\"")}"`;
+}
+
+function windowsBatchValue(value: string): string {
+  return value.replace(/%/g, "%%").replace(/\r?\n/g, " ");
+}
+
+function powershellCommand(script: string): string[] {
+  const command = commandAvailable("pwsh") ? "pwsh" : "powershell.exe";
+  return [command, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script];
+}
+
+function powerShellQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function currentUid(): number {
+  return typeof process.getuid === "function" ? process.getuid() : 0;
 }
 
 function credentialPath(): string {
@@ -1786,7 +2178,9 @@ Headless:
   hunsu-bridge remote status|enable|disable|devices|check
   hunsu-bridge protocol status|install
   hunsu-bridge supervise [--cwd <path>]
-  hunsu-bridge service install|start|stop|status
+  hunsu-bridge service install|uninstall|start|stop|status [--user|--system]
+  hunsu-bridge model-alias list|get|set|delete|validate|override
+  hunsu-bridge model-alias set PrimaryModel --model gpt-5.5-thinking --reasoning high --service-tier default
   hunsu-bridge auth-dev-server
   hunsu-bridge roadmaps list
   hunsu-bridge roadmaps add /path/to/project

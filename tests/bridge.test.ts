@@ -11,7 +11,7 @@ import { buildTeamPlanningPrompt, type CodexProviderStatus, type TeamPlanningInp
 import { resolveBridgeRuntimeConfig, unwrapConfigResult } from "../packages/config/src/index.ts";
 import type { RelayServerConfig } from "../packages/config/src/index.ts";
 import { createHunsuRelayServer } from "../apps/relay/src/index.ts";
-import { createDefaultHarness, createDefaultManagerConfig, createDefaultMemberConfig, harnessEntityFromSnapshot, makeNodeId, makePositiveInteger, promptTemplateFromText, rootHarnessSnapshot, type HubPackageLock, type Harness, type HarnessSnapshot, type HunsuOrigin, type NonEmptyText, type ExecutionPlan } from "../packages/protocol/src/index.ts";
+import { createDefaultHarness, createDefaultManagerConfig, createDefaultMemberConfig, harnessEntityFromSnapshot, makeNodeId, makePositiveInteger, promptTemplateFromText, rootHarnessSnapshot, type HubPackageLock, type Harness, type HarnessSnapshot, type HunsuOrigin, type NonEmptyText, type ExecutionPlan, type ModelAlias } from "../packages/protocol/src/index.ts";
 import {
   HUB_PACKAGE_MANIFEST_SCHEMA,
   computeManifestIntegrity,
@@ -78,6 +78,9 @@ import {
   prepareMemberCodexEnvironmentForExecute,
   connectionExecutePreflightError,
   providerExecutePreflightError,
+  defaultModelAliases,
+  providerInventoriesForBridgeStatus,
+  resolveModelSelection,
   listRemoteBridgeDevices,
   type AgentSessionEvent,
   type StudioLiveEvent,
@@ -449,6 +452,91 @@ test("Bridge runtime provider facade maps Codex status and registry placeholders
   assert.equal(connectionExecutePreflightError({
     localBridgeConnected: false
   })?.error, "BRIDGE_NOT_CONNECTED");
+});
+
+test("Bridge model alias inventory validates and resolves Codex aliases", () => {
+  const provider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const inventories = providerInventoriesForBridgeStatus({ provider });
+  const aliases = defaultModelAliases("2026-01-01T00:00:00.000Z");
+  const primary = resolveModelSelection({
+    selection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases,
+    inventories
+  });
+  assert.equal(primary.ok, true);
+  if (primary.ok) {
+    assert.equal(primary.backendId, "local");
+    assert.equal(primary.resolved.model, "gpt-5.5-thinking");
+    assert.equal(primary.resolved.reasoningEffort, "high");
+    assert.equal(primary.provider.providerId, "codex");
+    assert.equal(primary.provider.ready, true);
+  }
+  const explicitEmptyAliases = resolveModelSelection({
+    selection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases: [],
+    inventories
+  });
+  assert.equal(explicitEmptyAliases.ok, false);
+  if (!explicitEmptyAliases.ok) {
+    assert.equal(explicitEmptyAliases.error.error, "MODEL_ALIAS_NOT_FOUND");
+    assert.equal(explicitEmptyAliases.error.aliasId, "PrimaryModel");
+  }
+
+  const unsupported = resolveModelSelection({
+    selection: { kind: "direct", provider: { providerId: "codex", model: "gpt-5.5-thinking" as NonEmptyText, reasoningEffort: "medium", experimental: true } },
+    inventories
+  });
+  assert.equal(unsupported.ok, false);
+  if (!unsupported.ok) {
+    assert.equal(unsupported.error.error, "REASONING_UNSUPPORTED");
+  }
+});
+
+test("Bridge model alias endpoint treats an explicit empty aliases array as no aliases", async () => {
+  const provider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const server = createStudioServer({
+    state: createStudioState(),
+    persist: false,
+    modelInventories: providerInventoriesForBridgeStatus({ provider })
+  });
+
+  const response = await requestStudioServerJson(server, "POST", "/api/model-aliases/resolve", {
+    backendId: "local",
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" },
+    aliases: []
+  });
+
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.ok, false);
+  assert.equal(response.body.error, "MODEL_ALIAS_NOT_FOUND");
 });
 
 test("Bridge Codex provider env and auth-home diagnostics are explicit and secret-safe", () => {
@@ -1828,19 +1916,40 @@ test("Bridge HUNSU Draft resolves locked Manager packages and materializes Manag
   const opened = createStudioRoadmap({ path: repo, title: "hunsu-draft-locked-manager-roadmap" }, state, { persist: true, roadmapRegistryPath: registryPath });
   const originServer = await startOriginServer(repo, "motorhome");
   try {
+    const managerConfig = createDefaultManagerConfig("manager.idea-helper", "Explore options before editing request files.", [{
+      kind: "local-snapshot",
+      name: nt("draft-helper"),
+      sourcePath: nt("/skills/draft-helper"),
+      contentHash: nt("sha256:draft-helper"),
+      snapshotRef: nt("snapshot:draft-helper"),
+      snapshotFiles: [{ path: nt("SKILL.md"), text: "# Draft Helper\n\nHelp Hunsu Drafts.\n" }]
+    }]);
+    managerConfig.modelSelection = {
+      kind: "alias",
+      aliasId: nt("DraftCustomModel")
+    };
+    const aliases: ModelAlias[] = [{
+      aliasId: nt("DraftCustomModel"),
+      displayName: nt("Draft Custom Model"),
+      selection: {
+        kind: "direct",
+        provider: {
+          providerId: "codex",
+          model: "gpt-5.5",
+          reasoningEffort: "low",
+          serviceTier: "fast"
+        }
+      },
+      scope: { kind: "user" },
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    }];
     const managerManifest: ManagerPackageManifest = {
       schema: HUB_PACKAGE_MANIFEST_SCHEMA,
       kind: "manager",
       key: "manager.idea-helper",
       version: "1.0.0",
-      manager: createDefaultManagerConfig("manager.idea-helper", "Explore options before editing request files.", [{
-        kind: "local-snapshot",
-        name: nt("draft-helper"),
-        sourcePath: nt("/skills/draft-helper"),
-        contentHash: nt("sha256:draft-helper"),
-        snapshotRef: nt("snapshot:draft-helper"),
-        snapshotFiles: [{ path: nt("SKILL.md"), text: "# Draft Helper\n\nHelp Hunsu Drafts.\n" }]
-      }])
+      manager: managerConfig
     };
     const managerLock = writeOriginManifest(repo, managerManifest);
     await executeStudioCommand({
@@ -1848,18 +1957,40 @@ test("Bridge HUNSU Draft resolves locked Manager packages and materializes Manag
       origin: originServer.origin
     }, state, { cwd: repo, persist: true });
     const runner = new FakeRunner();
-    const server = createStudioServer({ cwd: repo, state, persist: true, roadmapRegistryPath: registryPath, runner });
+    const modelInventories = providerInventoriesForBridgeStatus({
+      provider: normalizeCodexRuntimeStatus({
+        runtime: "codex",
+        cli: {
+          installed: true,
+          binaryPath: "/usr/local/bin/codex",
+          source: "process_path",
+          version: "codex 1.2.3",
+          installActionAvailable: false
+        },
+        appServer: { available: true },
+        auth: { state: "authenticated", method: "chatgpt" },
+        usage: { rateLimitsAvailable: true },
+        ready: true,
+        recommendedAction: "none"
+      })
+    });
+    const server = createStudioServer({ cwd: repo, state, persist: true, roadmapRegistryPath: registryPath, runner, modelInventories });
     const baseUrl = `/api/roadmaps/${encodeURIComponent(opened.roadmap.roadmapId)}/hunsu/drafts`;
     const start = await requestStudioServerJson(server, "POST", baseUrl, {
       sourceNodeId: String(opened.board.nodes[0].id),
       sourceLineId: String(opened.board.lines[0].id),
-      managerLock
+      managerLock,
+      aliases
     });
 
-    assert.equal(start.status, 202);
+    assert.equal(start.status, 202, JSON.stringify(start.body));
     assert.equal(start.body.draft.manager.id, "manager.idea-helper");
     assert.deepEqual(start.body.draft.managerLock, managerLock);
     assert.equal(runner.hunsuDraftPrepared?.manager.promptTemplate.template, "Explore options before editing request files.");
+    assert.equal(runner.hunsuDraftPrepared?.resolvedModelSelection?.model, "gpt-5.5");
+    assert.equal(runner.hunsuDraftPrepared?.resolvedModelSelection?.reasoningEffort, "low");
+    assert.equal(runner.hunsuDraftPrepared?.resolvedModelSelection?.serviceTier, "fast");
+    assert.equal(start.body.draft.aliases[0].aliasId, "DraftCustomModel");
     assert.equal(existsSync(join(start.body.draft.worktree.path, ".agents", "skills", "draft-helper", "SKILL.md")), true);
     assert.equal(existsSync(join(repo, ".agents", "skills", "draft-helper", "SKILL.md")), false);
     const routeRuntime = requireDomainValue(decodeHunsuRuntimeFileText<{ manager: { id: string }; managerLock?: HubPackageLock }>(
@@ -2371,6 +2502,82 @@ test("Bridge server starts an injected runner with Team context", async () => {
 
   await waitFor(() => state.runs["run/req_batch"].debugEvents.length === 1);
   assert.equal(state.runs["run/req_batch"].debugEvents[0].type, "runner.status.changed");
+});
+
+test("Bridge server resolves member ModelSelection aliases before Member runner turns", async () => {
+  const repo = createRepo();
+  const state = createStudioState();
+  const protocol = createDefaultHarness();
+  protocol.members[0].modelSelection = {
+    kind: "alias",
+    aliasId: nt("FastModel")
+  };
+  class InspectingRunner extends CompletingRunner {
+    readonly memberInputs: MemberPathRunInput[] = [];
+
+    override async runMemberPath(input: MemberPathRunInput): Promise<RunnerRun> {
+      this.memberInputs.push(input);
+      return super.runMemberPath(input);
+    }
+  }
+  const runner = new InspectingRunner();
+  await seedRequestAndLine(state, repo, true, protocol);
+
+  await startStudioRun({
+    requestId: "req_batch",
+    lineId: "run/req_batch",
+    selectedDestinationIds: ["destination_001"],
+    aliases: defaultModelAliases("2026-01-01T00:00:00.000Z")
+  }, state, { cwd: repo, persist: true, runner });
+
+  await waitFor(() => runner.memberInputs.some(input => input.memberPath.executorId === "azir"));
+  const azirInput = runner.memberInputs.find(input => input.memberPath.executorId === "azir");
+  assert.equal(azirInput?.resolvedModelSelection?.providerId, "codex");
+  assert.equal(azirInput?.resolvedModelSelection?.model, "gpt-5.5");
+  assert.equal(azirInput?.resolvedModelSelection?.reasoningEffort, "medium");
+  assert.equal(azirInput?.resolvedModelSelection?.serviceTier, "fast");
+});
+
+test("Bridge Execute preflight rejects unresolved Member ModelSelection aliases before starting", async () => {
+  const repo = createRepo();
+  const state = createStudioState();
+  const protocol = createDefaultHarness();
+  protocol.members[0].modelSelection = {
+    kind: "alias",
+    aliasId: nt("PrimaryModel")
+  };
+  await seedRequestAndLine(state, repo, true, protocol);
+  const modelInventories = providerInventoriesForBridgeStatus({
+    provider: normalizeCodexRuntimeStatus({
+      runtime: "codex",
+      cli: {
+        installed: true,
+        binaryPath: "/usr/local/bin/codex",
+        source: "process_path",
+        version: "codex 1.2.3",
+        installActionAvailable: false
+      },
+      appServer: { available: true },
+      auth: { state: "authenticated", method: "chatgpt" },
+      usage: { rateLimitsAvailable: true },
+      ready: true,
+      recommendedAction: "none"
+    })
+  });
+  const server = createStudioServer({ cwd: repo, state, persist: true, modelInventories });
+
+  const start = await requestStudioServerJson(server, "POST", "/api/runs/start", {
+    requestId: "req_batch",
+    lineId: "run/req_batch",
+    selectedDestinationIds: ["destination_001"],
+    aliases: []
+  });
+
+  assert.equal(start.status, 409, JSON.stringify(start.body));
+  assert.equal(start.body.area, "model");
+  assert.equal(start.body.error, "MODEL_ALIAS_NOT_FOUND");
+  assert.equal(start.body.aliasId, "PrimaryModel");
+  assert.deepEqual(Object.keys(state.runs), []);
 });
 
 test("Bridge server scopes Roadmap run ids so parallel Roadmaps do not share runner events", async () => {

@@ -1,12 +1,17 @@
 use std::process::Command;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 use tauri_plugin_opener::OpenerExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const BRIDGE_TRAY_ID: &str = "hunsu-bridge";
+const BRIDGE_TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Serialize)]
 struct FolderSelection {
@@ -211,6 +216,9 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
         "login" => args.len() == 2 && args[1] == "--gui",
         "remote" => args.len() == 2 && matches!(args[1].as_str(), "enable" | "disable"),
         "protocol" => args.len() == 2 && matches!(args[1].as_str(), "install" | "status"),
+        "settings" => validate_settings_args(args),
+        "service" => validate_service_args(args),
+        "model-alias" => validate_model_alias_args(args),
         "inspect" => args.len() == 3 && args[2] == "--json" && validate_path_arg(&args[1]).is_ok(),
         "open-project" | "port" | "create" => {
             args.len() == 1 || (args.len() == 2 && validate_path_arg(&args[1]).is_ok())
@@ -228,6 +236,52 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
     } else {
         Err(format!("Bridge command is not allowed: {}", command))
     }
+}
+
+fn validate_settings_args(args: &[String]) -> bool {
+    matches!(
+        args,
+        [command, setting, action]
+            if command == "settings"
+                && setting == "quit-behavior"
+                && action == "get"
+    ) || matches!(
+        args,
+        [command, setting, action, value]
+            if command == "settings"
+                && setting == "quit-behavior"
+                && action == "set"
+                && matches!(value.as_str(), "keep-background" | "stop-background")
+    )
+}
+
+fn validate_service_args(args: &[String]) -> bool {
+    if args.len() < 2 || args[0] != "service" {
+        return false;
+    }
+    let subcommand = args[1].as_str();
+    if matches!(subcommand, "status" | "start" | "stop") {
+        return args.len() == 2;
+    }
+    if !matches!(subcommand, "install" | "uninstall") {
+        return false;
+    }
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dry-run" | "--user" | "--system" => index += 1,
+            "--cwd" if index + 1 < args.len() && validate_path_arg(&args[index + 1]).is_ok() => index += 2,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn validate_model_alias_args(args: &[String]) -> bool {
+    if args.len() < 2 || args[0] != "model-alias" {
+        return false;
+    }
+    matches!(args[1].as_str(), "list" | "get" | "set" | "delete" | "validate" | "override")
 }
 
 fn validate_roadmaps_args(args: &[String]) -> bool {
@@ -566,6 +620,242 @@ fn handle_protocol_url(app: &tauri::AppHandle, url: &str) {
     }
 }
 
+fn handle_protocol_url_and_show(app: &tauri::AppHandle, url: &str) {
+    handle_protocol_url(app, url);
+    show_main_window(app);
+}
+
+fn start_local_bridge_on_launch(app: &tauri::AppHandle) {
+    if let Ok(mut command) = sidecar_command(app) {
+        let _ = command.arg("start").arg("--no-open").spawn();
+    }
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn maybe_show_main_window_for_setup(app: &tauri::AppHandle) {
+    if should_open_main_window_on_launch(app) {
+        show_main_window(app);
+    }
+}
+
+fn should_open_main_window_on_launch(app: &tauri::AppHandle) -> bool {
+    let Ok(snapshot) = bridge_snapshot(app) else {
+        return true;
+    };
+    provider_needs_setup(&snapshot) || active_workspace_count(&snapshot) == 0 || snapshot["status"]["healthError"].is_string()
+}
+
+fn create_bridge_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let menu = bridge_tray_menu(app)?;
+    TrayIconBuilder::with_id(BRIDGE_TRAY_ID)
+        .tooltip("Hunsu Bridge")
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "summary_title" | "summary_provider" | "summary_local" | "summary_remote" | "summary_workspaces" => show_main_window(app),
+            "open_web" => handle_protocol_url_and_show(app, "hunsu://pair"),
+            "provider" => handle_protocol_url_and_show(app, "hunsu://provider"),
+            "add_workspace" => handle_protocol_url_and_show(app, "hunsu://add-workspace"),
+            "workspaces" => handle_protocol_url_and_show(app, "hunsu://workspaces"),
+            "connection" => handle_protocol_url_and_show(app, "hunsu://connection"),
+            "diagnostics" => handle_protocol_url_and_show(app, "hunsu://prerequisites"),
+            "quit" => quit_bridge_app(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(&tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn bridge_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let summary = tray_status_summary(app);
+    let title = MenuItemBuilder::with_id("summary_title", "Hunsu Bridge").build(app)?;
+    let provider_status = MenuItemBuilder::with_id("summary_provider", summary.provider).build(app)?;
+    let local_status = MenuItemBuilder::with_id("summary_local", summary.local).build(app)?;
+    let remote_status = MenuItemBuilder::with_id("summary_remote", summary.remote).build(app)?;
+    let workspace_status = MenuItemBuilder::with_id("summary_workspaces", summary.workspaces).build(app)?;
+    let open_web = MenuItemBuilder::with_id("open_web", "Open Hunsu Web").build(app)?;
+    let provider = MenuItemBuilder::with_id("provider", "Provider Setup").build(app)?;
+    let add_workspace = MenuItemBuilder::with_id("add_workspace", "Add Workspace").build(app)?;
+    let workspaces = MenuItemBuilder::with_id("workspaces", "Workspaces").build(app)?;
+    let connection = MenuItemBuilder::with_id("connection", "Connection").build(app)?;
+    let diagnostics = MenuItemBuilder::with_id("diagnostics", "Diagnostics").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let menu = MenuBuilder::new(app)
+        .items(&[
+            &title,
+            &provider_status,
+            &local_status,
+            &remote_status,
+            &workspace_status,
+            &open_web,
+            &provider,
+            &add_workspace,
+            &workspaces,
+            &connection,
+            &diagnostics,
+            &quit,
+        ])
+        .build()
+}
+
+fn refresh_bridge_tray_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let Some(tray) = app.tray_by_id(BRIDGE_TRAY_ID) else {
+        return Ok(());
+    };
+    let menu = bridge_tray_menu(app)?;
+    tray.set_menu(Some(menu))?;
+    Ok(())
+}
+
+fn start_bridge_tray_refresh(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(BRIDGE_TRAY_REFRESH_INTERVAL);
+            let _ = refresh_bridge_tray_menu(&app);
+        }
+    });
+}
+
+#[derive(Debug)]
+struct TrayStatusSummary {
+    provider: String,
+    local: String,
+    remote: String,
+    workspaces: String,
+}
+
+fn tray_status_summary(app: &tauri::AppHandle) -> TrayStatusSummary {
+    match bridge_snapshot(app) {
+        Ok(snapshot) => {
+            let provider_label = snapshot["providers"]["current"]["label"].as_str().unwrap_or("Provider");
+            let provider_ready = snapshot["providers"]["current"]["ready"].as_bool().unwrap_or(false);
+            let local = snapshot["status"]["localBridge"].as_str().unwrap_or("not-running");
+            let remote = snapshot["status"]["remoteAccess"].as_str().unwrap_or("Off");
+            TrayStatusSummary {
+                provider: format!("Provider: {provider_label} {}", if provider_ready { "Ready" } else { "Needs Setup" }),
+                local: format!("Local: {}", local_bridge_label(local)),
+                remote: format!("Remote: {}", remote_bridge_label(remote, &snapshot)),
+                workspaces: format!("Workspaces: {} active", active_workspace_count(&snapshot)),
+            }
+        }
+        Err(_) => TrayStatusSummary {
+            provider: "Provider: Needs Setup".to_string(),
+            local: "Local: Starting".to_string(),
+            remote: "Remote: Off".to_string(),
+            workspaces: "Workspaces: 0 active".to_string(),
+        },
+    }
+}
+
+fn bridge_snapshot(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let output = sidecar_command(app)?
+        .arg("snapshot")
+        .output()
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+}
+
+fn provider_needs_setup(snapshot: &serde_json::Value) -> bool {
+    !snapshot["providers"]["current"]["ready"].as_bool().unwrap_or(false)
+}
+
+fn active_workspace_count(snapshot: &serde_json::Value) -> usize {
+    snapshot["workspaces"]["active"]
+        .as_array()
+        .map(|items| items.len())
+        .or_else(|| {
+            snapshot["managedRoadmaps"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| item["lifecycle"].as_str() == Some("active"))
+                        .count()
+                })
+        })
+        .unwrap_or(0)
+}
+
+fn local_bridge_label(value: &str) -> &'static str {
+    match value {
+        "connected" => "Connected",
+        "starting" => "Starting",
+        "error" => "Error",
+        _ => "Not Running",
+    }
+}
+
+fn remote_bridge_label(value: &str, snapshot: &serde_json::Value) -> &'static str {
+    if snapshot["status"]["account"]
+        .as_str()
+        .map(|label| label.to_ascii_lowercase().contains("signed out"))
+        .unwrap_or(false)
+    {
+        return "Sign in required";
+    }
+    match value {
+        "On" => "On",
+        "Registered but offline" => "On",
+        _ => "Off",
+    }
+}
+
+fn quit_bridge_app(app: &tauri::AppHandle) {
+    let preference = quit_background_preference(app);
+    let message = match preference {
+        QuitBackgroundPreference::KeepBackground => "Quit Hunsu Bridge?\n\nYour quit preference keeps the background Bridge service running.",
+        QuitBackgroundPreference::StopBackground => "Quit Hunsu Bridge?\n\nYour quit preference stops the background Bridge service.",
+    };
+    let should_quit = app
+        .dialog()
+        .message(message)
+        .title("Hunsu Bridge")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancel)
+        .blocking_show();
+    if !matches!(should_quit, MessageDialogResult::Ok) {
+        return;
+    }
+    if matches!(preference, QuitBackgroundPreference::StopBackground) {
+        if let Ok(mut command) = sidecar_command(app) {
+            let _ = command.arg("stop").output();
+        }
+    }
+    app.exit(0);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuitBackgroundPreference {
+    KeepBackground,
+    StopBackground,
+}
+
+fn quit_background_preference(app: &tauri::AppHandle) -> QuitBackgroundPreference {
+    match bridge_snapshot(app)
+        .ok()
+        .and_then(|snapshot| snapshot["status"]["quitBehavior"].as_str().map(str::to_string))
+        .as_deref()
+    {
+        Some("stop-background") => QuitBackgroundPreference::StopBackground,
+        _ => QuitBackgroundPreference::KeepBackground,
+    }
+}
+
 fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
     validate_external_url(value)?;
     let without_scheme = value
@@ -721,19 +1011,29 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(url) = argv.iter().find(|arg| arg.starts_with("hunsu://")) {
-                handle_protocol_url(app, url);
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                handle_protocol_url_and_show(app, url);
             }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
+            start_local_bridge_on_launch(&app.handle());
+            create_bridge_tray(&app.handle())?;
+            start_bridge_tray_refresh(app.handle().clone());
+            let mut opened_protocol_url = false;
             for arg in std::env::args().filter(|arg| arg.starts_with("hunsu://")) {
-                handle_protocol_url(&app.handle(), &arg);
+                opened_protocol_url = true;
+                handle_protocol_url_and_show(&app.handle(), &arg);
+            }
+            if !opened_protocol_url {
+                maybe_show_main_window_for_setup(&app.handle());
             }
             Ok(())
         })
@@ -900,5 +1200,24 @@ mod tests {
         assert!(validate_bridge_command_args(&["provider".into(), "config".into(), "reset".into()]).is_ok());
         assert!(validate_bridge_command_args(&["provider".into(), "config".into(), "save-json".into(), "\0".into()]).is_err());
         assert!(validate_bridge_command_args(&["provider".into(), "shell".into(), "rm -rf /".into()]).is_err());
+        assert!(validate_bridge_command_args(&["settings".into(), "quit-behavior".into(), "get".into()]).is_ok());
+        assert!(validate_bridge_command_args(&[
+            "settings".into(),
+            "quit-behavior".into(),
+            "set".into(),
+            "keep-background".into()
+        ]).is_ok());
+        assert!(validate_bridge_command_args(&[
+            "settings".into(),
+            "quit-behavior".into(),
+            "set".into(),
+            "stop-background".into()
+        ]).is_ok());
+        assert!(validate_bridge_command_args(&[
+            "settings".into(),
+            "quit-behavior".into(),
+            "set".into(),
+            "delete-state".into()
+        ]).is_err());
     }
 }

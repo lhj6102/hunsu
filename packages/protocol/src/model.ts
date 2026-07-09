@@ -254,6 +254,7 @@ export type HunsuOrigin = {
 
 export type ReasoningEffort = "default" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ServiceTier = "default" | "fast";
+export type RuntimeProviderId = "codex" | "claude_code" | "gemini_cli" | "openhands" | "custom";
 export type MemberExecutionNetwork = "disabled" | "enabled";
 export type MemberExecutionConstraint =
   | { kind: "read_only"; network: MemberExecutionNetwork }
@@ -278,9 +279,107 @@ export type ResourceBinding =
   | { kind: "plugin"; plugin: MemberPluginBinding }
   | { kind: "package"; lock: HubPackageLock };
 
-export type RuntimePolicy = {
+export type CodexModelSelection =
+  | {
+      providerId: "codex";
+      model: "gpt-5.5-thinking";
+      reasoningEffort: Extract<ReasoningEffort, "high" | "xhigh">;
+      serviceTier?: ServiceTier;
+      experimental?: false;
+    }
+  | {
+      providerId: "codex";
+      model: "gpt-5.5";
+      reasoningEffort?: Exclude<ReasoningEffort, "minimal" | "xhigh">;
+      serviceTier?: ServiceTier;
+      experimental?: false;
+    }
+  | {
+      providerId: "codex";
+      model: MemberModelName;
+      reasoningEffort?: ReasoningEffort;
+      serviceTier?: ServiceTier;
+      experimental: true;
+    };
+
+export type DirectProviderModelSelection =
+  | CodexModelSelection
+  | {
+      providerId: Exclude<RuntimeProviderId, "codex">;
+      model: MemberModelName;
+      reasoningEffort?: ReasoningEffort;
+      serviceTier?: ServiceTier;
+      experimental?: boolean;
+    };
+
+export type DirectModelSelection = {
+  kind: "direct";
+  provider: DirectProviderModelSelection;
+};
+
+export type AliasModelSelection = {
+  kind: "alias";
+  aliasId: NonEmptyText;
+};
+
+export type ModelSelection = DirectModelSelection | AliasModelSelection;
+
+export type ModelAliasScope =
+  | { kind: "user" }
+  | { kind: "workspace"; workspaceId: NonEmptyText }
+  | { kind: "team"; teamId: NonEmptyText }
+  | { kind: "local" };
+
+export type ModelAlias = {
+  aliasId: NonEmptyText;
+  displayName: NonEmptyText;
+  description?: NonEmptyText;
+  selection: DirectModelSelection;
+  scope: ModelAliasScope;
+  createdAt: SerializedIsoTimestamp;
+  updatedAt: SerializedIsoTimestamp;
+};
+
+export type ModelAliasOverride = {
+  aliasId: NonEmptyText;
+  backendId: NonEmptyText;
+  selection: DirectModelSelection;
+  reason?: NonEmptyText;
+  updatedAt: SerializedIsoTimestamp;
+};
+
+export type ProviderModelDescriptor = {
   model: MemberModelName;
-  reasoningEffort: ReasoningEffort;
+  label: NonEmptyText;
+  capabilities: {
+    reasoningEfforts?: ReasoningEffort[];
+    serviceTiers?: ServiceTier[];
+    supportsReasoning?: boolean;
+    supportsFastTier?: boolean;
+  };
+  defaultConfig?: DirectProviderModelSelection;
+  experimental?: boolean;
+};
+
+export type ProviderInventoryProvider = {
+  providerId: RuntimeProviderId;
+  label: NonEmptyText;
+  ready: boolean;
+  authState?: "authenticated" | "not_authenticated" | "expired" | "invalid" | "unknown" | "error";
+  models: ProviderModelDescriptor[];
+};
+
+export type ProviderModelInventory = ProviderInventoryProvider;
+
+export type ProviderInventory = {
+  backendId: NonEmptyText;
+  providers: ProviderInventoryProvider[];
+};
+
+export type RuntimePolicy = {
+  modelSelection?: ModelSelection;
+  model?: MemberModelName;
+  reasoningEffort?: ReasoningEffort;
   serviceTier?: ServiceTier;
   execution: MemberExecutionConstraint;
   approval: MemberApprovalConstraint;
@@ -344,6 +443,7 @@ export type MemberConfig = {
   promptTemplate: PromptTemplate;
   skills: MemberSkillMetadata[];
   plugins: MemberPluginBinding[];
+  modelSelection?: ModelSelection;
   model: MemberModelName;
   reasoningEffort: ReasoningEffort;
   serviceTier?: ServiceTier;
@@ -356,6 +456,7 @@ export type ManagerConfig = {
   promptTemplate: PromptTemplate;
   skills: SkillBinding[];
   plugins: MemberPluginBinding[];
+  modelSelection?: ModelSelection;
 };
 
 export type MemberPath = {

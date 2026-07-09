@@ -5,10 +5,12 @@ import type { RoadmapRegistryWorkspaceEntry } from "../workspaces/workspaceRegis
 import {
   connectionExecutePreflightErrorForSelection,
   executeStartHasExplicitBackendSelection,
+  modelExecutePreflightErrorForSelection,
   normalizeExecuteStartSelectionForLocalBridge,
   providerAwareExecutePreflightForRoadmap,
   providerAwareExecutePreflightForRepository,
-  type ExecuteStartBackendSelection
+  type ExecuteStartBackendSelection,
+  type ProviderAwareExecutePreflightError
 } from "./executePreflight.ts";
 
 type ExecuteRouteContext = {
@@ -21,6 +23,7 @@ type ExecuteRouteContext = {
   localBridgeTokenPresent: () => boolean;
   runSummaries: () => unknown[];
   executeView: (run: unknown) => unknown;
+  modelPreflight?: (body: ExecuteStartBackendSelection) => Promise<ProviderAwareExecutePreflightError | undefined> | ProviderAwareExecutePreflightError | undefined;
   startRun: (body: unknown) => Promise<unknown> | unknown;
   pauseRun: (body: unknown) => Promise<unknown> | unknown;
   resumeRun: (body: unknown) => Promise<unknown> | unknown;
@@ -112,6 +115,9 @@ async function executeStartPreflight(
     localBridgeTokenPresent: context.localBridgeTokenPresent()
   });
   const selectedStatus = executeStartHasExplicitBackendSelection(preflightBody)
+    || preflightBody.modelSelection
+    || preflightBody.aliases?.length
+    || Boolean(context.modelPreflight)
     ? await context.bridgeStatus()
     : undefined;
   const connectionPreflightError = selectedStatus
@@ -119,6 +125,18 @@ async function executeStartPreflight(
     : undefined;
   if (connectionPreflightError) {
     return connectionPreflightError;
+  }
+  const modelPreflightError = selectedStatus
+    ? modelExecutePreflightErrorForSelection(preflightBody, selectedStatus)
+    : undefined;
+  if (modelPreflightError) {
+    return modelPreflightError;
+  }
+  const harnessModelPreflightError = context.modelPreflight
+    ? await context.modelPreflight(preflightBody)
+    : undefined;
+  if (harnessModelPreflightError) {
+    return harnessModelPreflightError;
   }
 
   if (context.roadmapId) {

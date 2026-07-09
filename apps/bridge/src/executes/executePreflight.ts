@@ -1,5 +1,11 @@
 import type { RuntimeProviderRegistry, RuntimeProviderStatus } from "../runtime-providers/types.ts";
 import type { BridgeBackendStatus } from "../connections/localConnection.ts";
+import type { ModelAlias, ModelSelection } from "@hunsu/protocol";
+import {
+  executePreflightErrorFromModelError,
+  providerInventoriesForBridgeStatus,
+  resolveModelSelection
+} from "../model-aliases/modelAliasStore.ts";
 import {
   workspaceSummaryFromRoadmap,
   type ConnectedWorkspaceSummary,
@@ -9,6 +15,8 @@ import {
 export type ExecuteStartBackendSelection = {
   backendId?: string;
   connectionMode?: "local" | "remote";
+  modelSelection?: ModelSelection;
+  aliases?: ModelAlias[];
   workspace?: {
     workspaceId?: string;
     backendId?: string;
@@ -32,7 +40,8 @@ export type ExecutePreflightAction = {
     | "install_provider"
     | "login_provider"
     | "recheck_provider"
-    | "activate_workspace";
+    | "activate_workspace"
+    | "edit_model_alias";
   label: string;
   href?: string;
   workspaceId?: string;
@@ -71,6 +80,21 @@ export type ProviderAwareExecutePreflightError =
         | "BRIDGE_NOT_CONNECTED"
         | "REMOTE_NOT_CONNECTED"
         | "REMOTE_LOGIN_REQUIRED";
+      message: string;
+      actions: ExecutePreflightAction[];
+    }
+  | {
+      area: "model";
+      providerId?: string;
+      aliasId?: string;
+      model?: string;
+      error:
+        | "MODEL_ALIAS_NOT_FOUND"
+        | "PROVIDER_NOT_READY"
+        | "PROVIDER_LOGIN_REQUIRED"
+        | "MODEL_UNSUPPORTED"
+        | "REASONING_UNSUPPORTED"
+        | "SERVICE_TIER_UNSUPPORTED";
       message: string;
       actions: ExecutePreflightAction[];
     };
@@ -153,6 +177,31 @@ export function providerWorkspaceExecutePreflightErrorForSelection(
     candidate.workspaceId === workspaceId || candidate.roadmapId === workspaceId
   ) ?? fallback.workspace;
   return workspaceExecutePreflightError(workspace) ?? providerExecutePreflightError(provider);
+}
+
+export function modelExecutePreflightErrorForSelection(
+  input: ExecuteStartBackendSelection,
+  status: ExecutePreflightBridgeStatus
+): ProviderAwareExecutePreflightError | undefined {
+  const aliases = input.aliases;
+  if (!input.modelSelection && !aliases?.length) {
+    return undefined;
+  }
+  const selection = selectedExecuteBackend(input);
+  const provider = selectedBridgeBackend(status.connections, selection)?.provider ?? status.connections[0]?.provider;
+  if (!provider) {
+    return undefined;
+  }
+  const resolution = resolveModelSelection({
+    selection: input.modelSelection,
+    aliases,
+    backendId: firstNonEmpty(input.backendId, input.workspace?.backendId),
+    inventories: providerInventoriesForBridgeStatus({
+      provider,
+      connections: status.connections
+    })
+  });
+  return resolution.ok ? undefined : executePreflightErrorFromModelError(resolution.error);
 }
 
 export function normalizeExecuteStartSelectionForLocalBridge<T extends ExecuteStartBackendSelection>(

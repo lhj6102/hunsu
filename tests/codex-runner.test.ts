@@ -610,6 +610,123 @@ test("CodexAppServerRunner maps worktree-write Member auto-review approval to ap
   assert.equal(result.providerTurnId, "turn_ryze_001");
 });
 
+test("CodexAppServerRunner applies resolved model selection over Member defaults", async () => {
+  const transport = new MockAppServerTransport();
+  const runner = createMockAppServerRunner(transport);
+  const runPromise = runner.runTeamPlanning(createRunInput({
+    resolvedModelSelection: {
+      providerId: "codex",
+      model: "gpt-5.5-thinking",
+      reasoningEffort: "xhigh",
+      serviceTier: "fast"
+    }
+  }));
+
+  respondTo(await transport.waitForRequest("initialize"), transport, {});
+  const threadStart = await transport.waitForRequest("thread/start");
+  assert.equal(threadStart.params?.model, "gpt-5.5-thinking");
+  assert.equal(threadStart.params?.serviceTier, "fast");
+  respondTo(threadStart, transport, { thread: { id: "thread_model_alias" } });
+  await respondToProviderGoalClear(transport, "thread_model_alias");
+  const turnStart = await transport.waitForRequest("turn/start");
+  assert.equal(turnStart.params?.model, "gpt-5.5-thinking");
+  assert.equal(turnStart.params?.effort, "xhigh");
+  assert.equal(turnStart.params?.serviceTier, "fast");
+  respondTo(turnStart, transport, {
+    turn: {
+      id: "turn_model_alias",
+      status: "completed",
+      items: [{ type: "agentMessage", id: "msg_model_alias", text: "{\"kind\":\"queue\",\"id\":\"plan\",\"items\":[]}" }],
+      error: null
+    }
+  });
+
+  const result = await runPromise;
+  assert.equal(result.providerThreadId, "thread_model_alias");
+  assert.equal(result.providerTurnId, "turn_model_alias");
+});
+
+test("CodexAppServerRunner maps direct Member modelSelection to app-server options", async () => {
+  const transport = new MockAppServerTransport();
+  const runner = createMockAppServerRunner(transport);
+  const protocol = createDefaultHarness("Run the selected member.");
+  if (protocol.kind === "team_execution_plan") {
+    const member = createDefaultMemberConfig("azir", "Implement the selected goal.");
+    member.modelSelection = {
+      kind: "direct",
+      provider: {
+        providerId: "codex",
+        model: "gpt-5.5",
+        reasoningEffort: "medium",
+        serviceTier: "fast"
+      }
+    };
+    member.model = "codex-default" as typeof member.model;
+    member.reasoningEffort = "default";
+    member.serviceTier = "default";
+    protocol.members = [member];
+  }
+  const runPromise = runner.runMemberPath(createMemberPathInput({
+    harness: protocol,
+    memberPath: memberPath("build", "azir", "Build and verify the focused goal.", "PrevMove"),
+    outputSchema: { type: "object" }
+  }));
+
+  respondTo(await transport.waitForRequest("initialize"), transport, {});
+  const threadStart = await transport.waitForRequest("thread/start");
+  assert.equal(threadStart.params?.model, "gpt-5.5");
+  assert.equal(threadStart.params?.serviceTier, "fast");
+  respondTo(threadStart, transport, { thread: { id: "thread_member_selection" } });
+  await respondToProviderGoalClear(transport, "thread_member_selection");
+  const turnStart = await transport.waitForRequest("turn/start");
+  assert.equal(turnStart.params?.model, "gpt-5.5");
+  assert.equal(turnStart.params?.effort, "medium");
+  assert.equal(turnStart.params?.serviceTier, "fast");
+  respondTo(turnStart, transport, {
+    turn: {
+      id: "turn_member_selection",
+      status: "completed",
+      items: [{ type: "agentMessage", id: "msg_member_selection", text: "Changed the worktree." }],
+      error: null
+    }
+  });
+
+  const result = await runPromise;
+  assert.equal(result.providerThreadId, "thread_member_selection");
+  assert.equal(result.providerTurnId, "turn_member_selection");
+});
+
+test("CodexAppServerRunner maps direct Hunsu Draft Manager modelSelection to app-server options", async () => {
+  const transport = new MockAppServerTransport();
+  const runner = createMockAppServerRunner(transport);
+  const manager = {
+    ...createDefaultManagerConfig(),
+    modelSelection: {
+      kind: "direct" as const,
+      provider: {
+        providerId: "codex" as const,
+        model: "gpt-5.5" as const,
+        reasoningEffort: "low" as const,
+        serviceTier: "fast" as const
+      }
+    }
+  };
+  const runPromise = runner.prepareHunsuDraftSession!({
+    ...createHunsuDraftInput(),
+    manager
+  });
+
+  respondTo(await transport.waitForRequest("initialize"), transport, {});
+  const threadStart = await transport.waitForRequest("thread/start");
+  assert.equal(threadStart.params?.model, "gpt-5.5");
+  assert.equal(threadStart.params?.serviceTier, "fast");
+  respondTo(threadStart, transport, { thread: { id: "thread_manager_selection" } });
+  await respondToTeamGoal(transport, "thread_manager_selection", /Discuss HUNSU changes conversationally/, false);
+
+  const result = await runPromise;
+  assert.equal(result.providerThreadId, "thread_manager_selection");
+});
+
 test("CodexAppServerRunner maps user-reviewed Member approval to app-server options", async () => {
   const transport = new MockAppServerTransport();
   const runner = createMockAppServerRunner(transport);

@@ -43,6 +43,10 @@ import type {
   MoveFileDiffResult,
   MoveFileTree,
   MoveFileTreeResult,
+  ModelAlias,
+  ModelAliasInventoryResult,
+  ModelAliasResolutionResult,
+  ModelAliasResolveRequest,
   ProjectInspectionResult,
   RemoteBridgeConnectRequest,
   RemoteBridgeConnectResult,
@@ -255,6 +259,18 @@ export async function fetchBridgeStatus(): Promise<BridgeStatusResponse> {
   }
 }
 
+export function fetchModelInventory(): Promise<ModelAliasInventoryResult> {
+  return requestJson<ModelAliasInventoryResult>("/api/providers/inventory", undefined, "Provider model inventory request");
+}
+
+export function validateModelAliases(body: ModelAliasResolveRequest): Promise<ModelAliasResolutionResult> {
+  return postJson<ModelAliasResolutionResult>("/api/model-aliases/validate", body, "Model alias validation request");
+}
+
+export function resolveModelAlias(body: ModelAliasResolveRequest): Promise<ModelAliasResolutionResult> {
+  return postJson<ModelAliasResolutionResult>("/api/model-aliases/resolve", body, "Model alias resolve request");
+}
+
 function mergeBridgeStatuses(localStatus: BridgeStatusResponse, remoteStatus: BridgeStatusResponse): BridgeStatusResponse {
   const remoteConnections = remoteStatus.connections.filter(connection => connection.mode === "remote");
   if (remoteConnections.length === 0) {
@@ -430,7 +446,7 @@ export function postCommands(roadmapId: string, commands: Command[]): Promise<Co
   return postJson<CommandResult>(roadmapApiPath(roadmapId, "/commands"), { commands }, "Command");
 }
 
-export function postHunsuDraftStart(roadmapId: string, body: { sourceNodeId?: string; sourceMoveId?: string; sourceLineId?: string; message?: string }): Promise<HunsuDraftResult> {
+export function postHunsuDraftStart(roadmapId: string, body: { sourceNodeId?: string; sourceMoveId?: string; sourceLineId?: string; message?: string; aliases?: ModelAlias[] }): Promise<HunsuDraftResult> {
   return postJson<HunsuDraftResult>(roadmapApiPath(roadmapId, "/hunsu/drafts"), body, "HUNSU Draft start");
 }
 
@@ -563,6 +579,9 @@ export type RemoteBridgeCommandRequest = {
     | "health"
     | "bridge.status"
     | "connection.status"
+    | "provider.inventory"
+    | "modelAlias.validate"
+    | "modelAlias.resolve"
     | "roadmap.registry.list"
     | "roadmap.registry.remove"
     | "roadmap.open"
@@ -629,6 +648,15 @@ export function remoteBridgeCommandForRequest(
   }
   if (method === "GET" && pathname === "/api/bridge/status") {
     return { deviceId: session.deviceId, command: "bridge.status" };
+  }
+  if (method === "GET" && pathname === "/api/providers/inventory") {
+    return { deviceId: session.deviceId, command: "provider.inventory" };
+  }
+  if (method === "POST" && pathname === "/api/model-aliases/validate") {
+    return { deviceId: session.deviceId, command: "modelAlias.validate", payload: body };
+  }
+  if (method === "POST" && pathname === "/api/model-aliases/resolve") {
+    return { deviceId: session.deviceId, command: "modelAlias.resolve", payload: body };
   }
   if (method === "POST" && pathname === "/api/roadmaps/recent/remove") {
     return { deviceId: session.deviceId, command: "roadmap.registry.remove", projectPath, payload: body };

@@ -10,6 +10,7 @@ on:
         default: windows
         options:
           - windows
+          - windows-arm64
           - macos-arm64
           - macos-intel
           - all
@@ -30,7 +31,10 @@ jobs:
         run: |
           case "${{ inputs.platform }}" in
             windows)
-              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"}]}'
+              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"}]}'
+              ;;
+            windows-arm64)
+              matrix='{"include":[{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"}]}'
               ;;
             macos-arm64)
               matrix='{"include":[{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"}]}'
@@ -39,7 +43,7 @@ jobs:
               matrix='{"include":[{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"}]}'
               ;;
             all)
-              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"},{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"}]}'
+              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"},{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"},{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"}]}'
               ;;
             *)
               echo "Unsupported platform: ${{ inputs.platform }}" >&2
@@ -128,6 +132,9 @@ jobs:
       - name: List bundle outputs
         shell: bash
         run: find apps/bridge-desktop/src-tauri/target/release/bundle -maxdepth 4 -type f -print
+
+      - name: Report artifact sizes
+        run: pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes
 
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4

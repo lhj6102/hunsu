@@ -16,6 +16,7 @@
     "build:ui": "node scripts/build-ui.mjs",
     "sidecars:build": "node --conditions=development scripts/build-native-sidecars.mjs",
     "sidecars:prepare": "node --conditions=development scripts/prepare-sidecars.mjs",
+    "artifacts:report-sizes": "node scripts/report-artifact-sizes.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

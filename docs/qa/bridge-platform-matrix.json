@@ -1,12 +1,12 @@
 {
   "schema": "hunsu.bridge-platform-qa.v1",
-  "updatedAt": "2026-07-07",
+  "updatedAt": "2026-07-10",
   "nativeHostResults": {
     "status": "not-run-in-this-workspace",
-    "recordedAt": "2026-07-08",
+    "recordedAt": "2026-07-10",
     "workspace": "Linux no-GUI development workspace",
     "realRuns": [],
-    "externalBlocker": "macOS, Windows, Linux GUI, packaged installer, tray/menu-bar, and real native host daemon QA require external hosts. This matrix records contract coverage only until those native-host runs are executed and appended here."
+    "externalBlocker": "macOS, Windows, Linux GUI, packaged installer, tray/menu-bar, and real native host daemon QA require external hosts. Product behavior contracts are covered in source tests; real native-host execution evidence is appended here only after those external runs complete."
   },
   "targets": [
     {
@@ -24,6 +24,7 @@
         "fresh install bundle contains hunsu:// URL scheme",
         "folder picker command is exposed through Tauri dialog plugin",
         "native sidecar artifacts are generated for x86_64-apple-darwin and aarch64-apple-darwin",
+        "tray deep links route and focus the Bridge window by source contract",
         "Bridge App can launch Studio through a fresh pairing URL",
         "sidecar supervisor records crash restart logs"
       ]
@@ -43,6 +44,7 @@
         "installer registers hunsu:// protocol through WiX fragment",
         "native sidecar .exe artifacts are generated for x86_64-pc-windows-msvc and aarch64-pc-windows-msvc",
         "DPAPI-backed credential adapter command boundary is covered with mocks",
+        "tray summary refresh and quit preference behavior are source-contract tested",
         "open project and launch Studio use the same Bridge App command surface",
         "uninstall and reinstall preserve no committed user data"
       ]
@@ -63,6 +65,7 @@
         "xdg hunsu:// protocol registration plan is generated",
         "Secret Service credential adapter command boundary is covered with mocks",
         "native sidecar artifacts are generated for Linux GNU targets",
+        "tray deep links, refresh, and persisted quit preference contracts are covered without claiming local GUI execution",
         "launch Studio uses a fresh pairing URL"
       ]
     },
