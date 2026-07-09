@@ -3,18 +3,19 @@ import type { ExecutePreflightAction } from "@/shared/api/bridgeTypes";
 export function bridgeActionHref(action: ExecutePreflightAction): string {
   if (action.href) return action.href;
   switch (action.type) {
-    case "install_codex":
-    case "codex_login_chatgpt":
-    case "codex_login_device":
-    case "codex_recheck":
-    case "open_prerequisites":
-      return "hunsu://prerequisites/codex";
-    case "open_roadmaps":
-      return "hunsu://roadmaps";
-    case "activate_roadmap":
-      return action.roadmapId
-        ? `hunsu://activate-roadmap?roadmapId=${encodeURIComponent(action.roadmapId)}`
-        : "hunsu://roadmaps";
+    case "open_provider_setup":
+    case "install_provider":
+    case "login_provider":
+    case "recheck_provider":
+      return action.providerId ? `hunsu://provider/${encodeURIComponent(action.providerId)}` : "hunsu://provider";
+    case "open_workspaces":
+      return "hunsu://workspaces";
+    case "activate_workspace":
+      return action.workspaceId
+        ? `hunsu://open-workspace?workspaceId=${encodeURIComponent(action.workspaceId)}`
+        : "hunsu://workspaces";
+    case "open_connection":
+      return "hunsu://connection";
     case "open_bridge_app":
     default:
       return "hunsu://open";

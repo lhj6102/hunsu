@@ -69,6 +69,7 @@
         margin: 0;
         min-width: 0;
         overflow-wrap: anywhere;
+        white-space: pre-line;
       }
       .actions {
         display: flex;
@@ -178,6 +179,19 @@
       .status-error {
         color: #b42318;
       }
+      .connection-state {
+        display: grid;
+        gap: 10px;
+      }
+      details {
+        margin-top: 14px;
+      }
+      summary {
+        color: #344054;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 700;
+      }
     </style>
   </head>
   <body>
@@ -186,74 +200,101 @@
         <h1>Hunsu Bridge</h1>
         <div class="actions">
           <button id="refresh">Refresh</button>
-          <button id="open-studio" class="primary">Open Studio</button>
+          <button id="open-studio" class="primary">Open Hunsu Web</button>
         </div>
       </header>
 
       <nav aria-label="Bridge sections">
-        <button data-tab="overview" aria-selected="true">Overview</button>
-        <button data-tab="prerequisites">Prerequisites</button>
-        <button data-tab="roadmaps">Roadmaps</button>
+        <button data-tab="provider" aria-selected="true">Provider</button>
+        <button data-tab="workspaces">Workspaces</button>
         <button data-tab="connection">Connection</button>
-        <button data-tab="remote">Remote Access</button>
-        <button data-tab="diagnostics">Diagnostics</button>
-        <button data-tab="settings">Settings</button>
       </nav>
+      <details>
+        <summary>Advanced</summary>
+        <div class="actions" style="margin-top: 10px;">
+          <button data-tab="advanced">Runtime Providers</button>
+          <button data-tab="diagnostics">Diagnostics</button>
+          <button data-tab="settings">Settings</button>
+        </div>
+      </details>
 
-      <section data-panel="overview">
-        <h2>Overview</h2>
+      <section data-panel="provider">
+        <h2>Provider</h2>
         <dl>
-          <dt>Local Bridge</dt>
-          <dd id="local-bridge">Not Running</dd>
-          <dt>Codex</dt>
+          <dt>Provider</dt>
           <dd id="codex-summary">Unknown</dd>
-          <dt>Active Roadmaps</dt>
+          <dt>Workspaces</dt>
           <dd id="active-roadmaps">0 active</dd>
-          <dt>Account</dt>
-          <dd id="account">Signed out</dd>
-          <dt>Remote Access</dt>
-          <dd id="remote-access">Off</dd>
-          <dt>Device</dt>
-          <dd id="device">Unknown</dd>
-          <dt>Service</dt>
-          <dd id="service">Not installed</dd>
+          <dt>Connection</dt>
+          <dd id="local-bridge">Connecting</dd>
         </dl>
-      </section>
-
-      <section data-panel="prerequisites" hidden>
-        <h2>Prerequisites</h2>
         <div id="codex-card" class="grid"></div>
-        <h2 style="margin-top: 18px;">Git</h2>
-        <div id="git-card" class="grid"></div>
-        <h2 style="margin-top: 18px;">Node / Package Manager</h2>
-        <div id="node-card" class="grid"></div>
       </section>
 
-      <section data-panel="roadmaps" hidden>
-        <h2>Roadmaps</h2>
+      <section data-panel="workspaces" hidden>
+        <h2>Workspaces</h2>
         <div class="actions">
-          <button id="choose-folder" class="primary">Add Roadmap</button>
+          <button id="choose-folder" class="primary">Add Workspace</button>
           <button id="selected-project-action" disabled>Select a Folder</button>
         </div>
         <div id="selected-project" class="message">No folder selected.</div>
-        <h2 style="margin-top: 18px;">Active Roadmaps</h2>
+        <h2 style="margin-top: 18px;">Active Workspaces</h2>
         <div id="active-roadmap-list" class="grid"></div>
-        <h2 style="margin-top: 18px;">Inactive Roadmaps</h2>
+        <h2 style="margin-top: 18px;">Inactive Workspaces</h2>
         <div id="inactive-roadmap-list" class="grid"></div>
       </section>
 
       <section data-panel="connection" hidden>
         <h2>Connection</h2>
-        <div class="actions">
-          <button id="start-bridge">Start Bridge</button>
-          <button id="stop-bridge">Stop Bridge</button>
-          <button id="open-studio-connection">Open Studio</button>
-          <button id="install-protocol">Install hunsu:// Handler</button>
+        <div class="connection-state">
+          <div class="project-row">
+            <div>
+              <div class="project-title">Local</div>
+              <div id="connection-local-status" class="project-meta">This computer · Connected</div>
+            </div>
+          </div>
+          <div class="project-row">
+            <div>
+              <div class="project-title">Remote</div>
+              <div id="connection-remote-status" class="project-meta">Sign in to use this computer from Hunsu Web when away.</div>
+              <div id="connection-remote-detail" class="message"></div>
+            </div>
+            <div class="actions">
+              <button id="connection-primary-action" class="primary">Sign in to Hunsu</button>
+              <button id="connection-secondary-action">Sign out</button>
+            </div>
+          </div>
         </div>
+        <details>
+          <summary>Advanced connection details</summary>
+          <dl style="margin-top: 10px;">
+            <dt>Account</dt>
+            <dd id="account">Signed out</dd>
+            <dt>Remote Access</dt>
+            <dd id="remote-access">Off</dd>
+            <dt>Device</dt>
+            <dd id="device">Unknown</dd>
+            <dt>Service</dt>
+            <dd id="service">Not installed</dd>
+          </dl>
+          <div class="actions" style="margin-top: 10px;">
+            <button id="start-bridge">Start Bridge</button>
+            <button id="stop-bridge">Stop Bridge</button>
+            <button id="open-studio-connection">Open Hunsu Web</button>
+            <button id="install-protocol">Install hunsu:// Handler</button>
+          </div>
+        </details>
       </section>
 
-      <section data-panel="remote" hidden>
-        <h2>Active Roadmap Remote Access</h2>
+      <section data-panel="advanced" hidden>
+        <h2>Runtime Providers</h2>
+        <div id="runtime-provider-list" class="grid"></div>
+        <h2 style="margin-top: 18px;">Advanced Checks</h2>
+        <h3>Git</h3>
+        <div id="git-card" class="grid"></div>
+        <h3 style="margin-top: 18px;">Node / Package Manager</h3>
+        <div id="node-card" class="grid"></div>
+        <h2 style="margin-top: 18px;">Advanced Remote Details</h2>
         <div id="remote-roadmap-list" class="grid"></div>
         <h2 style="margin-top: 18px;">Project Grants</h2>
         <div id="project-grants" class="grid"></div>

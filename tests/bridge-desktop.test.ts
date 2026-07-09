@@ -24,10 +24,10 @@ import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
-import { createStudioRoadmap, createStudioServer, createStudioState, setRoadmapLifecycle } from "../apps/bridge/src/index.ts";
+import { createStudioRoadmap, createStudioServer, createStudioState, listManagedRoadmapRegistry, setRoadmapLifecycle } from "../apps/bridge/src/index.ts";
 
 test("Bridge App parses browser deep links into command arguments", () => {
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open"]), ["status"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open"]), ["ui-intent", "provider"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://pair?next=/studio/roadmaps/roadmap_123"]), [
     "pair",
     "--next",
@@ -45,11 +45,23 @@ test("Bridge App parses browser deep links into command arguments", () => {
     "open-roadmap",
     "roadmap_123"
   ]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap"]), ["ui-intent", "roadmaps", "add-roadmap"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open-workspace?workspaceId=roadmap_123"]), [
+    "open-roadmap",
+    "roadmap_123"
+  ]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://provider"]), ["ui-intent", "provider"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://provider/codex"]), ["ui-intent", "provider", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://codex"]), ["ui-intent", "provider", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://workspaces"]), ["ui-intent", "workspaces"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-workspace"]), ["ui-intent", "workspaces", "add-workspace"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-workspace?path=/tmp/example"]), ["roadmaps", "add", "/tmp/example"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://connection"]), ["ui-intent", "connection"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://connection/remote"]), ["ui-intent", "connection", "remote"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap"]), ["ui-intent", "workspaces", "add-workspace"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://add-roadmap?path=/tmp/example"]), ["roadmaps", "add", "/tmp/example"]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://roadmaps"]), ["ui-intent", "roadmaps"]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites"]), ["ui-intent", "prerequisites"]);
-  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/codex"]), ["ui-intent", "prerequisites", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://roadmaps"]), ["ui-intent", "workspaces"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites"]), ["ui-intent", "provider"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/codex"]), ["ui-intent", "provider", "codex"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://activate-roadmap?roadmapId=roadmap_123"]), ["activate-roadmap", "roadmap_123"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://remote-disable"]), ["remote", "disable"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://sign-in"]), ["login", "--gui"]);
@@ -110,15 +122,19 @@ test("Bridge App Roadmap deep links record UI intents for native focus flows", a
   try {
     assert.equal(await main(["hunsu://add-roadmap"]), 0);
     const addRoadmapState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; action?: string } };
-    assert.deepEqual({ tab: addRoadmapState.uiIntent?.tab, action: addRoadmapState.uiIntent?.action }, { tab: "roadmaps", action: "add-roadmap" });
+    assert.deepEqual({ tab: addRoadmapState.uiIntent?.tab, action: addRoadmapState.uiIntent?.action }, { tab: "workspaces", action: "add-workspace" });
 
     assert.equal(await main(["hunsu://prerequisites/codex"]), 0);
     const codexState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; focus?: string } };
-    assert.deepEqual({ tab: codexState.uiIntent?.tab, focus: codexState.uiIntent?.focus }, { tab: "prerequisites", focus: "codex" });
+    assert.deepEqual({ tab: codexState.uiIntent?.tab, focus: codexState.uiIntent?.focus }, { tab: "provider", focus: "codex" });
+
+    assert.equal(await main(["hunsu://connection/remote"]), 0);
+    const remoteState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; focus?: string } };
+    assert.deepEqual({ tab: remoteState.uiIntent?.tab, focus: remoteState.uiIntent?.focus }, { tab: "connection", focus: "remote" });
 
     assert.equal(await main(["hunsu://activate-roadmap?roadmapId=unknown_roadmap"]), 0);
     const activateState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string } };
-    assert.equal(activateState.uiIntent?.tab, "roadmaps");
+    assert.equal(activateState.uiIntent?.tab, "workspaces");
   } finally {
     console.log = previousLog;
     restoreEnv(previousEnv);
@@ -445,6 +461,180 @@ test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGP
   assert.match(textForTestElement(ui.elements.get("#codex-card")), /Complete sign-in in your browser, then click Recheck/);
 });
 
+test("Bridge App desktop UI keeps Local/Remote connection primary and provider placeholders Advanced", () => {
+  const html = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/index.html"), "utf8");
+  const primaryNav = html.match(/<nav aria-label="Bridge sections">([\s\S]*?)<\/nav>/)?.[1] ?? "";
+  assert.deepEqual([...primaryNav.matchAll(/<button[^>]*>([^<]+)<\/button>/g)].map(match => match[1]), ["Provider", "Workspaces", "Connection"]);
+  assert.doesNotMatch(primaryNav, /Overview|Advanced|Diagnostics|Settings/);
+  const providerPanel = html.match(/<section data-panel="provider">([\s\S]*?)<\/section>/)?.[1] ?? "";
+  assert.match(providerPanel, /<dt>Provider<\/dt>[\s\S]*<dt>Workspaces<\/dt>[\s\S]*<dt>Connection<\/dt>/);
+  assert.doesNotMatch(providerPanel, /Account|Remote Access|Device|Service/);
+  const appSource = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/app.js"), "utf8");
+  assert.doesNotMatch(appSource, /Copy Install Command/);
+  assert.match(appSource, /\["codex", "install", "--confirm"\]/);
+  assert.match(appSource, /\["codex", "login", "--api-key"\]/);
+
+  const ui = loadBridgeDesktopUiForTest();
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "install_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    },
+    providers: {
+      currentProviderId: "codex",
+      current: { providerId: "codex", label: "Codex", ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      providers: [
+        { providerId: "codex", label: "Codex", ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+        { providerId: "claude_code", label: "Claude Code", ready: false, recommendedAction: "configure", safeMessage: "Coming later" }
+      ]
+    },
+    managedRoadmaps: [{
+      roadmapId: "roadmap_ui",
+      displayName: "UI Workspace",
+      repositoryPath: "/tmp/hunsu-ui-workspace",
+      lifecycle: "active",
+      health: "ok",
+      lastOpenedAt: "2026-07-09T00:00:00.000Z",
+      provider: { providerId: "codex", label: "Codex", readyForExecute: true },
+      codex: { readyForExecute: true },
+      remoteAccess: {
+        available: true,
+        enabled: true,
+        scopes: ["remoteRelay.access"],
+        scopeState: {
+          "execute.start": false,
+          "artifactAction.run": false,
+          "env.read": false,
+          "hostAlias.expose": false,
+          "remoteRelay.access": true
+        }
+      }
+    }],
+    projectGrants: [{
+      path: "/tmp/hunsu-ui-workspace",
+      grantedAt: "2026-07-09T00:00:00.000Z",
+      scopes: ["remoteRelay.access"]
+    }],
+    runtimeProviders: {
+      currentProviderId: "codex",
+      providers: [
+        { providerId: "codex", label: "Codex", ready: true, recommendedAction: "none" },
+        { providerId: "claude_code", label: "Claude Code", ready: false, recommendedAction: "configure", safeMessage: "Coming later" }
+      ]
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-summary")), /Codex · Ready/);
+  assert.match(textForTestElement(ui.elements.get("#local-bridge")), /Local · Connected/);
+  assert.match(textForTestElement(ui.elements.get("#local-bridge")), /Remote · Off/);
+  assert.match(textForTestElement(ui.elements.get("#connection-local-status")), /This computer · Connected/);
+  assert.match(textForTestElement(ui.elements.get("#connection-remote-status")), /Sign in to use this computer/);
+  const codexCard = ui.elements.get("#codex-card");
+  assert.match(textForTestElement(codexCard), /Change provider/);
+  assert.match(textForTestElement(codexCard), /Advanced provider details/);
+  assert.doesNotMatch(textForTestElement(codexCard?.children[0]), /Use API Key - Advanced/);
+  assert.match(textForTestElement(codexCard?.children[1]), /Use API Key - Advanced/);
+  assert.match(textForTestElement(ui.elements.get("#runtime-provider-list")), /Claude Code/);
+  assert.match(textForTestElement(ui.elements.get("#runtime-provider-list")), /Coming later/);
+  assert.doesNotMatch(textForTestElement(ui.elements.get("#active-roadmap-list")), /remoteRelay\.access|\/tmp\/hunsu-ui-workspace/);
+  assert.match(textForTestElement(ui.elements.get("#remote-roadmap-list")), /remoteRelay\.access/);
+
+  ui.renderSnapshot({
+    status: {
+      ...bridgeUiStatusFixture(),
+      localBridge: "not-running"
+    },
+    prerequisites: {
+      codex: { ready: true, recommendedAction: "none" },
+      tools: {}
+    },
+    providers: {
+      currentProviderId: "codex",
+      current: { providerId: "codex", label: "Codex", ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      providers: [{ providerId: "codex", label: "Codex", ready: true, recommendedAction: "none" }]
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#local-bridge")), /Local · Connecting/);
+  assert.doesNotMatch(textForTestElement(ui.elements.get("#local-bridge")), /Not Running/);
+
+  ui.renderSnapshot({
+    status: bridgeUiStatusFixture(),
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "recheck", auth: { state: "error" } },
+      tools: {}
+    },
+    providers: {
+      currentProviderId: "codex",
+      current: { providerId: "codex", label: "Codex", ready: false, recommendedAction: "recheck", safeMessage: "Codex needs attention." },
+      providers: [{ providerId: "codex", label: "Codex", ready: false, recommendedAction: "recheck", safeMessage: "Codex needs attention." }]
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /Select Existing Codex/);
+  assert.match(textForTestElement(ui.elements.get("#codex-card")), /Show details/);
+
+  ui.renderSnapshot({
+    status: {
+      ...bridgeUiStatusFixture(),
+      account: "Signed in as dev@example.test",
+      remoteAccess: "On",
+      device: { name: "MacBook Pro", registered: true }
+    },
+    prerequisites: {
+      codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      tools: {}
+    }
+  });
+  assert.match(textForTestElement(ui.elements.get("#connection-remote-status")), /Remote · On/);
+  assert.match(textForTestElement(ui.elements.get("#connection-remote-detail")), /Device: MacBook Pro/);
+  assert.match(textForTestElement(ui.elements.get("#connection-remote-detail")), /Status: Online/);
+});
+
+test("Bridge App command and state modules are imported by the desktop entrypoint", () => {
+  const root = process.cwd();
+  const mainSource = readFileSync(join(root, "apps/bridge-desktop/src/main.ts"), "utf8");
+  for (const modulePath of [
+    "./commands/codexCommands.ts",
+    "./commands/authCommands.ts",
+    "./commands/providerCommands.ts",
+    "./commands/workspaceCommands.ts",
+    "./commands/connectionCommands.ts",
+    "./commands/diagnosticsCommands.ts",
+    "./processes/backgroundSpawn.ts",
+    "./state/appState.ts"
+  ]) {
+    assert.match(mainSource, new RegExp(modulePath.replaceAll(".", "\\.").replaceAll("/", "\\/")));
+  }
+  assert.match(readFileSync(join(root, "apps/bridge-desktop/src/commands/codexCommands.ts"), "utf8"), /runCodexCommand/);
+  assert.match(readFileSync(join(root, "apps/bridge-desktop/src/commands/authCommands.ts"), "utf8"), /runLoginCommand/);
+  assert.match(readFileSync(join(root, "apps/bridge-desktop/src/commands/providerCommands.ts"), "utf8"), /providerStatusSummary/);
+  assert.match(readFileSync(join(root, "apps/bridge-desktop/src/commands/workspaceCommands.ts"), "utf8"), /runRoadmapsCommand/);
+  const connectionSource = readFileSync(join(root, "apps/bridge-desktop/src/commands/connectionCommands.ts"), "utf8");
+  assert.match(connectionSource, /runRemoteCommand/);
+  assert.match(connectionSource, /publishProjectGrantsToRelay/);
+  assert.match(connectionSource, /attachRemoteAccessCommand/);
+  assert.match(readFileSync(join(root, "apps/bridge-desktop/src/commands/diagnosticsCommands.ts"), "utf8"), /runDiagnosticsCommand/);
+  const backgroundSpawnSource = readFileSync(join(root, "apps/bridge-desktop/src/processes/backgroundSpawn.ts"), "utf8");
+  assert.match(backgroundSpawnSource, /startDetachedRemoteAccessProcess/);
+  assert.match(backgroundSpawnSource, /createBridgeAppSidecarSupervisor/);
+  assert.match(readFileSync(join(root, "apps/bridge-desktop/src/state/appState.ts"), "utf8"), /defaultBridgeAppState/);
+  assert.doesNotMatch(mainSource, /function publishProjectGrantsToRelay/);
+  assert.doesNotMatch(mainSource, /function startRemoteAccessProcessIfPossible/);
+  assert.doesNotMatch(mainSource, /function createBridgeAppSidecarSupervisor/);
+});
+
+test("Bridge App background child spawns hide Windows console windows", () => {
+  const codexSource = readFileSync(join(process.cwd(), "apps/bridge-desktop/src/commands/codexCommands.ts"), "utf8");
+  const backgroundSpawnSource = readFileSync(join(process.cwd(), "apps/bridge-desktop/src/processes/backgroundSpawn.ts"), "utf8");
+  const sidecarSource = readFileSync(join(process.cwd(), "apps/bridge-desktop/src/sidecar-supervisor.ts"), "utf8");
+  const bridgeSource = [
+    readFileSync(join(process.cwd(), "apps/bridge/src/index.ts"), "utf8"),
+    readFileSync(join(process.cwd(), "apps/bridge/src/runtime-providers/codex.ts"), "utf8")
+  ].join("\n");
+  assert.ok(([codexSource, backgroundSpawnSource].join("\n").match(/detached: true[\s\S]{0,180}windowsHide: true/g) ?? []).length >= 3);
+  assert.match(sidecarSource, /stdio: \["ignore", "pipe", "pipe"\],[\s\S]{0,80}windowsHide: true/);
+  assert.ok((bridgeSource.match(/detached: true[\s\S]{0,180}windowsHide: true/g) ?? []).length >= 3);
+});
+
 test("Bridge App headless commands persist device, Remote Access, Project Grant, and service state", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-app-test-"));
   const statePath = join(root, "state.json");
@@ -490,6 +680,7 @@ test("Bridge App headless commands persist device, Remote Access, Project Grant,
         health: "ok"
       }]
     }), "utf8");
+    assert.equal(await main(["remote", "check", "bridge.status"]), 1);
     assert.equal(await main(["projects", "remove", "--roadmap-id", "roadmap_missing"]), 0);
     assert.equal(await main(["remote", "check", "execute.start", root]), 1);
     assert.equal(await main(["service", "install"]), 0);
@@ -506,6 +697,9 @@ test("Bridge App headless commands persist device, Remote Access, Project Grant,
       service: { installed: boolean; manager: string };
     };
     const snapshot = JSON.parse(logs.at(-1) ?? "{}") as {
+      providers?: { current?: { providerId?: string; label?: string } };
+      workspaces?: { active?: unknown[]; managed?: unknown[] };
+      connections?: { local?: { state?: string }; remote?: { state?: string } };
       projectGrants?: Array<{ path: string; scopes: string[] }>;
       diagnostics?: { app?: { projectGrants?: Array<{ path: string; scopes: string[] }> } };
     };
@@ -518,6 +712,11 @@ test("Bridge App headless commands persist device, Remote Access, Project Grant,
     assert.equal(state.projectGrants[0]?.scopes.includes("env.read"), true);
     assert.equal(state.projectGrants[0]?.scopes.includes("hostAlias.expose"), true);
     assert.equal(state.projectGrants[0]?.scopes.includes("remoteRelay.access"), true);
+    assert.equal(snapshot.providers?.current?.providerId, "codex");
+    assert.equal(Array.isArray(snapshot.workspaces?.active), true);
+    assert.equal(Array.isArray(snapshot.workspaces?.managed), true);
+    assert.equal(snapshot.connections?.local?.state === "connected" || snapshot.connections?.local?.state === "not-running", true);
+    assert.equal(snapshot.connections?.remote?.state, "registered-offline");
     assert.equal(snapshot.projectGrants?.[0]?.path, root);
     assert.equal(snapshot.diagnostics?.app?.projectGrants?.[0]?.path, root);
     assert.equal(state.service.installed, true);
@@ -526,9 +725,9 @@ test("Bridge App headless commands persist device, Remote Access, Project Grant,
       assert.match(readFileSync(serviceUnitPath, "utf8"), /ExecStart=.*supervise --cwd/);
     }
     assert.equal(logs.some(line => line.includes("Remote Access: Registered but offline")), true);
-    assert.equal(logs.some(line => line.includes("Prerequisites:")), true);
-    assert.equal(logs.some(line => line.includes("Active Roadmaps:")), true);
-    assert.equal(logs.some(line => line.includes("Inactive Roadmaps:")), true);
+    assert.equal(logs.some(line => line.includes("Provider:")), true);
+    assert.equal(logs.some(line => line.includes("Active Workspaces:")), true);
+    assert.equal(logs.some(line => line.includes("Inactive Workspaces:")), true);
     assert.equal(logs.some(line => line.includes("Projects:")), false);
     assert.equal(existsSync(credentialPath), true);
     if (process.platform !== "win32") {
@@ -776,6 +975,14 @@ test("Bridge App publishes only active managed Roadmap grants to Relay", async (
     assert.equal(await main(["remote", "enable"]), 0);
     const published = relayRequest?.body?.projectGrants as ProjectGrant[] | undefined;
     assert.deepEqual(published?.map(grant => grant.path), [activePath]);
+
+    assert.equal(await main(["remote", "disable"]), 0);
+    const disabledState = JSON.parse(readFileSync(statePath, "utf8")) as { remoteAccess?: string; projectGrants?: ProjectGrant[] };
+    assert.equal(disabledState.remoteAccess, "off");
+    assert.equal(disabledState.projectGrants?.some(grant => grant.scopes.includes("remoteRelay.access")), false);
+    const disabledActive = listManagedRoadmapRegistry({ roadmapRegistryPath }).find(roadmap => roadmap.roadmapId === active.roadmap.roadmapId);
+    assert.equal(disabledActive?.remoteAccess?.enabled, false);
+    assert.equal(disabledActive?.remoteAccess?.scopes.includes("remoteRelay.access"), false);
   } finally {
     console.log = previousLog;
     restoreEnv(previousEnv);
@@ -917,6 +1124,77 @@ test("Bridge App service install dry-run does not persist installed state", asyn
     } else {
       process.env.HUNSU_BRIDGE_APP_LOG_PATH = previousLogPath;
     }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex install requires confirmation and supports dry-run", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-install-dry-run-test-"));
+  const previousEnv = {
+    PATH: process.env.PATH,
+    HUNSU_CODEX_BINARY_PATH: process.env.HUNSU_CODEX_BINARY_PATH,
+    HUNSU_CODEX_INSTALL_DRY_RUN: process.env.HUNSU_CODEX_INSTALL_DRY_RUN
+  };
+  const previousLog = console.log;
+  const logs: string[] = [];
+  process.env.PATH = join(root, "missing-path");
+  delete process.env.HUNSU_CODEX_BINARY_PATH;
+  process.env.HUNSU_CODEX_INSTALL_DRY_RUN = "1";
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(" "));
+  };
+
+  try {
+    assert.equal(await main(["codex", "install"]), 0);
+    assert.equal(logs.some(line => line.includes("Confirm Codex installation")), true);
+    assert.equal(logs.some(line => line.includes("--confirm")), true);
+    logs.length = 0;
+
+    assert.equal(await main(["codex", "install", "--confirm", "--dry-run"]), 0);
+    assert.equal(logs.some(line => line.includes("dry run completed")), true);
+    assert.equal(logs.some(line => line.includes("npm install -g @openai/codex@latest") || line.includes("npm.cmd install -g @openai/codex@latest")), true);
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Codex API-key login invokes API-key path", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-codex-api-key-test-"));
+  const fakeCodex = join(root, process.platform === "win32" ? "codex.cmd" : "codex");
+  const argsPath = join(root, "args.txt");
+  const previousEnv = {
+    PATH: process.env.PATH,
+    HUNSU_CODEX_BINARY_PATH: process.env.HUNSU_CODEX_BINARY_PATH
+  };
+  const previousLog = console.log;
+  const logs: string[] = [];
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const { writeFileSync } = require('node:fs');",
+    `const argsPath = ${JSON.stringify(argsPath)};`,
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 2.0.0'); process.exit(0); }",
+    "if (args[0] === 'login') { writeFileSync(argsPath, args.join(' ')); process.exit(0); }",
+    "process.exit(0);",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  process.env.HUNSU_CODEX_BINARY_PATH = fakeCodex;
+  process.env.PATH = root;
+  console.log = (...values: unknown[]) => {
+    logs.push(values.map(String).join(" "));
+  };
+
+  try {
+    assert.equal(await main(["codex", "login", "--api-key"]), 0);
+    await waitFor(() => existsSync(argsPath));
+    assert.equal(readFileSync(argsPath, "utf8"), "login --api-key");
+    assert.equal(logs.some(line => line.includes("API-key configuration started")), true);
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1240,6 +1518,7 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
   };
 
   assert.deepEqual(scopesForRelayCommand("execute.start"), ["execute.start", "remoteRelay.access"]);
+  assert.deepEqual(scopesForRelayCommand("bridge.status"), []);
   assert.deepEqual(scopesForRelayCommand("roadmap.board"), ["remoteRelay.access"]);
   assert.deepEqual(scopesForRelayCommand("artifactAction.runs"), ["env.read", "hostAlias.expose", "remoteRelay.access"]);
   assert.deepEqual(scopesForRelayCommand("artifactAction.start"), ["artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"]);
@@ -1262,6 +1541,15 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
     command: { deviceId: device.deviceId, command: "execute.start", projectPath: "/tmp/hunsu-project" },
     projectGrants: [grant]
   }).ok, false);
+  assert.deepEqual(evaluateRelayCommand({
+    device: { ...device, remoteAccess: "disabled" },
+    command: { deviceId: device.deviceId, command: "bridge.status" },
+    projectGrants: []
+  }), {
+    ok: false,
+    reason: "device_offline",
+    message: "Remote Bridge is disabled for this device."
+  });
   const denied = evaluateRelayCommand({
     device,
     command: { deviceId: device.deviceId, command: "artifactAction.start", projectPath: "/tmp/hunsu-project" },
@@ -1304,6 +1592,10 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
     method: "POST",
     path: "/api/roadmaps/open",
     body: { path: "/tmp/hunsu-project" }
+  });
+  assert.deepEqual(relayHttpRequestForCommand({ deviceId: device.deviceId, command: "bridge.status" }), {
+    method: "GET",
+    path: "/api/bridge/status"
   });
   assert.deepEqual(relayHttpRequestForCommand({
     deviceId: device.deviceId,
@@ -1386,10 +1678,13 @@ test("Bridge App Remote Access registry records offline and online device transi
       protocolVersion: "local-bridge-v1"
     });
     assert.equal(registered.status, "offline");
+    assert.equal(registered.remoteAccess, "enabled");
     assert.equal(registry.updateDeviceStatus("device_state", "online")?.status, "online");
     assert.equal(registry.listDevices("user_state")[0]?.status, "online");
     assert.equal(registry.updateDeviceStatus("device_state", "offline")?.status, "offline");
     assert.equal(registry.listDevices("user_state")[0]?.status, "offline");
+    assert.equal(registry.updateDeviceStatus("device_state", "offline", "disabled")?.remoteAccess, "disabled");
+    assert.deepEqual(registry.listDevices("user_state"), []);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1624,6 +1919,32 @@ test("Bridge App Relay forwarding redacts remote paths without Project Grant", a
         }
       }), { status: 200, headers: { "content-type": "application/json" } });
     }
+    if (pathname === "/api/bridge/status") {
+      return new Response(JSON.stringify({
+        provider: { providerId: "codex", label: "Codex", ready: true },
+        connections: [{
+          backendId: "local",
+          mode: "local",
+          label: "This computer",
+          connection: { state: "connected" },
+          workspaces: [
+            { workspaceId: "roadmap_granted", displayName: "Granted", path: "/tmp/granted-project" },
+            { workspaceId: "roadmap_secret", displayName: "Secret", path: "/tmp/secret-project" }
+          ]
+        }],
+        workspaces: {
+          active: [
+            { workspaceId: "roadmap_granted", displayName: "Granted", path: "/tmp/granted-project" },
+            { workspaceId: "roadmap_secret", displayName: "Secret", path: "/tmp/secret-project" }
+          ],
+          managed: [
+            { workspaceId: "roadmap_granted", displayName: "Granted", path: "/tmp/granted-project" },
+            { workspaceId: "roadmap_secret", displayName: "Secret", path: "/tmp/secret-project" }
+          ]
+        },
+        account: { signedIn: true, userId: "user_123" }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
     if (pathname === "/api/roadmaps/recent") {
       return new Response(JSON.stringify({
         roadmaps: [
@@ -1643,6 +1964,19 @@ test("Bridge App Relay forwarding redacts remote paths without Project Grant", a
   });
   assert.equal(status.ok, true);
   assert.equal(((status as { body: { project?: { repositoryPath?: string } } }).body.project ?? {}).repositoryPath, undefined);
+
+  const bridgeStatus = await forwardRelayCommand({
+    bridgeApiUrl,
+    command: { deviceId: "device_123", command: "bridge.status" },
+    projectGrants: [grant],
+    fetchImpl
+  });
+  assert.equal(bridgeStatus.ok, true);
+  const bridgeStatusBody = (bridgeStatus as { body: { workspaces: { active: Array<{ workspaceId: string; path?: string; pathRedacted?: boolean }> }; connections: Array<{ workspaces: Array<{ workspaceId: string; path?: string; pathRedacted?: boolean }> }> } }).body;
+  assert.equal(bridgeStatusBody.workspaces.active.find(workspace => workspace.workspaceId === "roadmap_granted")?.path, "/tmp/granted-project");
+  assert.equal(bridgeStatusBody.workspaces.active.find(workspace => workspace.workspaceId === "roadmap_secret")?.path, undefined);
+  assert.equal(bridgeStatusBody.workspaces.active.find(workspace => workspace.workspaceId === "roadmap_secret")?.pathRedacted, true);
+  assert.equal(bridgeStatusBody.connections[0]?.workspaces.find(workspace => workspace.workspaceId === "roadmap_secret")?.path, undefined);
 
   const registry = await forwardRelayCommand({
     bridgeApiUrl,
@@ -1691,6 +2025,7 @@ test("Bridge App Relay command mappings target implemented Bridge routes", async
 function relayMappingCommandCases(roadmapId: string, projectPath: string): RelayCommand[] {
   return [
     { deviceId: "device_123", command: "health" },
+    { deviceId: "device_123", command: "bridge.status" },
     { deviceId: "device_123", command: "connection.status" },
     { deviceId: "device_123", command: "roadmap.registry.list" },
     { deviceId: "device_123", command: "roadmap.open", projectPath },
@@ -1856,6 +2191,7 @@ test("Local dev Relay service authenticates sessions, lists devices, and routes 
 
 test("Bridge App outbound Relay client registers devices and forwards only granted typed commands", async () => {
   const sent: unknown[] = [];
+  const forwardedRequests: Array<{ path: string; method?: string; token?: string }> = [];
   let onOpen: (() => void) | undefined;
   let onMessage: ((event: { data: unknown }) => void) | undefined;
   const socket = {
@@ -1887,10 +2223,24 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
     bridgeAuthToken: "token",
     websocketFactory: () => socket,
     fetchImpl: async (url, init) => {
-      assert.equal(String(url), "http://127.0.0.1:19689/api/roadmaps/open");
+      const requestUrl = new URL(String(url));
+      const headers = init?.headers as Record<string, string> | undefined;
+      forwardedRequests.push({ path: requestUrl.pathname, method: init?.method, token: headers?.["x-hunsu-bridge-token"] });
+      if (requestUrl.pathname === "/api/bridge/status") {
+        assert.equal(init?.method, "GET");
+        assert.equal(headers?.["x-hunsu-bridge-token"], "token");
+        return new Response(JSON.stringify({ provider: { providerId: "codex" }, connections: [], workspaces: { active: [], managed: [] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      assert.equal(requestUrl.pathname, "/api/roadmaps/open");
       assert.equal(init?.method, "POST");
-      assert.equal((init?.headers as Record<string, string>)["x-hunsu-bridge-token"], "token");
-      return new Response(JSON.stringify({ ok: true }), { status: 202, headers: { "content-type": "application/json" } });
+      assert.equal(headers?.["x-hunsu-bridge-token"], "token");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 202,
+        headers: { "content-type": "application/json" }
+      });
     }
   });
 
@@ -1898,6 +2248,24 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
     client.start();
     onOpen?.();
     assert.equal((sent[0] as { type: string }).type, "device.register");
+    onMessage?.({ data: JSON.stringify({
+      type: "command",
+      commandId: "command_status",
+      userId: "user_123",
+      command: { deviceId: "device_123", command: "bridge.status" }
+    }) });
+    await delay(0);
+    assert.deepEqual(sent.at(-1), {
+      type: "command.result",
+      commandId: "command_status",
+      result: {
+        ok: true,
+        status: 200,
+        body: { provider: { providerId: "codex" }, connections: [], workspaces: { active: [], managed: [] } }
+      }
+    });
+    assert.deepEqual(forwardedRequests[0], { path: "/api/bridge/status", method: "GET", token: "token" });
+
     onMessage?.({ data: JSON.stringify({
       type: "command",
       commandId: "command_1",
@@ -1910,6 +2278,7 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
       commandId: "command_1",
       result: { ok: true, status: 202, body: { ok: true } }
     });
+    assert.deepEqual(forwardedRequests[1], { path: "/api/roadmaps/open", method: "POST", token: "token" });
 
     onMessage?.({ data: JSON.stringify({
       type: "command",

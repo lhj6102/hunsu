@@ -2,11 +2,14 @@ import { CheckCircle2, Clipboard, Download, ExternalLink, Link2, LogIn, LogOut, 
 import { useEffect, useState } from "react";
 import { currentStudioNext } from "@/app/routes";
 import { fetchRemoteBridgeDevices, postRemoteBridgeConnect } from "@/shared/api/bridgeClient";
-import { hasDirectRelaySession } from "@/shared/api/bridgeApiBase";
+import { hasDirectRelaySession, hasRemoteBridgeSession } from "@/shared/api/bridgeApiBase";
 import type { BridgeConnectionState } from "@/shared/api/bridgeConnection";
-import type { RemoteBridgeDevice, RoadmapRegistryEntry, StudioConnectionStatus } from "@/shared/api/bridgeTypes";
+import type { BridgeBackendStatus, RemoteBridgeDevice, RoadmapRegistryEntry, StudioConnectionStatus } from "@/shared/api/bridgeTypes";
 import { Button } from "@/shared/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/shared/ui/dialog";
+import { ProviderStatusCard, providerStatusLabel } from "./ProviderStatusCard.js";
+import { useBridgeStatus } from "./useBridgeStatus.js";
+import { WorkspaceConnectionList } from "./WorkspaceConnectionList.js";
 
 type ConnectionCenterProps = {
   open: boolean;
@@ -21,6 +24,8 @@ export function ConnectionCenter({ open, onOpenChange, connection, currentRoadma
   const status = connection.status === "online" ? connection.connection : undefined;
   const version = connection.status === "online" ? connection.version : undefined;
   const diagnostics = buildDiagnostics(connection);
+  const canFetchBridgeStatus = open && (connection.status !== "offline" || hasDirectRelaySession() || hasRemoteBridgeSession());
+  const bridgeModel = useBridgeStatus({ enabled: canFetchBridgeStatus, intervalMs: 3000 });
   const webUserId = status?.account?.webUserId ?? readWebUserId();
   const bridgeUserId = status?.account?.bridgeUserId;
   const [remoteDevices, setRemoteDevices] = useState<RemoteBridgeDevice[]>([]);
@@ -76,36 +81,19 @@ export function ConnectionCenter({ open, onOpenChange, connection, currentRoadma
       <DialogContent className="max-h-[min(760px,calc(100vh-2rem))] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Connection Center</DialogTitle>
-          <DialogDescription>{problemMessage(connection)}</DialogDescription>
+          <DialogDescription>{bridgeModel.data ? "Provider, Connections, and Workspaces" : problemMessage(connection)}</DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-3 md:grid-cols-3">
-          <ConnectionSection title="Connection mode" rows={[
-            ["Mode", connectionModeLabel(connection)],
-            ["Transport", status?.transport ?? "unreachable"],
-            ["Health", status?.health ?? connection.status]
-          ]} />
-          <ConnectionSection title="Bridge" rows={[
-            ["Name", status?.bridge?.name ?? "Local Bridge"],
-            ["Version", status?.bridge?.version ?? version?.bridgeVersion ?? "unknown"],
-            ["Protocol", status?.bridge?.protocolVersion ?? version?.protocolVersion ?? "unknown"],
-            ["Started at", status?.bridge?.startedAt ? formatDate(status.bridge.startedAt) : "unknown"],
-            ["Endpoint", status?.endpoint?.apiUrl ?? status?.endpoint?.relayLabel ?? "unknown"],
-            ["Last seen", status?.bridge?.lastSeenAt ? formatDate(status.bridge.lastSeenAt) : "not seen"]
-          ]} />
-          <ConnectionSection title="Account" rows={[
-            ["Web account", webUserId ? formatIdentity(webUserId) : "Signed out"],
-            ["Bridge account", bridgeUserId ? formatIdentity(bridgeUserId) : "Signed out or unavailable"],
-            ["Relationship", accountRelationshipLabel(status)]
-          ]} />
-        </div>
-
-        <ConnectionSection title="Project" rows={[
-          ["Current Roadmap", status?.project?.displayName ?? currentRoadmap?.displayName ?? status?.project?.roadmapId ?? currentRoadmap?.roadmapId ?? "None"],
-          ["Repository", status?.project?.repositoryPath ?? currentRoadmap?.repositoryPath ?? "Unknown"],
-          ["Grant", status?.projectAccess ?? "not_applicable"],
-          ["Warnings", status?.warnings.length ? status.warnings.join(", ") : "None"]
-        ]} />
+        {bridgeModel.data ? (
+          <div className="grid gap-3">
+            <BackendProviderList connections={bridgeModel.data.connections} />
+            <ConnectionSection title="Connections" rows={bridgeModel.data.connections.map(backend => [
+              backend.mode === "local" ? "Local Bridge" : "Remote Bridge",
+              `${backend.label} · ${connectionStateLabel(backend.connection.state)} · ${backend.provider.label} ${providerStatusLabel(backend.provider).toLowerCase()}`
+            ] as [string, string])} />
+            <WorkspaceConnectionList connections={bridgeModel.data.connections} compact={false} maxItems={8} />
+          </div>
+        ) : null}
 
         <RemoteBridgeSection
           devices={remoteDevices}
@@ -120,6 +108,18 @@ export function ConnectionCenter({ open, onOpenChange, connection, currentRoadma
             <ExternalLink className="size-4" />
             Open Hunsu Bridge App
           </Button>
+          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://provider")}>
+            <ExternalLink className="size-4" />
+            Provider Setup
+          </Button>
+          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://workspaces")}>
+            <ExternalLink className="size-4" />
+            Workspaces
+          </Button>
+          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://connection")}>
+            <ExternalLink className="size-4" />
+            Connections
+          </Button>
           <Button type="button" variant="outline" onClick={() => openBridgeLink("https://hunsu.app/download/bridge")}>
             <Download className="size-4" />
             Download Hunsu Bridge App
@@ -128,41 +128,89 @@ export function ConnectionCenter({ open, onOpenChange, connection, currentRoadma
             <RefreshCw className="size-4" />
             Reconnect
           </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink(currentStudioNext(window.location))}>
-            <ExternalLink className="size-4" />
-            Open Studio
-          </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink(pairAgainLink())}>
-            <Link2 className="size-4" />
-            Pair again
-          </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://sign-in")}>
-            <LogIn className="size-4" />
-            Sign in
-          </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://sign-out")}>
-            <LogOut className="size-4" />
-            Sign out
-          </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://remote-disable")}>
-            <ShieldAlert className="size-4" />
-            Disable Remote Access
-          </Button>
-          <Button type="button" variant="outline" onClick={copyDiagnostics}>
-            <Clipboard className="size-4" />
-            Copy diagnostics
-          </Button>
         </div>
 
         <details className="rounded-[16px] border border-[color:var(--apple-hairline)] bg-white/58 px-4 py-3">
-          <summary className="cursor-pointer text-[13px] font-semibold text-[color:var(--apple-ink)]">Advanced CLI</summary>
-          <pre className="mt-3 overflow-x-auto text-[12px] leading-5 text-muted-foreground">
-            <code>{advancedCliCommand()}</code>
-          </pre>
+          <summary className="cursor-pointer text-[13px] font-semibold text-[color:var(--apple-ink)]">Advanced</summary>
+          <div className="mt-3 grid gap-3">
+            <div className="grid gap-3 md:grid-cols-3">
+              <ConnectionSection title="Connection mode" rows={[
+                ["Mode", connectionModeLabel(connection)],
+                ["Transport", status?.transport ?? "unreachable"],
+                ["Health", status?.health ?? connection.status]
+              ]} />
+              <ConnectionSection title="Bridge" rows={[
+                ["Name", status?.bridge?.name ?? "Local Bridge"],
+                ["Version", status?.bridge?.version ?? version?.bridgeVersion ?? "unknown"],
+                ["Protocol", status?.bridge?.protocolVersion ?? version?.protocolVersion ?? "unknown"],
+                ["Started at", status?.bridge?.startedAt ? formatDate(status.bridge.startedAt) : "unknown"],
+                ["Endpoint", status?.endpoint?.apiUrl ?? status?.endpoint?.relayLabel ?? "unknown"],
+                ["Last seen", status?.bridge?.lastSeenAt ? formatDate(status.bridge.lastSeenAt) : "not seen"]
+              ]} />
+              <ConnectionSection title="Account" rows={[
+                ["Web account", webUserId ? formatIdentity(webUserId) : "Signed out"],
+                ["Bridge account", bridgeUserId ? formatIdentity(bridgeUserId) : "Signed out or unavailable"],
+                ["Relationship", accountRelationshipLabel(status)]
+              ]} />
+            </div>
+            <ConnectionSection title="Project" rows={[
+              ["Current Roadmap", status?.project?.displayName ?? currentRoadmap?.displayName ?? status?.project?.roadmapId ?? currentRoadmap?.roadmapId ?? "None"],
+              ["Repository", status?.project?.repositoryPath ?? currentRoadmap?.repositoryPath ?? "Unknown"],
+              ["Grant", status?.projectAccess ?? "not_applicable"],
+              ["Warnings", status?.warnings.length ? status.warnings.join(", ") : "None"]
+            ]} />
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://sign-in")}>
+                <LogIn className="size-4" />
+                Sign in
+              </Button>
+              <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://sign-out")}>
+                <LogOut className="size-4" />
+                Sign out
+              </Button>
+              <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://remote-disable")}>
+                <ShieldAlert className="size-4" />
+                Disable Remote Access
+              </Button>
+              <Button type="button" variant="outline" onClick={() => openBridgeLink(pairAgainLink())}>
+                <Link2 className="size-4" />
+                Pair again
+              </Button>
+              <Button type="button" variant="outline" onClick={copyDiagnostics}>
+                <Clipboard className="size-4" />
+                Copy diagnostics
+              </Button>
+            </div>
+            <pre className="overflow-x-auto text-[12px] leading-5 text-muted-foreground">
+              <code>{advancedCliCommand()}</code>
+            </pre>
+          </div>
         </details>
       </DialogContent>
     </Dialog>
   );
+}
+
+function BackendProviderList({ connections }: { connections: BridgeBackendStatus[] }) {
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      {connections.map(backend => (
+        <ProviderStatusCard
+          key={backend.backendId}
+          provider={backend.provider}
+          title={backend.mode === "local" ? "Local Provider" : `${backend.label} Provider`}
+        />
+      ))}
+    </div>
+  );
+}
+
+function connectionStateLabel(state: BridgeBackendStatus["connection"]["state"]): string {
+  if (state === "connected") return "Connected";
+  if (state === "login_required") return "Login required";
+  if (state === "relay_offline") return "Offline";
+  if (state === "not_running") return "Not running";
+  return "Error";
 }
 
 function RemoteBridgeSection({
@@ -236,8 +284,8 @@ export function connectionCardLabel(connection: BridgeConnectionState): string {
   if (status?.auth === "account_mismatch") return "Account mismatch";
   if (status?.auth === "expired") return "Session expired";
   if (status?.auth === "invalid") return "Pairing needed";
-  if (status?.projectAccess === "denied") return "Project access denied";
-  if (status?.projectAccess === "needs_grant") return "Project access needed";
+  if (status?.projectAccess === "denied") return "Workspace access denied";
+  if (status?.projectAccess === "needs_grant") return "Workspace access needed";
   if (status?.health === "error") return "Bridge error";
   if (status?.mode === "remote" && status.health === "checking") return "Remote Bridge · Reconnecting";
   if (status?.mode === "remote" && status.health === "connected") return "Remote Bridge · Connected";
@@ -270,8 +318,8 @@ function problemMessage(connection: BridgeConnectionState): string {
   if (compatibilityMessage) return compatibilityMessage;
   if (status?.warnings.includes("version_mismatch")) return "Bridge version is too old for this Studio session.";
   if (status?.auth === "invalid") return "Bridge rejected this browser pairing token. Pair Studio again from the Bridge App.";
-  if (status?.projectAccess === "denied") return "Bridge is connected, but the selected Project Grant does not allow this access.";
-  if (status?.projectAccess === "needs_grant") return "Bridge is connected, but this project still needs a Project Grant.";
+  if (status?.projectAccess === "denied") return "Bridge is connected, but the selected Workspace does not allow this access.";
+  if (status?.projectAccess === "needs_grant") return "Bridge is connected, but this Workspace still needs access.";
   if (status?.transport === "relay" && status.health !== "connected") return "Remote Bridge is offline or Relay is unavailable.";
   if (status?.auth === "account_mismatch") return "The Web account and Bridge account do not match.";
   if (connection.status === "checking") return "Studio is checking the Bridge connection.";

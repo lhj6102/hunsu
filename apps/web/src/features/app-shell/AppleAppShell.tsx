@@ -1,7 +1,9 @@
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { Boxes, ChevronLeft, ChevronRight, CircleDot, LayoutDashboard, Network } from "lucide-react";
 import { pushStudioPath, studioRoadmapPath } from "@/app/routes";
-import { ConnectionCenter, connectionCardIcon, connectionCardLabel, connectionCardTone } from "@/features/connection/ConnectionCenter";
+import { ConnectionCenter } from "@/features/connection/ConnectionCenter";
+import { ConnectionFooter } from "@/features/connection/ConnectionFooter";
+import { useBridgeStatus } from "@/features/connection/useBridgeStatus";
 import { cn } from "@/lib/utils";
 import { useBridgeConnection, type BridgeConnectionState } from "@/shared/api/bridgeConnection";
 import { useRoadmapRegistry } from "@/shared/api/useStudioData";
@@ -9,7 +11,6 @@ import type { RoadmapRegistryEntry, StudioConnectionStatus } from "@/shared/api/
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { ScrollArea } from "@/shared/ui/scroll-area";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/shared/ui/tooltip";
 
 type AppleAppShellProps = {
   active: "studio" | "hub";
@@ -24,6 +25,7 @@ export function AppleAppShell({ active, currentRoadmapId, connectionOverride, ch
   const [remoteConnection, setRemoteConnection] = useState<StudioConnectionStatus | undefined>();
   const registry = useRoadmapRegistry({ enabled: active === "studio" });
   const bridgeConnection = useBridgeConnection({ enabled: active === "studio" && !connectionOverride, intervalMs: 2500 });
+  const bridgeStatus = useBridgeStatus({ enabled: active === "studio", intervalMs: 2500 });
   const effectiveBridgeConnection = useMemo<BridgeConnectionState>(() => remoteConnection
     ? {
         status: "online",
@@ -125,10 +127,12 @@ export function AppleAppShell({ active, currentRoadmapId, connectionOverride, ch
         ) : (
           <div className="min-h-0 flex-1" />
         )}
-        <ConnectionRailCard
+        <ConnectionFooter
           collapsed={collapsed}
-          connection={effectiveBridgeConnection}
-          onClick={() => setConnectionCenterOpen(true)}
+          bridgeStatus={bridgeStatus.data}
+          bridgeStatusState={bridgeStatus.status}
+          fallbackConnection={effectiveBridgeConnection}
+          onOpen={() => setConnectionCenterOpen(true)}
         />
         <ConnectionCenter
           open={connectionCenterOpen}
@@ -241,65 +245,5 @@ function RoadmapRailItem({
         </span>
       ) : null}
     </button>
-  );
-}
-
-function ConnectionRailCard({
-  collapsed,
-  connection,
-  onClick
-}: {
-  collapsed: boolean;
-  connection: BridgeConnectionState;
-  onClick: () => void;
-}) {
-  const label = connectionCardLabel(connection);
-  const tone = connectionCardTone(connection);
-  const Icon = connectionCardIcon(connection);
-  const [title, subtitle = ""] = label.split(" · ");
-  const content = (
-    <button
-      type="button"
-      className={cn(
-        "mt-3 flex shrink-0 items-center gap-3 rounded-[14px] border text-left transition-colors focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/24",
-        collapsed ? "size-11 justify-center p-0" : "min-h-14 w-full px-3 py-2",
-        tone === "connected" && "border-[color:var(--apple-green)]/28 bg-white/70 text-[color:var(--apple-green)]",
-        tone === "warning" && "border-[color:var(--apple-orange)]/28 bg-white/70 text-[color:var(--apple-orange)]",
-        tone === "error" && "border-destructive/24 bg-white/70 text-destructive",
-        tone === "checking" && "border-[color:var(--apple-hairline)] bg-white/58 text-muted-foreground"
-      )}
-      aria-label={label}
-      title={collapsed ? label : undefined}
-      onClick={onClick}
-    >
-      <span className="relative flex size-8 shrink-0 items-center justify-center rounded-full bg-white/72">
-        <Icon className="size-4" />
-        <span className={cn(
-          "absolute right-1 top-1 size-2 rounded-full",
-          tone === "connected" && "bg-[color:var(--apple-green)]",
-          tone === "warning" && "bg-[color:var(--apple-orange)]",
-          tone === "error" && "bg-destructive",
-          tone === "checking" && "bg-muted-foreground"
-        )} />
-      </span>
-      {!collapsed ? (
-        <span className="min-w-0">
-          <span className="block truncate text-[12px] font-semibold leading-4">{title}</span>
-          <span className="block truncate text-[10px] leading-4 text-muted-foreground">{subtitle || "Connection"}</span>
-        </span>
-      ) : null}
-    </button>
-  );
-
-  if (!collapsed) {
-    return content;
-  }
-  return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>{content}</TooltipTrigger>
-        <TooltipContent side="right">{label}</TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
   );
 }

@@ -75,7 +75,8 @@ export class BridgeSidecarSupervisor {
     const child = spawn(this.options.command, this.options.args, {
       cwd: this.options.cwd,
       env: this.options.env,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
     });
     this.child = child;
     this.statusValue = {

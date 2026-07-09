@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { BridgeConnectionState } from "../apps/web/src/shared/api/bridgeConnection.ts";
@@ -37,11 +38,11 @@ test("Connection Center card labels cover required Studio connection states", as
 
     assert.equal(module.connectionCardLabel(onlineConnection({
       projectAccess: "needs_grant"
-    })), "Project access needed");
+    })), "Workspace access needed");
 
     assert.equal(module.connectionCardLabel(onlineConnection({
       projectAccess: "denied"
-    })), "Project access denied");
+    })), "Workspace access denied");
 
     assert.equal(module.connectionCardLabel(onlineConnection({
       warnings: ["version_mismatch"]
@@ -71,15 +72,34 @@ test("Connection Center card labels cover required Studio connection states", as
 test("Roadmap workspace preflight actions map to Bridge App destinations", async () => {
   const { module, close } = await loadPreflightActionsModule();
   try {
-    assert.equal(module.bridgeActionHref({ type: "install_codex", label: "Install Codex" }), "hunsu://prerequisites/codex");
-    assert.equal(module.bridgeActionHref({ type: "codex_login_device", label: "Use Device Code" }), "hunsu://prerequisites/codex");
-    assert.equal(module.bridgeActionHref({ type: "open_roadmaps", label: "Open Roadmaps" }), "hunsu://roadmaps");
-    assert.equal(module.bridgeActionHref({ type: "activate_roadmap", label: "Activate Roadmap", roadmapId: "roadmap 123" }), "hunsu://activate-roadmap?roadmapId=roadmap%20123");
+    assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex" }), "hunsu://provider");
+    assert.equal(module.bridgeActionHref({ type: "login_provider", label: "Sign In" }), "hunsu://provider");
+    assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Open Workspaces" }), "hunsu://workspaces");
+    assert.equal(module.bridgeActionHref({ type: "activate_workspace", label: "Activate Workspace", workspaceId: "workspace 123" }), "hunsu://open-workspace?workspaceId=workspace%20123");
     assert.equal(module.bridgeActionHref({ type: "open_bridge_app", label: "Open Bridge App" }), "hunsu://open");
-    assert.equal(module.bridgeActionHref({ type: "open_roadmaps", label: "Server href", href: "hunsu://roadmaps" }), "hunsu://roadmaps");
+    assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Server href", href: "hunsu://workspaces" }), "hunsu://workspaces");
+    assert.equal(module.bridgeActionHref({ type: "open_connection", label: "Open Connection" }), "hunsu://connection");
+    assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex", providerId: "codex" }), "hunsu://provider/codex");
+    assert.equal(module.bridgeActionHref({ type: "open_provider_setup", label: "Open Provider Setup" }), "hunsu://provider");
   } finally {
     await close();
   }
+});
+
+test("Web Execute preflight contract exposes provider workspace and connection areas only", () => {
+  const bridgeTypesSource = readFileSync(join(WEB_ROOT, "src/shared/api/bridgeTypes.ts"), "utf8");
+  const preflightContract = bridgeTypesSource.slice(
+    bridgeTypesSource.indexOf("export type ExecutePreflightAction"),
+    bridgeTypesSource.indexOf("export type RoadmapListResult")
+  );
+  const preflightActionsSource = readFileSync(join(WEB_ROOT, "src/features/roadmap-workspace/preflightActions.ts"), "utf8");
+  assert.match(preflightContract, /area: "provider"/);
+  assert.match(preflightContract, /area: "workspace"/);
+  assert.match(preflightContract, /area: "connection"/);
+  assert.doesNotMatch(preflightContract, /area: "codex"/);
+  assert.doesNotMatch(preflightContract, /area: "roadmap"/);
+  assert.doesNotMatch(preflightContract, /install_codex|codex_login|codex_recheck|open_prerequisites|open_roadmaps|activate_roadmap|CODEX_|ROADMAP_/);
+  assert.doesNotMatch(preflightActionsSource, /install_codex|codex_login|codex_recheck|open_prerequisites|open_roadmaps|activate_roadmap/);
 });
 
 test("Roadmap workspace renders multiple server-provided preflight actions", async () => {
@@ -89,24 +109,314 @@ test("Roadmap workspace renders multiple server-provided preflight actions", asy
     const reactDomServer = require("../apps/web/node_modules/react-dom/server.node.js") as { renderToString: (element: unknown) => string };
     const html = reactDomServer.renderToString(react.createElement(module.RoadmapWorkspacePreflightActions, {
       preflight: {
-        area: "roadmap",
-        error: "ROADMAP_INACTIVE",
-        message: "This Roadmap is inactive.",
-        roadmapId: "roadmap_123",
-        lifecycle: "inactive",
+        area: "workspace",
+        error: "WORKSPACE_INACTIVE",
+        message: "This Workspace is inactive.",
+        workspaceId: "roadmap_123",
         actions: [
-          { type: "open_roadmaps", label: "Open Roadmaps", href: "hunsu://roadmaps" },
-          { type: "activate_roadmap", label: "Activate Roadmap", href: "hunsu://activate-roadmap?roadmapId=roadmap_123" }
+          { type: "open_workspaces", label: "Open Workspaces", href: "hunsu://workspaces" },
+          { type: "activate_workspace", label: "Activate Workspace", href: "hunsu://open-workspace?workspaceId=roadmap_123" }
         ]
       },
       open: () => undefined
     }));
 
-    assert.match(html, /Open Roadmaps/);
-    assert.match(html, /Activate Roadmap/);
+    assert.match(html, /Open Workspaces/);
+    assert.match(html, /Activate Workspace/);
   } finally {
     await close();
   }
+});
+
+test("Connection footer renders local provider and active workspaces from Bridge status", async () => {
+  const { module, close } = await loadConnectionFooterModule();
+  try {
+    const react = require("../apps/web/node_modules/react") as { createElement: (type: unknown, props: unknown) => unknown };
+    const reactDomServer = require("../apps/web/node_modules/react-dom/server.node.js") as { renderToString: (element: unknown) => string };
+    const html = reactDomServer.renderToString(react.createElement(module.ConnectionFooter, {
+      collapsed: false,
+      bridgeStatusState: "online",
+      fallbackConnection: { status: "offline", tokenPresent: false },
+      onOpen: () => undefined,
+      bridgeStatus: {
+        provider: {
+          providerId: "codex",
+          kind: "codex",
+          label: "Codex",
+          connectionKind: "local_cli",
+          installed: true,
+          configured: true,
+          authenticated: true,
+          ready: true,
+          auth: { kind: "chatgpt_oauth", state: "authenticated", access: "subscription" },
+          capabilities: {
+            canExecute: true,
+            canEditFiles: true,
+            canRunShell: true,
+            supportsWorktree: true,
+            supportsEventStream: true,
+            supportsUsage: true,
+            supportsSubscriptionAuth: true,
+            supportsDeviceAuth: true,
+            supportsApiKeyAuth: true,
+            supportsRemoteRelay: true,
+            supportsAcp: false
+          },
+          recommendedAction: "none"
+        },
+        connections: [{
+          backendId: "local",
+          mode: "local",
+          label: "This computer",
+          provider: {
+            providerId: "codex",
+            kind: "codex",
+            label: "Codex",
+            connectionKind: "local_cli",
+            installed: true,
+            configured: true,
+            authenticated: true,
+            ready: true,
+            auth: { kind: "chatgpt_oauth", state: "authenticated", access: "subscription" },
+            capabilities: {
+              canExecute: true,
+              canEditFiles: true,
+              canRunShell: true,
+              supportsWorktree: true,
+              supportsEventStream: true,
+              supportsUsage: true,
+              supportsSubscriptionAuth: true,
+              supportsDeviceAuth: true,
+              supportsApiKeyAuth: true,
+              supportsRemoteRelay: true,
+              supportsAcp: false
+            },
+            recommendedAction: "none"
+          },
+          connection: { state: "connected" },
+          workspaces: [{
+            workspaceId: "roadmap_123",
+            roadmapId: "roadmap_123",
+            displayName: "my-product",
+            lifecycle: "active",
+            health: "ok",
+            backendId: "local",
+            connectionMode: "local",
+            provider: { providerId: "codex", label: "Codex", readyForExecute: true },
+            actions: ["open_studio", "deactivate"]
+          }]
+        }],
+        workspaces: { active: [], managed: [] },
+        account: { signedIn: false }
+      }
+    }));
+
+    assert.match(html, /Local Bridge/);
+    assert.match(html, /Codex ready/);
+    assert.match(html, /my-product/);
+    assert.match(html, /Remote — Sign in to connect remote workspaces/);
+    assert.match(html, /Add workspace/);
+  } finally {
+    await close();
+  }
+});
+
+test("Connection footer renders provider setup, no-remote, and empty remote states", async () => {
+  const { module, close } = await loadConnectionFooterModule();
+  try {
+    const react = require("../apps/web/node_modules/react") as { createElement: (type: unknown, props: unknown) => unknown };
+    const reactDomServer = require("../apps/web/node_modules/react-dom/server.node.js") as { renderToString: (element: unknown) => string };
+    const readyProvider = providerFixture({ ready: true, recommendedAction: "none" });
+    const providerNotReady = providerFixture({ ready: false, recommendedAction: "login", safeMessage: "Sign in to Codex." });
+    const localConnection = {
+      backendId: "local",
+      mode: "local",
+      label: "This computer",
+      provider: readyProvider,
+      connection: { state: "connected" },
+      workspaces: []
+    };
+
+    const setupHtml = reactDomServer.renderToString(react.createElement(module.ConnectionFooter, {
+      collapsed: false,
+      bridgeStatusState: "online",
+      fallbackConnection: { status: "offline", tokenPresent: false },
+      onOpen: () => undefined,
+      bridgeStatus: {
+        provider: providerNotReady,
+        connections: [{ ...localConnection, provider: providerNotReady }],
+        workspaces: { active: [], managed: [] },
+        account: { signedIn: false }
+      }
+    }));
+    assert.match(setupHtml, /This computer · Codex login required/);
+    assert.match(setupHtml, /Open Provider Setup/);
+
+    const noRemoteHtml = reactDomServer.renderToString(react.createElement(module.ConnectionFooter, {
+      collapsed: false,
+      bridgeStatusState: "online",
+      fallbackConnection: { status: "offline", tokenPresent: false },
+      onOpen: () => undefined,
+      bridgeStatus: {
+        provider: readyProvider,
+        connections: [localConnection],
+        workspaces: { active: [], managed: [] },
+        account: { signedIn: true, userId: "user_1" }
+      }
+    }));
+    assert.match(noRemoteHtml, /Enable Remote/);
+
+    const emptyRemoteHtml = reactDomServer.renderToString(react.createElement(module.ConnectionFooter, {
+      collapsed: false,
+      bridgeStatusState: "online",
+      fallbackConnection: { status: "offline", tokenPresent: false },
+      onOpen: () => undefined,
+      bridgeStatus: {
+        provider: readyProvider,
+        connections: [
+          localConnection,
+          {
+            backendId: "remote:device_1",
+            mode: "remote",
+            label: "MacBook Pro",
+            device: { deviceId: "device_1", name: "MacBook Pro", registered: true, online: true },
+            provider: readyProvider,
+            connection: { state: "connected" },
+            workspaces: []
+          }
+        ],
+        workspaces: { active: [], managed: [] },
+        account: { signedIn: true, userId: "user_1" }
+      }
+    }));
+    assert.match(emptyRemoteHtml, /Remote/);
+    assert.match(emptyRemoteHtml, /No active remote workspaces/);
+  } finally {
+    await close();
+  }
+});
+
+test("Connection footer surfaces selected remote provider readiness", async () => {
+  const { module, close } = await loadConnectionFooterModule();
+  try {
+    const react = require("../apps/web/node_modules/react") as { createElement: (type: unknown, props: unknown) => unknown };
+    const reactDomServer = require("../apps/web/node_modules/react-dom/server.node.js") as { renderToString: (element: unknown) => string };
+    const localProvider = providerFixture({ ready: true, recommendedAction: "none" });
+    const remoteProvider = providerFixture({
+      ready: false,
+      recommendedAction: "login",
+      safeMessage: "Sign in to Codex on Remote Devbox."
+    });
+    const html = reactDomServer.renderToString(react.createElement(module.ConnectionFooter, {
+      collapsed: false,
+      bridgeStatusState: "online",
+      fallbackConnection: { status: "offline", tokenPresent: false },
+      onOpen: () => undefined,
+      bridgeStatus: {
+        provider: localProvider,
+        connections: [
+          {
+            backendId: "local",
+            mode: "local",
+            label: "This computer",
+            provider: localProvider,
+            connection: { state: "connected" },
+            workspaces: []
+          },
+          {
+            backendId: "remote:device_1",
+            mode: "remote",
+            label: "Remote Devbox",
+            device: { deviceId: "device_1", name: "Remote Devbox", registered: true, online: true },
+            provider: remoteProvider,
+            connection: { state: "connected" },
+            workspaces: [{
+              workspaceId: "roadmap_remote",
+              roadmapId: "roadmap_remote",
+              displayName: "Remote Workspace",
+              lifecycle: "active",
+              health: "ok",
+              backendId: "remote:device_1",
+              connectionMode: "remote",
+              provider: { providerId: "codex", label: "Codex", readyForExecute: false },
+              actions: ["open_studio"]
+            }]
+          }
+        ],
+        workspaces: { active: [], managed: [] },
+        account: { signedIn: true, userId: "user_1" }
+      }
+    }));
+
+    assert.match(html, /Remote Bridge/);
+    assert.match(html, /Remote Devbox · Codex login required/);
+    assert.match(html, /Remote Provider/);
+    assert.match(html, /Codex · Login required/);
+    assert.match(html, /Remote Workspace/);
+  } finally {
+    await close();
+  }
+});
+
+test("Workspace connection list renders remote backend provider readiness", async () => {
+  const { module, close } = await loadWorkspaceConnectionListModule();
+  try {
+    const react = require("../apps/web/node_modules/react") as { createElement: (type: unknown, props: unknown) => unknown };
+    const reactDomServer = require("../apps/web/node_modules/react-dom/server.node.js") as { renderToString: (element: unknown) => string };
+    const html = reactDomServer.renderToString(react.createElement(module.WorkspaceConnectionList, {
+      compact: false,
+      connections: [
+        {
+          backendId: "local",
+          mode: "local",
+          label: "This computer",
+          provider: providerFixture({ ready: true, recommendedAction: "none" }),
+          connection: { state: "connected" },
+          workspaces: []
+        },
+        {
+          backendId: "remote:device_1",
+          mode: "remote",
+          label: "Remote Devbox",
+          provider: providerFixture({ ready: false, recommendedAction: "login" }),
+          connection: { state: "connected" },
+          workspaces: [{
+            workspaceId: "remote_workspace",
+            roadmapId: "remote_workspace",
+            displayName: "Remote Workspace",
+            lifecycle: "active",
+            health: "ok",
+            backendId: "remote:device_1",
+            connectionMode: "remote",
+            provider: { providerId: "codex", label: "Codex", readyForExecute: false },
+            actions: ["open_studio"]
+          }]
+        }
+      ]
+    }));
+
+    assert.match(html, /Remote · Remote Devbox/);
+    assert.match(html, /Codex login required/);
+    assert.match(html, /Remote Workspace/);
+  } finally {
+    await close();
+  }
+});
+
+test("Connection Center normal actions use Provider, Workspaces, and Connections language", () => {
+  const source = readFileSync(join(process.cwd(), "apps/web/src/features/connection/ConnectionCenter.tsx"), "utf8");
+  const actionStart = source.indexOf("<div className=\"flex flex-wrap gap-2\">", source.indexOf("<RemoteBridgeSection"));
+  const actionEnd = source.indexOf("<details", actionStart);
+  assert.notEqual(actionStart, -1);
+  assert.notEqual(actionEnd, -1);
+  const normalActions = source.slice(actionStart, actionEnd);
+  assert.match(normalActions, /hunsu:\/\/provider/);
+  assert.match(normalActions, /hunsu:\/\/workspaces/);
+  assert.match(normalActions, /hunsu:\/\/connection/);
+  assert.doesNotMatch(normalActions, /remote-disable|pairAgainLink|Project Grant|Project access/);
+  assert.match(source, /BackendProviderList/);
+  assert.match(source, /backend\.provider/);
+  assert.doesNotMatch(source, /ProviderStatusCard provider=\{bridgeModel\.data\.provider\}/);
 });
 
 test("Web remote Bridge client lists, connects, and routes commands directly through Relay", async () => {
@@ -319,6 +629,7 @@ test("Web remote Bridge client stores a session only after a usable connection",
     const stored = JSON.parse(storage.get("hunsu.remoteBridgeSession") ?? "{}") as { deviceId?: string; projectPath?: string; webUserId?: string };
     assert.deepEqual(stored, {
       deviceId: "device_1",
+      deviceName: "devbox",
       projectPath: "/tmp/hunsu-project",
       webUserId: "web@example.test",
       relayAccessToken: ""
@@ -337,7 +648,9 @@ test("Web Roadmap workspace APIs route through Relay with no local Bridge token"
   const storage = new Map<string, string>([
     ["hunsu.remoteBridgeSession", JSON.stringify({
       deviceId: "device_1",
+      deviceName: "Remote Devbox",
       projectPath: "/tmp/hunsu-project",
+      webUserId: "user_1",
       relayAccessToken: "relay-token"
     })]
   ]);
@@ -376,6 +689,7 @@ test("Web Roadmap workspace APIs route through Relay with no local Bridge token"
 
   const { module, close } = await loadBridgeClientModule();
   try {
+    const bridgeStatus = await module.fetchBridgeStatus();
     await module.fetchBoard("roadmap_123");
     await module.fetchWorktree("roadmap_123");
     await module.fetchSkills("roadmap_123");
@@ -406,7 +720,14 @@ test("Web Roadmap workspace APIs route through Relay with no local Bridge token"
     await module.postHunsuDraftApprove("roadmap_123", "draft_1", "diff_1", "Team");
     await module.postHunsuDraftDiscard("roadmap_123", "draft_1");
 
+    assert.equal(bridgeStatus.connections[0]?.mode, "remote");
+    assert.equal(bridgeStatus.connections[0]?.label, "Remote Devbox");
+    assert.equal(bridgeStatus.connections[0]?.workspaces[0]?.path, "/tmp/hunsu-project");
+    assert.equal(bridgeStatus.connections[0]?.workspaces[0]?.pathRedacted, undefined);
+    assert.equal(bridgeStatus.workspaces.active[0]?.path, "/tmp/hunsu-project");
+    assert.equal(bridgeStatus.workspaces.active[0]?.pathRedacted, undefined);
     assert.deepEqual(commands.map(command => command.command), [
+      "bridge.status",
       "roadmap.board",
       "roadmap.worktree",
       "roadmap.skills",
@@ -429,7 +750,7 @@ test("Web Roadmap workspace APIs route through Relay with no local Bridge token"
       "hunsuDraft.approve",
       "hunsuDraft.discard"
     ]);
-    assert.equal(commands.every(command => command.projectPath === "/tmp/hunsu-project"), true);
+    assert.equal(commands.filter(command => command.command !== "bridge.status").every(command => command.projectPath === "/tmp/hunsu-project"), true);
     assert.deepEqual(commands.find(command => command.command === "moveFile.blob")?.payload, {
       roadmapId: "roadmap_123",
       moveId: "M0001",
@@ -440,6 +761,244 @@ test("Web Roadmap workspace APIs route through Relay with no local Bridge token"
       draftSessionId: "draft_1",
       diffArtifactId: "diff_1"
     });
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+  }
+});
+
+test("Web Bridge status falls back to Remote Bridge when local status is unavailable", async () => {
+  const calls: Array<{ origin: string; pathname: string; command?: string }> = [];
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>([
+    ["hunsu.bridgeApiToken", "stale-local-token"],
+    ["hunsu.remoteBridgeSession", JSON.stringify({
+      deviceId: "device_1",
+      deviceName: "Remote Devbox",
+      projectPath: "/tmp/hunsu-project",
+      webUserId: "user_1",
+      relayAccessToken: "relay-token"
+    })]
+  ]);
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio",
+      origin: "https://studio.example.test"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url, init) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    if (requestUrl.pathname === "/api/bridge/status") {
+      calls.push({ origin: requestUrl.origin, pathname: requestUrl.pathname });
+      throw new TypeError("local Bridge is offline");
+    }
+    const command = JSON.parse(String(init?.body ?? "{}")) as { command: string };
+    calls.push({ origin: requestUrl.origin, pathname: requestUrl.pathname, command: command.command });
+    return new Response(JSON.stringify({
+      ok: true,
+      status: 200,
+      body: remoteCommandBody(command.command)
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  const { module, close } = await loadBridgeClientModule();
+  try {
+    const status = await module.fetchBridgeStatus();
+    assert.equal(status.connections[0]?.mode, "remote");
+    assert.equal(status.connections[0]?.label, "Remote Devbox");
+    assert.deepEqual(calls, [
+      { origin: "https://studio.example.test", pathname: "/api/bridge/status" },
+      { origin: "https://relay.example.test", pathname: "/v1/commands", command: "bridge.status" }
+    ]);
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+  }
+});
+
+test("Web Execute start uses selected remote backend even when local token exists", async () => {
+  const commands: Array<{ command: string; payload?: Record<string, unknown>; projectPath?: string }> = [];
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>([
+    ["hunsu.bridgeApiToken", "local-token"],
+    ["hunsu.remoteBridgeSession", JSON.stringify({
+      deviceId: "device_1",
+      deviceName: "Remote Devbox",
+      projectPath: "/tmp/hunsu-project",
+      webUserId: "user_1",
+      relayAccessToken: "relay-token"
+    })]
+  ]);
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio/roadmaps/roadmap_123",
+      origin: "https://studio.example.test"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url, init) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    assert.equal(requestUrl.origin, "https://relay.example.test");
+    assert.equal(requestUrl.pathname, "/v1/commands");
+    assert.equal(new Headers(init?.headers).get("authorization"), "Bearer relay-token");
+    const command = JSON.parse(String(init?.body ?? "{}")) as { command: string; payload?: Record<string, unknown>; projectPath?: string };
+    commands.push(command);
+    return new Response(JSON.stringify({
+      ok: true,
+      status: 202,
+      body: { run: { runId: "run_remote", status: "running" } }
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  const { module, close } = await loadBridgeClientModule();
+  try {
+    await module.postRunAction("roadmap_123", "start", {
+      requestId: "request_1",
+      lineId: "line_1",
+      selectedDestinationIds: ["destination_1"]
+    });
+    assert.equal(commands[0]?.command, "execute.start");
+    assert.equal(commands[0]?.projectPath, "/tmp/hunsu-project");
+    assert.equal(commands[0]?.payload?.backendId, "remote:device_1");
+    assert.equal(commands[0]?.payload?.connectionMode, "remote");
+    assert.deepEqual(commands[0]?.payload?.workspace, {
+      workspaceId: "roadmap_123",
+      backendId: "remote:device_1",
+      connectionMode: "remote"
+    });
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+  }
+});
+
+test("Web Bridge status keeps local and selected remote workspaces together", async () => {
+  const calls: Array<{ origin: string; pathname: string; command?: string }> = [];
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>([
+    ["hunsu.bridgeApiToken", "local-token"],
+    ["hunsu.remoteBridgeSession", JSON.stringify({
+      deviceId: "device_1",
+      deviceName: "Remote Devbox",
+      projectPath: "/tmp/hunsu-project",
+      webUserId: "user_1",
+      relayAccessToken: "relay-token"
+    })]
+  ]);
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio",
+      origin: "https://studio.example.test"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url, init) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    if (requestUrl.pathname === "/api/bridge/status") {
+      calls.push({ origin: requestUrl.origin, pathname: requestUrl.pathname });
+      return new Response(JSON.stringify({
+        provider: providerFixture(),
+        connections: [{
+          backendId: "local",
+          mode: "local",
+          label: "This computer",
+          provider: providerFixture(),
+          connection: { state: "connected" },
+          workspaces: [{
+            workspaceId: "roadmap_local",
+            roadmapId: "roadmap_local",
+            displayName: "Local Workspace",
+            lifecycle: "active",
+            health: "ok",
+            backendId: "local",
+            connectionMode: "local",
+            provider: { providerId: "codex", label: "Codex", readyForExecute: true },
+            actions: ["open_studio"]
+          }]
+        }],
+        workspaces: {
+          active: [{
+            workspaceId: "roadmap_local",
+            roadmapId: "roadmap_local",
+            displayName: "Local Workspace",
+            lifecycle: "active",
+            health: "ok",
+            backendId: "local",
+            connectionMode: "local",
+            provider: { providerId: "codex", label: "Codex", readyForExecute: true },
+            actions: ["open_studio"]
+          }],
+          managed: []
+        },
+        account: { signedIn: false }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    const command = JSON.parse(String(init?.body ?? "{}")) as { command: string };
+    calls.push({ origin: requestUrl.origin, pathname: requestUrl.pathname, command: command.command });
+    return new Response(JSON.stringify({
+      ok: true,
+      status: 200,
+      body: remoteCommandBody(command.command)
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  const { module, close } = await loadBridgeClientModule();
+  try {
+    const status = await module.fetchBridgeStatus();
+    assert.deepEqual(status.connections.map(connection => connection.mode), ["local", "remote"]);
+    assert.equal(status.connections.find(connection => connection.mode === "local")?.workspaces[0]?.displayName, "Local Workspace");
+    assert.equal(status.connections.find(connection => connection.mode === "remote")?.workspaces[0]?.displayName, "Remote Workspace");
+    assert.deepEqual(status.workspaces.active.map(workspace => workspace.displayName), ["Local Workspace", "Remote Workspace"]);
+    assert.deepEqual(calls, [
+      { origin: "https://studio.example.test", pathname: "/api/bridge/status" },
+      { origin: "https://relay.example.test", pathname: "/v1/commands", command: "bridge.status" }
+    ]);
   } finally {
     await close();
     globalThis.fetch = previousFetch;
@@ -528,16 +1087,21 @@ test("Web Roadmap workspace APIs prefer local Bridge when local and remote sessi
 
     assert.equal(eventSourceUrls.length, 2);
     const runEventsUrl = new URL(eventSourceUrls[0] ?? "", "https://studio.example.test");
-    assert.equal(runEventsUrl.pathname, "/api/roadmaps/roadmap_123/runs/events");
-    assert.equal(runEventsUrl.searchParams.get("hunsuBridgeToken"), "local-token");
-    assert.equal(runEventsUrl.searchParams.has("command"), false);
-    assert.equal(runEventsUrl.searchParams.has("hunsuRelayToken"), false);
+    assert.equal(runEventsUrl.origin, "https://relay.example.test");
+    assert.equal(runEventsUrl.pathname, "/v1/commands/events");
+    assert.equal(runEventsUrl.searchParams.get("access_token"), "relay-token");
+    const runCommand = JSON.parse(runEventsUrl.searchParams.get("command") ?? "{}") as { command?: string; payload?: { roadmapId?: string } };
+    assert.equal(runCommand.command, "live.events");
+    assert.equal(runCommand.payload?.roadmapId, "roadmap_123");
 
     const agentEventsUrl = new URL(eventSourceUrls[1] ?? "", "https://studio.example.test");
-    assert.equal(agentEventsUrl.pathname, "/api/roadmaps/roadmap_123/agent-sessions/agent_1/events");
-    assert.equal(agentEventsUrl.searchParams.get("hunsuBridgeToken"), "local-token");
-    assert.equal(agentEventsUrl.searchParams.has("command"), false);
-    assert.equal(agentEventsUrl.searchParams.has("hunsuRelayToken"), false);
+    assert.equal(agentEventsUrl.origin, "https://relay.example.test");
+    assert.equal(agentEventsUrl.pathname, "/v1/commands/events");
+    assert.equal(agentEventsUrl.searchParams.get("access_token"), "relay-token");
+    const agentCommand = JSON.parse(agentEventsUrl.searchParams.get("command") ?? "{}") as { command?: string; payload?: { roadmapId?: string; sessionId?: string } };
+    assert.equal(agentCommand.command, "agentSession.events");
+    assert.equal(agentCommand.payload?.roadmapId, "roadmap_123");
+    assert.equal(agentCommand.payload?.sessionId, "agent_1");
   } finally {
     await close();
     globalThis.fetch = previousFetch;
@@ -588,6 +1152,35 @@ function onlineConnection(overrides: Partial<StudioConnectionStatus>): BridgeCon
   };
 }
 
+function providerFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    providerId: "codex",
+    kind: "codex",
+    label: "Codex",
+    connectionKind: "local_cli",
+    installed: true,
+    configured: true,
+    authenticated: true,
+    ready: true,
+    auth: { kind: "chatgpt_oauth", state: "authenticated", access: "subscription" },
+    capabilities: {
+      canExecute: true,
+      canEditFiles: true,
+      canRunShell: true,
+      supportsWorktree: true,
+      supportsEventStream: true,
+      supportsUsage: true,
+      supportsSubscriptionAuth: true,
+      supportsDeviceAuth: true,
+      supportsApiKeyAuth: true,
+      supportsRemoteRelay: true,
+      supportsAcp: false
+    },
+    recommendedAction: "none",
+    ...overrides
+  };
+}
+
 function remoteConnectResult(overrides: Partial<StudioConnectionStatus>) {
   const compatibility = overrides.compatibility ?? { compatible: true as const };
   return {
@@ -631,6 +1224,65 @@ function remoteConnectResult(overrides: Partial<StudioConnectionStatus>) {
 
 function remoteCommandBody(command: string): unknown {
   switch (command) {
+    case "bridge.status":
+      return {
+        provider: {
+          providerId: "codex",
+          kind: "codex",
+          label: "Codex",
+          ready: true,
+          installed: true,
+          configured: true,
+          authenticated: true,
+          auth: { state: "authenticated" },
+          capabilities: { canExecute: true }
+        },
+        connections: [{
+          backendId: "local",
+          mode: "local",
+          label: "This computer",
+          connection: { state: "connected" },
+          workspaces: [{
+            workspaceId: "roadmap_123",
+            roadmapId: "roadmap_123",
+            displayName: "Remote Workspace",
+            path: "/tmp/hunsu-project",
+            lifecycle: "active",
+            health: "ok",
+            backendId: "local",
+            connectionMode: "local",
+            provider: { providerId: "codex", label: "Codex", readyForExecute: true },
+            actions: ["open_studio"]
+          }]
+        }],
+        workspaces: {
+          active: [{
+            workspaceId: "roadmap_123",
+            roadmapId: "roadmap_123",
+            displayName: "Remote Workspace",
+            path: "/tmp/hunsu-project",
+            lifecycle: "active",
+            health: "ok",
+            backendId: "local",
+            connectionMode: "local",
+            provider: { providerId: "codex", label: "Codex", readyForExecute: true },
+            actions: ["open_studio"]
+          }],
+          managed: [{
+            workspaceId: "roadmap_123",
+            roadmapId: "roadmap_123",
+            displayName: "Remote Workspace",
+            path: "/tmp/hunsu-project",
+            lifecycle: "active",
+            health: "ok",
+            backendId: "local",
+            connectionMode: "local",
+            provider: { providerId: "codex", label: "Codex", readyForExecute: true },
+            actions: ["open_studio"]
+          }]
+        },
+        account: { signedIn: true, userId: "user_1" }
+      };
     case "roadmap.skills":
       return { skills: [] };
     case "execute.status":
@@ -707,13 +1359,100 @@ async function loadConnectionModule(): Promise<{
   };
 }
 
+async function loadConnectionFooterModule(): Promise<{
+  module: {
+    ConnectionFooter: (props: unknown) => unknown;
+  };
+  close: () => Promise<void>;
+}> {
+  const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
+  const server = await vite.createServer({
+    root: WEB_ROOT,
+    configFile: false,
+    appType: "custom",
+    logLevel: "silent",
+    resolve: {
+      alias: {
+        "@": resolve(WEB_ROOT, "src")
+      }
+    },
+    define: {
+      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
+    },
+    server: {
+      middlewareMode: true
+    }
+  });
+  let module: Awaited<ReturnType<typeof loadConnectionFooterModule>>["module"];
+  try {
+    module = await server.ssrLoadModule("/src/features/connection/ConnectionFooter.tsx") as typeof module;
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+  return {
+    module,
+    close: () => server.close()
+  };
+}
+
+async function loadWorkspaceConnectionListModule(): Promise<{
+  module: {
+    WorkspaceConnectionList: (props: unknown) => unknown;
+  };
+  close: () => Promise<void>;
+}> {
+  const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
+  const server = await vite.createServer({
+    root: WEB_ROOT,
+    configFile: false,
+    appType: "custom",
+    logLevel: "silent",
+    resolve: {
+      alias: {
+        "@": resolve(WEB_ROOT, "src")
+      }
+    },
+    define: {
+      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
+    },
+    server: {
+      middlewareMode: true
+    }
+  });
+  let module: Awaited<ReturnType<typeof loadWorkspaceConnectionListModule>>["module"];
+  try {
+    module = await server.ssrLoadModule("/src/features/connection/WorkspaceConnectionList.tsx") as typeof module;
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+  return {
+    module,
+    close: () => server.close()
+  };
+}
+
 async function loadPreflightActionsModule(): Promise<{
   module: {
     bridgeActionHref: (action: {
-      type: "install_codex" | "codex_login_chatgpt" | "codex_login_device" | "codex_recheck" | "open_bridge_app" | "open_prerequisites" | "open_roadmaps" | "activate_roadmap";
+      type:
+        | "open_bridge_app"
+        | "open_provider_setup"
+        | "open_workspaces"
+        | "open_connection"
+        | "install_provider"
+        | "login_provider"
+        | "recheck_provider"
+        | "activate_workspace";
       label: string;
       href?: string;
-      roadmapId?: string;
+      workspaceId?: string;
+      providerId?: string;
     }) => string;
   };
   close: () => Promise<void>;
@@ -721,6 +1460,7 @@ async function loadPreflightActionsModule(): Promise<{
   const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
   const server = await vite.createServer({
     root: WEB_ROOT,
+    configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true },
     appType: "custom",
@@ -728,6 +1468,11 @@ async function loadPreflightActionsModule(): Promise<{
       alias: {
         "@": resolve(WEB_ROOT, "src")
       }
+    },
+    define: {
+      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
     }
   });
   let module: Awaited<ReturnType<typeof loadPreflightActionsModule>>["module"];
@@ -838,6 +1583,10 @@ async function loadBridgeClientModule(): Promise<{
   module: {
     fetchRemoteBridgeDevices: () => Promise<Array<{ deviceName: string }>>;
     postRemoteBridgeConnect: (input: { deviceId: string; webUserId?: string; projectPath?: string }) => Promise<{ connection: StudioConnectionStatus }>;
+    fetchBridgeStatus: () => Promise<{
+      connections: Array<{ mode: string; label: string; workspaces: Array<{ displayName: string; path?: string; pathRedacted?: boolean }> }>;
+      workspaces: { active: Array<{ displayName: string; path?: string; pathRedacted?: boolean }> };
+    }>;
     fetchRoadmapRegistry: () => Promise<unknown[]>;
     fetchBoard: (roadmapId: string) => Promise<unknown>;
     fetchWorktree: (roadmapId: string) => Promise<unknown>;

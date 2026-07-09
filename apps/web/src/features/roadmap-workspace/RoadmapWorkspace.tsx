@@ -316,7 +316,9 @@ function executePreflightError(error: unknown): ExecutePreflightError | undefine
     return undefined;
   }
   const body = error.body as Partial<ExecutePreflightError>;
-  return (body.area === "codex" || body.area === "roadmap") && typeof body.error === "string" && typeof body.message === "string"
+  return (body.area === "provider" || body.area === "workspace" || body.area === "connection")
+    && typeof body.error === "string"
+    && typeof body.message === "string"
     ? body as ExecutePreflightError
     : undefined;
 }
@@ -326,7 +328,7 @@ export function RoadmapWorkspacePreflightActions({ preflight, open = openBridgeL
     <>
       {(preflight?.actions ?? fallbackPreflightActions(preflight)).map(action => (
         <Button
-          key={`${action.type}:${action.href ?? action.roadmapId ?? ""}`}
+          key={`${action.type}:${action.href ?? action.workspaceId ?? action.providerId ?? ""}`}
           type="button"
           size="sm"
           variant={primaryAction(action) ? "default" : "outline"}
@@ -340,16 +342,22 @@ export function RoadmapWorkspacePreflightActions({ preflight, open = openBridgeL
 }
 
 function fallbackPreflightActions(preflight: ExecutePreflightError | undefined): ExecutePreflightAction[] {
-  return preflight?.area === "roadmap"
-    ? [{ type: "open_roadmaps", label: "Open Roadmaps" }]
-    : [{ type: "open_prerequisites", label: "Open Prerequisites" }];
+  if (preflight?.area === "workspace") {
+    return [{ type: "open_workspaces", label: "Open Workspaces" }];
+  }
+  if (preflight?.area === "connection") {
+    return [{ type: "open_connection", label: "Open Connection" }];
+  }
+  return [{ type: "open_provider_setup", label: "Open Provider Setup" }];
 }
 
 function primaryAction(action: ExecutePreflightAction): boolean {
-  return action.type === "install_codex"
-    || action.type === "codex_login_chatgpt"
-    || action.type === "open_roadmaps"
-    || action.type === "activate_roadmap";
+  return action.type === "open_provider_setup"
+    || action.type === "install_provider"
+    || action.type === "login_provider"
+    || action.type === "open_workspaces"
+    || action.type === "activate_workspace"
+    || action.type === "open_connection";
 }
 
 function openBridgeLink(url: string): void {

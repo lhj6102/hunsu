@@ -442,33 +442,154 @@ export type RoadmapRegistryEntry = {
   primaryAction?: "open" | "port" | "repair" | "remove";
 };
 
+export type RuntimeProviderStatus = {
+  providerId: string;
+  kind: "codex" | "claude_code" | "gemini_cli" | "openhands" | "acp_agent" | "litellm_gateway" | "openrouter_gateway" | "custom";
+  label: string;
+  description?: string;
+  connectionKind: "local_cli" | "local_server" | "remote_agent_server" | "gateway";
+  installed: boolean;
+  configured: boolean;
+  authenticated: boolean | "unknown";
+  ready: boolean;
+  auth: {
+    kind: "none" | "chatgpt_oauth" | "api_key" | "device_flow" | "provider_owned" | "unknown";
+    state: "authenticated" | "not_authenticated" | "expired" | "invalid" | "unknown" | "error";
+    access?: "subscription" | "usage_based" | "gateway" | "local" | "unknown";
+    accountSummary?: {
+      displayName?: string;
+      email?: string;
+      workspaceName?: string;
+      planLabel?: string;
+    };
+    error?: string;
+  };
+  install?: {
+    installed: boolean;
+    binaryPath?: string;
+    source?: string;
+    version?: string;
+    error?: string;
+  };
+  usage?: {
+    available: boolean;
+    rateLimited?: boolean;
+    summary?: {
+      label?: string;
+      resetAt?: string;
+      remainingLabel?: string;
+    };
+    lastRunUsage?: {
+      inputTokens: number;
+      cachedInputTokens: number;
+      outputTokens: number;
+      reasoningTokens: number;
+    };
+    error?: string;
+  };
+  capabilities: {
+    canExecute: boolean;
+    canEditFiles: boolean;
+    canRunShell: boolean;
+    supportsWorktree: boolean;
+    supportsEventStream: boolean;
+    supportsUsage: boolean;
+    supportsSubscriptionAuth: boolean;
+    supportsDeviceAuth: boolean;
+    supportsApiKeyAuth: boolean;
+    supportsRemoteRelay: boolean;
+    supportsAcp: boolean;
+  };
+  recommendedAction: "install" | "select_binary" | "login" | "connect" | "configure" | "recheck" | "none";
+  safeMessage?: string;
+};
+
+export type ConnectedWorkspaceSummary = {
+  workspaceId: string;
+  roadmapId: string;
+  displayName: string;
+  path?: string;
+  pathRedacted?: boolean;
+  lifecycle: "active" | "inactive" | "missing" | "needs_upgrade" | "error";
+  health: "ok" | "missing" | "needs_upgrade" | "error" | "unknown";
+  backendId: string;
+  connectionMode: "local" | "remote";
+  provider: {
+    providerId: string;
+    label: string;
+    readyForExecute: boolean;
+  };
+  actions: Array<"open_studio" | "activate" | "deactivate" | "remove" | "repair">;
+};
+
+export type BridgeBackendStatus = {
+  backendId: string;
+  mode: "local" | "remote";
+  label: string;
+  device?: {
+    deviceId: string;
+    name: string;
+    registered: boolean;
+    online: boolean;
+    lastSeenAt?: string;
+  };
+  provider: RuntimeProviderStatus;
+  connection:
+    | { state: "connected" }
+    | { state: "not_running" }
+    | { state: "login_required" }
+    | { state: "relay_offline" }
+    | { state: "error"; error: string };
+  workspaces: ConnectedWorkspaceSummary[];
+};
+
+export type BridgeStatusResponse = {
+  provider: RuntimeProviderStatus;
+  connections: BridgeBackendStatus[];
+  workspaces: {
+    active: ConnectedWorkspaceSummary[];
+    managed: ConnectedWorkspaceSummary[];
+  };
+  account: {
+    signedIn: boolean;
+    userId?: string;
+    email?: string;
+  };
+};
+
 export type ExecutePreflightAction = {
   type:
-    | "install_codex"
-    | "codex_login_chatgpt"
-    | "codex_login_device"
-    | "codex_recheck"
     | "open_bridge_app"
-    | "open_prerequisites"
-    | "open_roadmaps"
-    | "activate_roadmap";
+    | "open_provider_setup"
+    | "open_workspaces"
+    | "open_connection"
+    | "install_provider"
+    | "login_provider"
+    | "recheck_provider"
+    | "activate_workspace";
   label: string;
   href?: string;
-  roadmapId?: string;
+  workspaceId?: string;
+  providerId?: string;
 };
 
 export type ExecutePreflightError = {
-  area: "codex";
-  error: "CODEX_CLI_MISSING" | "CODEX_LOGIN_REQUIRED" | "CODEX_AUTH_EXPIRED" | "CODEX_APP_SERVER_UNAVAILABLE" | "CODEX_RATE_LIMITED" | "CODEX_RUNTIME_UNKNOWN";
+  area: "provider";
+  providerId: string;
+  error: "PROVIDER_MISSING" | "PROVIDER_LOGIN_REQUIRED" | "PROVIDER_AUTH_EXPIRED" | "PROVIDER_UNAVAILABLE" | "PROVIDER_RATE_LIMITED" | "PROVIDER_CAPABILITY_MISSING";
   message: string;
-  runtime: "codex";
   actions: ExecutePreflightAction[];
 } | {
-  area: "roadmap";
-  error: "ROADMAP_INACTIVE" | "ROADMAP_MISSING" | "ROADMAP_NEEDS_UPGRADE" | "ROADMAP_UNHEALTHY";
+  area: "workspace";
+  workspaceId?: string;
+  error: "WORKSPACE_INACTIVE" | "WORKSPACE_MISSING" | "WORKSPACE_NEEDS_UPGRADE" | "WORKSPACE_UNHEALTHY";
   message: string;
-  roadmapId?: string;
-  lifecycle?: "inactive" | "missing" | "needs_upgrade" | "error";
+  actions: ExecutePreflightAction[];
+} | {
+  area: "connection";
+  backendId?: string;
+  error: "BRIDGE_NOT_CONNECTED" | "REMOTE_NOT_CONNECTED" | "REMOTE_LOGIN_REQUIRED";
+  message: string;
   actions: ExecutePreflightAction[];
 };
 
@@ -584,6 +705,14 @@ export type RemoteBridgeDevice = {
   registeredAt: string;
   lastSeenAt?: string;
   status: "online" | "offline";
+  remoteAccess?: "enabled" | "disabled";
+  provider?: RuntimeProviderStatus;
+  projectGrants?: Array<{
+    path: string;
+    grantedAt?: string;
+    scopes: Array<"execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose" | "remoteRelay.access">;
+    active?: boolean;
+  }>;
   bridgeVersion?: string;
   bridgeAppVersion?: string;
   protocolVersion?: string;

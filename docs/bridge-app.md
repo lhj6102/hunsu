@@ -1,7 +1,8 @@
 # Hunsu Bridge App
 
-Hunsu Bridge App is the small companion app that connects local workspaces to
-Hunsu Studio. It is not an IDE and it does not replace Studio.
+Hunsu Bridge App is the small companion app that connects runtime providers and
+local workspaces to Hunsu Studio. It is not an IDE and it does not replace
+Studio.
 
 ## Primary User Path
 
@@ -33,12 +34,43 @@ Browser and Studio handoff use the app protocol surface:
 
 ```text
 hunsu://open
+hunsu://provider
+hunsu://provider/codex
+hunsu://workspaces
+hunsu://add-workspace
+hunsu://connection
+hunsu://connection/remote
 hunsu://pair?next=/studio
 hunsu://open-project?path=/path/to/project
+hunsu://open-workspace?workspaceId=<id>
 hunsu://open-roadmap?roadmapId=<id>
+```
+
+On the primary Provider tab, a ready provider shows Recheck and Change provider.
+Provider errors show Recheck, Select Existing Codex, and Show details. API-key
+configuration stays in Advanced provider details instead of the primary ready
+card.
+
+Advanced and compatibility intents remain available for diagnostics, legacy
+links, or account/Remote Access management:
+
+```text
 hunsu://sign-in
 hunsu://sign-out
 hunsu://remote-disable
+```
+
+`hunsu://open` is the safe default open/focus intent. It opens Bridge App on
+the Provider view without implying that Bridge status was checked.
+
+Older aliases remain supported:
+
+```text
+hunsu://codex
+hunsu://prerequisites
+hunsu://prerequisites/codex
+hunsu://roadmaps
+hunsu://add-roadmap
 ```
 
 ## Responsibilities
@@ -48,11 +80,11 @@ Hunsu Bridge App owns local runtime supervision:
 - start, stop, restart, and report local Bridge health
 - open Studio with a fresh pairing token
 - handle `hunsu://` browser handoff links
-- show Overview, Prerequisites, Roadmaps, Connection, Remote Access,
-  Diagnostics, and Settings navigation
-- check Codex CLI readiness without reading Codex credential files
+- show Provider, Workspaces, and Connection as the primary navigation
+- keep Settings, Diagnostics, logs, and provider/remote internals secondary
+- check runtime provider readiness without reading provider credential files
 - inspect selected folders through Project Finder
-- add, activate, deactivate, and remove managed Roadmaps
+- add, activate, deactivate, and remove managed Workspaces
 - open existing Hunsu Roadmaps
 - port Git projects into Hunsu
 - create Roadmaps in new folders
@@ -102,18 +134,25 @@ passed to the sidecar.
 Studio remains the main product UI for Roadmaps, Execute, Hunsu Drafts,
 Artifact Actions, and Hub.
 
-## Prerequisites
+## Provider Setup
 
-Codex is an external prerequisite runtime. Bridge App starts and remains useful
-when Codex is missing: local Bridge pairing, Project Finder, Roadmap activation,
-Hub, and non-Execute Studio flows still work.
+Codex is the first supported runtime provider. Bridge App starts and remains
+useful when Codex is missing: local Bridge pairing, Project Finder, Workspace
+activation, Hub, and non-Execute Studio flows still work.
 
 Codex resolution order is:
 
 1. saved custom `HUNSU_CODEX_BINARY_PATH`
 2. `HUNSU_CODEX_APP_SERVER_COMMAND`
 3. `codex` on `PATH`
-4. missing
+4. Windows known OpenAI Codex install directories
+5. missing
+
+On Windows, Bridge checks the process `PATH`, Windows `Path`, and captured User
+PATH and Machine PATH snapshots when available, then known OpenAI Codex install
+directories such as LocalAppData OpenAI Codex and roaming npm locations.
+WindowsApps execution aliases are treated as "select an existing binary"
+because they can launch a Store prompt instead of a usable Codex executable.
 
 Bridge App may run `codex --version`, `codex app-server --stdio`, and Codex
 app-server account/rate-limit requests. It must not read `~/.codex/auth.json`,
@@ -123,12 +162,36 @@ state, and redact token-like values.
 
 Codex UI states:
 
-- Install Required: show Install Codex, Use Existing Installation, Copy Install
-  Command, and Recheck.
+- Install Required: show Install Codex, Use Existing Installation, and Recheck.
+  Install Codex asks for explicit confirmation before running the fixed Codex
+  npm installer and rechecks provider status after the installer returns.
+- Select Binary: show Select Existing Codex and Recheck.
 - Login Required: show Sign in with ChatGPT, Use Device Code, API key advanced,
   and Recheck.
 - Ready: show auth method/access where safely detectable.
 - Error: show Recheck and diagnostics without credential material.
+
+Advanced Runtime Providers lists the current Codex provider plus future
+providers such as Claude Code, Gemini CLI, OpenHands Agent Server, ACP Agent,
+LiteLLM Gateway, and OpenRouter Gateway as Coming later. That list is hidden
+from the default Provider UI until the adapters exist.
+
+The Advanced list is populated from the provider registry API. The default
+Provider view shows only the current provider and keeps Codex source, binary
+path, raw usage/rate-limit payloads, and other low-level details in
+Advanced/Diagnostics.
+
+The first Provider screen is a compact summary:
+
+```text
+Provider: Codex · Ready
+Workspaces: N active
+Connection: Local · Connected / Remote · Off or On
+```
+
+Account, Remote Access, device, service, Project Grant, and raw Codex details
+live under Connection, Advanced, Settings, or Diagnostics instead of the
+primary Provider panel.
 
 ## Project Finder
 
@@ -143,33 +206,56 @@ Project Finder classifies selected folders as:
 Inspection is a Bridge API primitive so the Bridge App, Studio, and headless
 commands can share classification rules.
 
-## Active Roadmaps
+## Active Workspaces
 
-Bridge App manages Roadmaps through Add Roadmap, Activate Roadmap, Deactivate
-Roadmap, and Remove Roadmap. Remove only deletes the Bridge registry entry; it
+Bridge App manages Workspaces through Add Workspace, Activate Workspace,
+Deactivate Workspace, and Remove Workspace. Remove only deletes the Bridge registry entry; it
 does not delete local files.
 
-Studio consumes active Roadmaps from Bridge by default. Inactive Roadmaps remain
-visible in Bridge App Roadmaps but are hidden from Studio navigation and are not
+Studio consumes active Workspaces from Bridge by default. Inactive Workspaces remain
+visible in Bridge App Workspaces but are hidden from Studio navigation and are not
 Remote Access candidates until activated again.
 
 ## Connection Center
 
-Studio always shows Bridge connection state at the bottom of the left
-navigation. The card opens Connection Center.
+Studio always shows Bridge connection state and active workspaces at the bottom
+of the left navigation. The footer opens Connection Center.
 
 Connection Center shows:
 
-- connection mode: Local direct, Remote relay, or Not connected
-- Bridge name, version, protocol version, started time, and last seen time
-- Web account and Bridge account relationship
-- current Project Grant status
-- registered Remote Bridge devices with online/offline state
-- recovery actions: Open Hunsu Bridge App, Download Hunsu Bridge App,
-  Reconnect, Pair again, Sign in, Sign out, Disable Remote Access, and Copy
-  diagnostics
+- Provider readiness
+- Local and Remote Bridge connections
+- active local and remote Workspaces
+- Bridge name, version, protocol version, started time, and last seen time in
+  Advanced details
+- Web account and Bridge account relationship in Advanced details
+- current Project Grant status in Advanced details
+- registered Remote Bridge devices with online/offline state in Advanced details
+- normal recovery actions: Open Hunsu Bridge App, Provider Setup, Workspaces,
+  Connections, Download Hunsu Bridge App, and Reconnect
+- advanced recovery actions: Pair again, Sign in, Sign out, Disable Remote
+  Access, and Copy diagnostics
 
-Advanced terminal instructions remain available but secondary.
+Local Bridge is always represented. Remote Bridge uses three primary states:
+signed out with a Sign in action, signed in but off with Enable Remote Access,
+and signed in/on with Disable Remote Access. Low-level endpoint, grant, path,
+scope, pairing, Relay, CLI, and diagnostics details stay under Advanced.
+
+Web asks `/api/bridge/status` for the combined provider, workspace, and
+connection summary. Local status combines request account hints, Relay headers,
+and Bridge App persisted sign-in state and grants when available. When a local
+Bridge token exists and Web also has a selected remote Bridge session, Web keeps
+the local backend and fetches the selected remote `bridge.status` so the
+lower-left navigation can show local and remote Workspaces together. If the
+local Bridge status request is unavailable, Web falls back to the same Relay or
+direct remote command path and normalizes the result as a remote backend.
+Remote devices remain visible when connected even before they expose remote
+workspaces. Remote workspace paths stay redacted until the matching Project
+Grant allows `remoteRelay.access`.
+
+When Remote Access is enabled, Bridge publishes the active Workspace set as
+remote workspace grants and marks those active Workspaces remote-enabled in the
+local registry. Inactive Workspaces are not published until activated.
 
 ## Local Pairing And Security
 
@@ -183,7 +269,7 @@ Permission layers are modeled separately:
 
 1. Local Bridge pairing
 2. Bridge device identity
-3. Project Grant
+3. Workspace access grant
 4. Dangerous action scope
 
 Planned dangerous scopes include Execute start, Artifact Action run,
@@ -244,6 +330,10 @@ hunsu-bridge projects revoke /path/to/project
 with the configured Relay HTTP API when `HUNSU_RELAY_PUBLIC_API_URL` or
 `HUNSU_RELAY_API_URL` is present, and applies Project Grant scopes. The
 file-backed registry remains a local fallback when no Relay API is configured.
+Enable and disable persist a final `remoteAccess` state in the Relay or local
+device registry. Disabled devices are filtered from remote connection lists and
+remote command routing, so `/api/bridge/status` and `/api/connections/remote`
+reflect the off state without touching `.hunsu/state.hunsu`.
 `start --remote` opens an authenticated outbound WebSocket Relay session from
 `HUNSU_RELAY_PUBLIC_WS_URL` or `HUNSU_RELAY_WS_URL`.
 
@@ -278,7 +368,7 @@ Local Git / Worktree / Codex / Artifact Actions
 ```
 
 Relay forwards typed commands and events, not a blind HTTP proxy. Command names
-include `health`, `connection.status`, `roadmap.registry.list`,
+include `health`, `bridge.status`, `connection.status`, `roadmap.registry.list`,
 `roadmap.open`, `roadmap.port.inspect`, `roadmap.port.apply`,
 `roadmap.create`, `execute.start`, `execute.status`,
 `artifactAction.start`, `artifactAction.stop`, `agentSession.events`, and
@@ -286,11 +376,26 @@ include `health`, `connection.status`, `roadmap.registry.list`,
 `artifactAction.stop` are mapped to protected Bridge API endpoints only after
 Project Grant and command-scope checks pass.
 
-Relay checks Web session, device access, device online state, Project Grant,
-and command scope. Bridge checks Relay session, granted project path, allowed
-command scope, and Roadmap-to-path mapping. Remote `connection.status` and
-Roadmap Registry results do not expose local repository paths unless the
-requested project is granted.
+Relay checks Web session, device access, Remote Access enablement, device online
+state, Project Grant, and command scope. Bridge checks Relay session, granted
+project path, allowed command scope, and Roadmap-to-path mapping. Remote
+`connection.status`, `bridge.status`, and Roadmap Registry results do not expose
+local repository paths unless the requested project is granted.
+
+## Execute Preflight
+
+Execute preflight returns user-facing areas rather than legacy setup buckets:
+
+- Provider problems route to `hunsu://provider` or `hunsu://provider/codex`.
+- Workspace problems route to `hunsu://workspaces` or the specific workspace.
+- Connection problems route to `hunsu://connection`.
+
+Roadmap compatibility endpoints keep their API shape, but their preflight
+errors now use Provider, Workspaces, and Connection language so Web can send the
+user to the right Bridge App section.
+
+Remote Execute preflight also reports production connection failures:
+`BRIDGE_NOT_CONNECTED`, `REMOTE_NOT_CONNECTED`, and `REMOTE_LOGIN_REQUIRED`.
 
 ## Process Status, Stop, And Services
 

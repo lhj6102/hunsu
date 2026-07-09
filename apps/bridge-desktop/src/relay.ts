@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 
 export type RelayCommandName =
   | "health"
+  | "bridge.status"
   | "connection.status"
   | "roadmap.registry.list"
   | "roadmap.registry.remove"
@@ -63,6 +64,8 @@ export type RemoteBridgeDevice = {
   registeredAt: string;
   lastSeenAt?: string;
   status: "online" | "offline";
+  remoteAccess?: "enabled" | "disabled";
+  provider?: unknown;
   bridgeVersion?: string;
   bridgeAppVersion?: string;
   protocolVersion?: string;
@@ -174,17 +177,19 @@ export class FileRelayRegistry {
   }
 
   listDevices(userId?: string): RemoteBridgeDevice[] {
-    const devices = this.read().devices;
+    const devices = this.read().devices.filter(device => device.remoteAccess !== "disabled");
     return userId ? devices.filter(device => device.userId === userId) : devices;
   }
 
   registerDevice(device: Omit<RemoteBridgeDevice, "registeredAt" | "status"> & { status?: RemoteBridgeDevice["status"] }): RemoteBridgeDevice {
     const store = this.read();
+    const existing = store.devices.find(candidate => candidate.deviceId === device.deviceId);
     const registered: RemoteBridgeDevice = {
       ...device,
-      registeredAt: store.devices.find(candidate => candidate.deviceId === device.deviceId)?.registeredAt ?? new Date().toISOString(),
-      lastSeenAt: device.status === "online" ? new Date().toISOString() : store.devices.find(candidate => candidate.deviceId === device.deviceId)?.lastSeenAt,
-      status: device.status ?? "offline"
+      registeredAt: existing?.registeredAt ?? new Date().toISOString(),
+      lastSeenAt: device.status === "online" ? new Date().toISOString() : existing?.lastSeenAt,
+      status: device.status ?? "offline",
+      remoteAccess: device.remoteAccess ?? (device.status === "online" ? "enabled" : existing?.remoteAccess ?? "enabled")
     };
     this.write({
       schema: "hunsu.relay-registry.v1",
@@ -193,7 +198,7 @@ export class FileRelayRegistry {
     return registered;
   }
 
-  updateDeviceStatus(deviceId: string, status: RemoteBridgeDevice["status"]): RemoteBridgeDevice | undefined {
+  updateDeviceStatus(deviceId: string, status: RemoteBridgeDevice["status"], remoteAccess?: RemoteBridgeDevice["remoteAccess"]): RemoteBridgeDevice | undefined {
     const store = this.read();
     let updated: RemoteBridgeDevice | undefined;
     const devices = store.devices.map(device => {
@@ -203,6 +208,7 @@ export class FileRelayRegistry {
       updated = {
         ...device,
         status,
+        remoteAccess: remoteAccess ?? device.remoteAccess,
         lastSeenAt: status === "online" ? new Date().toISOString() : device.lastSeenAt
       };
       return updated;
@@ -476,6 +482,9 @@ export function evaluateRelayCommand(input: {
   if (input.requestUserId && input.device.userId !== input.requestUserId) {
     return { ok: false, reason: "account_mismatch", message: "Web session and Bridge device belong to different accounts." };
   }
+  if (input.device.remoteAccess === "disabled") {
+    return { ok: false, reason: "device_offline", message: "Remote Bridge is disabled for this device." };
+  }
   if (input.device.status !== "online") {
     return { ok: false, reason: "device_offline", message: "Bridge device is offline." };
   }
@@ -683,6 +692,9 @@ function relayCommandProjectPathPayloadFields(command: RelayCommandName): Array<
 }
 
 function sanitizeRelayResponseBody(body: unknown, command: RelayCommand, projectGrants: ProjectGrant[]): unknown {
+  if (command.command === "bridge.status") {
+    return redactBridgeStatusBody(body, projectGrants);
+  }
   if (command.command === "connection.status") {
     return redactConnectionStatusBody(body, command, projectGrants);
   }
@@ -690,6 +702,44 @@ function sanitizeRelayResponseBody(body: unknown, command: RelayCommand, project
     return filterRemoteRoadmapRegistryBody(body, projectGrants);
   }
   return body;
+}
+
+function redactBridgeStatusBody(body: unknown, projectGrants: ProjectGrant[]): unknown {
+  const value = objectPayload(body);
+  if (!value) {
+    return body;
+  }
+  const redactWorkspace = (workspace: unknown): unknown => {
+    const item = objectPayload(workspace);
+    if (!item) return workspace;
+    const path = typeof item.path === "string" ? item.path : undefined;
+    if (!path || projectPathIsGranted(path, undefined, projectGrants)) {
+      return item;
+    }
+    const next: Record<string, unknown> = { ...item, pathRedacted: true };
+    delete next.path;
+    return next;
+  };
+  const redactConnection = (connection: unknown): unknown => {
+    const item = objectPayload(connection);
+    if (!item || !Array.isArray(item.workspaces)) return connection;
+    return {
+      ...item,
+      workspaces: item.workspaces.map(redactWorkspace)
+    };
+  };
+  const workspaces = objectPayload(value.workspaces);
+  return {
+    ...value,
+    connections: Array.isArray(value.connections) ? value.connections.map(redactConnection) : value.connections,
+    workspaces: workspaces
+      ? {
+          ...workspaces,
+          active: Array.isArray(workspaces.active) ? workspaces.active.map(redactWorkspace) : workspaces.active,
+          managed: Array.isArray(workspaces.managed) ? workspaces.managed.map(redactWorkspace) : workspaces.managed
+        }
+      : value.workspaces
+  };
 }
 
 function redactConnectionStatusBody(body: unknown, command: RelayCommand, projectGrants: ProjectGrant[]): unknown {
@@ -755,6 +805,8 @@ export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequ
   switch (command.command) {
     case "health":
       return { method: "GET", path: "/health" };
+    case "bridge.status":
+      return { method: "GET", path: "/api/bridge/status" };
     case "connection.status":
       return { method: "GET", path: "/api/connection/status" };
     case "roadmap.registry.list":
@@ -916,7 +968,8 @@ export class LocalDevRelayService {
       ...device,
       registeredAt: existing?.registeredAt ?? new Date().toISOString(),
       lastSeenAt: device.status === "online" ? new Date().toISOString() : existing?.lastSeenAt,
-      status: device.status ?? "offline"
+      status: device.status ?? "offline",
+      remoteAccess: device.remoteAccess ?? (device.status === "online" ? "enabled" : existing?.remoteAccess ?? "enabled")
     };
     this.devices.set(device.deviceId, registered);
     return registered;
@@ -925,7 +978,7 @@ export class LocalDevRelayService {
   connectDevice(accessToken: string, deviceId: string, handler: RelayCommandHandler): RemoteBridgeDevice {
     const session = this.requireSession(accessToken);
     const device = this.requireDeviceForSession(deviceId, session);
-    this.devices.set(deviceId, { ...device, status: "online", lastSeenAt: new Date().toISOString() });
+    this.devices.set(deviceId, { ...device, status: "online", remoteAccess: "enabled", lastSeenAt: new Date().toISOString() });
     this.handlers.set(deviceId, handler);
     return this.devices.get(deviceId)!;
   }
@@ -941,7 +994,7 @@ export class LocalDevRelayService {
 
   listDevices(accessToken: string): RemoteBridgeDevice[] {
     const session = this.requireSession(accessToken);
-    return [...this.devices.values()].filter(device => device.userId === session.userId);
+    return [...this.devices.values()].filter(device => device.userId === session.userId && device.remoteAccess !== "disabled");
   }
 
   async routeCommand(accessToken: string, command: RelayCommand): Promise<LocalDevRelayCommandResult> {
@@ -1023,6 +1076,7 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "roadmap.registry.remove":
       return ["remoteRelay.access"];
     case "health":
+    case "bridge.status":
     case "connection.status":
     case "roadmap.registry.list":
       return [];
@@ -1206,6 +1260,7 @@ function queryWithOptionalPath(payload: Record<string, unknown> | undefined): UR
 function isRelayCommandName(value: string): value is RelayCommandName {
   return [
     "health",
+    "bridge.status",
     "connection.status",
     "roadmap.registry.list",
     "roadmap.registry.remove",

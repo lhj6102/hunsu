@@ -99,16 +99,28 @@ Studio recovery links use the Bridge App protocol surface:
 
 ```text
 hunsu://open
+hunsu://provider
+hunsu://provider/codex
 hunsu://pair?next=/studio
-hunsu://add-roadmap
-hunsu://roadmaps
-hunsu://prerequisites/codex
+hunsu://add-workspace
+hunsu://workspaces
+hunsu://connection
+hunsu://connection/remote
+hunsu://open-workspace?workspaceId=<id>
 hunsu://activate-roadmap?roadmapId=<id>
 hunsu://open-project?path=/path/to/project
 hunsu://open-roadmap?roadmapId=<id>
 hunsu://sign-in
 hunsu://remote-disable
 ```
+
+Older aliases remain accepted: `hunsu://codex`,
+`hunsu://prerequisites`, `hunsu://prerequisites/codex`,
+`hunsu://roadmaps`, and `hunsu://add-roadmap`.
+
+`hunsu://open` is the safe default open/focus intent and opens Bridge App on
+Provider setup. Older `roadmaps`, `add-roadmap`, and `prerequisites` aliases
+remain supported for compatibility.
 
 The desktop bundle includes macOS and Windows installer metadata for the
 `hunsu://` protocol. Linux GUI installs can register the user-level handler with
