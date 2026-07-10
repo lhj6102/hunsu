@@ -109,6 +109,7 @@ import {
 import { createRuntimeProviderRegistry } from "./runtime-providers/registry.ts";
 import { createBridgeAppRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
 import {
+  codexAccountAuthStatus,
   codexProviderEnv,
   codexRuntimeStatusForResponse,
   type BridgeCodexSettings,
@@ -174,6 +175,7 @@ export type { CodexCliStatus, CodexDiscoveryCandidate, CodexRuntimeStatus } from
 export { createRuntimeProviderRegistry, placeholderProvider } from "./runtime-providers/registry.ts";
 export {
   codexAuthHomeDiagnostic,
+  codexCliLaunchCommand,
   codexEffectiveEnvSummary,
   codexProviderModelInventory,
   codexProviderEnv,
@@ -2033,22 +2035,14 @@ function codexProviderAccountSummary(account: unknown): {
   if (!isRecord(account)) {
     return undefined;
   }
-  const nested = isRecord(account.account) ? account.account : {};
-  const merged = { ...nested, ...account };
-  const requiresAuth = merged.requiresOpenaiAuth === true;
-  const method = legacyAuthMethod(merged);
+  const decoded = codexAccountAuthStatus(account);
   return {
     auth: {
-      state: requiresAuth ? "not_authenticated" : "authenticated",
-      method,
-      access: method === "chatgpt" ? "subscription" : method === "api_key" || method === "access_token" ? "usage_based" : "unknown"
+      state: decoded.state === "authenticated" || decoded.state === "not_authenticated" ? decoded.state : "unknown",
+      method: decoded.method,
+      access: decoded.access
     },
-    summary: requiresAuth ? undefined : {
-      displayName: legacyStringField(merged, ["displayName", "name", "userName"]),
-      email: legacyStringField(merged, ["email", "userEmail"]),
-      workspaceName: legacyStringField(merged, ["workspaceName", "organizationName", "orgName"]),
-      planLabel: legacyStringField(merged, ["planLabel", "plan", "planType", "subscriptionPlan"])
-    }
+    summary: decoded.state === "authenticated" ? decoded.accountSummary : undefined
   };
 }
 
@@ -2073,14 +2067,6 @@ function codexProviderRateLimitSummary(rateLimits: unknown): { summary?: { label
     },
     rateLimited
   };
-}
-
-function legacyAuthMethod(object: Record<string, unknown>): "chatgpt" | "api_key" | "access_token" | "unknown" {
-  const raw = `${legacyStringField(object, ["authMethod", "method", "loginMethod", "accountType", "type"]) ?? ""}`.toLowerCase();
-  if (raw.includes("chatgpt") || raw.includes("subscription")) return "chatgpt";
-  if (raw.includes("api")) return "api_key";
-  if (raw.includes("access")) return "access_token";
-  return "unknown";
 }
 
 function legacyStringField(object: Record<string, unknown>, keys: string[]): string | undefined {

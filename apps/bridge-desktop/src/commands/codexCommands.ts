@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { withBridgeCodexProviderSettings, type BridgeAppState, type BridgeCodexSettings } from "../state/appState.ts";
-import { parseCodexDeviceAuthOutput, type CodexRuntimeStatus, type RuntimeProviderStatus } from "@hunsu/bridge";
+import { codexCliLaunchCommand, parseCodexDeviceAuthOutput, type CodexRuntimeStatus, type RuntimeProviderStatus } from "@hunsu/bridge";
 
 type ParsedCodexArgs = {
   rest: string[];
@@ -186,7 +186,8 @@ export async function runCodexDeviceLoginCli(options: { json: boolean; backgroun
   if (!options.json && !options.background) {
     const startedAt = new Date().toISOString();
     writeCodexLoginState({ kind: "device", startedAt, status: "starting" }, context);
-    const child = spawnSync(binaryPath, args, {
+    const launch = codexCliLaunchCommand(binaryPath, args, context.codexProbeEnv(), process.platform);
+    const child = spawnSync(launch.command, launch.args, {
       stdio: "inherit",
       env: context.codexProbeEnv(),
       windowsHide: false
@@ -209,7 +210,8 @@ export async function runCodexDeviceLoginCli(options: { json: boolean; backgroun
     return;
   }
 
-  const child = spawn(binaryPath, args, {
+  const launch = codexCliLaunchCommand(binaryPath, args, context.codexProbeEnv(), process.platform);
+  const child = spawn(launch.command, launch.args, {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
     env: context.codexProbeEnv(),
@@ -317,12 +319,14 @@ export async function runCodexChatGptLoginCli(context: CodexCliActionContext): P
     throw new Error(codex.cli.error ?? "Codex CLI was not found.");
   }
   try {
-    const child = spawn(binaryPath, args, {
+    const launch = codexCliLaunchCommand(binaryPath, args, context.codexProbeEnv(), process.platform);
+    const child = spawn(launch.command, launch.args, {
       detached: true,
       stdio: "ignore",
       env: context.codexProbeEnv(),
       windowsHide: true
     });
+    await waitForCodexChildSpawn(child);
     child.unref();
     writeCodexLoginState({
       kind: "chatgpt",
@@ -391,7 +395,8 @@ export function runCodexCli(args: string[], context: CodexCliActionContext): voi
   if (!binaryPath || !codex?.cli.installed) {
     throw new Error(codex?.cli.error ?? "Codex CLI was not found.");
   }
-  const child = spawnSync(binaryPath, args, {
+  const launch = codexCliLaunchCommand(binaryPath, args, context.codexProbeEnv(), process.platform);
+  const child = spawnSync(launch.command, launch.args, {
     stdio: "inherit",
     env: context.codexProbeEnv()
   });
@@ -455,4 +460,11 @@ function lastNonEmptyLine(output: string): string | undefined {
     .map(line => line.trim())
     .filter(Boolean)
     .at(-1);
+}
+
+function waitForCodexChildSpawn(child: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
 }

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { currentProcessEnv } from "@hunsu/config";
-import { detectCodexBinary } from "./codexDetection.ts";
+import { codexCliLaunchCommand, detectCodexBinary } from "./codexDetection.ts";
 import type { RuntimeProviderLoginResult } from "../types.ts";
 
 export type CodexLoginProcessState = {
@@ -21,6 +21,7 @@ export type CodexLoginStateHost = {
 
 type TrackedCodexLoginProcess = {
   child: ReturnType<typeof spawn>;
+  command: string;
   startedAt: string;
   output: string;
   cleared: boolean;
@@ -38,14 +39,25 @@ export async function spawnCodexAction(args: string[], env: Record<string, strin
   if (!cli.installed || !cli.binaryPath) {
     return { started: false, args, message: cli.error ?? "Codex CLI was not found." };
   }
-  const child = spawn(cli.binaryPath, args, {
-    detached: true,
-    stdio: "ignore",
-    env: { ...currentProcessEnv(), ...env },
-    windowsHide: true
-  });
-  child.unref();
-  return { started: true, command: cli.binaryPath, args };
+  try {
+    const launch = codexCliLaunchCommand(cli.binaryPath, args, env, process.platform);
+    const child = spawn(launch.command, launch.args, {
+      detached: true,
+      stdio: "ignore",
+      env: { ...currentProcessEnv(), ...env },
+      windowsHide: true
+    });
+    await waitForCodexChildSpawn(child);
+    child.unref();
+    return { started: true, command: cli.binaryPath, args };
+  } catch (error) {
+    return {
+      started: false,
+      command: cli.binaryPath,
+      args,
+      message: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 export async function spawnCodexChatGptLogin(
@@ -66,12 +78,14 @@ export async function spawnCodexChatGptLogin(
     return codexChatGptLoginResult(undefined, args, failed, false);
   }
   try {
-    const child = spawn(cli.binaryPath, args, {
+    const launch = codexCliLaunchCommand(cli.binaryPath, args, env, process.platform);
+    const child = spawn(launch.command, launch.args, {
       detached: true,
       stdio: "ignore",
       env: { ...currentProcessEnv(), ...env },
       windowsHide: true
     });
+    await waitForCodexChildSpawn(child);
     child.unref();
     const pending = updateCodexLoginState(state, {
       kind: "chatgpt",
@@ -101,7 +115,7 @@ export async function spawnCodexDeviceLogin(
   const args = ["login", "--device-auth"];
   const existing = codexLoginTrackers.get(state);
   if (existing && !existing.cleared) {
-    return codexDeviceLoginResult(existing.child.spawnfile, args, state.codexLogin);
+    return codexDeviceLoginResult(existing.command, args, state.codexLogin);
   }
   const cli = await detectCodexBinary({ env });
   if (!cli.installed || !cli.binaryPath) {
@@ -114,7 +128,8 @@ export async function spawnCodexDeviceLogin(
     return codexDeviceLoginResult(undefined, args, failed, false);
   }
 
-  const child = spawn(cli.binaryPath, args, {
+  const launch = codexCliLaunchCommand(cli.binaryPath, args, env, process.platform);
+  const child = spawn(launch.command, launch.args, {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...currentProcessEnv(), ...env },
@@ -122,6 +137,7 @@ export async function spawnCodexDeviceLogin(
   });
   const tracker: TrackedCodexLoginProcess = {
     child,
+    command: cli.binaryPath,
     startedAt: new Date().toISOString(),
     output: "",
     cleared: false
@@ -308,4 +324,11 @@ function codeFromVerificationUrl(value: string): string | undefined {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function waitForCodexChildSpawn(child: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
 }

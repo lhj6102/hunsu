@@ -151,10 +151,10 @@ function renderSnapshot(snapshot) {
     diagnostics: snapshot.diagnostics,
     logs: snapshot.logLines
   }, null, 2);
-  if (snapshot.codexLogin) {
-    latestCodexDeviceLoginResult = snapshot.codexLogin;
-  } else if (currentProvider.ready || currentProvider.auth?.state === "authenticated") {
+  if (currentProvider.ready || currentProvider.auth?.state === "authenticated") {
     latestCodexDeviceLoginResult = undefined;
+  } else if (snapshot.codexLogin) {
+    latestCodexDeviceLoginResult = snapshot.codexLogin;
   }
   renderProviderCard(currentProvider);
   renderToolCards(snapshot.prerequisites?.tools);
@@ -511,23 +511,11 @@ function renderProviderCard(provider) {
     });
     buttons.append(useDefaultHome);
   }
-  if (providerNeedsAttention(provider)) {
+  if (providerCanRecheck(provider)) {
     const recheck = document.createElement("button");
-    recheck.className = "primary";
+    recheck.className = providerNeedsAttention(provider) ? "primary" : "";
     recheck.textContent = "Recheck";
-    recheck.addEventListener("click", async () => {
-      await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
-      await refresh();
-    });
-    buttons.append(recheck);
-  }
-  if (provider?.recommendedAction === "none") {
-    const recheck = document.createElement("button");
-    recheck.textContent = "Recheck";
-    recheck.addEventListener("click", async () => {
-      await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
-      await refresh();
-    });
+    recheck.addEventListener("click", () => forceProviderRecheck(provider));
     buttons.append(recheck);
   }
   row.append(body, buttons);
@@ -558,6 +546,42 @@ function providerNeedsAttention(provider) {
     && provider.recommendedAction !== "install"
     && provider.recommendedAction !== "select_binary"
     && provider.recommendedAction !== "login";
+}
+
+function providerCanRecheck(provider) {
+  return providerNeedsAttention(provider)
+    || provider?.recommendedAction === "none"
+    || (provider?.providerId === "codex" && provider.recommendedAction === "login");
+}
+
+async function forceProviderRecheck(provider) {
+  await run(provider?.providerId === "codex" ? ["codex", "recheck"] : ["snapshot"]);
+  await refresh();
+}
+
+async function refreshPendingCodexLogin() {
+  const result = latestCodexDeviceLoginResult ?? latestSnapshot?.codexLogin;
+  if (!result || result.status === "failed" || result.state === "failed") {
+    return;
+  }
+  const provider = currentRuntimeProvider(
+    latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders,
+    latestSnapshot?.prerequisites?.codex
+  );
+  if (provider.providerId !== "codex" || provider.ready || provider.auth?.state === "authenticated") {
+    return;
+  }
+  try {
+    await forceProviderRecheck(provider);
+  } catch (error) {
+    diagnostics.textContent = JSON.stringify({ error: String(error) }, null, 2);
+  }
+}
+
+function scheduleCodexLoginRefresh() {
+  window.setTimeout(() => {
+    void refreshPendingCodexLogin();
+  }, 1500);
 }
 
 function providerAdvancedDetails(provider) {
@@ -599,6 +623,7 @@ async function startCodexChatGptLogin() {
   renderProviderCard(currentRuntimeProvider(latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders, latestSnapshot?.prerequisites?.codex));
   try {
     await spawn(["codex", "login"]);
+    scheduleCodexLoginRefresh();
   } catch (error) {
     latestCodexDeviceLoginResult = {
       kind: "chatgpt",
@@ -618,6 +643,7 @@ async function startCodexDeviceLogin() {
   renderProviderCard(currentRuntimeProvider(latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders, latestSnapshot?.prerequisites?.codex));
   try {
     await spawn(["codex", "login", "--device", "--background"]);
+    scheduleCodexLoginRefresh();
     latestCodexDeviceLoginResult = {
       state: "pending",
       message: "Codex device login started."
@@ -648,6 +674,7 @@ async function startCodexApiKeyLogin() {
   renderProviderCard(currentRuntimeProvider(latestSnapshot?.providers ?? latestSnapshot?.runtimeProviders, latestSnapshot?.prerequisites?.codex));
   try {
     diagnostics.textContent = await run(["codex", "login", "--api-key"]);
+    scheduleCodexLoginRefresh();
   } catch (error) {
     latestCodexDeviceLoginResult = {
       kind: "api_key",
@@ -1223,6 +1250,8 @@ function canonicalTabName(tabName) {
   if (tabName === "remote") return "advanced";
   return tabName;
 }
+
+window.addEventListener?.("focus", refreshPendingCodexLogin);
 
 void refresh();
 window.setInterval(refresh, 3000);

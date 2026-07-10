@@ -574,6 +574,14 @@ test("Bridge App desktop UI clears stale Codex login status after authentication
 
   ui.renderSnapshot({
     status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "device",
+      status: "device_code",
+      state: "device_code",
+      message: "Codex device login started.",
+      verificationUriComplete: "https://auth.openai.com/activate?user_code=HUNSU-UI",
+      userCode: "HUNSU-UI"
+    },
     prerequisites: {
       codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
       tools: {}
@@ -614,6 +622,60 @@ test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGP
   });
   assert.match(textForTestElement(ui.elements.get("#codex-card")), /Codex login started/);
   assert.match(textForTestElement(ui.elements.get("#codex-card")), /Complete sign-in in your browser, then click Recheck/);
+});
+
+test("Bridge App desktop UI force-rechecks login-required Codex on demand and after focus returns", async () => {
+  const loginSnapshot = {
+    status: bridgeUiStatusFixture(),
+    codexLogin: {
+      kind: "chatgpt",
+      status: "pending",
+      message: "Codex login started."
+    },
+    prerequisites: {
+      codex: { ready: false, recommendedAction: "login_codex", auth: { state: "not_authenticated" } },
+      tools: {}
+    }
+  };
+  const authenticatedSnapshot = {
+    ...loginSnapshot,
+    prerequisites: {
+      codex: { ready: true, recommendedAction: "none", auth: { state: "authenticated" } },
+      tools: {}
+    }
+  };
+  let snapshot = loginSnapshot;
+  const commands: string[][] = [];
+  const ui = loadBridgeDesktopUiForTest(async (command, payload) => {
+    assert.equal(command, "run_bridge_app_command");
+    const args = Array.from(payload?.input?.args ?? [], String);
+    commands.push(args);
+    return {
+      status: 0,
+      stdout: args[0] === "snapshot" ? JSON.stringify(snapshot) : "Codex rechecked.",
+      stderr: ""
+    };
+  });
+  await delay(0);
+
+  const codexCard = ui.elements.get("#codex-card");
+  assert.match(textForTestElement(codexCard), /Sign in with ChatGPT/);
+  assert.match(textForTestElement(codexCard), /Complete sign-in in your browser, then click Recheck/);
+  commands.length = 0;
+  snapshot = authenticatedSnapshot;
+  await ui.dispatchWindowEvent("focus");
+  assert.deepEqual(commands, [["codex", "recheck"], ["snapshot"]]);
+  assert.doesNotMatch(textForTestElement(codexCard), /Complete sign-in in your browser/);
+
+  snapshot = loginSnapshot;
+  ui.renderSnapshot(loginSnapshot);
+  const recheck = findBridgeUiTestElement(codexCard, "Recheck");
+  assert.ok(recheck, "login-required Codex card must expose Recheck");
+  commands.length = 0;
+  snapshot = authenticatedSnapshot;
+  await dispatchBridgeUiTestEvent(recheck, "click");
+  assert.deepEqual(commands, [["codex", "recheck"], ["snapshot"]]);
+  assert.doesNotMatch(textForTestElement(codexCard), /Complete sign-in in your browser/);
 });
 
 test("Bridge App desktop UI keeps Local/Remote connection primary and provider placeholders Advanced", () => {
@@ -3321,6 +3383,7 @@ type BridgeUiTestElement = {
   textContent: string;
   className: string;
   children: unknown[];
+  eventListeners: Record<string, Array<(event?: unknown) => unknown>>;
   dataset: Record<string, string>;
   value: string;
   checked: boolean;
@@ -3330,14 +3393,21 @@ type BridgeUiTestElement = {
   type: string;
   append: (...nodes: unknown[]) => void;
   replaceChildren: (...nodes: unknown[]) => void;
-  addEventListener: () => void;
+  addEventListener: (type: string, listener: (event?: unknown) => unknown) => void;
   focus: () => void;
   scrollIntoView: () => void;
   setAttribute: (name: string, value: string) => void;
 };
 
-function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => void; elements: Map<string, BridgeUiTestElement> } {
+type BridgeUiTestInvoke = (command: string, payload?: { input?: { args?: unknown[] } }) => Promise<unknown>;
+
+function loadBridgeDesktopUiForTest(invoke?: BridgeUiTestInvoke): {
+  renderSnapshot: (snapshot: unknown) => void;
+  elements: Map<string, BridgeUiTestElement>;
+  dispatchWindowEvent: (type: string) => Promise<void>;
+} {
   const elements = new Map<string, BridgeUiTestElement>();
+  const windowEventListeners: Record<string, Array<(event?: unknown) => unknown>> = {};
   const document = {
     querySelector(selector: string) {
       if (!elements.has(selector)) {
@@ -3356,10 +3426,13 @@ function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => 
     }
   };
   const window = {
-    __TAURI__: undefined,
+    __TAURI__: invoke ? { core: { invoke } } : undefined,
     location: { href: "" },
     setTimeout: () => 0,
-    setInterval: () => 0
+    setInterval: () => 0,
+    addEventListener(type: string, listener: (event?: unknown) => unknown) {
+      (windowEventListeners[type] ??= []).push(listener);
+    }
   };
   const context = {
     window,
@@ -3376,7 +3449,12 @@ function loadBridgeDesktopUiForTest(): { renderSnapshot: (snapshot: unknown) => 
   runInNewContext(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/app.js"), "utf8"), context);
   return {
     renderSnapshot: (context as unknown as { renderSnapshot: (snapshot: unknown) => void }).renderSnapshot,
-    elements
+    elements,
+    async dispatchWindowEvent(type: string) {
+      for (const listener of windowEventListeners[type] ?? []) {
+        await listener({ type });
+      }
+    }
   };
 }
 
@@ -3385,6 +3463,7 @@ function createBridgeUiTestElement(): BridgeUiTestElement {
     textContent: "",
     className: "",
     children: [],
+    eventListeners: {},
     dataset: {},
     value: "",
     checked: false,
@@ -3398,7 +3477,9 @@ function createBridgeUiTestElement(): BridgeUiTestElement {
     replaceChildren(...nodes: unknown[]) {
       this.children = nodes;
     },
-    addEventListener() {},
+    addEventListener(type: string, listener: (event?: unknown) => unknown) {
+      (this.eventListeners[type] ??= []).push(listener);
+    },
     focus() {},
     scrollIntoView() {},
     setAttribute(name: string, value: string) {
@@ -3418,6 +3499,29 @@ function textForTestElement(element: unknown): string {
     typeof node.textContent === "string" ? node.textContent : "",
     ...(node.children ?? []).map(child => textForTestElement(child))
   ].filter(Boolean).join("\n");
+}
+
+function findBridgeUiTestElement(element: unknown, text: string): BridgeUiTestElement | undefined {
+  if (!element || typeof element !== "object") {
+    return undefined;
+  }
+  const node = element as BridgeUiTestElement;
+  if (node.textContent === text) {
+    return node;
+  }
+  for (const child of node.children ?? []) {
+    const match = findBridgeUiTestElement(child, text);
+    if (match) {
+      return match;
+    }
+  }
+  return undefined;
+}
+
+async function dispatchBridgeUiTestEvent(element: BridgeUiTestElement, type: string): Promise<void> {
+  for (const listener of element.eventListeners[type] ?? []) {
+    await listener({ type, currentTarget: element, target: element });
+  }
 }
 
 function bridgeUiStatusFixture() {

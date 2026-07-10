@@ -239,7 +239,7 @@ export async function getCodexRuntimeStatus(options: CodexRuntimeStatusOptions =
   const account = probe.account ?? { ok: false, authState: "unknown" as const, error: "Codex account probe did not return a result." };
   const rateLimits = probe.rateLimits ?? { ok: false, error: "Codex rate limit probe did not return a result." };
   const authWithoutHomeDiagnostic = account.ok
-    ? accountStatus(account.account)
+    ? codexAccountAuthStatus(account.account)
     : { state: account.authState, access: "unknown" as const, error: account.error };
   const homeDiagnostic = codexAuthHomeDiagnostic({ env, platform });
   const auth = authWithoutHomeDiagnostic.state === "not_authenticated" || authWithoutHomeDiagnostic.state === "expired" || authWithoutHomeDiagnostic.state === "invalid"
@@ -442,21 +442,23 @@ function firstNonEmpty(env: Record<string, string | undefined>, keys: string[]):
   return undefined;
 }
 
-function accountStatus(account: unknown): CodexRuntimeStatus["auth"] {
+export function codexAccountAuthStatus(account: unknown): CodexRuntimeStatus["auth"] {
   const object = isRecord(account) ? account : {};
-  if (object.requiresOpenaiAuth === true) {
+  const nestedAccount = isRecord(object.account) ? object.account : undefined;
+  if (!nestedAccount && object.requiresOpenaiAuth === true) {
     return { state: "not_authenticated", access: "unknown" };
   }
-  const method = authMethod(object);
+  const accountDetails = nestedAccount ? { ...object, ...nestedAccount } : object;
+  const method = authMethod(accountDetails);
   return {
     state: "authenticated",
     method,
     access: method === "api_key" || method === "access_token" ? "usage_based" : method === "chatgpt" ? "subscription" : "unknown",
     accountSummary: {
-      displayName: stringField(object, ["displayName", "name", "userName"]),
-      email: stringField(object, ["email", "userEmail"]),
-      workspaceName: stringField(object, ["workspaceName", "organizationName", "orgName"]),
-      planLabel: stringField(object, ["planLabel", "plan", "subscriptionPlan"])
+      displayName: stringField(accountDetails, ["displayName", "name", "userName"]),
+      email: stringField(accountDetails, ["email", "userEmail"]),
+      workspaceName: stringField(accountDetails, ["workspaceName", "organizationName", "orgName"]),
+      planLabel: stringField(accountDetails, ["planLabel", "plan", "planType", "subscriptionPlan"])
     }
   };
 }

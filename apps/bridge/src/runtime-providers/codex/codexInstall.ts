@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
 import { currentProcessEnv } from "@hunsu/config";
+import { codexCliLaunchCommand } from "./codexDetection.ts";
 import type { RuntimeProviderInstallPlan } from "../types.ts";
 
 export type CodexInstaller = (input: {
   env: Record<string, string | undefined>;
   dryRun?: boolean;
+  platform?: NodeJS.Platform;
 }) => Promise<{ ok: boolean; command: string; args: string[]; exitCode?: number; output?: string; error?: string }>;
 
 export function codexInstallPlan(): RuntimeProviderInstallPlan {
@@ -23,15 +25,18 @@ export function codexInstallPlan(): RuntimeProviderInstallPlan {
 }
 
 export const runDefaultCodexInstaller: CodexInstaller = async input => {
-  const command = process.platform === "win32" ? "npm.cmd" : "npm";
+  const platform = input.platform ?? process.platform;
+  const command = platform === "win32" ? "npm.cmd" : "npm";
   const args = ["install", "-g", "@openai/codex@latest"];
   if (input.dryRun) {
     return { ok: true, command, args };
   }
   return new Promise(resolve => {
-    const child = spawn(command, args, {
+    const env = { ...currentProcessEnv(), ...input.env };
+    const launch = codexCliLaunchCommand(command, args, env, platform);
+    const child = spawn(launch.command, launch.args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...currentProcessEnv(), ...input.env },
+      env,
       windowsHide: true
     });
     let output = "";

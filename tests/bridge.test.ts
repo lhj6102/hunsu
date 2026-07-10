@@ -1739,7 +1739,7 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
     "rl.on('line', line => {",
     "  const msg = JSON.parse(line);",
     "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
-    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test', planLabel: 'Team' } }));",
+    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { account: { type: 'chatgpt', email: 'dev@example.test', planType: 'team' }, requiresOpenaiAuth: true } }));",
     "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
     "});",
     ""
@@ -1779,6 +1779,8 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
     assert.equal(ready.auth.state, "authenticated");
     assert.equal(ready.auth.method, "chatgpt");
     assert.equal(ready.auth.access, "subscription");
+    assert.equal(ready.auth.accountSummary?.email, "dev@example.test");
+    assert.equal(ready.auth.accountSummary?.planLabel, "team");
     assert.equal(ready.ready, true);
     assert.equal(codexRuntimePreflightError(ready), undefined);
 
@@ -1804,6 +1806,80 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
     assert.equal(limited.usage.rateLimited, true);
     assert.equal(limited.ready, false);
     assert.equal(codexRuntimePreflightError(limited)?.error, "CODEX_RATE_LIMITED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge Codex runtime status decodes official account/read authentication states", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-codex-account-read-contract-test-"));
+  const fakeCodex = join(root, "codex");
+  writeFileSync(fakeCodex, [
+    `#!${process.execPath}`,
+    "const readline = require('node:readline');",
+    "const args = process.argv.slice(2);",
+    "if (args.includes('--version')) { console.log('codex 1.2.3'); process.exit(0); }",
+    "if (args[0] !== 'app-server') process.exit(2);",
+    "const account = JSON.parse(process.env.HUNSU_TEST_CODEX_ACCOUNT_RESPONSE);",
+    "const rl = readline.createInterface({ input: process.stdin });",
+    "rl.on('line', line => {",
+    "  const msg = JSON.parse(line);",
+    "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
+    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: account }));",
+    "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { rateLimits: { rateLimitReachedType: null } } }));",
+    "});",
+    ""
+  ].join("\n"), "utf8");
+  chmodSync(fakeCodex, 0o755);
+  const statusFor = (account: unknown) => getCodexRuntimeStatus({
+    env: {
+      PATH: "",
+      HUNSU_CODEX_BINARY_PATH: fakeCodex,
+      HUNSU_TEST_CODEX_ACCOUNT_RESPONSE: JSON.stringify(account)
+    },
+    force: true
+  });
+  try {
+    const chatgpt = await statusFor({
+      account: { type: "chatgpt", email: "subscriber@example.test", planType: "plus" },
+      requiresOpenaiAuth: true
+    });
+    assert.equal(chatgpt.auth.state, "authenticated");
+    assert.equal(chatgpt.auth.method, "chatgpt");
+    assert.equal(chatgpt.auth.access, "subscription");
+    assert.equal(chatgpt.auth.accountSummary?.email, "subscriber@example.test");
+    assert.equal(chatgpt.auth.accountSummary?.planLabel, "plus");
+    assert.equal(chatgpt.ready, true);
+    assert.equal(chatgpt.recommendedAction, "none");
+
+    const apiKey = await statusFor({
+      account: { type: "apiKey" },
+      requiresOpenaiAuth: true
+    });
+    assert.equal(apiKey.auth.state, "authenticated");
+    assert.equal(apiKey.auth.method, "api_key");
+    assert.equal(apiKey.auth.access, "usage_based");
+    assert.equal(apiKey.ready, true);
+    assert.equal(apiKey.recommendedAction, "none");
+
+    const loginRequired = await statusFor({
+      account: null,
+      requiresOpenaiAuth: true
+    });
+    assert.equal(loginRequired.auth.state, "not_authenticated");
+    assert.equal(loginRequired.ready, false);
+    assert.equal(loginRequired.recommendedAction, "login_codex");
+    assert.equal(codexRuntimePreflightError(loginRequired)?.error, "CODEX_LOGIN_REQUIRED");
+
+    const noAuthRequired = await statusFor({
+      account: null,
+      requiresOpenaiAuth: false
+    });
+    assert.equal(noAuthRequired.auth.state, "authenticated");
+    assert.equal(noAuthRequired.auth.method, "unknown");
+    assert.equal(noAuthRequired.auth.access, "unknown");
+    assert.equal(noAuthRequired.ready, true);
+    assert.equal(noAuthRequired.recommendedAction, "none");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -3660,7 +3736,7 @@ test("Bridge server exposes sanitized legacy Codex provider status", async () =>
         planType: "plus",
         apiKey: "sk-provider-secret"
       },
-      requiresOpenaiAuth: false,
+      requiresOpenaiAuth: true,
       refreshToken: "refresh-provider-secret"
     },
     rateLimits: {
@@ -3680,6 +3756,7 @@ test("Bridge server exposes sanitized legacy Codex provider status", async () =>
   assert.equal(response.body.backend, "app-server");
   assert.equal(response.body.available, true);
   assert.equal(response.body.auth.method, "chatgpt");
+  assert.equal(response.body.auth.state, "authenticated");
   assert.equal(response.body.auth.access, "subscription");
   assert.equal(response.body.accountSummary.email, "test@hunsu.app");
   assert.equal(response.body.accountSummary.planLabel, "plus");

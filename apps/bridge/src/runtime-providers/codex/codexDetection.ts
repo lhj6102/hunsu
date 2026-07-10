@@ -162,7 +162,7 @@ export async function getCodexVersion(input: {
   try {
     const env = input.env ?? currentProcessEnv();
     const platform = input.platform ?? process.platform;
-    const launch = codexProbeLaunchCommand(input.binaryPath, ["--version"], env, platform);
+    const launch = codexCliLaunchCommand(input.binaryPath, ["--version"], env, platform);
     const { stdout, stderr } = await execFileAsync(launch.command, launch.args, {
       env: processEnvForProbe(env, platform),
       timeout: input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS,
@@ -623,7 +623,7 @@ function expandWindowsPathVariables(path: string, env: Record<string, string | u
   });
 }
 
-function codexProbeLaunchCommand(
+export function codexCliLaunchCommand(
   binaryPath: string,
   args: string[],
   env: Record<string, string | undefined>,
@@ -690,7 +690,7 @@ export class CodexAppServerProbeClient {
     this.timeoutMs = timeoutMs;
     const env = options.env ?? currentProcessEnv();
     const platform = options.platform ?? process.platform;
-    const launch = codexProbeLaunchCommand(this.command, this.args, env, platform);
+    const launch = codexCliLaunchCommand(this.command, this.args, env, platform);
     this.child = spawn(launch.command, launch.args, {
       env: processEnvForProbe(env, platform),
       stdio: ["pipe", "pipe", "pipe"],
