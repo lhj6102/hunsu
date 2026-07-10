@@ -21,13 +21,19 @@ Raw credential payloads, app-server JSON-RPC details, environment variables,
 API-key configuration, and discovery candidates belong in diagnostics or
 Advanced views.
 
-Provider setup is metadata-driven. Codex exposes these config keys:
+Provider setup is Bridge-owned and metadata-driven. The Provider tab Configure
+button opens a Codex setup modal instead of sending users to generic Settings.
+Codex exposes these config keys:
 
 - `binaryPath`: optional path to the Codex executable.
 - `codexHome`: optional `CODEX_HOME` directory.
 - `appServerCommand`: optional command override for the Codex app-server.
 - `appServerArgs`: optional app-server argument override.
 - `authenticationPreference`: `chatgpt`, `device_code`, or `api_key`.
+
+Primary fields are `binaryPath` and `codexHome`. Authentication preference is
+shown separately. `appServerCommand` and `appServerArgs` stay collapsed under
+Advanced.
 
 Bridge persists Codex provider config only under
 `runtimeProviders.providers.codex.settings`. Legacy Bridge App fields such as
@@ -70,6 +76,10 @@ open `hunsu://provider` or `hunsu://provider/codex`. Workspace and connection
 problems are reported separately so Web does not send users to provider setup
 for an inactive workspace or offline Bridge.
 
+Model-selection failures are reported separately as `area: "model"`. Bridge
+validates Web and CLI aliases against the current provider inventory before
+Execute starts; see [Model Aliases](model-aliases.md).
+
 ## API
 
 Provider APIs:
@@ -88,7 +98,24 @@ POST /api/providers/current/configure
 POST /api/providers/current/validate
 POST /api/providers/current/config
 DELETE /api/providers/current/config
+GET  /api/providers/inventory
+POST /api/model-aliases/validate
+POST /api/model-aliases/resolve
 ```
+
+Every runtime-provider status publishes a required model-inventory state.
+Codex publishes its provider-owned catalog even when its binary or login needs
+attention; providers without an inventory publish an explicit unavailable
+state. `GET /api/providers/inventory` returns
+`{ ok: true, value: { backendId, providers } }` or a typed
+`BACKEND_UNAVAILABLE` / `PROVIDER_INVENTORY_UNAVAILABLE` result. Model
+descriptors expose capabilities such as `reasoningEfforts` and `serviceTiers`
+so Web can render direct model controls without hardcoded reasoning choices.
+An explicit backend never falls back to the local provider.
+Alias resolve returns `{ ok: true, backendId, resolved, provider }` or one of
+the documented model/provider errors with actions. Web sends custom aliases
+with the public `aliases?: ModelAlias[]` request field; omitted aliases allow
+Bridge defaults, while `aliases: []` is an explicit empty alias set.
 
 `/api/providers/current/login` runs the current provider adapter. For Codex it
 starts `codex login`, `codex login --device-auth`, or the API-key

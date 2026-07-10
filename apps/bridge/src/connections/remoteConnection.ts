@@ -54,6 +54,9 @@ export type RelayCommandName =
   | "health"
   | "bridge.status"
   | "connection.status"
+  | "provider.inventory"
+  | "modelAlias.validate"
+  | "modelAlias.resolve"
   | "roadmap.registry.list"
   | "roadmap.registry.remove"
   | "roadmap.open"
@@ -566,6 +569,11 @@ export function remoteProviderStatusFromDevice(device: RemoteBridgeDeviceSummary
       ...unavailableProviderCapabilities,
       supportsRemoteRelay: true
     },
+    modelInventory: {
+      state: "unavailable",
+      reason: "not_reported",
+      message: "Remote provider model inventory has not been reported by this Bridge."
+    },
     recommendedAction: "recheck",
     safeMessage: "Remote provider status is not available until that Bridge reports it."
   };
@@ -890,6 +898,9 @@ function isRelayCommandName(value: string): value is RelayCommandName {
     "health",
     "bridge.status",
     "connection.status",
+    "provider.inventory",
+    "modelAlias.validate",
+    "modelAlias.resolve",
     "roadmap.registry.list",
     "roadmap.registry.remove",
     "roadmap.open",
@@ -942,7 +953,28 @@ function isRuntimeProviderStatus(value: unknown): value is RuntimeProviderStatus
     && typeof candidate.auth === "object"
     && candidate.auth !== null
     && typeof candidate.capabilities === "object"
-    && candidate.capabilities !== null;
+    && candidate.capabilities !== null
+    && isRuntimeProviderModelInventory(candidate.modelInventory);
+}
+
+function isRuntimeProviderModelInventory(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || !("state" in value)) {
+    return false;
+  }
+  const candidate = value as { state?: unknown; models?: unknown; reason?: unknown; message?: unknown };
+  if (candidate.state === "available") {
+    return Array.isArray(candidate.models) && candidate.models.every(model => {
+      if (typeof model !== "object" || model === null) return false;
+      const descriptor = model as { model?: unknown; label?: unknown; capabilities?: unknown };
+      return typeof descriptor.model === "string"
+        && typeof descriptor.label === "string"
+        && typeof descriptor.capabilities === "object"
+        && descriptor.capabilities !== null;
+    });
+  }
+  return candidate.state === "unavailable"
+    && (candidate.reason === "not_reported" || candidate.reason === "not_supported")
+    && typeof candidate.message === "string";
 }
 
 function isConnectedWorkspaceSummary(value: unknown): value is ConnectedWorkspaceSummary {

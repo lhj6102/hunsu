@@ -10,6 +10,9 @@ export type RelayCommandName =
   | "health"
   | "bridge.status"
   | "connection.status"
+  | "provider.inventory"
+  | "modelAlias.validate"
+  | "modelAlias.resolve"
   | "roadmap.registry.list"
   | "roadmap.registry.remove"
   | "roadmap.open"
@@ -788,6 +791,9 @@ export function scopesForRelayCommand(command: RelayCommandName): BridgeCommandS
     case "health":
     case "bridge.status":
     case "connection.status":
+    case "provider.inventory":
+    case "modelAlias.validate":
+    case "modelAlias.resolve":
     case "roadmap.registry.list":
       return [];
   }
@@ -1077,6 +1083,9 @@ function isRelayCommandName(value: string): value is RelayCommandName {
     "health",
     "bridge.status",
     "connection.status",
+    "provider.inventory",
+    "modelAlias.validate",
+    "modelAlias.resolve",
     "roadmap.registry.list",
     "roadmap.registry.remove",
     "roadmap.open",

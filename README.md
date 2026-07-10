@@ -106,6 +106,7 @@ hunsu://add-workspace
 hunsu://workspaces
 hunsu://connection
 hunsu://connection/remote
+hunsu://diagnostics
 hunsu://open-workspace?workspaceId=<id>
 hunsu://activate-roadmap?roadmapId=<id>
 hunsu://open-project?path=/path/to/project

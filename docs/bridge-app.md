@@ -4,14 +4,17 @@ Hunsu Bridge App is the small companion app that connects runtime providers and
 local workspaces to Hunsu Studio. It is not an IDE and it does not replace
 Studio.
 
+Bridge App intentionally remains a lightweight Tauri companion app. Electron is
+not used for this surface.
+
 ## Primary User Path
 
 ```text
 Install Hunsu Bridge App
 Open the app
-Choose or create a project
-Hunsu Bridge starts locally
-Studio opens in the browser
+Hunsu Bridge starts locally and shows the tray/menu-bar item
+Provider setup or Workspace setup opens only when attention is required
+Open Hunsu Web from the tray when ready
 ```
 
 The advanced developer fallback remains:
@@ -28,7 +31,11 @@ hunsu-bridge remote status
 hunsu-bridge projects grant /path/to/project
 hunsu-bridge start --remote
 hunsu-bridge service install
+hunsu-bridge model-alias list
 ```
+
+See [Headless Service](headless-service.md) for user-scoped service artifacts
+and [Model Aliases](model-aliases.md) for Execute model selection.
 
 Browser and Studio handoff use the app protocol surface:
 
@@ -40,6 +47,7 @@ hunsu://workspaces
 hunsu://add-workspace
 hunsu://connection
 hunsu://connection/remote
+hunsu://diagnostics
 hunsu://pair?next=/studio
 hunsu://open-project?path=/path/to/project
 hunsu://open-workspace?workspaceId=<id>
@@ -102,25 +110,48 @@ Hunsu Bridge App owns local runtime supervision:
   `dist-ui/` for packaging; it polls live status, recent projects,
   selected-folder inspection, diagnostics, and logs
 - a native folder picker command for macOS, Windows, and Linux GUI
-- `hunsu://` protocol registration through macOS `Info.plist`, a Windows WiX
-  registry fragment, and a Linux user-level `.desktop`/`xdg-mime` handler
+- `hunsu://` protocol registration through Tauri's desktop deep-link plugin for
+  packaged macOS and Windows apps, runtime registration for Linux GUI bundles,
+  and a Linux user-level `.desktop`/`xdg-mime` handler for headless installs
 - a supervised sidecar process that restarts a crashed Bridge daemon and writes
   structured logs
+- a tray-first lifecycle: the main window is hidden by default, closing the
+  window keeps Local Bridge running, and the tray shows Provider, Local,
+  Remote, and active Workspace summary plus Open Hunsu Web, Provider Setup,
+  Add Workspace, Connection, Diagnostics, and Quit
 
 Build commands:
 
 ```sh
 pnpm --filter @hunsu/bridge-desktop build
+pnpm --filter @hunsu/bridge-desktop desktop:prepare
+pnpm --filter @hunsu/bridge-desktop desktop:dev
 pnpm --filter @hunsu/bridge-desktop desktop:build
+pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes
 ```
 
 `build` compiles the headless command package, bundles the sidecar entrypoint,
-creates a Node SEA blob, downloads the pinned Node runtime archives for each
-configured Tauri sidecar target, verifies them against Node's
-`SHASUMS256.txt`, injects the SEA blob with `postject`, and writes native
-ELF/Mach-O/PE sidecar artifacts plus `dist/sidecar-manifest.json`. The packaged
-sidecar is a native executable and does not require `node` on the installed
-user's `PATH`.
+creates a Node SEA blob, downloads the pinned Node runtime archive for the
+selected Tauri target, verifies it against Node's `SHASUMS256.txt`, injects the
+SEA blob with `postject`, and writes that target's native ELF/Mach-O/PE sidecar
+plus `dist/sidecar-manifest.json`. The target defaults to the build host and can
+be selected with `HUNSU_BRIDGE_SIDECAR_TARGET` or `--target`. Desktop packaging
+uses Tauri `externalBin` for the active sidecar and keeps resources limited to
+the sidecar manifest; see [Windows Packaging](windows-packaging.md). The
+packaged sidecar is a native executable and does not require `node` on the
+installed user's `PATH`.
+
+SEA generation verifies that its Node executable reports exactly the pinned
+embedded runtime version before creating the blob. Local builds can set
+`HUNSU_BRIDGE_SEA_NODE_PATH` to an exact-version Node executable; mismatches
+fail before bundling or injection. After `postject` modifies a macOS sidecar,
+the build ad-hoc signs it and verifies the new signature before native
+validation and the `status` smoke test.
+
+`desktop:prepare` builds the UI and command package, removes stale prepared
+sidecars, and builds only the current host target plus its manifest. Therefore
+`desktop:dev` can start from a clean checkout without generated `dist/`,
+`native-sidecars/`, or `.sidecar-cache/` content.
 
 `desktop:build` requires Rust/Cargo plus platform Tauri dependencies. The
 TypeScript sidecar/headless package can be built and tested without those native
@@ -130,6 +161,19 @@ The Tauri shell ships with an explicit CSP. Browser JavaScript is loaded from a
 bundled app script, and native command invocation is allowlisted to known Bridge
 App commands. Unsupported `hunsu://` commands are rejected instead of being
 passed to the sidecar.
+
+Tray Provider Setup, Add Workspace, Workspaces, Connection, Diagnostics, and
+cold-start `hunsu://` entries route through the same sidecar intent path and
+show/focus the Bridge window after routing. The tray summary is rebuilt from the
+sidecar snapshot on an asynchronous periodic refresh so provider, local, remote,
+and workspace state do not stay at launch-time values. Diagnostics routes to
+`hunsu://diagnostics`; `hunsu://prerequisites` remains a Provider compatibility
+alias.
+
+Quit is explicit. The native menu confirms before exiting and honors the
+persisted background preference for keeping or stopping the supervised Local
+Bridge. The preference is exposed in Bridge App Settings and through
+`hunsu-bridge settings quit-behavior`.
 
 Studio remains the main product UI for Roadmaps, Execute, Hunsu Drafts,
 Artifact Actions, and Hub.
@@ -160,6 +204,11 @@ Codex provider setup saves all Codex config under
 Legacy `codex.binaryPath` and `codex.environment` fields are read as migration
 inputs only. Bridge App writes the canonical provider settings object after
 configuration.
+
+The Provider tab owns setup. Configure opens a Codex setup modal generated from
+provider metadata. Primary fields are Codex binary and Codex home, authentication
+method is a separate section, and app-server command/args remain collapsed under
+Advanced.
 
 On Windows, Bridge checks the process `PATH`, Windows `Path`, and captured User
 PATH and Machine PATH snapshots when available, then known OpenAI Codex install
@@ -284,7 +333,9 @@ Grant allows `remoteRelay.access`.
 
 When Remote Access is enabled, Bridge publishes the active Workspace set as
 remote workspace grants and marks those active Workspaces remote-enabled in the
-local registry. Inactive Workspaces are not published until activated.
+local registry. The same snapshot includes the current provider's explicit
+model-inventory state, so remote model validation uses the provider-owned
+catalog. Inactive Workspaces are not published until activated.
 
 ## Local Pairing And Security
 
@@ -460,7 +511,7 @@ The native/browser QA contract is recorded in
 Linux no-GUI, and Chrome/Safari/Edge/Firefox browser checks with concrete
 in-repo evidence files and command checklists. Real native-host executions are
 recorded separately in the matrix's `nativeHostResults` section. As of
-2026-07-08, this Linux workspace has not run macOS, Windows, Linux GUI,
+2026-07-10, this Linux no-GUI workspace has not run macOS, Windows, Linux GUI,
 packaged installer, tray/menu-bar, or native daemon QA; those remain external
 host blockers rather than contract-only pass claims.
 

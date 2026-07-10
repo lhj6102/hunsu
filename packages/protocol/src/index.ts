@@ -1,4 +1,5 @@
 export * from "./model.ts";
+export * from "./model-selection.ts";
 export * from "./errors.ts";
 export {
   cloneHarnessPlanner,

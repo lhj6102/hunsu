@@ -10,6 +10,7 @@ import {
   unwrapDomainModelResult,
   type DomainWorkflowError
 } from "./errors.ts";
+import { normalizeRuntimePolicy } from "./model-selection.ts";
 import type {
   ExecutorEntity,
   ExecutorId,
@@ -274,13 +275,15 @@ export function createDefaultManagerConfig(
   id = "manager.hunsu.default",
   prompt = DEFAULT_MANAGER_PROMPT,
   skills: SkillBinding[] = [],
-  plugins: MemberPluginBinding[] = []
+  plugins: MemberPluginBinding[] = [],
+  modelSelection?: ManagerConfig["modelSelection"]
 ): ManagerConfig {
   return {
     id: unwrapDomainModelResult(makeNonEmptyText(id, "manager.id")),
     promptTemplate: promptTemplateFromText(prompt),
     skills: cloneSkills(skills),
-    plugins: clonePlugins(plugins)
+    plugins: clonePlugins(plugins),
+    ...(modelSelection ? { modelSelection: JSON.parse(JSON.stringify(modelSelection)) as ManagerConfig["modelSelection"] } : {})
   };
 }
 
@@ -399,6 +402,7 @@ export function getHarnessMember(harness: Harness, executorId: string): Member |
 }
 
 export function memberConfigFromMemberEntity(member: Member): MemberConfig {
+  const runtimePolicy = normalizeRuntimePolicy(member.runtimePolicy);
   return {
     id: member.id,
     promptTemplate: { ...member.promptTemplate },
@@ -408,11 +412,12 @@ export function memberConfigFromMemberEntity(member: Member): MemberConfig {
     plugins: member.resources
       .filter((binding): binding is Extract<ResourceBinding, { kind: "plugin" }> => binding.kind === "plugin")
       .map(binding => ({ ...binding.plugin })),
-    model: member.runtimePolicy.model,
-    reasoningEffort: member.runtimePolicy.reasoningEffort,
-    serviceTier: member.runtimePolicy.serviceTier,
-    execution: cloneMemberExecution(member.runtimePolicy.execution),
-    approval: cloneMemberApproval(member.runtimePolicy.approval)
+    ...(member.runtimePolicy.modelSelection ? { modelSelection: runtimePolicy.modelSelection } : {}),
+    model: runtimePolicy.model,
+    reasoningEffort: runtimePolicy.reasoningEffort,
+    serviceTier: runtimePolicy.serviceTier,
+    execution: cloneMemberExecution(runtimePolicy.execution),
+    approval: cloneMemberApproval(runtimePolicy.approval)
   };
 }
 
@@ -450,6 +455,7 @@ function executorId(value: string, path: string): ExecutorId {
 
 function runtimePolicyFromMemberConfig(member: MemberConfig): RuntimePolicy {
   return {
+    ...(member.modelSelection ? { modelSelection: member.modelSelection } : {}),
     model: member.model,
     reasoningEffort: member.reasoningEffort,
     serviceTier: member.serviceTier,
@@ -564,17 +570,19 @@ function cloneExecutorEntity(executor: ExecutorEntity): ExecutorEntity {
 }
 
 function cloneMemberEntity(member: Member): Member {
+  const runtimePolicy = normalizeRuntimePolicy(member.runtimePolicy);
   return {
     kind: "member",
     id: member.id,
     promptTemplate: { ...member.promptTemplate },
     resources: member.resources.map(cloneResourceBinding),
     runtimePolicy: {
-      model: member.runtimePolicy.model,
-      reasoningEffort: member.runtimePolicy.reasoningEffort,
-      serviceTier: member.runtimePolicy.serviceTier,
-      execution: cloneMemberExecution(member.runtimePolicy.execution),
-      approval: cloneMemberApproval(member.runtimePolicy.approval)
+      ...(member.runtimePolicy.modelSelection ? { modelSelection: runtimePolicy.modelSelection } : {}),
+      model: runtimePolicy.model,
+      reasoningEffort: runtimePolicy.reasoningEffort,
+      serviceTier: runtimePolicy.serviceTier,
+      execution: cloneMemberExecution(runtimePolicy.execution),
+      approval: cloneMemberApproval(runtimePolicy.approval)
     }
   };
 }
@@ -765,6 +773,7 @@ function memberConfigResult(member: Record<string, unknown>, path: string): Resu
     return workflowValidationError(`${path}.model must be a non-empty string`);
   }
   for (const validation of [
+    modelSelectionResult(member.modelSelection, `${path}.modelSelection`, true),
     allowedResult(`${path}.reasoningEffort`, member.reasoningEffort, REASONING_EFFORTS),
     member.serviceTier === undefined ? ok(undefined) : allowedResult(`${path}.serviceTier`, member.serviceTier, SERVICE_TIERS),
     memberExecutionResult(member.execution, `${path}.execution`),
@@ -794,13 +803,15 @@ function memberConfigResult(member: Record<string, unknown>, path: string): Resu
 }
 
 function managerConfigResult(manager: Record<string, unknown>, path: string): Result<void, DomainWorkflowError> {
-  const keys = exactKeysResult(manager, ["id", "plugins", "promptTemplate", "skills"], path);
+  const keys = allowedKeysResult(manager, ["id", "plugins", "promptTemplate", "skills"], ["modelSelection"], path);
   if (!keys.ok) return keys;
   if (typeof manager.id !== "string" || manager.id.trim() === "") {
     return workflowValidationError(`${path}.id must be a non-empty string`);
   }
   const promptTemplate = decodePromptTemplate(manager.promptTemplate, `${path}.promptTemplate`);
   if (!promptTemplate.ok) return promptTemplate;
+  const modelSelection = modelSelectionResult(manager.modelSelection, `${path}.modelSelection`, true);
+  if (!modelSelection.ok) return modelSelection;
   if (!Array.isArray(manager.skills)) {
     return workflowValidationError(`${path}.skills must be an array`);
   }
@@ -917,11 +928,19 @@ function memberExecutorResult(member: Record<string, unknown>, path: string): Re
 function runtimePolicyResult(value: unknown, path: string): Result<void, DomainWorkflowError> {
   const policy = recordResult(value, path);
   if (!policy.ok) return policy;
-  if (typeof policy.value.model !== "string" || policy.value.model.trim() === "") {
-    return workflowValidationError(`${path}.model must be a non-empty string`);
+  const modelSelection = modelSelectionResult(policy.value.modelSelection, `${path}.modelSelection`, true);
+  if (!modelSelection.ok) return modelSelection;
+  const hasModelSelection = policy.value.modelSelection !== undefined;
+  if (policy.value.model !== undefined && (typeof policy.value.model !== "string" || policy.value.model.trim() === "")) {
+    return workflowValidationError(`${path}.model must be a non-empty string when provided`);
+  }
+  if (policy.value.model === undefined && !hasModelSelection) {
+    return workflowValidationError(`${path}.modelSelection or ${path}.model must be provided`);
   }
   for (const validation of [
-    allowedResult(`${path}.reasoningEffort`, policy.value.reasoningEffort, REASONING_EFFORTS),
+    policy.value.reasoningEffort === undefined && hasModelSelection
+      ? ok(undefined)
+      : allowedResult(`${path}.reasoningEffort`, policy.value.reasoningEffort, REASONING_EFFORTS),
     policy.value.serviceTier === undefined ? ok(undefined) : allowedResult(`${path}.serviceTier`, policy.value.serviceTier, SERVICE_TIERS),
     memberExecutionResult(policy.value.execution, `${path}.execution`),
     memberApprovalResult(policy.value.approval, `${path}.approval`)
@@ -931,6 +950,48 @@ function runtimePolicyResult(value: unknown, path: string): Result<void, DomainW
     }
   }
   return ok(undefined);
+}
+
+function modelSelectionResult(value: unknown, path: string, optional = false): Result<void, DomainWorkflowError> {
+  if (value === undefined && optional) {
+    return ok(undefined);
+  }
+  const selection = recordResult(value, path);
+  if (!selection.ok) return selection;
+  if (selection.value.kind === "alias") {
+    return nonEmptyStringResult(selection.value.aliasId, `${path}.aliasId`);
+  }
+  if (selection.value.kind !== "direct") {
+    return workflowValidationError(`${path}.kind must be direct or alias`);
+  }
+  const provider = recordResult(selection.value.provider, `${path}.provider`);
+  if (!provider.ok) return provider;
+  for (const validation of [
+    nonEmptyStringResult(provider.value.providerId, `${path}.provider.providerId`),
+    nonEmptyStringResult(provider.value.model, `${path}.provider.model`),
+    provider.value.reasoningEffort === undefined ? ok(undefined) : allowedResult(`${path}.provider.reasoningEffort`, provider.value.reasoningEffort, REASONING_EFFORTS),
+    provider.value.serviceTier === undefined ? ok(undefined) : allowedResult(`${path}.provider.serviceTier`, provider.value.serviceTier, SERVICE_TIERS)
+  ]) {
+    if (!validation.ok) return validation;
+  }
+  if (provider.value.experimental !== undefined && typeof provider.value.experimental !== "boolean") {
+    return workflowValidationError(`${path}.provider.experimental must be a boolean when provided`);
+  }
+  if (provider.value.providerId === "codex" && provider.value.experimental !== true) {
+    if (provider.value.model === "gpt-5.5-thinking" && provider.value.reasoningEffort !== "high" && provider.value.reasoningEffort !== "xhigh") {
+      return workflowValidationError(`${path}.provider.reasoningEffort must be high or xhigh for gpt-5.5-thinking`);
+    }
+    if (provider.value.model === "gpt-5.5" && (provider.value.reasoningEffort === "minimal" || provider.value.reasoningEffort === "xhigh")) {
+      return workflowValidationError(`${path}.provider.reasoningEffort is not supported for gpt-5.5`);
+    }
+  }
+  return ok(undefined);
+}
+
+function nonEmptyStringResult(value: unknown, path: string): Result<void, DomainWorkflowError> {
+  return typeof value === "string" && value.trim() !== ""
+    ? ok(undefined)
+    : workflowValidationError(`${path} must be a non-empty string`);
 }
 
 function resourceEntityResult(value: unknown, path: string): Result<void, DomainWorkflowError> {
@@ -1037,6 +1098,18 @@ function exactKeysResult(record: Record<string, unknown>, allowedKeys: readonly 
     : ok(undefined);
 }
 
+function allowedKeysResult(record: Record<string, unknown>, requiredKeys: readonly string[], optionalKeys: readonly string[], path: string): Result<void, DomainWorkflowError> {
+  const missing = requiredKeys.filter(key => !(key in record));
+  if (missing.length > 0) {
+    return workflowValidationError(`${path} is missing required keys: ${missing.join(", ")}`);
+  }
+  const allowedKeys = [...requiredKeys, ...optionalKeys];
+  const extra = Object.keys(record).filter(key => !allowedKeys.includes(key));
+  return extra.length > 0
+    ? workflowValidationError(`${path} has unsupported keys: ${extra.join(", ")}`)
+    : ok(undefined);
+}
+
 function positiveIntegerResult(value: unknown, path: string): Result<void, DomainWorkflowError> {
   return Number.isInteger(value) && Number(value) >= 1
     ? ok(undefined)
@@ -1106,6 +1179,10 @@ function assertValidMemberConfig(member: Record<string, unknown>, path: string):
   assertValidPromptTemplate(member.promptTemplate, `${path}.promptTemplate`);
   if (typeof member.model !== "string" || member.model.trim() === "") {
     throw new DomainInvariantError(`${path}.model must be a non-empty string`);
+  }
+  const modelSelection = modelSelectionResult(member.modelSelection, `${path}.modelSelection`, true);
+  if (!modelSelection.ok) {
+    throw new DomainInvariantError(modelSelection.error.message);
   }
   assertAllowed(`${path}.reasoningEffort`, member.reasoningEffort, REASONING_EFFORTS);
   if (member.serviceTier !== undefined) {
@@ -1202,7 +1279,7 @@ function assertString(value: unknown, message: string): void {
 }
 
 function cloneMemberConfig(member: MemberConfig): MemberConfig {
-  return {
+  const cloned: MemberConfig = {
     ...member,
     promptTemplate: { ...member.promptTemplate },
     skills: cloneSkills(member.skills),
@@ -1210,15 +1287,23 @@ function cloneMemberConfig(member: MemberConfig): MemberConfig {
     execution: cloneMemberExecution(member.execution),
     approval: cloneMemberApproval(member.approval)
   };
+  if (member.modelSelection) {
+    cloned.modelSelection = JSON.parse(JSON.stringify(member.modelSelection)) as MemberConfig["modelSelection"];
+  }
+  return cloned;
 }
 
 function cloneManagerConfig(manager: ManagerConfig): ManagerConfig {
-  return {
+  const cloned: ManagerConfig = {
     ...manager,
     promptTemplate: { ...manager.promptTemplate },
     skills: cloneSkills(manager.skills),
     plugins: clonePlugins(manager.plugins)
   };
+  if (manager.modelSelection) {
+    cloned.modelSelection = JSON.parse(JSON.stringify(manager.modelSelection)) as ManagerConfig["modelSelection"];
+  }
+  return cloned;
 }
 
 function cloneMemberExecution(execution: MemberExecutionConstraint): MemberExecutionConstraint {

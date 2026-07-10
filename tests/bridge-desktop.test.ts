@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -63,6 +63,7 @@ test("Bridge App parses browser deep links into command arguments", () => {
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://roadmaps"]), ["ui-intent", "workspaces"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites"]), ["ui-intent", "provider"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/codex"]), ["ui-intent", "provider", "codex"]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://diagnostics"]), ["ui-intent", "diagnostics"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://activate-roadmap?roadmapId=roadmap_123"]), ["activate-roadmap", "roadmap_123"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://activate-workspace?workspaceId=roadmap_123"]), ["activate-roadmap", "roadmap_123"]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://remote-disable"]), ["remote", "disable"]);
@@ -75,6 +76,10 @@ test("Bridge App parses browser deep links into command arguments", () => {
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://prerequisites/other"]), [
     "protocol-error",
     "Unsupported hunsu://prerequisites path."
+  ]);
+  assert.deepEqual(normalizeBridgeAppArgv(["hunsu://diagnostics/other"]), [
+    "protocol-error",
+    "Unsupported hunsu://diagnostics path."
   ]);
   assert.deepEqual(normalizeBridgeAppArgv(["hunsu://open-roadmap"]), [
     "protocol-error",
@@ -138,6 +143,10 @@ test("Bridge App Roadmap deep links record UI intents for native focus flows", a
     const remoteState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string; focus?: string } };
     assert.deepEqual({ tab: remoteState.uiIntent?.tab, focus: remoteState.uiIntent?.focus }, { tab: "connection", focus: "remote" });
 
+    assert.equal(await main(["hunsu://diagnostics"]), 0);
+    const diagnosticsState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string } };
+    assert.equal(diagnosticsState.uiIntent?.tab, "diagnostics");
+
     assert.equal(await main(["hunsu://activate-roadmap?roadmapId=unknown_roadmap"]), 0);
     const activateState = JSON.parse(readFileSync(statePath, "utf8")) as { uiIntent?: { tab?: string } };
     assert.equal(activateState.uiIntent?.tab, "workspaces");
@@ -146,6 +155,25 @@ test("Bridge App Roadmap deep links record UI intents for native focus flows", a
     restoreEnv(previousEnv);
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Bridge App Tauri tray routes focus, refreshes summaries, and uses persisted quit behavior", () => {
+  const source = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8");
+  assert.match(source, /fn handle_protocol_url_and_show/);
+  assert.match(source, /"provider" => handle_protocol_url_and_show\(app, "hunsu:\/\/provider"\)/);
+  assert.match(source, /"add_workspace" => handle_protocol_url_and_show\(app, "hunsu:\/\/add-workspace"\)/);
+  assert.match(source, /"workspaces" => handle_protocol_url_and_show\(app, "hunsu:\/\/workspaces"\)/);
+  assert.match(source, /"connection" => handle_protocol_url_and_show\(app, "hunsu:\/\/connection"\)/);
+  assert.match(source, /"diagnostics" => handle_protocol_url_and_show\(app, "hunsu:\/\/diagnostics"\)/);
+  assert.match(source, /app\.deep_link\(\)\.on_open_url/);
+  assert.match(source, /app\.deep_link\(\)\.get_current\(\)/);
+  assert.match(source, /#\[cfg\(target_os = "linux"\)\][\s\S]*app\.deep_link\(\)\.register_all\(\)/);
+  assert.match(source, /fn start_bridge_tray_refresh/);
+  assert.match(source, /fn refresh_bridge_tray_menu/);
+  assert.match(source, /tray\.set_menu\(Some\(menu\)\)/);
+  assert.match(source, /quit_background_preference/);
+  assert.match(source, /snapshot\["status"\]\["quitBehavior"\]/);
+  assert.doesNotMatch(source, /HUNSU_BRIDGE_QUIT_BACKGROUND/);
 });
 
 test("Bridge App Codex device login command returns verification details for UI display", async () => {
@@ -461,6 +489,42 @@ test("Bridge App Codex path command persists provider settings instead of legacy
     assert.equal(resetState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
     assert.equal(resetState.runtimeProviders?.providers?.codex?.settings?.codexHome, undefined);
     assert.equal(resetState.runtimeProviders?.providers?.codex?.settings?.authenticationPreference, "device_code");
+  } finally {
+    console.log = previousLog;
+    restoreEnv(previousEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App settings and headless model-alias CLI persist local state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-settings-alias-test-"));
+  const statePath = join(root, "state.json");
+  const previousEnv = snapshotEnv(["HUNSU_BRIDGE_APP_STATE_PATH"]);
+  const previousLog = console.log;
+  const logs: string[] = [];
+  console.log = (message?: unknown) => {
+    logs.push(String(message ?? ""));
+  };
+  try {
+    process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+
+    assert.equal(await main(["settings", "quit-behavior", "get"]), 0);
+    assert.equal(logs.at(-1), "keep-background");
+    assert.equal(await main(["settings", "quit-behavior", "set", "stop-background"]), 0);
+    assert.equal(await main(["settings", "quit-behavior", "get"]), 0);
+    assert.equal(logs.at(-1), "stop-background");
+    const settingsState = JSON.parse(readFileSync(statePath, "utf8")) as { quitBehavior?: string };
+    assert.equal(settingsState.quitBehavior, "stop-background");
+
+    logs.length = 0;
+    assert.equal(await main(["model-alias", "list", "--json"]), 0);
+    const listed = JSON.parse(logs.at(-1) ?? "{}") as { aliases?: Array<{ scope?: { kind?: string } }> };
+    assert.equal((listed.aliases ?? []).length > 0, true);
+    assert.equal((listed.aliases ?? []).every(alias => alias.scope?.kind === "local"), true);
+
+    assert.equal(await main(["model-alias", "set", "PrimaryModel", "--model", "gpt-5.5"]), 0);
+    const aliasState = JSON.parse(readFileSync(statePath, "utf8")) as { modelAliases?: Array<{ aliasId?: string; scope?: { kind?: string } }> };
+    assert.equal(aliasState.modelAliases?.find(alias => alias.aliasId === "PrimaryModel")?.scope?.kind, "local");
   } finally {
     console.log = previousLog;
     restoreEnv(previousEnv);
@@ -860,7 +924,7 @@ test("Bridge App headless commands persist device, Remote Access, Project Grant,
     assert.equal(snapshot.projectGrants?.[0]?.path, root);
     assert.equal(snapshot.diagnostics?.app?.projectGrants?.[0]?.path, root);
     assert.equal(state.service.installed, true);
-    assert.match(state.service.manager, /systemd-user|launchd-user|windows-service|manual/);
+    assert.match(state.service.manager, /systemd-user|launchd-user|windows-startup-user|manual/);
     if (process.platform === "linux") {
       assert.match(readFileSync(serviceUnitPath, "utf8"), /ExecStart=.*"?supervise"? "?--cwd"?/);
     }
@@ -1116,6 +1180,11 @@ test("Bridge App publishes only active managed Roadmap grants to Relay", async (
     const published = relayRequest?.body?.projectGrants as ProjectGrant[] | undefined;
     assert.deepEqual(published?.map(grant => grant.path), [activePath]);
     assert.equal(relayRequest?.body?.device?.provider?.providerId, "codex");
+    assert.equal(relayRequest?.body?.device?.provider?.modelInventory?.state, "available");
+    assert.deepEqual(
+      relayRequest?.body?.device?.provider?.modelInventory?.models?.map((model: { model: string }) => model.model),
+      ["codex-default", "gpt-5.5-thinking", "gpt-5.5"]
+    );
     assert.deepEqual(relayRequest?.body?.device?.projectGrants?.map((grant: ProjectGrant) => grant.path), [activePath]);
     assert.deepEqual(relayRequest?.body?.device?.workspaces?.map((workspace: { workspaceId: string }) => workspace.workspaceId), [active.roadmap.roadmapId]);
     assert.equal(relayRequest?.body?.device?.workspaces?.some((workspace: { workspaceId: string }) => workspace.workspaceId === inactive.roadmap.roadmapId), false);
@@ -1227,7 +1296,7 @@ test("Bridge App service install dry-run does not persist installed state", asyn
   const manager = process.platform === "darwin"
     ? "launchd-user"
     : process.platform === "win32"
-      ? "windows-service"
+      ? "windows-startup-user"
       : process.platform === "linux"
         ? "systemd-user"
         : "manual";
@@ -1275,6 +1344,24 @@ test("Bridge App service install dry-run does not persist installed state", asyn
     }
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Bridge App user service managers preserve provider env on Windows and macOS", () => {
+  const source = readFileSync(join(process.cwd(), "apps/bridge-desktop/src/main.ts"), "utf8");
+  assert.match(source, /Register-ScheduledTask/);
+  assert.match(source, /Start-ScheduledTask/);
+  assert.match(source, /Stop-ScheduledTask/);
+  assert.match(source, /Unregister-ScheduledTask/);
+  assert.match(source, /windowsUserStartupScriptText/);
+  assert.match(source, /set "\$\{key\}=\$\{windowsBatchValue\(value\)\}"/);
+  assert.match(source, /launchctl", "bootstrap"/);
+  assert.match(source, /launchctl", "kickstart"/);
+  assert.match(source, /launchctl", "bootout"/);
+  assert.match(source, /serviceEnvironmentSnapshot/);
+  assert.match(source, /codexProviderEnv/);
+  assert.match(source, /bridgeCodexProviderSettings\(state\)/);
+  assert.match(source, /HUNSU_BRIDGE_HEADLESS/);
+  assert.match(source, /hasFlag\(parsed, "system"\) \? "manual" : defaultBridgeServiceManager/);
 });
 
 test("Bridge App Codex install requires confirmation and supports dry-run", async () => {
@@ -1468,6 +1555,7 @@ test("Bridge App systemd service artifact escapes special paths", async () => {
     assert.match(text, /100%%/);
     assert.match(text, /ExecStart=".*" ".*" "supervise" "--cwd" "/);
     assert.match(text, /Environment="HUNSU_BRIDGE_HEADLESS=1"/);
+    assert.match(text, /Environment="HUNSU_BRIDGE_APP_STATE_PATH=/);
   } finally {
     if (previousStatePath === undefined) delete process.env.HUNSU_BRIDGE_APP_STATE_PATH;
     else process.env.HUNSU_BRIDGE_APP_STATE_PATH = previousStatePath;
@@ -1668,6 +1756,9 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
 
   assert.deepEqual(scopesForRelayCommand("execute.start"), ["execute.start", "remoteRelay.access"]);
   assert.deepEqual(scopesForRelayCommand("bridge.status"), []);
+  assert.deepEqual(scopesForRelayCommand("provider.inventory"), []);
+  assert.deepEqual(scopesForRelayCommand("modelAlias.validate"), []);
+  assert.deepEqual(scopesForRelayCommand("modelAlias.resolve"), []);
   assert.deepEqual(scopesForRelayCommand("roadmap.board"), ["remoteRelay.access"]);
   assert.deepEqual(scopesForRelayCommand("artifactAction.runs"), ["env.read", "hostAlias.expose", "remoteRelay.access"]);
   assert.deepEqual(scopesForRelayCommand("artifactAction.start"), ["artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"]);
@@ -1748,6 +1839,30 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
   });
   assert.deepEqual(relayHttpRequestForCommand({
     deviceId: device.deviceId,
+    command: "provider.inventory",
+    payload: { backendId: `remote:${device.deviceId}` }
+  }), {
+    method: "GET",
+    path: "/api/providers/inventory?backendId=local"
+  });
+  assert.deepEqual(relayHttpRequestForCommand({
+    deviceId: device.deviceId,
+    command: "modelAlias.resolve",
+    payload: {
+      backendId: `remote:${device.deviceId}`,
+      modelSelection: { kind: "alias", aliasId: "PrimaryModel" }
+    }
+  }), {
+    method: "POST",
+    path: "/api/model-aliases/resolve",
+    body: {
+      backendId: "local",
+      connectionMode: "local",
+      modelSelection: { kind: "alias", aliasId: "PrimaryModel" }
+    }
+  });
+  assert.deepEqual(relayHttpRequestForCommand({
+    deviceId: device.deviceId,
     command: "roadmap.board",
     projectPath: "/tmp/hunsu-project",
     payload: { roadmapId: "roadmap_123" }
@@ -1764,6 +1879,26 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
     method: "POST",
     path: "/api/roadmaps/roadmap_123/executes/start",
     body: { roadmapId: "roadmap_123", selectedDestinationIds: ["destination_001"] }
+  });
+  assert.deepEqual(relayHttpRequestForCommand({
+    deviceId: device.deviceId,
+    command: "execute.start",
+    projectPath: "/tmp/hunsu-project",
+    payload: {
+      roadmapId: "roadmap_123",
+      backendId: `remote:${device.deviceId}`,
+      connectionMode: "remote",
+      workspace: { workspaceId: "roadmap_123", backendId: `remote:${device.deviceId}`, connectionMode: "remote" }
+    }
+  }), {
+    method: "POST",
+    path: "/api/roadmaps/roadmap_123/executes/start",
+    body: {
+      roadmapId: "roadmap_123",
+      backendId: "local",
+      connectionMode: "local",
+      workspace: { workspaceId: "roadmap_123", backendId: "local", connectionMode: "local" }
+    }
   });
   assert.deepEqual(relayHttpRequestForCommand({
     deviceId: device.deviceId,
@@ -1812,6 +1947,34 @@ test("Bridge App relay foundation enforces device status, Project Grants, and co
     method: "GET",
     path: "/api/roadmaps/roadmap_123/agent-sessions/agent_1/events",
     stream: true
+  });
+});
+
+test("Bridge App Relay inventory transport preserves the selected remote backend identity", async () => {
+  const deviceId = "device_inventory";
+  const result = await forwardRelayCommand({
+    bridgeApiUrl: "http://127.0.0.1:19689",
+    command: {
+      deviceId,
+      command: "provider.inventory",
+      payload: { backendId: `remote:${deviceId}` }
+    },
+    fetchImpl: async url => {
+      assert.equal(String(url), "http://127.0.0.1:19689/api/providers/inventory?backendId=local");
+      return new Response(JSON.stringify({
+        ok: true,
+        value: { backendId: "local", providers: [] }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+  });
+
+  assert.deepEqual(result, {
+    ok: true,
+    status: 200,
+    body: {
+      ok: true,
+      value: { backendId: `remote:${deviceId}`, providers: [] }
+    }
   });
 });
 
@@ -2367,7 +2530,7 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
       userId: "user_123",
       registeredAt: new Date().toISOString(),
       status: "online",
-      provider: { providerId: "codex", kind: "codex", label: "Codex", connectionKind: "local_cli", installed: true, configured: true, authenticated: true, ready: true, auth: { kind: "chatgpt_oauth", state: "authenticated" }, capabilities: { canExecute: true, canEditFiles: true, canRunShell: true, supportsWorktree: true, supportsEventStream: true, supportsUsage: true, supportsSubscriptionAuth: true, supportsDeviceAuth: true, supportsApiKeyAuth: false, supportsRemoteRelay: true, supportsAcp: false }, recommendedAction: "none" },
+      provider: { providerId: "codex", kind: "codex", label: "Codex", connectionKind: "local_cli", installed: true, configured: true, authenticated: true, ready: true, auth: { kind: "chatgpt_oauth", state: "authenticated" }, capabilities: { canExecute: true, canEditFiles: true, canRunShell: true, supportsWorktree: true, supportsEventStream: true, supportsUsage: true, supportsSubscriptionAuth: true, supportsDeviceAuth: true, supportsApiKeyAuth: false, supportsRemoteRelay: true, supportsAcp: false }, modelInventory: { state: "available", models: [] }, recommendedAction: "none" },
       workspaces: [{
         workspaceId: "roadmap_remote",
         roadmapId: "roadmap_remote",
@@ -2608,10 +2771,20 @@ test("Bridge App outbound Relay client heartbeats and reconnects with backoff", 
   }
 });
 
+const CURRENT_SIDECAR_TARGET = new Map([
+  ["darwin/x64", "x86_64-apple-darwin"],
+  ["darwin/arm64", "aarch64-apple-darwin"],
+  ["linux/x64", "x86_64-unknown-linux-gnu"],
+  ["linux/arm64", "aarch64-unknown-linux-gnu"],
+  ["win32/x64", "x86_64-pc-windows-msvc"],
+  ["win32/arm64", "aarch64-pc-windows-msvc"]
+]).get(`${process.platform}/${process.arch}`);
 const BUILT_CURRENT_PLATFORM_SIDECAR = join(
   process.cwd(),
   "apps/bridge-desktop/dist",
-  process.platform === "win32" ? "hunsu-bridge-sidecar.exe" : "hunsu-bridge-sidecar"
+  CURRENT_SIDECAR_TARGET
+    ? `hunsu-bridge-sidecar-${CURRENT_SIDECAR_TARGET}${process.platform === "win32" ? ".exe" : ""}`
+    : "unsupported-sidecar-target"
 );
 const SIDECAR_DIST_DIR = join(process.cwd(), "apps/bridge-desktop/dist");
 const SIDECAR_DIST_MUTATED_FILES = [
@@ -2658,6 +2831,68 @@ test("built current-platform Bridge sidecar status matches the Node bundle", {
   }
 });
 
+test("Bridge desktop filtered artifact report command resolves package-root defaults", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-artifact-report-test-"));
+  const workspaceRoot = join(root, "workspace");
+  const packageRoot = join(workspaceRoot, "apps/bridge-desktop");
+  const bundleDir = join(packageRoot, "src-tauri/target/release/bundle");
+  const distDir = join(packageRoot, "dist");
+  const target = "x86_64-unknown-linux-gnu";
+  const sidecarFile = `hunsu-bridge-sidecar-${target}`;
+  try {
+    mkdirSync(join(packageRoot, "scripts"), { recursive: true });
+    mkdirSync(bundleDir, { recursive: true });
+    mkdirSync(distDir, { recursive: true });
+    writeFileSync(join(workspaceRoot, "pnpm-workspace.yaml"), "packages:\n  - apps/*\n", "utf8");
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      readFileSync(join(process.cwd(), "apps/bridge-desktop/package.json"), "utf8"),
+      "utf8"
+    );
+    writeFileSync(
+      join(packageRoot, "scripts/report-artifact-sizes.mjs"),
+      readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/report-artifact-sizes.mjs"), "utf8"),
+      "utf8"
+    );
+    writeFileSync(join(bundleDir, "Hunsu Bridge.test-bundle"), "bundle", "utf8");
+    writeFileSync(join(distDir, sidecarFile), "sidecar", "utf8");
+    writeFileSync(join(distDir, "sidecar-manifest.json"), `${JSON.stringify({
+      schema: "hunsu.bridge-sidecars.v1",
+      target,
+      artifacts: [{ target, file: sidecarFile, kind: "native-executable" }]
+    }, null, 2)}\n`, "utf8");
+
+    const reported = spawnSync("pnpm", [
+      "--filter",
+      "@hunsu/bridge-desktop",
+      "artifacts:report-sizes",
+      "--",
+      "--target",
+      target
+    ], { cwd: workspaceRoot, encoding: "utf8" });
+
+    assert.equal(reported.status, 0, `${reported.stdout}\n${reported.stderr}`);
+    const report = JSON.parse(readFileSync(join(bundleDir, "artifact-size-report.json"), "utf8")) as {
+      schema: string;
+      directory: string;
+      artifacts: Array<{ path: string }>;
+      sidecars: Array<{ target: string; file: string }>;
+    };
+    assert.equal(report.schema, "hunsu.bridge-desktop-artifact-sizes.v2");
+    assert.equal(report.directory, bundleDir);
+    assert.deepEqual(report.artifacts.map(artifact => artifact.path), ["Hunsu Bridge.test-bundle"]);
+    assert.deepEqual(report.sidecars, [{
+      target,
+      file: sidecarFile,
+      sizeBytes: 7,
+      sizeMiB: 0
+    }]);
+    assert.match(reported.stdout, new RegExp(`sidecar:${target}`));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Bridge App protocol plan and sidecar supervisor expose native desktop foundations", async () => {
   await delay(1_000);
   const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-sidecar-test-"));
@@ -2695,22 +2930,54 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.equal(devInvocation.args.includes("/opt/hunsu/bridge/main.js"), true);
     assert.equal(devInvocation.args.at(-1), "daemon");
     assert.equal(plan.supported, process.platform === "darwin" || process.platform === "win32" || process.platform === "linux");
-    assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/Info.plist"), "utf8"), /CFBundleURLSchemes/);
-    assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/windows/hunsu-protocol.wxs"), "utf8"), /Software\\Classes\\hunsu/);
     const tauriConfig = JSON.parse(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/tauri.conf.json"), "utf8")) as {
-      bundle: { externalBin?: string[]; resources?: string[] };
+      app: { windows: Array<{ visible?: boolean }> };
+      bundle: { externalBin?: string[]; resources?: string[]; targets?: string[] };
+      plugins?: { "deep-link"?: { desktop?: { schemes?: string[] } } };
     };
+    assert.equal(tauriConfig.app.windows[0]?.visible, false);
+    assert.deepEqual(tauriConfig.bundle.targets, ["nsis"]);
     assert.deepEqual(tauriConfig.bundle.externalBin, ["../dist/hunsu-bridge-sidecar"]);
-    assert.equal(tauriConfig.bundle.resources?.includes("../dist/hunsu-bridge-sidecar*"), true);
-    assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8"), /hunsu-bridge-sidecar/);
+    assert.deepEqual(tauriConfig.bundle.resources, ["../dist/sidecar-manifest.json"]);
+    assert.equal(tauriConfig.bundle.resources?.some(resource => resource.includes("hunsu-bridge-sidecar")), false);
+    assert.deepEqual(tauriConfig.plugins?.["deep-link"]?.desktop?.schemes, ["hunsu"]);
+    const cargoToml = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/Cargo.toml"), "utf8");
+    assert.match(cargoToml, /tauri-plugin-deep-link = "2"/);
+    assert.match(cargoToml, /tauri-plugin-single-instance = \{ version = "2", features = \["deep-link"\] \}/);
+    const tauriSource = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8");
+    const singleInstancePlugin = tauriSource.indexOf(".plugin(tauri_plugin_single_instance::init");
+    const deepLinkPlugin = tauriSource.indexOf(".plugin(tauri_plugin_deep_link::init())");
+    assert.equal(singleInstancePlugin >= 0, true);
+    assert.equal(deepLinkPlugin > singleInstancePlugin, true);
+    assert.match(tauriSource, /app\.deep_link\(\)\.on_open_url/);
+    assert.match(tauriSource, /app\.deep_link\(\)\.get_current\(\)/);
+    assert.match(tauriSource, /#\[cfg\(target_os = "linux"\)\][\s\S]*app\.deep_link\(\)\.register_all\(\)/);
+    assert.match(tauriSource, /const BRIDGE_SIDECAR_NAME: &str = "hunsu-bridge-sidecar"/);
+    assert.match(tauriSource, /\.sidecar\(BRIDGE_SIDECAR_NAME\)/);
+    assert.match(tauriSource, /async fn bridge_snapshot/);
+    assert.match(tauriSource, /tauri::async_runtime::spawn/);
+    assert.doesNotMatch(tauriSource, /BaseDirectory::Resource|fn sidecar_path|std::process::Command|hunsu-bridge-sidecar\.exe/);
+    assert.match(tauriSource, /Provider:/);
+    assert.match(tauriSource, /Local:/);
+    assert.match(tauriSource, /Remote:/);
+    assert.match(tauriSource, /Workspaces:/);
+    assert.match(tauriSource, /Open Hunsu Web/);
+    assert.match(tauriSource, /Add Workspace/);
+    assert.match(tauriSource, /MessageDialogButtons::OkCancel/);
+    assert.match(tauriSource, /quit_background_preference/);
+    assert.match(tauriSource, /status"\]\["quitBehavior"\]/);
+    assert.doesNotMatch(tauriSource, /HUNSU_BRIDGE_QUIT_BACKGROUND/);
     const sidecarScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/prepare-sidecars.mjs"), "utf8");
     const buildScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/build-native-sidecars.mjs"), "utf8");
+    const artifactWorkflow = readFileSync(join(process.cwd(), ".github/workflows/bridge-desktop-artifacts.yml"), "utf8");
     const packageJson = JSON.parse(readFileSync(join(process.cwd(), "apps/bridge-desktop/package.json"), "utf8")) as {
       scripts: Record<string, string>;
       devDependencies: Record<string, string>;
     };
     assert.match(packageJson.scripts.build, /build-native-sidecars\.mjs/);
     assert.match(packageJson.scripts["sidecars:build"], /build-native-sidecars\.mjs/);
+    assert.match(packageJson.scripts["artifacts:report-sizes"], /report-artifact-sizes\.mjs/);
+    assert.match(packageJson.scripts["desktop:verify-windows-gui"], /verify-windows-gui-subsystem\.mjs/);
     assert.equal(packageJson.devDependencies.esbuild.length > 0, true);
     assert.equal(packageJson.devDependencies.postject.length > 0, true);
     assert.match(sidecarScript, /x86_64-apple-darwin/);
@@ -2723,7 +2990,46 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(buildScript, /SHASUMS256\.txt/);
     assert.match(buildScript, /darwin-x64/);
     assert.match(buildScript, /win-arm64/);
-    assert.match(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8"), /hunsu-bridge-sidecar\.exe/);
+    assert.match(artifactWorkflow, /Windows ARM64/);
+    assert.match(artifactWorkflow, /aarch64-pc-windows-msvc/);
+    assert.match(artifactWorkflow, /hunsu-bridge-windows-arm64/);
+    assert.match(artifactWorkflow, /Linux x64/);
+    assert.match(artifactWorkflow, /aarch64-unknown-linux-gnu/);
+    assert.match(artifactWorkflow, /HUNSU_BRIDGE_SIDECAR_TARGET/);
+    assert.match(artifactWorkflow, /if: startsWith\(matrix\.platform, 'windows'\)/);
+    assert.match(artifactWorkflow, /desktop:verify-windows-gui/);
+    assert.match(artifactWorkflow, /Verify and smoke-test native sidecar/);
+    assert.match(artifactWorkflow, /spawnSync\(sidecarPath, \["status"\]/);
+    assert.match(artifactWorkflow, /HUNSU_BRIDGE_APP_STATE_PATH/);
+    assert.match(artifactWorkflow, /Local Bridge:/);
+    assert.match(artifactWorkflow, /finally \{[\s\S]*rmSync\(smokeRoot, \{ recursive: true, force: true \}\)/);
+    assert.match(artifactWorkflow, /codesign --verify --strict --verbose=2 "\$\{SIDECAR_PATH\}"/);
+    assert.match(artifactWorkflow, /codesign --verify --deep --strict --verbose=2 "\$\{app_bundle\}"/);
+    assert.match(artifactWorkflow, /test -x "\$\{SIDECAR_PATH\}"/);
+    assert.match(artifactWorkflow, /SIDECAR_SHA256SUM\.txt/);
+    assert.equal(
+      artifactWorkflow.indexOf("codesign --verify --strict --verbose=2")
+        < artifactWorkflow.indexOf("spawnSync(sidecarPath, [\"status\"]"),
+      true
+    );
+    for (const target of [
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]) {
+      assert.match(artifactWorkflow, new RegExp(target));
+    }
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/tauri.macos.conf.json"), "utf8")).bundle.targets,
+      ["app", "dmg"]
+    );
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/tauri.linux.conf.json"), "utf8")).bundle.targets,
+      ["deb", "appimage"]
+    );
 
     const launcherPath = join(root, "hunsu-bridge-sidecar-x86_64-unknown-linux-gnu");
     writeFileSync(launcherPath, [
@@ -2750,38 +3056,69 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.equal(accepted.status, 0, accepted.stderr);
 
     const nativeDir = join(root, "native-sidecars");
-    const preparedDist = join(root, "prepared-dist");
     mkdirSync(nativeDir);
     const sidecarArtifacts = [
-      ["hunsu-bridge-sidecar-x86_64-apple-darwin", "mach-o"],
-      ["hunsu-bridge-sidecar-aarch64-apple-darwin", "mach-o"],
-      ["hunsu-bridge-sidecar-x86_64-unknown-linux-gnu", "elf"],
-      ["hunsu-bridge-sidecar-aarch64-unknown-linux-gnu", "elf"],
-      ["hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe", "pe"],
-      ["hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe", "pe"]
+      ["x86_64-apple-darwin", "hunsu-bridge-sidecar-x86_64-apple-darwin", "mach-o"],
+      ["aarch64-apple-darwin", "hunsu-bridge-sidecar-aarch64-apple-darwin", "mach-o"],
+      ["x86_64-unknown-linux-gnu", "hunsu-bridge-sidecar-x86_64-unknown-linux-gnu", "elf"],
+      ["aarch64-unknown-linux-gnu", "hunsu-bridge-sidecar-aarch64-unknown-linux-gnu", "elf"],
+      ["x86_64-pc-windows-msvc", "hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe", "pe"],
+      ["aarch64-pc-windows-msvc", "hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe", "pe"]
     ] as const;
-    for (const [artifact, kind] of sidecarArtifacts) {
+    for (const [, artifact, kind] of sidecarArtifacts) {
       writeFileSync(join(nativeDir, artifact), fakeNativeExecutable(kind));
     }
-    const prepared = spawnSync(process.execPath, [
-      "--conditions=development",
-      "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
-      "--native-dir",
-      nativeDir,
-      "--dist-dir",
-      preparedDist
-    ], { cwd: process.cwd(), encoding: "utf8" });
-    assert.equal(prepared.status, 0, prepared.stderr);
-    const sidecarManifest = JSON.parse(readFileSync(join(preparedDist, "sidecar-manifest.json"), "utf8")) as {
-      artifacts: Array<{ target: string; file: string; kind: string }>;
-      currentPlatform?: { file: string };
-    };
-    assert.equal(sidecarManifest.artifacts.length, sidecarArtifacts.length);
-    assert.deepEqual(sidecarManifest.artifacts.map(artifact => artifact.kind), sidecarArtifacts.map(() => "native-executable"));
-    assert.equal(sidecarManifest.artifacts.some(artifact => artifact.file.endsWith(".cmd")), false);
-    if (sidecarManifest.currentPlatform) {
-      assert.equal(existsSync(join(preparedDist, sidecarManifest.currentPlatform.file)), true);
+    let reportSidecarManifest = "";
+    for (const [target, artifact] of sidecarArtifacts) {
+      const preparedDist = join(root, `prepared-${target}`);
+      mkdirSync(preparedDist);
+      writeFileSync(join(preparedDist, "hunsu-bridge-sidecar.exe"), fakeNativeExecutable("pe"));
+      writeFileSync(join(preparedDist, "hunsu-bridge-sidecar-x86_64-apple-darwin"), fakeNativeExecutable("mach-o"));
+      const prepared = spawnSync(process.execPath, [
+        "--conditions=development",
+        "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
+        "--native-dir",
+        nativeDir,
+        "--dist-dir",
+        preparedDist,
+        "--target",
+        target
+      ], { cwd: process.cwd(), encoding: "utf8" });
+      assert.equal(prepared.status, 0, prepared.stderr);
+      const manifestPath = join(preparedDist, "sidecar-manifest.json");
+      const sidecarManifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+        target: string;
+        artifacts: Array<{ target: string; file: string; kind: string }>;
+      };
+      assert.equal(sidecarManifest.target, target);
+      assert.deepEqual(sidecarManifest.artifacts, [{ target, file: artifact, kind: "native-executable" }]);
+      assert.deepEqual(readdirSync(preparedDist).filter(file => file.startsWith("hunsu-bridge-sidecar")), [artifact]);
+      reportSidecarManifest ||= manifestPath;
     }
+
+    const bundleReportDir = join(root, "bundle-report");
+    const artifactSizeReport = join(bundleReportDir, "artifact-size-report.json");
+    mkdirSync(bundleReportDir);
+    writeFileSync(join(bundleReportDir, "Hunsu Bridge.test-bundle"), "bundle");
+    const reported = spawnSync(process.execPath, [
+      "apps/bridge-desktop/scripts/report-artifact-sizes.mjs",
+      "--directory",
+      bundleReportDir,
+      "--output",
+      artifactSizeReport,
+      "--sidecar-manifest",
+      reportSidecarManifest,
+      "--target",
+      sidecarArtifacts[0][0]
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    assert.equal(reported.status, 0, reported.stderr);
+    const sizeReport = JSON.parse(readFileSync(artifactSizeReport, "utf8")) as {
+      schema: string;
+      sidecars: Array<{ target: string; file: string }>;
+    };
+    assert.equal(sizeReport.schema, "hunsu.bridge-desktop-artifact-sizes.v2");
+    assert.deepEqual(sizeReport.sidecars.map(sidecar => sidecar.target), [sidecarArtifacts[0][0]]);
+    assert.match(reported.stdout, new RegExp(`sidecar:${sidecarArtifacts[0][0]}`));
 
     const bundleOnly = spawnSync("pnpm", [
       "--filter",
@@ -2822,6 +3159,49 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(readFileSync(logPath, "utf8"), /sidecar.crashed/);
   } finally {
     restoreSidecarDist(sidecarDistSnapshot);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge App Windows release crate selects the GUI subsystem", () => {
+  const tauriSource = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/src/main.rs"), "utf8");
+  assert.equal(
+    tauriSource.split(/\r?\n/, 1)[0],
+    '#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]'
+  );
+});
+
+test("Bridge App Windows executable validator requires PE GUI subsystem value 2", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-windows-subsystem-test-"));
+  const validator = join(process.cwd(), "apps/bridge-desktop/scripts/verify-windows-gui-subsystem.mjs");
+  try {
+    const guiExecutable = join(root, "hunsu-bridge-gui.exe");
+    writeFileSync(guiExecutable, fakeWindowsExecutable(2));
+    const accepted = spawnSync(process.execPath, [validator, "--executable", guiExecutable], {
+      cwd: process.cwd(),
+      encoding: "utf8"
+    });
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.stdout, /PE Optional Header Subsystem is Windows GUI \(2\)/);
+
+    const cuiExecutable = join(root, "hunsu-bridge-cui.exe");
+    writeFileSync(cuiExecutable, fakeWindowsExecutable(3));
+    const rejected = spawnSync(process.execPath, [validator, "--executable", cuiExecutable], {
+      cwd: process.cwd(),
+      encoding: "utf8"
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /expected Windows GUI \(2\), found Windows CUI \(3\)/);
+
+    const missingExecutable = join(root, "missing-hunsu-bridge.exe");
+    const missing = spawnSync(process.execPath, [validator, "--executable", missingExecutable], {
+      cwd: process.cwd(),
+      encoding: "utf8"
+    });
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /Windows release executable is missing/);
+    assert.match(missing.stderr, /src-tauri\/target\/release\/hunsu-bridge\.exe/);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2880,6 +3260,20 @@ function fakeNativeExecutable(kind: "elf" | "mach-o" | "pe"): Buffer {
       buffer.set([0x4d, 0x5a, 0x90, 0x00], 0);
       break;
   }
+  return buffer;
+}
+
+function fakeWindowsExecutable(subsystem: number): Buffer {
+  const buffer = Buffer.alloc(512);
+  const peOffset = 0x80;
+  const coffOffset = peOffset + 4;
+  const optionalHeaderOffset = coffOffset + 20;
+  buffer.set([0x4d, 0x5a], 0);
+  buffer.writeUInt32LE(peOffset, 0x3c);
+  buffer.writeUInt32LE(0x00004550, peOffset);
+  buffer.writeUInt16LE(0xf0, coffOffset + 16);
+  buffer.writeUInt16LE(0x20b, optionalHeaderOffset);
+  buffer.writeUInt16LE(subsystem, optionalHeaderOffset + 68);
   return buffer;
 }
 

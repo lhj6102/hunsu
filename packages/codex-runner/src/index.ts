@@ -3,13 +3,14 @@ import {
   createDefaultHarness,
   createDefaultMemberConfig,
   DEFAULT_TEAM_PROMPT,
+  directProviderSelectionFromModelSelection,
   getHarnessMember,
   getHarnessMemberConfig,
   harnessSnapshotForTeam,
   memberConfigFromMemberEntity,
   renderPromptTemplate
 } from "@hunsu/protocol";
-import type { BoardProjection, Harness, HubPackageLock, HarnessSnapshot, ManagerConfig, MemberConfig, MemberPath, Destination } from "@hunsu/protocol";
+import type { BoardProjection, DirectProviderModelSelection, Harness, HubPackageLock, HarnessSnapshot, ManagerConfig, MemberConfig, MemberPath, Destination, ServiceTier } from "@hunsu/protocol";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -97,6 +98,7 @@ export type CodexRunnerThreadOptions = {
   additionalDirectories?: string[];
   model?: string;
   modelReasoningEffort?: string;
+  serviceTier?: ServiceTier;
 };
 
 export type ProcessEnvironment = Record<string, string | undefined>;
@@ -232,6 +234,7 @@ export type StartRunInput = {
   previousMemberOutputs?: string[];
   conversationRef?: { conversationHash: string; worktreeHash?: string };
   codexThreadOptions?: CodexRunnerThreadOptions;
+  resolvedModelSelection?: DirectProviderModelSelection;
   board: BoardProjection;
 };
 
@@ -995,7 +998,7 @@ export class CodexAppServerRunner implements Runner {
       approvalsReviewer: options.approvalsReviewer ?? "user",
       sandbox: options.sandboxMode,
       model: options.model ?? null,
-      serviceTier: config.serviceTier === "fast" ? "fast" : null,
+      serviceTier: options.serviceTier === "fast" ? "fast" : null,
       ephemeral: false,
       threadSource: "user"
     };
@@ -1010,7 +1013,7 @@ export class CodexAppServerRunner implements Runner {
       approvalsReviewer: options.approvalsReviewer ?? "user",
       sandbox: options.sandboxMode,
       model: options.model ?? null,
-      serviceTier: config.serviceTier === "fast" ? "fast" : null
+      serviceTier: options.serviceTier === "fast" ? "fast" : null
     };
   }
 
@@ -1038,7 +1041,7 @@ export class CodexAppServerRunner implements Runner {
       approvalsReviewer: options.approvalsReviewer ?? "user",
       sandboxPolicy: appServerSandboxPolicyFor(input.repositoryPath, options, readOnly),
       model: options.model ?? null,
-      serviceTier: config.serviceTier === "fast" ? "fast" : null,
+      serviceTier: options.serviceTier === "fast" ? "fast" : null,
       effort: options.modelReasoningEffort ?? null,
       outputSchema: outputSchema ?? null
     };
@@ -1049,7 +1052,8 @@ export class CodexAppServerRunner implements Runner {
     const options: CodexRunnerThreadOptions = {
       ...this.threadOptions,
       ...input.codexThreadOptions,
-      ...memberOptions
+      ...memberOptions,
+      ...threadOptionsForResolvedModel(input.resolvedModelSelection)
     };
     if (readOnly) {
       options.networkAccessEnabled = input.codexThreadOptions?.networkAccessEnabled ?? this.threadOptions.networkAccessEnabled ?? memberOptions.networkAccessEnabled;
@@ -2176,6 +2180,7 @@ function hunsuDraftConfigFor(manager: ManagerConfig = createDefaultManagerConfig
     ...config,
     promptTemplate: { ...manager.promptTemplate },
     plugins: manager.plugins.map(plugin => ({ ...plugin })),
+    ...(manager.modelSelection ? { modelSelection: JSON.parse(JSON.stringify(manager.modelSelection)) as MemberConfig["modelSelection"] } : {}),
     execution: { kind: "worktree_write", network: "enabled" },
     approval: { policy: "never" }
   };
@@ -2221,13 +2226,37 @@ function threadOptionsForMember(member: MemberConfig): CodexRunnerThreadOptions 
       options.sandboxMode = "danger-full-access";
       break;
   }
+  const directSelection = member.modelSelection
+    ? directProviderSelectionFromModelSelection(member.modelSelection)
+    : undefined;
+  if (directSelection) {
+    return {
+      ...options,
+      ...threadOptionsForResolvedModel(directSelection)
+    };
+  }
+  if (member.modelSelection) {
+    return options;
+  }
   if (member.model && member.model !== "codex-default") {
     options.model = member.model;
   }
   if (member.reasoningEffort && member.reasoningEffort !== "default") {
     options.modelReasoningEffort = member.reasoningEffort;
   }
+  options.serviceTier = member.serviceTier ?? "default";
   return options;
+}
+
+function threadOptionsForResolvedModel(selection: DirectProviderModelSelection | undefined): CodexRunnerThreadOptions {
+  if (!selection || selection.providerId !== "codex") {
+    return {};
+  }
+  return {
+    model: selection.model === "codex-default" ? undefined : selection.model,
+    modelReasoningEffort: selection.reasoningEffort && selection.reasoningEffort !== "default" ? selection.reasoningEffort : undefined,
+    serviceTier: selection.serviceTier ?? "default"
+  };
 }
 
 function isMemberPathRunInput(input: StartRunInput): input is MemberPathRunInput {

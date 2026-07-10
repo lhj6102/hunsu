@@ -83,8 +83,8 @@ export function protocolRegistrationPlan(commandPath: string, args: string[] = [
       protocol: "hunsu",
       supported: true,
       installerManaged: true,
-      commands: ["Register CFBundleURLSchemes=hunsu in the Hunsu Bridge app bundle Info.plist."],
-      notes: ["The Tauri bundle config owns macOS protocol registration during app packaging."]
+      commands: ["Package the hunsu desktop scheme with Tauri's deep-link plugin."],
+      notes: ["Tauri's deep-link configuration generates the macOS bundle registration."]
     };
   }
   if (os === "win32") {
@@ -93,7 +93,7 @@ export function protocolRegistrationPlan(commandPath: string, args: string[] = [
       protocol: "hunsu",
       supported: true,
       installerManaged: true,
-      commands: ["Register HKCU\\Software\\Classes\\hunsu\\shell\\open\\command in the Windows installer."],
+      commands: ["Register HKCU\\Software\\Classes\\hunsu\\shell\\open\\command through Tauri's deep-link installer integration."],
       notes: [`Default command: ${commandLine([resolvedCommand, ...args, "%1"])}`]
     };
   }

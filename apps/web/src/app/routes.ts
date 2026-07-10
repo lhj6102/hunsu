@@ -1,6 +1,7 @@
 export type StudioRoute =
   | { kind: "hub" }
   | { kind: "setup"; next: string }
+  | { kind: "modelAliases" }
   | { kind: "launcher" }
   | { kind: "open"; path: string | undefined; browseToken?: string; rootId?: string }
   | { kind: "port"; path: string | undefined; browseToken?: string; rootId?: string }
@@ -13,6 +14,9 @@ export function parseStudioRoute(location: Location): StudioRoute {
   if (location.pathname === "/studio/setup") {
     const params = new URLSearchParams(location.search);
     return { kind: "setup", next: safeStudioNext(params.get("next")) };
+  }
+  if (location.pathname === "/studio/settings/model-aliases") {
+    return { kind: "modelAliases" };
   }
   if (location.pathname === "/" || location.pathname === "" || location.pathname === "/studio") {
     return { kind: "launcher" };
@@ -33,7 +37,7 @@ export function parseStudioRoute(location: Location): StudioRoute {
 }
 
 export function isBridgeBackedStudioRoute(route: StudioRoute): boolean {
-  return route.kind === "launcher" || route.kind === "open" || route.kind === "port" || route.kind === "roadmap";
+  return route.kind === "launcher" || route.kind === "open" || route.kind === "port" || route.kind === "roadmap" || route.kind === "modelAliases";
 }
 
 export function roadmapApiPath(roadmapId: string, suffix: string): string {

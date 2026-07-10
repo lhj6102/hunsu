@@ -79,6 +79,7 @@ test("Roadmap workspace preflight actions map to Bridge App destinations", async
     assert.equal(module.bridgeActionHref({ type: "open_bridge_app", label: "Open Bridge App" }), "hunsu://open");
     assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Server href", href: "hunsu://workspaces" }), "hunsu://workspaces");
     assert.equal(module.bridgeActionHref({ type: "open_connection", label: "Open Connection" }), "hunsu://connection");
+    assert.equal(module.bridgeActionHref({ type: "edit_model_alias", label: "Edit Model Alias" }), "/studio/settings/model-aliases");
     assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex", providerId: "codex" }), "hunsu://provider/codex");
     assert.equal(module.bridgeActionHref({ type: "open_provider_setup", label: "Open Provider Setup" }), "hunsu://provider");
   } finally {
@@ -86,7 +87,7 @@ test("Roadmap workspace preflight actions map to Bridge App destinations", async
   }
 });
 
-test("Web Execute preflight contract exposes provider workspace and connection areas only", () => {
+test("Web Execute preflight contract exposes provider workspace connection and model areas", () => {
   const bridgeTypesSource = readFileSync(join(WEB_ROOT, "src/shared/api/bridgeTypes.ts"), "utf8");
   const preflightContract = bridgeTypesSource.slice(
     bridgeTypesSource.indexOf("export type ExecutePreflightAction"),
@@ -96,10 +97,157 @@ test("Web Execute preflight contract exposes provider workspace and connection a
   assert.match(preflightContract, /area: "provider"/);
   assert.match(preflightContract, /area: "workspace"/);
   assert.match(preflightContract, /area: "connection"/);
+  assert.match(preflightContract, /area: "model"/);
+  assert.match(preflightContract, /area: "model";\s+backendId: string;/);
   assert.doesNotMatch(preflightContract, /area: "codex"/);
   assert.doesNotMatch(preflightContract, /area: "roadmap"/);
   assert.doesNotMatch(preflightContract, /install_codex|codex_login|codex_recheck|open_prerequisites|open_roadmaps|activate_roadmap|CODEX_|ROADMAP_/);
   assert.doesNotMatch(preflightActionsSource, /install_codex|codex_login|codex_recheck|open_prerequisites|open_roadmaps|activate_roadmap/);
+});
+
+test("Web model selection UX keeps alias and direct provider modes available", () => {
+  const roadmapWorkspaceSource = readFileSync(join(WEB_ROOT, "src/features/roadmap-workspace/RoadmapWorkspace.tsx"), "utf8");
+  const aliasSettingsSource = readFileSync(join(WEB_ROOT, "src/features/model-aliases/ModelAliasSettings.tsx"), "utf8");
+  const aliasStorageSource = readFileSync(join(WEB_ROOT, "src/features/model-aliases/modelAliasStorage.ts"), "utf8");
+  const assignmentSource = readFileSync(join(WEB_ROOT, "src/features/model-aliases/modelSelectionAssignment.ts"), "utf8");
+  const configDraftSource = readFileSync(join(WEB_ROOT, "src/features/model-aliases/modelConfigDraftStorage.ts"), "utf8");
+  assert.match(roadmapWorkspaceSource, /executeModelMode/);
+  assert.match(roadmapWorkspaceSource, /Use alias/);
+  assert.match(roadmapWorkspaceSource, /Direct provider/);
+  assert.match(roadmapWorkspaceSource, /kind: "direct"/);
+  assert.match(roadmapWorkspaceSource, /capabilities\.reasoningEfforts/);
+  assert.match(roadmapWorkspaceSource, /capabilities\.serviceTiers/);
+  assert.match(roadmapWorkspaceSource, /aliases: input\.aliases/);
+  assert.doesNotMatch(roadmapWorkspaceSource, /modelAliases: input\.aliases/);
+  assert.match(aliasSettingsSource, /aliases\s*\}/);
+  assert.doesNotMatch(aliasSettingsSource, /modelAliases: aliases/);
+  assert.doesNotMatch(roadmapWorkspaceSource, /executeModelAliasPayload/);
+  assert.match(aliasSettingsSource, /createAlias/);
+  assert.match(aliasSettingsSource, /deleteSelectedAlias/);
+  assert.match(aliasSettingsSource, /capabilities\.reasoningEfforts/);
+  assert.match(aliasStorageSource, /scope: \{ kind: "user" \}/);
+  assert.doesNotMatch(aliasStorageSource, /scope: "user"/);
+  assert.match(assignmentSource, /assignManagerModelSelection/);
+  assert.match(assignmentSource, /assignMemberModelSelection/);
+  assert.match(assignmentSource, /assignExecutorModelSelection/);
+  assert.match(aliasSettingsSource, /Web Config Draft/);
+  assert.match(aliasSettingsSource, /readWebModelConfigDraft/);
+  assert.match(aliasSettingsSource, /assignWebModelConfigDraft/);
+  assert.match(aliasSettingsSource, /writeWebModelConfigDraft/);
+  assert.match(aliasSettingsSource, /Model aliases are currently saved in this browser/);
+  assert.match(aliasSettingsSource, /Account and workspace sync will be added later/);
+  assert.match(configDraftSource, /assignManagerModelSelection/);
+  assert.match(configDraftSource, /assignMemberModelSelection/);
+  assert.match(configDraftSource, /assignExecutorModelSelection/);
+  assert.doesNotMatch(readFileSync(join(WEB_ROOT, "src/shared/api/bridgeTypes.ts"), "utf8"), /modelAliasOverrides\?:|modelAliases\?:/);
+});
+
+test("Web model alias settings config draft assigns Manager Member and Executor configs through the production path", async () => {
+  const { module, close } = await loadModelConfigDraftStorageModule();
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>();
+  try {
+    const directProvider = {
+      providerId: "codex",
+      model: "gpt-5.5",
+      reasoningEffort: "medium",
+      serviceTier: "fast"
+    };
+    const draft = module.createDefaultWebModelConfigDraft("2026-07-10T00:00:00.000Z");
+    const managerAlias = module.assignWebModelConfigDraft(draft, "manager", { mode: "alias", aliasId: "ReviewerModel" }, "2026-07-10T00:01:00.000Z");
+    assert.equal(managerAlias.manager.modelSelection.kind, "alias");
+    assert.equal(managerAlias.manager.modelSelection.aliasId, "ReviewerModel");
+
+    const managerDirect = module.assignWebModelConfigDraft(managerAlias, "manager", { mode: "direct", provider: directProvider }, "2026-07-10T00:02:00.000Z");
+    assert.equal(managerDirect.manager.modelSelection.kind, "direct");
+    assert.equal(managerDirect.manager.modelSelection.provider.model, "gpt-5.5");
+
+    const memberDirect = module.assignWebModelConfigDraft(managerDirect, "member", { mode: "direct", provider: directProvider }, "2026-07-10T00:03:00.000Z");
+    assert.equal(memberDirect.member.modelSelection.kind, "direct");
+    assert.equal(memberDirect.member.model, "gpt-5.5");
+    assert.equal(memberDirect.member.reasoningEffort, "medium");
+    assert.equal(memberDirect.member.serviceTier, "fast");
+
+    const executorAlias = module.assignWebModelConfigDraft(memberDirect, "executor", { mode: "alias", aliasId: "PrimaryModel" }, "2026-07-10T00:04:00.000Z");
+    assert.equal(executorAlias.executor.runtimePolicy.modelSelection.kind, "alias");
+    assert.equal(executorAlias.executor.runtimePolicy.modelSelection.aliasId, "PrimaryModel");
+
+    (globalThis as unknown as { window: unknown }).window = {
+      localStorage: {
+        getItem(key: string) {
+          return storage.get(key) ?? null;
+        },
+        setItem(key: string, value: string) {
+          storage.set(key, value);
+        },
+        removeItem(key: string) {
+          storage.delete(key);
+        }
+      }
+    };
+    module.writeWebModelConfigDraft(executorAlias);
+    const persisted = module.readWebModelConfigDraft();
+    assert.equal(persisted.manager.modelSelection.kind, "direct");
+    assert.equal(persisted.member.modelSelection.provider.model, "gpt-5.5");
+    assert.equal(persisted.executor.runtimePolicy.modelSelection.aliasId, "PrimaryModel");
+  } finally {
+    await close();
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+  }
+});
+
+test("Web model selection assignment helpers update Manager Member and Executor configs", async () => {
+  const { module, close } = await loadModelSelectionAssignmentModule();
+  try {
+    const directProvider = {
+      providerId: "codex",
+      model: "gpt-5.5",
+      reasoningEffort: "medium",
+      serviceTier: "fast"
+    };
+    const manager = module.assignManagerModelSelection({
+      id: "manager.test",
+      promptTemplate: { engine: "hunsu-template-v1", template: "Guide the draft." },
+      skills: [],
+      plugins: []
+    }, { mode: "alias", aliasId: "PrimaryModel" });
+    assert.equal(manager.modelSelection.kind, "alias");
+    assert.equal(manager.modelSelection.aliasId, "PrimaryModel");
+
+    const member = module.assignMemberModelSelection({
+      id: "member.test",
+      promptTemplate: { engine: "hunsu-template-v1", template: "Build." },
+      skills: [],
+      plugins: [],
+      model: "codex-default",
+      reasoningEffort: "default",
+      serviceTier: "default",
+      execution: { kind: "read_only", network: "disabled" },
+      approval: { policy: "never" }
+    }, { mode: "direct", provider: directProvider });
+    assert.equal(member.modelSelection.kind, "direct");
+    assert.equal(member.model, "gpt-5.5");
+    assert.equal(member.reasoningEffort, "medium");
+    assert.equal(member.serviceTier, "fast");
+
+    const executor = module.assignExecutorModelSelection({
+      kind: "member",
+      id: "executor.test",
+      promptTemplate: { engine: "hunsu-template-v1", template: "Execute." },
+      resources: [],
+      runtimePolicy: {
+        model: "codex-default",
+        reasoningEffort: "default",
+        serviceTier: "default",
+        execution: { kind: "read_only", network: "disabled" },
+        approval: { policy: "never" }
+      }
+    }, { mode: "alias", aliasId: "ReviewerModel" });
+    assert.equal(executor.runtimePolicy.modelSelection.kind, "alias");
+    assert.equal(executor.runtimePolicy.modelSelection.aliasId, "ReviewerModel");
+  } finally {
+    await close();
+  }
 });
 
 test("Roadmap workspace renders multiple server-provided preflight actions", async () => {
@@ -906,6 +1054,131 @@ test("Web Execute start uses selected remote backend even when local token exist
   }
 });
 
+test("Web backend-scoped transport lets explicit backend IDs override conflicting connection modes", async () => {
+  const calls: Array<{
+    transport: "local" | "relay";
+    body: Record<string, unknown>;
+    command?: string;
+  }> = [];
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>([
+    ["hunsu.remoteBridgeSession", JSON.stringify({
+      deviceId: "device_1",
+      deviceName: "Remote Devbox",
+      projectPath: "/tmp/hunsu-project",
+      webUserId: "user_1",
+      relayAccessToken: "relay-token"
+    })]
+  ]);
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio/roadmaps/roadmap_123",
+      origin: "https://studio.example.test"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url, init) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    const parsed = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    if (requestUrl.pathname === "/v1/commands") {
+      const command = parsed as { command?: string; payload?: Record<string, unknown> };
+      calls.push({ transport: "relay", command: command.command, body: command.payload ?? {} });
+      if (command.command === "provider.inventory") {
+        return new Response(JSON.stringify({
+          ok: true,
+          status: 200,
+          body: { ok: true, value: { backendId: "remote:device_1", providers: [] } }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        status: 202,
+        body: { run: { runId: "run_remote", status: "running" } }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    calls.push({ transport: "local", body: parsed });
+    if (requestUrl.pathname === "/api/providers/inventory") {
+      return new Response(JSON.stringify({
+        ok: true,
+        value: { backendId: "local", providers: [] }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      run: { runId: "run_local", status: "running" }
+    }), { status: 202, headers: { "content-type": "application/json" } });
+  };
+
+  const { module, close } = await loadBridgeClientModule();
+  const start = (body: Record<string, unknown>) => module.postRunAction("roadmap_123", "start", {
+    requestId: "request_1",
+    lineId: "line_1",
+    selectedDestinationIds: ["destination_1"],
+    ...body
+  });
+  try {
+    await start({ backendId: "local", connectionMode: "remote" });
+    await start({
+      connectionMode: "remote",
+      workspace: { backendId: "local", connectionMode: "remote" }
+    });
+    await start({ backendId: "remote:device_1", connectionMode: "local" });
+    await start({
+      connectionMode: "local",
+      workspace: { backendId: "remote:device_1", connectionMode: "local" }
+    });
+    await module.fetchModelInventory("local");
+    await module.fetchModelInventory("remote:device_1");
+
+    assert.deepEqual(calls.map(call => call.transport), ["local", "local", "relay", "relay", "local", "relay"]);
+    assert.equal(calls.filter(call => call.transport === "local").some(call => call.command), false);
+    assert.equal(calls.slice(2, 4).every(call => call.command === "execute.start"), true);
+    for (const call of calls.slice(0, 2)) {
+      assert.equal(call.body.backendId, "local");
+      assert.equal(call.body.connectionMode, "local");
+      assert.deepEqual(call.body.workspace, {
+        workspaceId: "roadmap_123",
+        backendId: "local",
+        connectionMode: "local"
+      });
+    }
+    for (const call of calls.slice(2)) {
+      if (call.command === "provider.inventory" || call.transport === "local") {
+        continue;
+      }
+      assert.equal(call.body.backendId, "remote:device_1");
+      assert.equal(call.body.connectionMode, "remote");
+      assert.deepEqual(call.body.workspace, {
+        workspaceId: "roadmap_123",
+        backendId: "remote:device_1",
+        connectionMode: "remote"
+      });
+    }
+    assert.deepEqual(calls[5], {
+      transport: "relay",
+      command: "provider.inventory",
+      body: { backendId: "remote:device_1" }
+    });
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+  }
+});
+
 test("Web Bridge status keeps local and selected remote workspaces together", async () => {
   const calls: Array<{ origin: string; pathname: string; command?: string }> = [];
   const previousFetch = globalThis.fetch;
@@ -1553,7 +1826,8 @@ async function loadPreflightActionsModule(): Promise<{
         | "install_provider"
         | "login_provider"
         | "recheck_provider"
-        | "activate_workspace";
+        | "activate_workspace"
+        | "edit_model_alias";
       label: string;
       href?: string;
       workspaceId?: string;
@@ -1689,6 +1963,7 @@ async function loadBridgeClientModule(): Promise<{
     fetchRemoteBridgeDevices: () => Promise<Array<{ deviceName: string }>>;
     postRemoteBridgeConnect: (input: { deviceId: string; webUserId?: string; projectPath?: string }) => Promise<{ connection: StudioConnectionStatus }>;
     fetchBridgeStatus: () => Promise<BridgeStatusResponse>;
+    fetchModelInventory: (backendId?: string) => Promise<unknown>;
     fetchRoadmapRegistry: () => Promise<unknown[]>;
     fetchBoard: (roadmapId: string) => Promise<unknown>;
     fetchWorktree: (roadmapId: string) => Promise<unknown>;
@@ -1747,6 +2022,89 @@ async function loadBridgeClientModule(): Promise<{
   let module: Awaited<ReturnType<typeof loadBridgeClientModule>>["module"];
   try {
     module = await server.ssrLoadModule("/src/shared/api/bridgeClient.ts") as typeof module;
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+  return {
+    module,
+    close: () => server.close()
+  };
+}
+
+async function loadModelSelectionAssignmentModule(): Promise<{
+  module: {
+    assignManagerModelSelection: (manager: any, assignment: any) => any;
+    assignMemberModelSelection: (member: any, assignment: any) => any;
+    assignExecutorModelSelection: (executor: any, assignment: any) => any;
+  };
+  close: () => Promise<void>;
+}> {
+  const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
+  const server = await vite.createServer({
+    root: WEB_ROOT,
+    configFile: false,
+    appType: "custom",
+    logLevel: "silent",
+    resolve: {
+      alias: {
+        "@": resolve(WEB_ROOT, "src")
+      }
+    },
+    define: {
+      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify("https://relay.example.test"),
+      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
+    },
+    server: {
+      middlewareMode: true
+    }
+  });
+  let module: Awaited<ReturnType<typeof loadModelSelectionAssignmentModule>>["module"];
+  try {
+    module = await server.ssrLoadModule("/src/features/model-aliases/modelSelectionAssignment.ts") as typeof module;
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+  return {
+    module,
+    close: () => server.close()
+  };
+}
+
+async function loadModelConfigDraftStorageModule(): Promise<{
+  module: {
+    createDefaultWebModelConfigDraft: (now?: string) => any;
+    assignWebModelConfigDraft: (draft: any, target: "manager" | "member" | "executor", assignment: any, now?: string) => any;
+    readWebModelConfigDraft: () => any;
+    writeWebModelConfigDraft: (draft: any) => void;
+  };
+  close: () => Promise<void>;
+}> {
+  const vite = await import("../apps/web/node_modules/vite/dist/node/index.js");
+  const server = await vite.createServer({
+    root: WEB_ROOT,
+    configFile: false,
+    appType: "custom",
+    logLevel: "silent",
+    resolve: {
+      alias: {
+        "@": resolve(WEB_ROOT, "src")
+      }
+    },
+    define: {
+      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify("https://relay.example.test"),
+      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
+    },
+    server: {
+      middlewareMode: true
+    }
+  });
+  let module: Awaited<ReturnType<typeof loadModelConfigDraftStorageModule>>["module"];
+  try {
+    module = await server.ssrLoadModule("/src/features/model-aliases/modelConfigDraftStorage.ts") as typeof module;
   } catch (error) {
     await server.close();
     throw error;

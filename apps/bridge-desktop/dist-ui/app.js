@@ -7,7 +7,8 @@ const statusEls = {
   account: document.querySelector("#account"),
   remoteAccess: document.querySelector("#remote-access"),
   device: document.querySelector("#device"),
-  service: document.querySelector("#service")
+  service: document.querySelector("#service"),
+  quitBehavior: document.querySelector("#quit-behavior")
 };
 const activeRoadmapList = document.querySelector("#active-roadmap-list");
 const inactiveRoadmapList = document.querySelector("#inactive-roadmap-list");
@@ -27,7 +28,11 @@ const connectionEls = {
 const selectedProject = document.querySelector("#selected-project");
 const selectedProjectAction = document.querySelector("#selected-project-action");
 const providerConfigForm = document.querySelector("#provider-config-form");
+const providerConfigDialog = document.querySelector("#provider-config-dialog");
+const providerConfigClose = document.querySelector("#close-provider-config");
+const providerConfigSettingsOpen = document.querySelector("#open-provider-config-settings");
 const codexInstallChannel = document.querySelector("#codex-install-channel");
+const quitBehaviorSelect = document.querySelector("#quit-behavior-select");
 let codexBinaryPath = undefined;
 let codexEnvHome = undefined;
 let latestProviderConfigMetadata = undefined;
@@ -138,6 +143,10 @@ function renderSnapshot(snapshot) {
   statusEls.remoteAccess.textContent = status.remoteAccess;
   statusEls.device.textContent = `${status.device.name}${status.device.registered ? " (registered)" : ""}`;
   statusEls.service.textContent = status.service.installed ? `Installed (${status.service.manager})` : "Not installed";
+  statusEls.quitBehavior.textContent = formatQuitBehavior(status.quitBehavior);
+  if (quitBehaviorSelect) {
+    quitBehaviorSelect.value = status.quitBehavior ?? "keep-background";
+  }
   diagnostics.textContent = JSON.stringify({
     diagnostics: snapshot.diagnostics,
     logs: snapshot.logLines
@@ -448,7 +457,7 @@ function renderProviderCard(provider) {
   buttons.className = "actions";
   const configure = document.createElement("button");
   configure.textContent = "Configure";
-  configure.addEventListener("click", () => selectTab("settings"));
+  configure.addEventListener("click", openProviderConfigDialog);
   buttons.append(configure);
   if (provider?.recommendedAction === "install") {
     const install = document.createElement("button");
@@ -793,23 +802,27 @@ function renderCodexSettings(providerConfig, settings, legacyCodexSettings) {
   const savedFields = new Map((providerConfig.fields ?? []).map(field => [field.key, field]));
   providerConfigFieldElements.clear();
   const sections = [];
-  const primaryKeys = metadata.configKeys.filter(key => !key.advanced);
+  const primaryKeys = metadata.configKeys.filter(key => key.primary);
+  const authenticationKeys = metadata.configKeys.filter(key => key.name === "authenticationPreference");
   const advancedKeys = metadata.configKeys.filter(key => key.advanced);
   if (primaryKeys.length > 0) {
     sections.push(providerConfigSection("Primary", primaryKeys, savedFields, settings, legacyCodexSettings));
   }
+  if (authenticationKeys.length > 0) {
+    sections.push(providerConfigSection("Authentication", authenticationKeys, savedFields, settings, legacyCodexSettings));
+  }
   if (advancedKeys.length > 0) {
-    sections.push(providerConfigSection("Advanced", advancedKeys, savedFields, settings, legacyCodexSettings));
+    sections.push(providerConfigSection("Advanced", advancedKeys, savedFields, settings, legacyCodexSettings, { collapsed: true }));
   }
   providerConfigForm.replaceChildren(...sections);
   codexBinaryPath = providerConfigFieldElements.get("binaryPath");
   codexEnvHome = providerConfigFieldElements.get("codexHome");
 }
 
-function providerConfigSection(titleText, keys, savedFields, settings, legacyCodexSettings) {
-  const section = document.createElement("div");
+function providerConfigSection(titleText, keys, savedFields, settings, legacyCodexSettings, options = {}) {
+  const section = options.collapsed ? document.createElement("details") : document.createElement("div");
   section.className = "grid";
-  const title = document.createElement("h3");
+  const title = options.collapsed ? document.createElement("summary") : document.createElement("h3");
   title.textContent = titleText;
   section.append(title, ...keys.flatMap(key => providerConfigControls(key, savedFields, settings, legacyCodexSettings)));
   return section;
@@ -936,6 +949,21 @@ async function saveCodexConfig() {
   ]);
   diagnostics.textContent = stdout;
   await refresh();
+  closeProviderConfigDialog();
+}
+
+function openProviderConfigDialog() {
+  if (providerConfigDialog) {
+    providerConfigDialog.hidden = false;
+  }
+  const focusTarget = codexBinaryPath ?? providerConfigForm?.querySelector("input, select, button");
+  focusTarget?.focus();
+}
+
+function closeProviderConfigDialog() {
+  if (providerConfigDialog) {
+    providerConfigDialog.hidden = true;
+  }
 }
 
 function projectGrantRows(grants) {
@@ -987,6 +1015,10 @@ function providerConnectionSummary(status) {
   const remoteAccess = status?.remoteAccess ?? "Off";
   const remote = `Remote · ${remoteAccess === "On" ? "On" : remoteAccess === "Registered but offline" ? "Registered but offline" : "Off"}`;
   return `${local}\n${remote}`;
+}
+
+function formatQuitBehavior(value) {
+  return value === "stop-background" ? "Stop background service on quit" : "Keep background service running";
 }
 
 async function inspectSelectedFolder(path) {
@@ -1097,7 +1129,7 @@ async function chooseProjectFolder() {
 
 async function chooseCodexBinary() {
   if (!invoke) {
-    selectTab("settings");
+    openProviderConfigDialog();
     codexBinaryPath?.focus();
     return;
   }
@@ -1150,10 +1182,21 @@ async function runConnectionAction(event) {
 document.querySelector("#copy-diagnostics").addEventListener("click", async () => {
   await navigator.clipboard.writeText(diagnostics.textContent || "{}");
 });
+providerConfigSettingsOpen?.addEventListener("click", openProviderConfigDialog);
+providerConfigClose?.addEventListener("click", closeProviderConfigDialog);
+providerConfigDialog?.addEventListener("click", event => {
+  if (event.target === providerConfigDialog) {
+    closeProviderConfigDialog();
+  }
+});
 document.querySelector("#validate-codex-config").addEventListener("click", validateCodexConfig);
 document.querySelector("#save-codex-config").addEventListener("click", saveCodexConfig);
 document.querySelector("#reset-codex-config").addEventListener("click", async () => {
   await run(["provider", "config", "reset"]);
+  await refresh();
+});
+quitBehaviorSelect?.addEventListener("change", async () => {
+  diagnostics.textContent = await run(["settings", "quit-behavior", "set", quitBehaviorSelect.value]);
   await refresh();
 });
 

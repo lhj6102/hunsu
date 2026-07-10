@@ -152,6 +152,11 @@ export function placeholderProvider(kind: Exclude<RuntimeProviderKind, "codex" |
           available: false
         },
         capabilities: unavailableProviderCapabilities,
+        modelInventory: {
+          state: "unavailable",
+          reason: "not_supported",
+          message: `${label} does not publish a model inventory yet.`
+        },
         recommendedAction: "configure",
         safeMessage: "Coming later"
       };

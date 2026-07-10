@@ -12,9 +12,10 @@ import { gunzipSync, inflateRawSync } from "node:zlib";
 import * as esbuild from "esbuild";
 import { currentProcessEnv, resolveBridgeSidecarPackagingConfig, unwrapConfigResult } from "@hunsu/config";
 import {
+  currentSidecarTarget,
   prepareNativeSidecars,
   sidecarArtifactNameForTarget,
-  sidecarTargets,
+  sidecarTargetByName,
   validateNativeSidecarArtifact
 } from "./prepare-sidecars.mjs";
 
@@ -39,17 +40,29 @@ const nodePlatformBySidecarTarget = new Map([
 export async function buildNativeSidecars(options = {}) {
   const packagingConfig = unwrapConfigResult(resolveBridgeSidecarPackagingConfig(currentProcessEnv()));
   const nodeVersion = normalizeNodeVersion(options.nodeVersion ?? packagingConfig.sidecarNodeVersion ?? defaultNodeVersion);
+  const dependencies = options.dependencies ?? {};
+  const seaNodeExecutable = resolveSeaBuilderNodeExecutable({
+    configuredNodeVersion: nodeVersion,
+    nodeExecutable: options.seaNodePath ?? packagingConfig.seaNodePath,
+    runner: dependencies.versionRunner
+  });
+  const distDir = resolve(options.distDir ?? dist);
   const nativeDir = resolve(options.nativeDir ?? packagingConfig.nativeSidecarDir ?? defaultNativeDir);
   const cacheDir = resolve(options.cacheDir ?? packagingConfig.sidecarCacheDir ?? defaultCacheDir);
 
-  mkdirSync(dist, { recursive: true });
+  mkdirSync(distDir, { recursive: true });
   mkdirSync(nativeDir, { recursive: true });
   mkdirSync(cacheDir, { recursive: true });
 
-  const bundlePath = resolve(dist, "sidecar-bundle.cjs");
-  const blobPath = resolve(dist, "hunsu-bridge-sidecar.blob");
-  await bundleSidecar(bundlePath);
-  createSeaBlob({ bundlePath, blobPath });
+  const bundlePath = resolve(distDir, "sidecar-bundle.cjs");
+  const blobPath = resolve(distDir, "hunsu-bridge-sidecar.blob");
+  await (dependencies.bundleSidecar ?? bundleSidecar)(bundlePath);
+  (dependencies.createSeaBlob ?? createSeaBlob)({
+    nodeExecutable: seaNodeExecutable,
+    bundlePath,
+    blobPath,
+    seaConfigPath: resolve(distDir, "sidecar-sea-config.json")
+  });
 
   if (options.bundleOnly) {
     return {
@@ -57,45 +70,56 @@ export async function buildNativeSidecars(options = {}) {
       nodeVersion,
       bundlePath,
       blobPath,
+      distDir,
       artifacts: []
     };
   }
 
+  const target = options.target
+    ? sidecarTargetByName(options.target)
+    : packagingConfig.sidecarTarget
+      ? sidecarTargetByName(packagingConfig.sidecarTarget)
+      : currentSidecarTarget();
   const shasums = await loadNodeShasums({ nodeVersion, cacheDir });
   const builtArtifacts = [];
-  for (const target of sidecarTargets) {
-    const archiveName = nodeArchiveNameForTarget(target, nodeVersion);
-    const archivePath = await ensureNodeArchive({
-      nodeVersion,
-      cacheDir,
-      archiveName,
-      expectedSha256: shasums.get(archiveName)
-    });
-    const executable = extractNodeExecutable({ archivePath, target, nodeVersion });
-    const artifactPath = resolve(nativeDir, sidecarArtifactNameForTarget(target));
-    writeFileSync(artifactPath, executable);
-    if (target.extension === "") {
-      chmodSync(artifactPath, 0o755);
-    }
-    injectSeaBlob({ artifactPath, blobPath, target });
-    if (target.extension === "") {
-      chmodSync(artifactPath, 0o755);
-    }
-    validateNativeSidecarArtifact(artifactPath);
-    builtArtifacts.push({
-      target: target.target,
-      file: basename(artifactPath),
-      nodeRuntime: archiveName
-    });
+  const archiveName = nodeArchiveNameForTarget(target, nodeVersion);
+  const archivePath = await ensureNodeArchive({
+    nodeVersion,
+    cacheDir,
+    archiveName,
+    expectedSha256: shasums.get(archiveName)
+  });
+  const executable = extractNodeExecutable({ archivePath, target, nodeVersion });
+  const artifactPath = resolve(nativeDir, sidecarArtifactNameForTarget(target));
+  writeFileSync(artifactPath, executable);
+  if (target.extension === "") {
+    chmodSync(artifactPath, 0o755);
   }
+  const manifest = finalizeNativeSidecar({
+    artifactPath,
+    blobPath,
+    bundlePath,
+    distDir,
+    nativeDir,
+    target,
+    runner: dependencies.commandRunner,
+    hostPlatform: dependencies.hostPlatform,
+    validateArtifact: dependencies.validateArtifact,
+    prepareSidecars: dependencies.prepareSidecars,
+    smokeTest: dependencies.smokeTest
+  });
+  builtArtifacts.push({
+    target: target.target,
+    file: basename(artifactPath),
+    nodeRuntime: archiveName
+  });
 
-  const manifest = prepareNativeSidecars({ nativeDir });
-  smokeTestCurrentPlatformSidecar({ bundlePath, manifest });
   return {
     schema: "hunsu.bridge-sidecar-build.v1",
     nodeVersion,
     bundlePath,
     blobPath,
+    distDir,
     nativeDir,
     artifacts: builtArtifacts,
     preparedManifest: manifest
@@ -103,11 +127,15 @@ export async function buildNativeSidecars(options = {}) {
 }
 
 export function smokeTestCurrentPlatformSidecar(input) {
-  const currentPlatform = input.manifest.currentPlatform;
-  if (!currentPlatform) {
+  const artifact = input.manifest.artifacts[0];
+  if (!artifact) {
     return;
   }
-  const sidecarPath = resolve(dist, currentPlatform.file);
+  const target = sidecarTargetByName(artifact.target);
+  if (target.platform !== process.platform || target.arch !== process.arch) {
+    return;
+  }
+  const sidecarPath = resolve(input.distDir ?? dist, artifact.file);
   const smokeRoot = mkdtempSync(join(tmpdir(), "hunsu-bridge-sidecar-smoke-"));
   const smokeEnv = {
     ...currentProcessEnv(),
@@ -166,14 +194,43 @@ export async function bundleSidecar(bundlePath = resolve(dist, "sidecar-bundle.c
 }
 
 export function createSeaBlob(input) {
-  const seaConfigPath = resolve(dist, "sidecar-sea-config.json");
+  if (!input.nodeExecutable) {
+    throw new Error("Cannot build Hunsu Bridge sidecar: createSeaBlob requires a verified Node executable.");
+  }
+  const seaConfigPath = input.seaConfigPath
+    ? resolve(input.seaConfigPath)
+    : resolve(dist, "sidecar-sea-config.json");
   writeFileSync(seaConfigPath, `${JSON.stringify({
     main: input.bundlePath,
     output: input.blobPath,
     disableExperimentalSEAWarning: true
   }, null, 2)}\n`, "utf8");
-  runCommand(process.execPath, ["--experimental-sea-config", seaConfigPath], { cwd: root });
+  (input.runner ?? runCommand)(input.nodeExecutable, ["--experimental-sea-config", seaConfigPath], { cwd: root });
   return input.blobPath;
+}
+
+export function resolveSeaBuilderNodeExecutable(input) {
+  const configuredNodeVersion = normalizeNodeVersion(input.configuredNodeVersion);
+  const nodeExecutable = input.nodeExecutable || process.execPath;
+  let versionResult;
+  try {
+    versionResult = (input.runner ?? runCommandCapture)(nodeExecutable, ["--version"], { cwd: root });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error([
+      `Cannot build Hunsu Bridge sidecar: could not run SEA builder Node at ${nodeExecutable}.`,
+      reason,
+      `Run the build with Node ${configuredNodeVersion} or set HUNSU_BRIDGE_SEA_NODE_PATH to a matching Node executable.`
+    ].join("\n"));
+  }
+  const builderNodeVersion = normalizeNodeVersion(versionResult.stdout);
+  if (builderNodeVersion !== configuredNodeVersion) {
+    throw new Error([
+      `Cannot build Hunsu Bridge sidecar: SEA builder Node is ${builderNodeVersion || "unknown"}, but the embedded runtime is ${configuredNodeVersion}.`,
+      `Run the build with Node ${configuredNodeVersion} or set HUNSU_BRIDGE_SEA_NODE_PATH to a matching Node executable.`
+    ].join("\n"));
+  }
+  return nodeExecutable;
 }
 
 export function nodeArchiveNameForTarget(target, nodeVersion = defaultNodeVersion) {
@@ -342,7 +399,37 @@ function nodeDistUrl(nodeVersion, fileName) {
   return `https://nodejs.org/dist/v${nodeVersion}/${fileName}`;
 }
 
-function injectSeaBlob(input) {
+export function finalizeNativeSidecar(input) {
+  injectSeaBlob({
+    artifactPath: input.artifactPath,
+    blobPath: input.blobPath,
+    target: input.target,
+    runner: input.runner
+  });
+  if (input.target.extension === "") {
+    chmodSync(input.artifactPath, 0o755);
+  }
+  signInjectedMacOsSidecar({
+    artifactPath: input.artifactPath,
+    target: input.target,
+    runner: input.runner,
+    hostPlatform: input.hostPlatform
+  });
+  (input.validateArtifact ?? validateNativeSidecarArtifact)(input.artifactPath);
+  const manifest = (input.prepareSidecars ?? prepareNativeSidecars)({
+    nativeDir: input.nativeDir,
+    distDir: input.distDir,
+    target: input.target.target
+  });
+  (input.smokeTest ?? smokeTestCurrentPlatformSidecar)({
+    bundlePath: input.bundlePath,
+    distDir: input.distDir,
+    manifest
+  });
+  return manifest;
+}
+
+export function injectSeaBlob(input) {
   const postjectCli = require.resolve("postject/dist/cli.js");
   const args = [
     postjectCli,
@@ -356,7 +443,22 @@ function injectSeaBlob(input) {
   if (input.target.platform === "darwin") {
     args.push("--macho-segment-name", "NODE_SEA");
   }
-  runCommand(process.execPath, args, { cwd: root });
+  (input.runner ?? runCommand)(process.execPath, args, { cwd: root });
+}
+
+export function signInjectedMacOsSidecar(input) {
+  if (input.target.platform !== "darwin") {
+    return;
+  }
+  const hostPlatform = input.hostPlatform ?? process.platform;
+  if (hostPlatform !== "darwin") {
+    throw new Error(
+      `Cannot build Hunsu Bridge sidecar for ${input.target.target}: injected macOS sidecars must be signed on a Darwin host (current host: ${hostPlatform}).`
+    );
+  }
+  const runner = input.runner ?? runCommand;
+  runner("codesign", ["--force", "--sign", "-", "--timestamp=none", input.artifactPath], { cwd: root });
+  runner("codesign", ["--verify", "--strict", "--verbose=2", input.artifactPath], { cwd: root });
 }
 
 function nodePlatformForTarget(target) {
@@ -367,8 +469,8 @@ function nodePlatformForTarget(target) {
   return platform;
 }
 
-function normalizeNodeVersion(version) {
-  return String(version).replace(/^v/u, "");
+export function normalizeNodeVersion(version) {
+  return String(version).trim().replace(/^v/u, "");
 }
 
 function sha256File(path) {
@@ -424,11 +526,13 @@ function parseArgs(argv) {
   const nativeDirArgIndex = argv.indexOf("--native-dir");
   const cacheDirArgIndex = argv.indexOf("--cache-dir");
   const nodeVersionArgIndex = argv.indexOf("--node-version");
+  const targetArgIndex = argv.indexOf("--target");
   return {
     bundleOnly: argv.includes("--bundle-only"),
     nativeDir: readRequiredArg(argv, nativeDirArgIndex, "--native-dir"),
     cacheDir: readRequiredArg(argv, cacheDirArgIndex, "--cache-dir"),
-    nodeVersion: readRequiredArg(argv, nodeVersionArgIndex, "--node-version")
+    nodeVersion: readRequiredArg(argv, nodeVersionArgIndex, "--node-version"),
+    target: readRequiredArg(argv, targetArgIndex, "--target")
   };
 }
 

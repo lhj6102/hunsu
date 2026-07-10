@@ -14,6 +14,8 @@ export function bridgeActionHref(action: ExecutePreflightAction): string {
       return action.workspaceId
         ? `hunsu://activate-workspace?workspaceId=${encodeURIComponent(action.workspaceId)}`
         : "hunsu://workspaces";
+    case "edit_model_alias":
+      return "/studio/settings/model-aliases";
     case "open_connection":
       return "hunsu://connection";
     case "open_bridge_app":

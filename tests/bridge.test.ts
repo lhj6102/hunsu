@@ -11,7 +11,7 @@ import { buildTeamPlanningPrompt, type CodexProviderStatus, type TeamPlanningInp
 import { resolveBridgeRuntimeConfig, unwrapConfigResult } from "../packages/config/src/index.ts";
 import type { RelayServerConfig } from "../packages/config/src/index.ts";
 import { createHunsuRelayServer } from "../apps/relay/src/index.ts";
-import { createDefaultHarness, createDefaultManagerConfig, createDefaultMemberConfig, harnessEntityFromSnapshot, makeNodeId, makePositiveInteger, promptTemplateFromText, rootHarnessSnapshot, type HubPackageLock, type Harness, type HarnessSnapshot, type HunsuOrigin, type NonEmptyText, type ExecutionPlan } from "../packages/protocol/src/index.ts";
+import { createDefaultHarness, createDefaultManagerConfig, createDefaultMemberConfig, harnessEntityFromSnapshot, makeNodeId, makePositiveInteger, promptTemplateFromText, rootHarnessSnapshot, type HubPackageLock, type Harness, type HarnessSnapshot, type HunsuOrigin, type NonEmptyText, type ExecutionPlan, type ModelAlias, type ProviderInventoryResult } from "../packages/protocol/src/index.ts";
 import {
   HUB_PACKAGE_MANIFEST_SCHEMA,
   computeManifestIntegrity,
@@ -78,11 +78,17 @@ import {
   prepareMemberCodexEnvironmentForExecute,
   connectionExecutePreflightError,
   providerExecutePreflightError,
+  modelExecutePreflightErrorForSelection,
+  selectedExecuteBackend,
+  defaultModelAliases,
+  providerInventoryForBridgeStatus,
+  resolveModelSelection,
   listRemoteBridgeDevices,
   type AgentSessionEvent,
   type StudioLiveEvent,
   type StudioRunState
 } from "../apps/bridge/src/index.ts";
+import { connectionExecutePreflightErrorForSelection } from "../apps/bridge/src/executes/executePreflight.ts";
 import { codexRuntimePreflightError } from "../apps/bridge/src/runtimes/codex.ts";
 
 test("Bridge server exposes named modular HTTP boundaries", () => {
@@ -451,6 +457,408 @@ test("Bridge runtime provider facade maps Codex status and registry placeholders
   })?.error, "BRIDGE_NOT_CONNECTED");
 });
 
+test("Bridge production Codex status owns the local provider inventory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-provider-owned-inventory-test-"));
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+    PATH: join(root, "missing-codex-path")
+  }, {
+    cwd: root,
+    roadmapRegistryPath: join(root, "roadmaps.json")
+  }));
+  const server = createStudioServer({
+    cwd: root,
+    state: createStudioState(),
+    persist: false,
+    runtimeConfig
+  });
+
+  try {
+    const status = await requestStudioServerJson(server, "GET", "/api/bridge/status");
+    const inventory = await requestStudioServerJson(server, "GET", "/api/providers/inventory");
+    assert.equal(status.status, 200);
+    assert.equal(status.body.provider.modelInventory.state, "available");
+    assert.equal(inventory.status, 200);
+    assert.equal(inventory.body.ok, true, JSON.stringify(inventory.body));
+    assert.equal(inventory.body.value.backendId, "local");
+    assert.deepEqual(
+      inventory.body.value.providers[0].models.map((model: { model: string }) => model.model),
+      status.body.provider.modelInventory.models.map((model: { model: string }) => model.model)
+    );
+    assert.deepEqual(
+      inventory.body.value.providers[0].models.map((model: { model: string }) => model.model),
+      ["codex-default", "gpt-5.5-thinking", "gpt-5.5"]
+    );
+  } finally {
+    server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge model alias inventory validates and resolves Codex aliases", () => {
+  const provider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const inventoryResult = providerInventoryForBridgeStatus({ provider });
+  if (!inventoryResult.ok) assert.fail(inventoryResult.error.message);
+  const inventories = inventoryResult.value.providers;
+  const aliases = defaultModelAliases("2026-01-01T00:00:00.000Z");
+  const primary = resolveModelSelection({
+    selection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases,
+    inventories
+  });
+  assert.equal(primary.ok, true);
+  if (primary.ok) {
+    assert.equal(primary.backendId, "local");
+    assert.equal(primary.resolved.model, "gpt-5.5-thinking");
+    assert.equal(primary.resolved.reasoningEffort, "high");
+    assert.equal(primary.provider.providerId, "codex");
+    assert.equal(primary.provider.ready, true);
+  }
+  const explicitEmptyAliases = resolveModelSelection({
+    selection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases: [],
+    inventories
+  });
+  assert.equal(explicitEmptyAliases.ok, false);
+  if (!explicitEmptyAliases.ok) {
+    assert.equal(explicitEmptyAliases.backendId, "local");
+    assert.equal(explicitEmptyAliases.error.error, "MODEL_ALIAS_NOT_FOUND");
+    assert.equal(explicitEmptyAliases.error.aliasId, "PrimaryModel");
+  }
+
+  const unsupported = resolveModelSelection({
+    selection: { kind: "direct", provider: { providerId: "codex", model: "gpt-5.5-thinking" as NonEmptyText, reasoningEffort: "medium", experimental: true } },
+    inventories
+  });
+  assert.equal(unsupported.ok, false);
+  if (!unsupported.ok) {
+    assert.equal(unsupported.backendId, "local");
+    assert.equal(unsupported.error.error, "REASONING_UNSUPPORTED");
+  }
+});
+
+test("Bridge model preflight validates aliases against the selected backend inventory", () => {
+  const localProvider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const localInventoryResult = providerInventoryForBridgeStatus({ provider: localProvider });
+  if (!localInventoryResult.ok) assert.fail(localInventoryResult.error.message);
+  const localInventory = localInventoryResult.value.providers[0];
+  const remoteProvider = {
+    ...localProvider,
+    label: "Remote Codex",
+    modelInventory: {
+      state: "available" as const,
+      models: localInventory.models.filter(model => model.model === "gpt-5.5")
+    }
+  };
+  const localConnection = {
+    backendId: "local",
+    mode: "local" as const,
+    label: "This computer",
+    provider: localProvider,
+    connection: { state: "connected" as const },
+    workspaces: []
+  };
+  const remoteConnection = {
+    backendId: "remote:device_1",
+    mode: "remote" as const,
+    label: "Remote Devbox",
+    provider: remoteProvider,
+    connection: { state: "connected" as const },
+    workspaces: []
+  };
+  const status = {
+    account: { signedIn: true },
+    connections: [localConnection, remoteConnection]
+  };
+  const aliases = defaultModelAliases("2026-01-01T00:00:00.000Z");
+
+  const unsupported = modelExecutePreflightErrorForSelection({
+    backendId: "remote:device_1",
+    modelSelection: {
+      kind: "direct",
+      provider: { providerId: "codex", model: "gpt-5.5-thinking", reasoningEffort: "high" }
+    }
+  }, status);
+  assert.equal(unsupported?.area, "model");
+  if (unsupported?.area !== "model") assert.fail("Expected remote model preflight failure.");
+  assert.equal(unsupported?.backendId, "remote:device_1");
+  assert.equal(unsupported?.error, "MODEL_UNSUPPORTED");
+  assert.equal(unsupported?.providerId, "codex");
+
+  assert.equal(modelExecutePreflightErrorForSelection({
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases
+  }, status), undefined);
+
+  assert.equal(modelExecutePreflightErrorForSelection({
+    backendId: "local",
+    workspace: { backendId: "remote:device_1", connectionMode: "remote" },
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases
+  }, status), undefined);
+});
+
+test("Bridge model preflight preserves backend identity across selection paths", () => {
+  const readyLocalProvider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const localProvider = {
+    ...readyLocalProvider,
+    label: "Local Codex",
+    ready: false,
+    recommendedAction: "recheck" as const
+  };
+  const remoteProvider = {
+    ...readyLocalProvider,
+    label: "Remote Codex",
+    authenticated: false as const,
+    ready: false,
+    auth: { ...localProvider.auth, state: "not_authenticated" as const },
+    recommendedAction: "login" as const
+  };
+  const status = {
+    account: { signedIn: true },
+    connections: [{
+      backendId: "local",
+      mode: "local" as const,
+      label: "This computer",
+      provider: localProvider,
+      connection: { state: "connected" as const },
+      workspaces: []
+    }, {
+      backendId: "remote:device_1",
+      mode: "remote" as const,
+      label: "Remote Devbox",
+      provider: remoteProvider,
+      connection: { state: "connected" as const },
+      workspaces: []
+    }]
+  };
+  const aliases = defaultModelAliases("2026-01-01T00:00:00.000Z");
+
+  const explicitRemote = modelExecutePreflightErrorForSelection({
+    backendId: "remote:device_1",
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases
+  }, status);
+  assert.equal(explicitRemote?.area, "model");
+  if (explicitRemote?.area !== "model") assert.fail("Expected remote provider model preflight failure.");
+  assert.equal(explicitRemote.backendId, "remote:device_1");
+  assert.equal(explicitRemote?.error, "PROVIDER_LOGIN_REQUIRED");
+  assert.equal(explicitRemote?.providerId, "codex");
+  assert.match(explicitRemote.message, /Remote Codex/);
+  assert.equal(explicitRemote?.actions.some(action => action.type === "login_provider" && action.providerId === "codex"), true);
+
+  const workspaceRemote = modelExecutePreflightErrorForSelection({
+    workspace: { backendId: "remote:device_1", connectionMode: "remote" },
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases
+  }, status);
+  assert.equal(workspaceRemote?.area, "model");
+  if (workspaceRemote?.area !== "model") assert.fail("Expected workspace remote model preflight failure.");
+  assert.equal(workspaceRemote.backendId, "remote:device_1");
+  assert.equal(workspaceRemote?.error, "PROVIDER_LOGIN_REQUIRED");
+  assert.match(workspaceRemote.message, /Remote Codex/);
+
+  const explicitLocal = modelExecutePreflightErrorForSelection({
+    backendId: "local",
+    workspace: { backendId: "remote:device_1", connectionMode: "remote" },
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases
+  }, status);
+  assert.equal(explicitLocal?.area, "model");
+  if (explicitLocal?.area !== "model") assert.fail("Expected explicit local model preflight failure.");
+  assert.equal(explicitLocal.backendId, "local");
+  assert.equal(explicitLocal.error, "PROVIDER_NOT_READY");
+  assert.match(explicitLocal.message, /Local Codex/);
+
+  const defaultLocal = modelExecutePreflightErrorForSelection({
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" as NonEmptyText },
+    aliases
+  }, status);
+  assert.equal(defaultLocal?.area, "model");
+  if (defaultLocal?.area !== "model") assert.fail("Expected default local model preflight failure.");
+  assert.equal(defaultLocal.backendId, "local");
+  assert.equal(defaultLocal.error, "PROVIDER_NOT_READY");
+  assert.match(defaultLocal.message, /Local Codex/);
+});
+
+test("Bridge explicit backend IDs determine connection mode while signed out", () => {
+  const provider = readyCodexProviderFixture();
+  const status = {
+    account: { signedIn: false },
+    connections: [{
+      backendId: "local",
+      mode: "local" as const,
+      label: "This computer",
+      provider,
+      connection: { state: "connected" as const },
+      workspaces: []
+    }, {
+      backendId: "remote:device_1",
+      mode: "remote" as const,
+      label: "Remote Devbox",
+      provider,
+      connection: { state: "connected" as const },
+      workspaces: []
+    }]
+  };
+  const cases = [{
+    name: "top-level local",
+    input: { backendId: "local", connectionMode: "remote" as const },
+    mode: "local" as const,
+    error: undefined
+  }, {
+    name: "workspace local",
+    input: { workspace: { backendId: "local", connectionMode: "remote" as const } },
+    mode: "local" as const,
+    error: undefined
+  }, {
+    name: "top-level remote",
+    input: { backendId: "remote:device_1", connectionMode: "local" as const },
+    mode: "remote" as const,
+    error: "REMOTE_LOGIN_REQUIRED"
+  }, {
+    name: "workspace remote",
+    input: { workspace: { backendId: "remote:device_1", connectionMode: "local" as const } },
+    mode: "remote" as const,
+    error: "REMOTE_LOGIN_REQUIRED"
+  }];
+
+  for (const entry of cases) {
+    const selection = selectedExecuteBackend(entry.input);
+    assert.equal(selection.connectionMode, entry.mode, entry.name);
+    assert.equal(selection.remoteRequested, entry.mode === "remote", entry.name);
+    assert.equal(connectionExecutePreflightErrorForSelection(entry.input, status)?.error, entry.error, entry.name);
+  }
+});
+
+test("Bridge model alias endpoint treats an explicit empty aliases array as no aliases", async () => {
+  const provider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const server = createStudioServer({
+    state: createStudioState(),
+    persist: false,
+    providerInventory: providerInventoryForBridgeStatus({ provider })
+  });
+
+  const response = await requestStudioServerJson(server, "POST", "/api/model-aliases/resolve", {
+    backendId: "local",
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" },
+    aliases: []
+  });
+
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.ok, false);
+  assert.equal(response.body.backendId, "local");
+  assert.equal(response.body.error, "MODEL_ALIAS_NOT_FOUND");
+});
+
+test("Bridge inventory and alias APIs fail closed for an unknown explicit backend", async () => {
+  const provider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const injectedInventory = providerInventoryForBridgeStatus({ provider });
+  if (!injectedInventory.ok) assert.fail(injectedInventory.error.message);
+  const servers = [
+    createStudioServer({ state: createStudioState(), persist: false }),
+    createStudioServer({ state: createStudioState(), persist: false, providerInventory: injectedInventory })
+  ];
+
+  try {
+    for (const server of servers) {
+      const backendId = "remote:missing_device";
+      const inventory = await requestStudioServerJson(server, "GET", `/api/providers/inventory?backendId=${encodeURIComponent(backendId)}`);
+      assert.equal(inventory.status, 200);
+      assert.equal(inventory.body.ok, false);
+      assert.equal(inventory.body.error.code, "BACKEND_UNAVAILABLE");
+      assert.equal(inventory.body.error.backendId, backendId);
+      assert.equal(inventory.body.value, undefined);
+      assert.equal(inventory.body.providers, undefined);
+
+      for (const action of ["validate", "resolve"]) {
+        const alias = await requestStudioServerJson(server, "POST", `/api/model-aliases/${action}`, {
+          backendId,
+          modelSelection: { kind: "alias", aliasId: "PrimaryModel" },
+          aliases: defaultModelAliases("2026-01-01T00:00:00.000Z")
+        });
+        assert.equal(alias.status, 200);
+        assert.equal(alias.body.ok, false);
+        assert.equal(alias.body.backendId, backendId);
+        assert.equal(alias.body.error, "BACKEND_UNAVAILABLE");
+        assert.equal(alias.body.resolved, undefined);
+        assert.equal(alias.body.provider, undefined);
+      }
+    }
+  } finally {
+    for (const server of servers) server.close();
+  }
+});
+
 test("Bridge Codex provider env and auth-home diagnostics are explicit and secret-safe", () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-codex-provider-env-test-"));
   const defaultHome = join(root, "default-home", ".codex");
@@ -565,6 +973,22 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
   assert.equal(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.label, "MacBook Pro");
   assert.equal(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.provider.providerId, "remote:device_1:provider");
   assert.match(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.provider.safeMessage ?? "", /Remote provider status is not available/);
+  const unavailableBackendId = "remote:device_1";
+  const unavailableInventory = await requestStudioServerJson(server, "GET", `/api/providers/inventory?backendId=${encodeURIComponent(unavailableBackendId)}`);
+  assert.equal(unavailableInventory.body.ok, false);
+  assert.equal(unavailableInventory.body.error.code, "PROVIDER_INVENTORY_UNAVAILABLE");
+  assert.equal(unavailableInventory.body.error.backendId, unavailableBackendId);
+  assert.equal(unavailableInventory.body.error.providerId, "remote:device_1:provider");
+  assert.equal(unavailableInventory.body.value, undefined);
+  const unavailableAlias = await requestStudioServerJson(server, "POST", "/api/model-aliases/resolve", {
+    backendId: unavailableBackendId,
+    modelSelection: { kind: "alias", aliasId: "PrimaryModel" },
+    aliases: defaultModelAliases("2026-01-01T00:00:00.000Z")
+  });
+  assert.equal(unavailableAlias.body.ok, false);
+  assert.equal(unavailableAlias.body.backendId, unavailableBackendId);
+  assert.equal(unavailableAlias.body.error, "PROVIDER_INVENTORY_UNAVAILABLE");
+  assert.equal(unavailableAlias.body.resolved, undefined);
   const remoteWorkspace = status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.workspaces[0];
   assert.equal(remoteWorkspace?.displayName, "remote-workspace");
   assert.equal(remoteWorkspace?.path, undefined);
@@ -657,12 +1081,18 @@ test("Bridge Execute preflight honors selected remote backend with x-hunsu-bridg
     roadmapRegistryPath: registryPath
   }));
   const pairing = createBridgePairingSession({ token: "local-token" });
+  const runner = new FakeRunner();
+  let inventoryLookups = 0;
   const server = createStudioServer({
     cwd: active.repository.root,
     state,
     persist: false,
-    runner: new FakeRunner(),
+    runner,
     runtimeConfig,
+    providerInventory: () => {
+      inventoryLookups += 1;
+      throw new Error("Connection preflight must run before provider inventory lookup.");
+    },
     security: { pairingSession: pairing, allowedOrigins: ["https://studio.example.test"] }
   });
 
@@ -672,30 +1102,472 @@ test("Bridge Execute preflight honors selected remote backend with x-hunsu-bridg
       account: { status: "signed-in", userId: "user_remote", email: "remote@example.test" },
       projectGrants: []
     }, null, 2)}\n`, "utf8");
-    const response = await requestStudioServerJson(server, "POST", `/api/roadmaps/${encodeURIComponent(active.roadmap.roadmapId)}/runs/start`, {
+    const executeBody = {
       requestId: String(active.board.requests[0].id),
       lineId: String(active.board.lines[0].id),
       selectedDestinationIds: [String(active.board.destinations[0].id)],
       backendId: "remote:device_offline",
       connectionMode: "remote",
+      modelSelection: { kind: "alias" as const, aliasId: "PrimaryModel" },
+      aliases: defaultModelAliases("2026-01-01T00:00:00.000Z"),
       workspace: {
         workspaceId: active.roadmap.roadmapId,
         backendId: "remote:device_offline",
-        connectionMode: "remote"
+        connectionMode: "remote" as const
       }
-    }, {
+    };
+    const requestOptions = {
       headers: {
         origin: "https://studio.example.test",
         "x-hunsu-bridge-token": "local-token"
       }
-    });
+    };
+    const response = await requestStudioServerJson(server, "POST", `/api/roadmaps/${encodeURIComponent(active.roadmap.roadmapId)}/runs/start`, executeBody, requestOptions);
     assert.equal(response.status, 409);
     assert.equal(response.body.area, "connection");
     assert.equal(response.body.error, "REMOTE_NOT_CONNECTED");
     assert.equal(response.body.backendId, "remote:device_offline");
+    assert.equal(inventoryLookups, 0);
+    assert.equal(runner.started, undefined);
+
+    const unknownBackendId = "remote:missing_device";
+    const unknown = await requestStudioServerJson(server, "POST", `/api/roadmaps/${encodeURIComponent(active.roadmap.roadmapId)}/runs/start`, {
+      ...executeBody,
+      backendId: unknownBackendId,
+      workspace: { ...executeBody.workspace, backendId: unknownBackendId }
+    }, requestOptions);
+    assert.equal(unknown.status, 409);
+    assert.equal(unknown.body.area, "connection");
+    assert.equal(unknown.body.error, "REMOTE_NOT_CONNECTED");
+    assert.equal(unknown.body.backendId, unknownBackendId);
+    assert.equal(inventoryLookups, 0);
+    assert.equal(runner.started, undefined);
   } finally {
     server.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge Execute rejects unknown explicit backend IDs before inventory or runner work", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-unknown-execute-backend-test-"));
+  const registryPath = join(root, "roadmaps.json");
+  const state = createStudioState();
+  const active = createStudioRoadmap({ path: join(root, "workspace"), title: "unknown-backend" }, state, {
+    persist: true,
+    roadmapRegistryPath: registryPath
+  });
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+    PATH: join(root, "missing-path")
+  }, {
+    cwd: active.repository.root,
+    roadmapRegistryPath: registryPath
+  }));
+  const runner = new FakeRunner();
+  let inventoryLookups = 0;
+  const server = createStudioServer({
+    cwd: active.repository.root,
+    state,
+    persist: false,
+    roadmapRegistryPath: registryPath,
+    runtimeConfig,
+    runner,
+    providerInventory: () => {
+      inventoryLookups += 1;
+      throw new Error("Unknown backends must fail before provider inventory lookup.");
+    }
+  });
+  const baseBody = {
+    requestId: String(active.board.requests[0].id),
+    lineId: String(active.board.lines[0].id),
+    selectedDestinationIds: [String(active.board.destinations[0].id)]
+  };
+  const cases = [{
+    path: "/api/runs/start",
+    body: { ...baseBody, backendId: "missing_backend" }
+  }, {
+    path: `/api/roadmaps/${encodeURIComponent(active.roadmap.roadmapId)}/runs/start`,
+    body: {
+      ...baseBody,
+      workspace: {
+        workspaceId: active.roadmap.roadmapId,
+        backendId: "missing_backend"
+      }
+    }
+  }];
+
+  try {
+    for (const entry of cases) {
+      const response = await requestStudioServerJson(server, "POST", entry.path, entry.body);
+      assert.equal(response.status, 409, JSON.stringify(response.body));
+      assert.equal(response.body.area, "connection");
+      assert.equal(response.body.error, "BRIDGE_NOT_CONNECTED");
+      assert.equal(response.body.backendId, "missing_backend");
+    }
+    assert.equal(inventoryLookups, 0);
+    assert.equal(runner.started, undefined);
+    assert.equal(runner.resumed, undefined);
+    assert.equal(runner.memberPathRun, undefined);
+    assert.deepEqual(Object.keys(state.runs), []);
+  } finally {
+    server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Bridge Execute rejects a remote-unsupported Harness Member model before invoking the runner", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "hunsu-remote-harness-model-preflight-test-"));
+  const repo = createRepo();
+  const registryPath = join(configRoot, "roadmaps.json");
+  const relayRegistryPath = join(configRoot, "relay-devices.json");
+  const bridgeAppStatePath = join(configRoot, "bridge-app.json");
+  const state = createStudioState();
+  const protocol = createDefaultHarness();
+  protocol.members[0].modelSelection = {
+    kind: "direct",
+    provider: {
+      providerId: "codex",
+      model: "gpt-5.5-thinking",
+      reasoningEffort: "high",
+      serviceTier: "default"
+    }
+  };
+  await seedRequestAndLine(state, repo, true, protocol);
+  const opened = openStudioRoadmap({ path: repo, title: "remote-harness-model" }, state, {
+    persist: true,
+    roadmapRegistryPath: registryPath
+  });
+  const readyCodexProvider = normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
+  const localInventoryResult = providerInventoryForBridgeStatus({ provider: readyCodexProvider });
+  if (!localInventoryResult.ok) assert.fail(localInventoryResult.error.message);
+  const localModels = localInventoryResult.value.providers[0].models;
+  assert.equal(localModels.some(model => model.model === "gpt-5.5-thinking"), true);
+  const remoteProvider = {
+    ...readyCodexProvider,
+    label: "Remote Codex",
+    modelInventory: {
+      state: "available" as const,
+      models: localModels.filter(model => model.model === "gpt-5.5")
+    }
+  };
+  writeFileSync(relayRegistryPath, `${JSON.stringify({
+    schema: "hunsu.relay-registry.v1",
+    devices: [{
+      deviceId: "device_model_limited",
+      deviceName: "Model-limited Devbox",
+      userId: "user_model_test",
+      registeredAt: "2026-07-09T00:00:00.000Z",
+      lastSeenAt: "2026-07-09T00:01:00.000Z",
+      status: "online",
+      remoteAccess: "enabled",
+      provider: remoteProvider,
+      projectGrants: [{
+        path: repo,
+        grantedAt: "2026-07-09T00:01:00.000Z",
+        scopes: ["remoteRelay.access", "execute.start"]
+      }],
+      workspaces: [{
+        workspaceId: opened.roadmap.roadmapId,
+        roadmapId: opened.roadmap.roadmapId,
+        displayName: "remote-harness-model",
+        path: repo,
+        lifecycle: "active",
+        health: "ok",
+        backendId: "local",
+        connectionMode: "local",
+        provider: {
+          providerId: "codex",
+          label: "Remote Codex",
+          readyForExecute: true
+        },
+        actions: ["open_studio"]
+      }]
+    }]
+  }, null, 2)}\n`, "utf8");
+  writeFileSync(bridgeAppStatePath, `${JSON.stringify({
+    schema: "hunsu.bridge-app-state.v1",
+    account: { status: "signed-in", userId: "user_model_test", email: "model-test@example.test" },
+    projectGrants: []
+  }, null, 2)}\n`, "utf8");
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+    PATH: join(configRoot, "missing-path"),
+    HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
+    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+  }, {
+    cwd: repo,
+    roadmapRegistryPath: registryPath
+  }));
+  const runner = new FakeRunner();
+  const server = createStudioServer({
+    cwd: repo,
+    state,
+    persist: true,
+    roadmapRegistryPath: registryPath,
+    runner,
+    runtimeConfig
+  });
+
+  try {
+    const backendId = "remote:device_model_limited";
+    const inventory = await requestStudioServerJson(server, "GET", `/api/providers/inventory?backendId=${encodeURIComponent(backendId)}`);
+    assert.equal(inventory.body.ok, true, JSON.stringify(inventory.body));
+    assert.deepEqual(inventory.body.value.providers[0].models.map((model: { model: string }) => model.model), ["gpt-5.5"]);
+
+    const startBody = {
+      requestId: "req_batch",
+      lineId: "run/req_batch",
+      selectedDestinationIds: ["destination_001"],
+      workspace: {
+        workspaceId: opened.roadmap.roadmapId,
+        backendId,
+        connectionMode: "remote" as const
+      }
+    };
+    const start = await requestStudioServerJson(server, "POST", `/api/roadmaps/${encodeURIComponent(opened.roadmap.roadmapId)}/runs/start`, startBody);
+
+    assert.equal(start.status, 409, JSON.stringify(start.body));
+    assert.equal(start.body.area, "model");
+    assert.equal(start.body.backendId, backendId);
+    assert.equal(start.body.providerId, "codex");
+    assert.equal(start.body.model, "gpt-5.5-thinking");
+    assert.equal(start.body.error, "MODEL_UNSUPPORTED");
+    assert.match(start.body.message, /Remote Codex/);
+    assert.equal(runner.started, undefined);
+    assert.equal(runner.memberPathRun, undefined);
+    assert.deepEqual(Object.keys(state.runs), []);
+
+    const unpublishedStore = JSON.parse(readFileSync(relayRegistryPath, "utf8")) as {
+      devices: Array<{ provider?: { modelInventory?: unknown } }>;
+    };
+    if (unpublishedStore.devices[0]?.provider) {
+      delete unpublishedStore.devices[0].provider.modelInventory;
+    }
+    writeFileSync(relayRegistryPath, `${JSON.stringify({ schema: "hunsu.relay-registry.v1", ...unpublishedStore }, null, 2)}\n`, "utf8");
+
+    const unavailable = await requestStudioServerJson(server, "POST", `/api/roadmaps/${encodeURIComponent(opened.roadmap.roadmapId)}/runs/start`, startBody);
+    assert.equal(unavailable.status, 409, JSON.stringify(unavailable.body));
+    assert.equal(unavailable.body.area, "model");
+    assert.equal(unavailable.body.backendId, backendId);
+    assert.equal(unavailable.body.error, "PROVIDER_INVENTORY_UNAVAILABLE");
+    assert.equal(runner.started, undefined);
+    assert.equal(runner.memberPathRun, undefined);
+    assert.deepEqual(Object.keys(state.runs), []);
+  } finally {
+    server.close();
+    rmSync(configRoot, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("Bridge Execute resume revalidates remote backend inventory and models before state or runner work", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "hunsu-remote-resume-preflight-test-"));
+  const repo = createRepo();
+  const registryPath = join(configRoot, "roadmaps.json");
+  const relayRegistryPath = join(configRoot, "relay-devices.json");
+  const bridgeAppStatePath = join(configRoot, "bridge-app.json");
+  const state = createStudioState();
+  const protocol = createDefaultHarness();
+  protocol.members[0].modelSelection = {
+    kind: "direct",
+    provider: {
+      providerId: "codex",
+      model: "gpt-5.5-thinking",
+      reasoningEffort: "high",
+      serviceTier: "default"
+    }
+  };
+  await seedRequestAndLine(state, repo, true, protocol);
+  const opened = openStudioRoadmap({ path: repo, title: "remote-resume-preflight" }, state, {
+    persist: true,
+    roadmapRegistryPath: registryPath
+  });
+  await executeStudioCommand({ type: "PauseLine", lineId: "run/req_batch" }, state, { cwd: repo, persist: true });
+
+  const remoteBackendId = "remote:device_resume";
+  const remoteProvider = readyCodexProviderFixture();
+  writeFileSync(relayRegistryPath, `${JSON.stringify({
+    schema: "hunsu.relay-registry.v1",
+    devices: [{
+      deviceId: "device_resume",
+      deviceName: "Resume Devbox",
+      userId: "user_resume",
+      registeredAt: "2026-07-10T00:00:00.000Z",
+      lastSeenAt: "2026-07-10T00:01:00.000Z",
+      status: "online",
+      remoteAccess: "enabled",
+      provider: remoteProvider,
+      projectGrants: [{
+        path: repo,
+        grantedAt: "2026-07-10T00:01:00.000Z",
+        scopes: ["remoteRelay.access", "execute.start"]
+      }],
+      workspaces: []
+    }]
+  }, null, 2)}\n`, "utf8");
+  writeFileSync(bridgeAppStatePath, `${JSON.stringify({
+    schema: "hunsu.bridge-app-state.v1",
+    account: { status: "signed-in", userId: "user_resume", email: "resume@example.test" },
+    projectGrants: []
+  }, null, 2)}\n`, "utf8");
+
+  const localInventory = providerInventoryForBridgeStatus({ provider: remoteProvider });
+  if (!localInventory.ok) assert.fail(localInventory.error.message);
+  const remoteInventory: ProviderInventoryResult = {
+    ok: true,
+    value: { ...localInventory.value, backendId: nt(remoteBackendId) }
+  };
+  const limitedRemoteInventory: ProviderInventoryResult = {
+    ok: true,
+    value: {
+      ...remoteInventory.value,
+      providers: remoteInventory.value.providers.map(provider => ({
+        ...provider,
+        models: provider.models.filter(model => model.model === "gpt-5.5")
+      }))
+    }
+  };
+  let currentInventory: ProviderInventoryResult = {
+    ok: false,
+    error: {
+      code: "BACKEND_UNAVAILABLE",
+      backendId: nt(remoteBackendId),
+      message: `Backend ${remoteBackendId} is no longer available.`
+    }
+  };
+  const inventorySelections: Array<{ backendId?: string; connectionMode?: string; workspaceBackendId?: string; workspaceConnectionMode?: string }> = [];
+  const runner = new FakeRunner();
+  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+    PATH: join(configRoot, "missing-path"),
+    HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
+    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+  }, {
+    cwd: repo,
+    roadmapRegistryPath: registryPath
+  }));
+  const resumeRunState: StudioRunState = {
+    ...studioRunFixture(),
+    roadmapId: opened.roadmap.roadmapId,
+    repositoryPath: repo,
+    backendId: remoteBackendId,
+    connectionMode: "local" as const,
+    workspace: {
+      workspaceId: opened.roadmap.roadmapId,
+      backendId: remoteBackendId,
+      connectionMode: "local" as const
+    },
+    modelSelection: { kind: "alias" as const, aliasId: nt("PrimaryModel") },
+    aliases: defaultModelAliases("2026-01-01T00:00:00.000Z"),
+    resolvedModelSelection: {
+      providerId: "codex" as const,
+      model: "gpt-5.5-thinking" as const,
+      reasoningEffort: "high" as const,
+      serviceTier: "default" as const
+    },
+    status: "paused" as const
+  };
+  state.runs[resumeRunState.runId] = resumeRunState;
+  const server = createStudioServer({
+    cwd: repo,
+    state,
+    persist: true,
+    roadmapRegistryPath: registryPath,
+    runtimeConfig,
+    runner,
+    providerInventory: selection => {
+      inventorySelections.push({
+        backendId: selection.backendId,
+        connectionMode: selection.connectionMode,
+        workspaceBackendId: selection.workspace?.backendId,
+        workspaceConnectionMode: selection.workspace?.connectionMode
+      });
+      return currentInventory;
+    }
+  });
+  const unscopedPath = "/api/runs/resume";
+  const scopedPath = `/api/roadmaps/${encodeURIComponent(opened.roadmap.roadmapId)}/runs/resume`;
+  const headBefore = run("git", ["rev-parse", "HEAD"], repo).trim();
+  const statusBefore = run("git", ["status", "--short"], repo);
+  const eventsBefore = cloneTestJson(state.events);
+  const assertBlockedWithoutMutation = (expectedRun: StudioRunState) => {
+    assert.deepEqual(state.runs[resumeRunState.runId], expectedRun);
+    assert.deepEqual(state.events, eventsBefore);
+    assert.equal(run("git", ["rev-parse", "HEAD"], repo).trim(), headBefore);
+    assert.equal(run("git", ["status", "--short"], repo), statusBefore);
+    assert.equal(runner.resumed, undefined);
+    assert.equal(runner.started, undefined);
+    assert.equal(runner.memberPathRun, undefined);
+  };
+
+  try {
+    let expectedRun = cloneTestJson(resumeRunState);
+    const backendUnavailable = await requestStudioServerJson(server, "POST", unscopedPath, { runId: resumeRunState.runId });
+    assert.equal(backendUnavailable.status, 409, JSON.stringify(backendUnavailable.body));
+    assert.equal(backendUnavailable.body.area, "connection");
+    assert.equal(backendUnavailable.body.error, "REMOTE_NOT_CONNECTED");
+    assert.equal(backendUnavailable.body.backendId, remoteBackendId);
+    assertBlockedWithoutMutation(expectedRun);
+
+    currentInventory = {
+      ok: false,
+      error: {
+        code: "PROVIDER_INVENTORY_UNAVAILABLE",
+        backendId: nt(remoteBackendId),
+        providerId: "codex",
+        message: "Remote Codex has not published a current model inventory."
+      }
+    };
+    const inventoryUnavailable = await requestStudioServerJson(server, "POST", scopedPath, { runId: resumeRunState.runId });
+    assert.equal(inventoryUnavailable.status, 409, JSON.stringify(inventoryUnavailable.body));
+    assert.equal(inventoryUnavailable.body.area, "model");
+    assert.equal(inventoryUnavailable.body.error, "PROVIDER_INVENTORY_UNAVAILABLE");
+    assert.equal(inventoryUnavailable.body.backendId, remoteBackendId);
+    assertBlockedWithoutMutation(expectedRun);
+
+    currentInventory = limitedRemoteInventory;
+    const persistedModelMismatch = await requestStudioServerJson(server, "POST", unscopedPath, { runId: resumeRunState.runId });
+    assert.equal(persistedModelMismatch.status, 409, JSON.stringify(persistedModelMismatch.body));
+    assert.equal(persistedModelMismatch.body.area, "model");
+    assert.equal(persistedModelMismatch.body.error, "MODEL_UNSUPPORTED");
+    assert.equal(persistedModelMismatch.body.backendId, remoteBackendId);
+    assert.equal(persistedModelMismatch.body.model, "gpt-5.5-thinking");
+    assertBlockedWithoutMutation(expectedRun);
+
+    resumeRunState.resolvedModelSelection = {
+      providerId: "codex",
+      model: "gpt-5.5",
+      reasoningEffort: "medium",
+      serviceTier: "default"
+    };
+    resumeRunState.modelSelection = { kind: "direct", provider: { ...resumeRunState.resolvedModelSelection } };
+    expectedRun = cloneTestJson(resumeRunState);
+    const memberModelMismatch = await requestStudioServerJson(server, "POST", scopedPath, { runId: resumeRunState.runId });
+    assert.equal(memberModelMismatch.status, 409, JSON.stringify(memberModelMismatch.body));
+    assert.equal(memberModelMismatch.body.area, "model");
+    assert.equal(memberModelMismatch.body.error, "MODEL_UNSUPPORTED");
+    assert.equal(memberModelMismatch.body.backendId, remoteBackendId);
+    assert.equal(memberModelMismatch.body.model, "gpt-5.5-thinking");
+    assertBlockedWithoutMutation(expectedRun);
+
+    assert.equal(inventorySelections.length, 4);
+    assert.equal(inventorySelections.every(selection => selection.backendId === remoteBackendId), true);
+    assert.equal(inventorySelections.every(selection => selection.workspaceBackendId === remoteBackendId), true);
+  } finally {
+    server.close();
+    rmSync(configRoot, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
   }
 });
 
@@ -1828,19 +2700,40 @@ test("Bridge HUNSU Draft resolves locked Manager packages and materializes Manag
   const opened = createStudioRoadmap({ path: repo, title: "hunsu-draft-locked-manager-roadmap" }, state, { persist: true, roadmapRegistryPath: registryPath });
   const originServer = await startOriginServer(repo, "motorhome");
   try {
+    const managerConfig = createDefaultManagerConfig("manager.idea-helper", "Explore options before editing request files.", [{
+      kind: "local-snapshot",
+      name: nt("draft-helper"),
+      sourcePath: nt("/skills/draft-helper"),
+      contentHash: nt("sha256:draft-helper"),
+      snapshotRef: nt("snapshot:draft-helper"),
+      snapshotFiles: [{ path: nt("SKILL.md"), text: "# Draft Helper\n\nHelp Hunsu Drafts.\n" }]
+    }]);
+    managerConfig.modelSelection = {
+      kind: "alias",
+      aliasId: nt("DraftCustomModel")
+    };
+    const aliases: ModelAlias[] = [{
+      aliasId: nt("DraftCustomModel"),
+      displayName: nt("Draft Custom Model"),
+      selection: {
+        kind: "direct",
+        provider: {
+          providerId: "codex",
+          model: "gpt-5.5",
+          reasoningEffort: "low",
+          serviceTier: "fast"
+        }
+      },
+      scope: { kind: "user" },
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    }];
     const managerManifest: ManagerPackageManifest = {
       schema: HUB_PACKAGE_MANIFEST_SCHEMA,
       kind: "manager",
       key: "manager.idea-helper",
       version: "1.0.0",
-      manager: createDefaultManagerConfig("manager.idea-helper", "Explore options before editing request files.", [{
-        kind: "local-snapshot",
-        name: nt("draft-helper"),
-        sourcePath: nt("/skills/draft-helper"),
-        contentHash: nt("sha256:draft-helper"),
-        snapshotRef: nt("snapshot:draft-helper"),
-        snapshotFiles: [{ path: nt("SKILL.md"), text: "# Draft Helper\n\nHelp Hunsu Drafts.\n" }]
-      }])
+      manager: managerConfig
     };
     const managerLock = writeOriginManifest(repo, managerManifest);
     await executeStudioCommand({
@@ -1848,18 +2741,40 @@ test("Bridge HUNSU Draft resolves locked Manager packages and materializes Manag
       origin: originServer.origin
     }, state, { cwd: repo, persist: true });
     const runner = new FakeRunner();
-    const server = createStudioServer({ cwd: repo, state, persist: true, roadmapRegistryPath: registryPath, runner });
+    const providerInventory = providerInventoryForBridgeStatus({
+      provider: normalizeCodexRuntimeStatus({
+        runtime: "codex",
+        cli: {
+          installed: true,
+          binaryPath: "/usr/local/bin/codex",
+          source: "process_path",
+          version: "codex 1.2.3",
+          installActionAvailable: false
+        },
+        appServer: { available: true },
+        auth: { state: "authenticated", method: "chatgpt" },
+        usage: { rateLimitsAvailable: true },
+        ready: true,
+        recommendedAction: "none"
+      })
+    });
+    const server = createStudioServer({ cwd: repo, state, persist: true, roadmapRegistryPath: registryPath, runner, providerInventory });
     const baseUrl = `/api/roadmaps/${encodeURIComponent(opened.roadmap.roadmapId)}/hunsu/drafts`;
     const start = await requestStudioServerJson(server, "POST", baseUrl, {
       sourceNodeId: String(opened.board.nodes[0].id),
       sourceLineId: String(opened.board.lines[0].id),
-      managerLock
+      managerLock,
+      aliases
     });
 
-    assert.equal(start.status, 202);
+    assert.equal(start.status, 202, JSON.stringify(start.body));
     assert.equal(start.body.draft.manager.id, "manager.idea-helper");
     assert.deepEqual(start.body.draft.managerLock, managerLock);
     assert.equal(runner.hunsuDraftPrepared?.manager.promptTemplate.template, "Explore options before editing request files.");
+    assert.equal(runner.hunsuDraftPrepared?.resolvedModelSelection?.model, "gpt-5.5");
+    assert.equal(runner.hunsuDraftPrepared?.resolvedModelSelection?.reasoningEffort, "low");
+    assert.equal(runner.hunsuDraftPrepared?.resolvedModelSelection?.serviceTier, "fast");
+    assert.equal(start.body.draft.aliases[0].aliasId, "DraftCustomModel");
     assert.equal(existsSync(join(start.body.draft.worktree.path, ".agents", "skills", "draft-helper", "SKILL.md")), true);
     assert.equal(existsSync(join(repo, ".agents", "skills", "draft-helper", "SKILL.md")), false);
     const routeRuntime = requireDomainValue(decodeHunsuRuntimeFileText<{ manager: { id: string }; managerLock?: HubPackageLock }>(
@@ -2371,6 +3286,110 @@ test("Bridge server starts an injected runner with Team context", async () => {
 
   await waitFor(() => state.runs["run/req_batch"].debugEvents.length === 1);
   assert.equal(state.runs["run/req_batch"].debugEvents[0].type, "runner.status.changed");
+});
+
+test("Bridge server resolves Member ModelSelection aliases with the selected remote inventory before runner turns", async () => {
+  const repo = createRepo();
+  const state = createStudioState();
+  const protocol = createDefaultHarness();
+  protocol.members[0].modelSelection = {
+    kind: "alias",
+    aliasId: nt("FastModel")
+  };
+  class InspectingRunner extends CompletingRunner {
+    readonly memberInputs: MemberPathRunInput[] = [];
+
+    override async runMemberPath(input: MemberPathRunInput): Promise<RunnerRun> {
+      this.memberInputs.push(input);
+      return super.runMemberPath(input);
+    }
+  }
+  const runner = new InspectingRunner();
+  const localProviderInventory = providerInventoryForBridgeStatus({
+    provider: normalizeCodexRuntimeStatus({
+      runtime: "codex",
+      cli: {
+        installed: true,
+        binaryPath: "/usr/local/bin/codex",
+        source: "process_path",
+        version: "codex 1.2.3",
+        installActionAvailable: false
+      },
+      appServer: { available: true },
+      auth: { state: "authenticated", method: "chatgpt" },
+      usage: { rateLimitsAvailable: true },
+      ready: true,
+      recommendedAction: "none"
+    })
+  });
+  if (!localProviderInventory.ok) assert.fail(localProviderInventory.error.message);
+  const providerInventory = {
+    ok: true as const,
+    value: {
+      ...localProviderInventory.value,
+      backendId: nt("remote:device_member")
+    }
+  };
+  await seedRequestAndLine(state, repo, true, protocol);
+
+  await startStudioRun({
+    requestId: "req_batch",
+    lineId: "run/req_batch",
+    selectedDestinationIds: ["destination_001"],
+    backendId: "remote:device_member",
+    connectionMode: "remote",
+    aliases: defaultModelAliases("2026-01-01T00:00:00.000Z")
+  }, state, { cwd: repo, persist: true, runner, providerInventory });
+
+  await waitFor(() => runner.memberInputs.some(input => input.memberPath.executorId === "azir"));
+  const azirInput = runner.memberInputs.find(input => input.memberPath.executorId === "azir");
+  assert.equal(azirInput?.resolvedModelSelection?.providerId, "codex");
+  assert.equal(azirInput?.resolvedModelSelection?.model, "gpt-5.5");
+  assert.equal(azirInput?.resolvedModelSelection?.reasoningEffort, "medium");
+  assert.equal(azirInput?.resolvedModelSelection?.serviceTier, "fast");
+});
+
+test("Bridge Execute preflight rejects unresolved Member ModelSelection aliases before starting", async () => {
+  const repo = createRepo();
+  const state = createStudioState();
+  const protocol = createDefaultHarness();
+  protocol.members[0].modelSelection = {
+    kind: "alias",
+    aliasId: nt("PrimaryModel")
+  };
+  await seedRequestAndLine(state, repo, true, protocol);
+  const providerInventory = providerInventoryForBridgeStatus({
+    provider: normalizeCodexRuntimeStatus({
+      runtime: "codex",
+      cli: {
+        installed: true,
+        binaryPath: "/usr/local/bin/codex",
+        source: "process_path",
+        version: "codex 1.2.3",
+        installActionAvailable: false
+      },
+      appServer: { available: true },
+      auth: { state: "authenticated", method: "chatgpt" },
+      usage: { rateLimitsAvailable: true },
+      ready: true,
+      recommendedAction: "none"
+    })
+  });
+  const server = createStudioServer({ cwd: repo, state, persist: true, providerInventory });
+
+  const start = await requestStudioServerJson(server, "POST", "/api/runs/start", {
+    requestId: "req_batch",
+    lineId: "run/req_batch",
+    selectedDestinationIds: ["destination_001"],
+    aliases: []
+  });
+
+  assert.equal(start.status, 409, JSON.stringify(start.body));
+  assert.equal(start.body.area, "model");
+  assert.equal(start.body.backendId, "local");
+  assert.equal(start.body.error, "MODEL_ALIAS_NOT_FOUND");
+  assert.equal(start.body.aliasId, "PrimaryModel");
+  assert.deepEqual(Object.keys(state.runs), []);
 });
 
 test("Bridge server scopes Roadmap run ids so parallel Roadmaps do not share runner events", async () => {
@@ -4905,6 +5924,8 @@ test("Bridge server Artifact Action Runs use resolved runtime config root", asyn
 test("Bridge server controls runtime pause, resume, and stop state", async () => {
   const state = createStudioState();
   const runner = new FakeRunner();
+  const provider = readyCodexProviderFixture();
+  const providerInventory = providerInventoryForBridgeStatus({ provider });
   await seedRequestAndLine(state);
   state.runs["run/req_batch"] = studioRunFixture();
 
@@ -4913,9 +5934,27 @@ test("Bridge server controls runtime pause, resume, and stop state", async () =>
   assert.equal(paused.board.lines[0].status, "paused");
   assert.deepEqual(runner.paused, ["run/req_batch"]);
 
-  const resumed = await resumeStudioRun({ runId: "run/req_batch" }, state, { cwd: "/repo", persist: false, runner });
-  assert.equal(resumed.run.status, "running");
-  assert.equal(resumed.board.lines[0].status, "active");
+  const resumed = await resumeStudioRun({ runId: "run/req_batch" }, state, {
+    cwd: "/repo",
+    persist: false,
+    runner,
+    bridgeStatus: {
+      account: { signedIn: false },
+      connections: [{
+        backendId: "local",
+        mode: "local",
+        label: "This computer",
+        provider,
+        connection: { state: "connected" },
+        workspaces: []
+      }]
+    },
+    providerInventory
+  });
+  if (!resumed.ok) assert.fail(resumed.error.message);
+  assert.equal(resumed.ok, true);
+  assert.equal(resumed.value.run.status, "running");
+  assert.equal(resumed.value.board.lines[0].status, "active");
   await waitFor(() => runner.resumed?.runId === "run/req_batch");
 
   const stopped = await stopStudioRun({ runId: "run/req_batch" }, state, { cwd: "/repo", persist: false, runner });
@@ -5439,6 +6478,24 @@ function studioRunFixture(): StudioRunState {
     startedAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z"
   };
+}
+
+function readyCodexProviderFixture() {
+  return normalizeCodexRuntimeStatus({
+    runtime: "codex",
+    cli: {
+      installed: true,
+      binaryPath: "/usr/local/bin/codex",
+      source: "process_path",
+      version: "codex 1.2.3",
+      installActionAvailable: false
+    },
+    appServer: { available: true },
+    auth: { state: "authenticated", method: "chatgpt" },
+    usage: { rateLimitsAvailable: true },
+    ready: true,
+    recommendedAction: "none"
+  });
 }
 
 function nonExecutableHarness(kind: "role_squad" | "council_vote" | "court_debate"): HarnessSnapshot {

@@ -1,14 +1,17 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Result } from "@hunsu/protocol";
 import type { RuntimeProviderRegistry } from "../runtime-providers/types.ts";
 import type { BridgeStatusResponse } from "../server/bridgeStatus.ts";
 import type { RoadmapRegistryWorkspaceEntry } from "../workspaces/workspaceRegistry.ts";
 import {
   connectionExecutePreflightErrorForSelection,
   executeStartHasExplicitBackendSelection,
+  modelExecutePreflightErrorForSelection,
   normalizeExecuteStartSelectionForLocalBridge,
   providerAwareExecutePreflightForRoadmap,
   providerAwareExecutePreflightForRepository,
-  type ExecuteStartBackendSelection
+  type ExecuteStartBackendSelection,
+  type ProviderAwareExecutePreflightError
 } from "./executePreflight.ts";
 
 type ExecuteRouteContext = {
@@ -21,9 +24,10 @@ type ExecuteRouteContext = {
   localBridgeTokenPresent: () => boolean;
   runSummaries: () => unknown[];
   executeView: (run: unknown) => unknown;
+  modelPreflight?: (body: ExecuteStartBackendSelection) => Promise<ProviderAwareExecutePreflightError | undefined> | ProviderAwareExecutePreflightError | undefined;
   startRun: (body: unknown) => Promise<unknown> | unknown;
   pauseRun: (body: unknown) => Promise<unknown> | unknown;
-  resumeRun: (body: unknown) => Promise<unknown> | unknown;
+  resumeRun: (body: unknown) => Promise<Result<unknown, ProviderAwareExecutePreflightError>> | Result<unknown, ProviderAwareExecutePreflightError>;
   stopRun: (body: unknown) => Promise<unknown> | unknown;
   completeMove: (body: unknown) => Promise<unknown> | unknown;
   streamLiveEvents: () => void;
@@ -87,7 +91,12 @@ async function handleExecuteRouteWithPath(
   }
 
   if (request.method === "POST" && (routePath === `${apiPrefix}/runs/resume` || routePath === `${apiPrefix}/executes/resume`)) {
-    context.sendJson(response, 202, await context.resumeRun(await context.readJson(request)));
+    const result = await context.resumeRun(await context.readJson(request));
+    if (!result.ok) {
+      context.sendJson(response, 409, result.error);
+      return true;
+    }
+    context.sendJson(response, 202, result.value);
     return true;
   }
 
@@ -112,6 +121,9 @@ async function executeStartPreflight(
     localBridgeTokenPresent: context.localBridgeTokenPresent()
   });
   const selectedStatus = executeStartHasExplicitBackendSelection(preflightBody)
+    || preflightBody.modelSelection
+    || preflightBody.aliases?.length
+    || Boolean(context.modelPreflight)
     ? await context.bridgeStatus()
     : undefined;
   const connectionPreflightError = selectedStatus
@@ -119,6 +131,18 @@ async function executeStartPreflight(
     : undefined;
   if (connectionPreflightError) {
     return connectionPreflightError;
+  }
+  const modelPreflightError = selectedStatus
+    ? modelExecutePreflightErrorForSelection(preflightBody, selectedStatus)
+    : undefined;
+  if (modelPreflightError) {
+    return modelPreflightError;
+  }
+  const harnessModelPreflightError = context.modelPreflight
+    ? await context.modelPreflight(preflightBody)
+    : undefined;
+  if (harnessModelPreflightError) {
+    return harnessModelPreflightError;
   }
 
   if (context.roadmapId) {

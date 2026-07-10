@@ -8,7 +8,9 @@ import type {
   RoadmapRegistryEntry,
   RuntimeProviderConfigField,
   RuntimeProviderMetadata,
-  RuntimeProviderStatus
+  RuntimeProviderStatus,
+  ModelAlias,
+  ModelAliasOverride
 } from "@hunsu/bridge";
 import type { BridgeCommandScope, ProjectGrant } from "../relay.ts";
 
@@ -75,10 +77,12 @@ export type BridgePendingAuthState = {
 
 export type BridgeServiceState = {
   installed: boolean;
-  manager: "systemd-user" | "launchd-user" | "windows-service" | "manual";
+  manager: "systemd-user" | "launchd-user" | "windows-startup-user" | "manual";
   unitPath?: string;
   updatedAt?: string;
 };
+
+export type BridgeQuitBehavior = "keep-background" | "stop-background";
 
 export type BridgeCodexSettings = {
   binaryPath?: string;
@@ -127,8 +131,11 @@ export type BridgeAppState = {
   device: BridgeDeviceState;
   remoteAccess: "off" | "on" | "registered-offline" | "unavailable";
   projectGrants: ProjectGrant[];
+  modelAliases: ModelAlias[];
+  modelAliasOverrides: ModelAliasOverride[];
   uiIntent?: BridgeUiIntent;
   service: BridgeServiceState;
+  quitBehavior: BridgeQuitBehavior;
 };
 
 export type BridgeRoadmapAccessSnapshot = Omit<RoadmapRegistryEntry, "codex" | "remoteAccess"> & {
@@ -158,6 +165,7 @@ export type BridgeAppSnapshot = {
     remoteAccess: "Off" | "On" | "Registered but offline" | "Unavailable";
     device: BridgeDeviceState;
     service: BridgeServiceState;
+    quitBehavior: BridgeQuitBehavior;
     supervisorPid?: number;
     pid?: number;
     bridgeApiUrl?: string;
@@ -229,7 +237,10 @@ export function defaultBridgeAppState(): BridgeAppState {
     device: defaultBridgeDeviceState(),
     remoteAccess: "off",
     projectGrants: [],
-    service: defaultBridgeServiceState()
+    modelAliases: [],
+    modelAliasOverrides: [],
+    service: defaultBridgeServiceState(),
+    quitBehavior: "keep-background"
   };
 }
 
@@ -302,6 +313,7 @@ export function createBridgeAppSnapshot(input: {
       remoteAccess: input.remoteAccessLabel,
       device: input.state.device,
       service: input.state.service,
+      quitBehavior: input.state.quitBehavior,
       supervisorPid: input.state.supervisorPid,
       pid: input.state.pid,
       bridgeApiUrl: input.bridgeApiUrl,
@@ -375,7 +387,10 @@ export function normalizeBridgeAppState(parsed: Partial<BridgeAppState>): Bridge
     device: parsed.device ?? defaultBridgeDeviceState(),
     remoteAccess: parseBridgeRemoteAccessState(parsed.remoteAccess),
     projectGrants: Array.isArray(parsed.projectGrants) ? parsed.projectGrants : [],
-    service: parsed.service ?? defaultBridgeServiceState()
+    modelAliases: Array.isArray(parsed.modelAliases) ? parsed.modelAliases : [],
+    modelAliasOverrides: Array.isArray(parsed.modelAliasOverrides) ? parsed.modelAliasOverrides : [],
+    service: parsed.service ?? defaultBridgeServiceState(),
+    quitBehavior: parseBridgeQuitBehavior(parsed.quitBehavior)
   };
 }
 
@@ -570,9 +585,15 @@ export function defaultBridgeServiceState(): BridgeServiceState {
 export function defaultBridgeServiceManager(): BridgeServiceState["manager"] {
   const os = platform();
   if (os === "darwin") return "launchd-user";
-  if (os === "win32") return "windows-service";
+  if (os === "win32") return "windows-startup-user";
   if (os === "linux") return "systemd-user";
   return "manual";
+}
+
+export function parseBridgeQuitBehavior(value: unknown): BridgeQuitBehavior {
+  return value === "stop-background" || value === "keep-background"
+    ? value
+    : "keep-background";
 }
 
 export function parseBridgeRemoteAccessState(value: unknown): BridgeAppState["remoteAccess"] {

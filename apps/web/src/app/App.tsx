@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { currentStudioNext, isBridgeBackedStudioRoute, parseStudioRoute, replaceStudioPath, setupPath, type StudioRoute } from "@/app/routes";
 import { AppleAppShell } from "@/features/app-shell/AppleAppShell";
 import { HubScreen } from "@/features/hub/HubScreen";
+import { ModelAliasSettings } from "@/features/model-aliases/ModelAliasSettings";
 import { RoadmapWorkspace } from "@/features/roadmap-workspace/RoadmapWorkspace";
 import { SetupScreen } from "@/features/setup/SetupScreen";
 import { StudioLauncher } from "@/features/studio-launcher/StudioLauncher";
@@ -69,6 +70,14 @@ export function App() {
     return (
       <AppleAppShell active="studio" currentRoadmapId={route.roadmapId} connectionOverride={remoteBridgeConnection}>
         <RoadmapWorkspace roadmapId={route.roadmapId} />
+      </AppleAppShell>
+    );
+  }
+
+  if (route.kind === "modelAliases") {
+    return (
+      <AppleAppShell active="studio" connectionOverride={remoteBridgeConnection}>
+        <ModelAliasSettings />
       </AppleAppShell>
     );
   }

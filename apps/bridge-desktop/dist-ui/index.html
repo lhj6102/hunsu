@@ -192,9 +192,59 @@
         font-size: 13px;
         font-weight: 700;
       }
+      .modal {
+        align-items: center;
+        background: rgba(15, 23, 42, 0.42);
+        box-sizing: border-box;
+        display: flex;
+        inset: 0;
+        justify-content: center;
+        padding: 24px;
+        position: fixed;
+        z-index: 10;
+      }
+      .modal[hidden] {
+        display: none;
+      }
+      .modal-panel {
+        background: #ffffff;
+        border: 1px solid #dce2ea;
+        border-radius: 8px;
+        box-shadow: 0 22px 54px rgba(15, 23, 42, 0.22);
+        box-sizing: border-box;
+        max-height: calc(100vh - 48px);
+        max-width: 680px;
+        overflow: auto;
+        padding: 18px;
+        width: min(680px, 100%);
+      }
     </style>
   </head>
   <body>
+    <div id="provider-config-dialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="provider-config-title">
+      <div class="modal-panel">
+        <header>
+          <h2 id="provider-config-title">Configure Codex</h2>
+          <button id="close-provider-config" aria-label="Close provider setup">Close</button>
+        </header>
+        <div class="grid" style="margin-top: 14px;">
+          <label>
+            <span class="project-meta">Install channel</span>
+            <select id="codex-install-channel">
+              <option value="stable">Stable</option>
+              <option value="latest">Latest</option>
+              <option value="manual">Manual</option>
+            </select>
+          </label>
+          <div id="provider-config-form" class="grid"></div>
+          <div class="actions">
+            <button id="validate-codex-config">Validate</button>
+            <button id="save-codex-config" class="primary">Save</button>
+            <button id="reset-codex-config">Reset</button>
+          </div>
+        </div>
+      </div>
+    </div>
     <main>
       <header>
         <h1>Hunsu Bridge</h1>
@@ -276,6 +326,8 @@
             <dd id="device">Unknown</dd>
             <dt>Service</dt>
             <dd id="service">Not installed</dd>
+            <dt>Quit Behavior</dt>
+            <dd id="quit-behavior">Keep background service running</dd>
           </dl>
           <div class="actions" style="margin-top: 10px;">
             <button id="start-bridge">Start Bridge</button>
@@ -316,19 +368,15 @@
         <h2>Settings</h2>
         <div class="grid">
           <label>
-            <span class="project-meta">Install channel</span>
-            <select id="codex-install-channel">
-              <option value="stable">Stable</option>
-              <option value="latest">Latest</option>
-              <option value="manual">Manual</option>
+            <span class="project-meta">Quit Behavior</span>
+            <select id="quit-behavior-select">
+              <option value="keep-background">Keep background service running</option>
+              <option value="stop-background">Stop background service on quit</option>
             </select>
           </label>
-          <div id="provider-config-form" class="grid"></div>
-          <div class="actions">
-            <button id="validate-codex-config">Validate</button>
-            <button id="save-codex-config" class="primary">Save</button>
-            <button id="reset-codex-config">Reset</button>
-          </div>
+        </div>
+        <div class="actions" style="margin-top: 10px;">
+          <button id="open-provider-config-settings">Configure Codex</button>
         </div>
       </section>
     </main>
