@@ -1,6 +1,6 @@
 import { type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
@@ -103,9 +103,9 @@ import {
 } from "./execute/execute-workflow.ts";
 import {
   getCodexRuntimeStatus,
-  sanitizeDiagnostics,
   type CodexRuntimeStatus
 } from "./runtimes/codex.ts";
+import { sanitizeDiagnostics } from "./diagnostics/redaction.ts";
 import { createRuntimeProviderRegistry } from "./runtime-providers/registry.ts";
 import { createBridgeAppRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
 import {
@@ -167,9 +167,14 @@ import {
 
 export {
   detectCodexBinary,
-  getCodexRuntimeStatus,
-  sanitizeDiagnostics
+  getCodexRuntimeStatus
 } from "./runtimes/codex.ts";
+export {
+  assertDiagnosticsSafe,
+  redactDiagnosticText,
+  redactDiagnosticUrl,
+  sanitizeDiagnostics
+} from "./diagnostics/redaction.ts";
 export type { CodexCliStatus, CodexDiscoveryCandidate, CodexRuntimeStatus } from "./runtimes/codex.ts";
 export { createRuntimeProviderRegistry, placeholderProvider } from "./runtime-providers/registry.ts";
 export {
@@ -729,6 +734,25 @@ export type StudioServerSecurityOptions = {
   pairingTokenTtlMs?: number;
   allowedOrigins?: string[];
   allowNoOrigin?: boolean;
+  requirePairing?: boolean;
+};
+
+export type BridgeControlStatusResponse = {
+  ok: true;
+  instanceId: string;
+  protocolVersion: string;
+  bridgeVersion: string;
+  daemonPid: number;
+  supervisorPid?: number;
+  startedAt: string;
+  state: "running";
+};
+
+export type StudioServerControlStatusOptions = {
+  instanceId?: string;
+  daemonPid?: number;
+  supervisorPid?: number;
+  startedAt?: string;
 };
 
 type StudioServerSecurity = {
@@ -738,6 +762,7 @@ type StudioServerSecurity = {
   pairingTokenTtlMs: number;
   allowedOrigins: string[];
   allowNoOrigin: boolean;
+  requirePairing: boolean;
 };
 
 type StudioRequestSecurity = {
@@ -783,6 +808,7 @@ export type StudioServerOptions = {
   runtimeConfig?: BridgeRuntimeConfig;
   providerInventory?: ExecuteProviderInventorySource;
   security?: StudioServerSecurityOptions;
+  controlStatus?: StudioServerControlStatusOptions;
 };
 
 export type StudioCommandResult = {
@@ -936,17 +962,29 @@ export type BridgePairingSession = {
   revokedAt?: string;
 };
 
-export type BridgeRuntimeHandle = {
+type BridgeRuntimeHandleBase = {
   bridgeApiUrl: string;
-  studioUrl?: string;
   allowedOrigin: string;
-  authToken: string;
   controlToken: string;
-  pairing: BridgePairingSession;
   status: BridgeRuntimeStatus;
   startedAt?: string;
   error?: string;
 };
+
+export type BridgeRuntimeHandle = BridgeRuntimeHandleBase & (
+  | {
+      pairingState: "unpaired";
+      studioUrl?: never;
+      authToken?: never;
+      pairing?: never;
+    }
+  | {
+      pairingState: "paired";
+      studioUrl: string;
+      authToken: string;
+      pairing: BridgePairingSession;
+    }
+);
 
 export type BridgeMode = "local" | "remote-ready";
 export type StudioPairingTokenQueryParam = "hunsuBridgeToken";
@@ -962,6 +1000,7 @@ export type StartBridgeInput = {
   pairingTtlMs?: number;
   runtimeConfig?: BridgeRuntimeConfig;
   tokenQueryParam?: StudioPairingTokenQueryParam;
+  deferPairing?: boolean;
 };
 
 export type CreatePairingUrlInput = {
@@ -978,6 +1017,7 @@ export type OpenStudioInput = CreatePairingUrlInput & {
 export type BridgeSupervisor = {
   start(input?: StartBridgeInput): Promise<BridgeRuntimeHandle>;
   stop(): Promise<void>;
+  waitForTerminal(): Promise<void>;
   restart(input?: StartBridgeInput): Promise<BridgeRuntimeHandle>;
   status(): Promise<BridgeRuntimeHandle | undefined>;
   createPairingUrl(input?: CreatePairingUrlInput): Promise<string>;
@@ -1556,23 +1596,41 @@ function studioBridgePairingUrl(webUrl: string, authToken: string): string {
 
 function printStudioBridgeStartInfo(info: StudioBridgeStartInfo, options: Pick<StudioBridgeStartOptions, "json">): void {
   if (options.json) {
-    console.log(JSON.stringify(info, null, 2));
+    console.log(JSON.stringify({
+      bridgeApiUrl: info.bridgeApiUrl,
+      allowedOrigin: info.allowedOrigin,
+      pairing: "ready"
+    }, null, 2));
     return;
   }
   console.log(`Hunsu Bridge: ${info.bridgeApiUrl}`);
-  console.log(`Hunsu Studio: ${info.studioUrl}`);
+  console.log("Hunsu Studio pairing: Ready");
   console.log(`Allowed Studio origin: ${info.allowedOrigin}`);
 }
 
-function openStudioBridgeBrowser(url: string): void {
+function openStudioBridgeBrowser(url: string): Promise<void> {
+  const testCapturePath = currentProcessEnv().HUNSU_BRIDGE_TEST_MODE === "1"
+    ? currentProcessEnv().HUNSU_BRIDGE_TEST_BROWSER_CAPTURE_PATH?.trim()
+    : undefined;
+  if (testCapturePath) {
+    mkdirSync(dirname(testCapturePath), { recursive: true });
+    appendFileSync(testCapturePath, `${url}\n`, { encoding: "utf8", mode: 0o600 });
+    return Promise.resolve();
+  }
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-  const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
-  child.unref();
+  return new Promise<void>((resolveOpen, rejectOpen) => {
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+    child.once("spawn", () => {
+      child.unref();
+      resolveOpen();
+    });
+    child.once("error", rejectOpen);
+  });
 }
 
-export function openStudioInBrowser(url: string): void {
-  openStudioBridgeBrowser(url);
+export function openStudioInBrowser(url: string): Promise<void> {
+  return openStudioBridgeBrowser(url);
 }
 
 export function createBridgeSupervisor(): BridgeSupervisor {
@@ -1585,6 +1643,8 @@ export function createBridgeSupervisor(): BridgeSupervisor {
   let pairingSession: BridgePairingSession | undefined;
   let controlToken: string | undefined;
   let stopping = false;
+  let resolveTerminal: (() => void) | undefined;
+  let terminal = Promise.resolve();
 
   const supervisor: BridgeSupervisor = {
     async start(input: StartBridgeInput = {}) {
@@ -1597,22 +1657,32 @@ export function createBridgeSupervisor(): BridgeSupervisor {
       webUrl = resolveStudioBridgeWebUrl(input.webUrl ?? webUrl, runtimeConfig.processEnv);
       const allowedOrigin = new URL(webUrl).origin;
       allowedOrigins = uniqueStrings([allowedOrigin, ...(input.allowedOrigins ?? allowedOrigins)]);
-      pairingSession = createBridgePairingSession({ token: input.authToken, ttlMs: input.pairingTtlMs });
-      const authToken = pairingSession.token;
+      pairingSession = input.deferPairing
+        ? undefined
+        : createBridgePairingSession({ token: input.authToken, ttlMs: input.pairingTtlMs });
       controlToken = input.controlToken ?? controlToken ?? createBridgeControlToken();
       const initialBridgeApiUrl = endpointUrl(runtimeConfig.bridgeApi);
       const tokenQueryParam = input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM;
-      const studioUrl = createStudioPairingUrl({ webUrl, authToken, tokenQueryParam });
-      handle = {
+      const handleBase: BridgeRuntimeHandleBase = {
         bridgeApiUrl: initialBridgeApiUrl,
-        studioUrl,
         allowedOrigin,
-        authToken,
         controlToken,
-        pairing: pairingSession,
         status: "starting"
       };
+      handle = pairingSession ? {
+        ...handleBase,
+        pairingState: "paired",
+        studioUrl: createStudioPairingUrl({ webUrl, authToken: pairingSession.token, tokenQueryParam }),
+        authToken: pairingSession.token,
+        pairing: pairingSession
+      } : {
+        ...handleBase,
+        pairingState: "unpaired"
+      };
       stopping = false;
+      terminal = new Promise<void>(resolve => {
+        resolveTerminal = resolve;
+      });
 
       server = createStudioServer({
         cwd: repositoryPath,
@@ -1620,7 +1690,8 @@ export function createBridgeSupervisor(): BridgeSupervisor {
         security: {
           pairingSession,
           controlToken,
-          allowedOrigins
+          allowedOrigins,
+          requirePairing: true
         }
       });
 
@@ -1636,13 +1707,21 @@ export function createBridgeSupervisor(): BridgeSupervisor {
             status: "error",
             error: error.message
           };
+          resolveTerminal?.();
+          resolveTerminal = undefined;
           reject(error);
         };
         activeServer.once("error", onError);
         activeServer.once("close", () => {
+          if (server === activeServer) {
+            server = undefined;
+          }
           if (handle && !stopping && handle.status !== "error") {
             handle = { ...handle, status: "stopped" };
           }
+          stopping = false;
+          resolveTerminal?.();
+          resolveTerminal = undefined;
         });
         activeServer.listen(runtimeConfig.bridgeApi.port, runtimeConfig.bridgeApi.host, () => {
           activeServer.off("error", onError);
@@ -1651,13 +1730,12 @@ export function createBridgeSupervisor(): BridgeSupervisor {
           handle = {
             ...handle!,
             bridgeApiUrl,
-            studioUrl: createStudioPairingUrl({ webUrl: webUrl!, authToken, tokenQueryParam }),
             controlToken: controlToken!,
             status: "running",
             startedAt
           };
-          if (!input.noOpen) {
-            openStudioBridgeBrowser(handle.studioUrl!);
+          if (!input.noOpen && handle.pairingState === "paired") {
+            void openStudioBridgeBrowser(handle.studioUrl).catch(() => undefined);
           }
           resolve();
         });
@@ -1670,6 +1748,8 @@ export function createBridgeSupervisor(): BridgeSupervisor {
         if (handle) {
           handle = { ...handle, status: "stopped" };
         }
+        resolveTerminal?.();
+        resolveTerminal = undefined;
         return;
       }
       stopping = true;
@@ -1694,6 +1774,9 @@ export function createBridgeSupervisor(): BridgeSupervisor {
           resolve();
         });
       });
+    },
+    async waitForTerminal() {
+      await terminal;
     },
     async restart(input: StartBridgeInput = {}) {
       await supervisor.stop();
@@ -1723,7 +1806,7 @@ export function createBridgeSupervisor(): BridgeSupervisor {
       });
     },
     async openStudio(input: OpenStudioInput = {}) {
-      openStudioBridgeBrowser(input.url ?? await supervisor.createPairingUrl(input));
+      await openStudioBridgeBrowser(input.url ?? await supervisor.createPairingUrl(input));
     },
     async rotatePairing(input: CreatePairingUrlInput = {}) {
       return supervisor.restart({
@@ -1737,7 +1820,7 @@ export function createBridgeSupervisor(): BridgeSupervisor {
       });
     },
     async revokePairing() {
-      if (!pairingSession || !handle) {
+      if (!pairingSession || !handle || handle.pairingState !== "paired") {
         return handle;
       }
       revokeBridgePairingSession(pairingSession);
@@ -1784,7 +1867,8 @@ function createStudioServerSecurity(options: StudioServerSecurityOptions | undef
       ...bridgeStudioOriginsFromEnv(runtimeConfig.processEnv),
       ...(options?.allowedOrigins ?? [])
     ].map(normalizeOrigin).filter((origin): origin is string => origin !== undefined)),
-    allowNoOrigin: options?.allowNoOrigin ?? true
+    allowNoOrigin: options?.allowNoOrigin ?? true,
+    requirePairing: options?.requirePairing ?? Boolean(pairingSession || options?.authToken)
   };
 }
 
@@ -1810,7 +1894,7 @@ function evaluateStudioRequestSecurity(request: IncomingMessage, url: URL, secur
     };
   }
   const headers = corsHeaders ?? baseCorsHeaders();
-  const tokenValidation = !options.skipAuth && security.authToken && !isPublicBridgeRoute(url.pathname)
+  const tokenValidation = !options.skipAuth && security.requirePairing && !isPublicBridgeRoute(url.pathname)
     ? validateBridgeApiToken(request, url, security)
     : { valid: true as const };
   if (!tokenValidation.valid) {
@@ -1870,7 +1954,11 @@ type BridgeTokenValidation =
 function validateBridgeApiToken(request: IncomingMessage, url: URL, security: StudioServerSecurity): BridgeTokenValidation {
   const expected = security.authToken;
   if (!expected) {
-    return { valid: true };
+    return {
+      valid: false,
+      code: "pairing_token_missing",
+      error: "Pair Hunsu Web from the Bridge App before using the local Bridge API."
+    };
   }
   const authorization = requestHeader(request, "authorization");
   const bearerToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
@@ -2527,6 +2615,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
   const ownsRunner = options.runner === undefined;
   const actionRunner = options.actionRunner;
   const security = createStudioServerSecurity(options.security, runtimeConfig);
+  const controlStatus = createBridgeControlStatus(options.controlStatus, runtimeConfig);
   const providerRegistry = createRuntimeProviderRegistry({
     providerStateStore: createBridgeAppRuntimeProviderStore(runtimeConfig.processEnv),
     codex: {
@@ -2561,8 +2650,9 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     try {
       const url = studioRequestUrl(request);
       const pathname = url.pathname;
+      const authenticatedControlRequest = validateBridgeControlToken(request, security).allowed;
       const requestSecurity = evaluateStudioRequestSecurity(request, url, security, {
-        skipAuth: request.method === "OPTIONS" || isBridgeControlRoute(pathname)
+        skipAuth: request.method === "OPTIONS" || isBridgeControlRoute(pathname) || authenticatedControlRequest
       });
       responseSecurityHeaders.set(response, requestSecurity.corsHeaders);
       if (request.method === "OPTIONS") {
@@ -2586,6 +2676,10 @@ export function createStudioServer(options: StudioServerOptions = {}) {
             error: controlSecurity.error ?? "Bridge control request is not allowed.",
             code: controlSecurity.code
           });
+          return;
+        }
+        if (request.method === "GET" && pathname === "/api/bridge/control/status") {
+          sendJson(response, 200, controlStatus);
           return;
         }
         if (request.method !== "POST") {
@@ -2963,6 +3057,33 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     }
   });
   return server;
+}
+
+function createBridgeControlStatus(
+  options: StudioServerControlStatusOptions | undefined,
+  runtimeConfig: BridgeRuntimeConfig
+): BridgeControlStatusResponse {
+  const version = bridgeVersionInfo();
+  const configuredSupervisorPid = positiveProcessId(runtimeConfig.processEnv.HUNSU_BRIDGE_SUPERVISOR_PID);
+  return {
+    ok: true,
+    instanceId: options?.instanceId?.trim() || `bridge_instance_${randomBytes(18).toString("base64url")}`,
+    protocolVersion: version.protocolVersion,
+    bridgeVersion: version.bridgeVersion,
+    daemonPid: positiveProcessId(options?.daemonPid) ?? process.pid,
+    supervisorPid: positiveProcessId(options?.supervisorPid) ?? configuredSupervisorPid,
+    startedAt: options?.startedAt ?? new Date().toISOString(),
+    state: "running"
+  };
+}
+
+function positiveProcessId(value: unknown): number | undefined {
+  const candidate = typeof value === "string" && /^\d+$/.test(value.trim())
+    ? Number(value)
+    : value;
+  return typeof candidate === "number" && Number.isInteger(candidate) && candidate > 0
+    ? candidate
+    : undefined;
 }
 
 function applyCodexProviderSettings(

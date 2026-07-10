@@ -3710,6 +3710,9 @@ test("Bridge supervisor starts, stops, and creates pairing URLs", async () => {
   try {
     assert.equal(handle.status, "running");
     assert.match(handle.bridgeApiUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
+    if (handle.pairingState !== "paired") {
+      assert.fail("Default Bridge startup should create an active pairing.");
+    }
     assert.match(handle.authToken, /^hunsu_bridge_/);
     assert.equal(bridgePairingSessionState(handle.pairing), "active");
     const health = await fetch(`${handle.bridgeApiUrl}/health`);
@@ -3779,6 +3782,9 @@ test("Bridge supervisor starts, stops, and creates pairing URLs", async () => {
     assert.equal(controlledAccepted.status, 200);
 
     const rotated = await supervisor.rotatePairing();
+    if (rotated.pairingState !== "paired") {
+      assert.fail("Pairing rotation should produce a paired runtime handle.");
+    }
     assert.notEqual(rotated.authToken, oldToken);
     assert.equal(bridgePairingSessionState(rotated.pairing), "active");
   } finally {

@@ -1338,11 +1338,14 @@ test("Bridge App service install dry-run does not persist installed state", asyn
       projectGrants: [],
       service: { installed: false, manager }
     }, null, 2), "utf8");
-    const before = readFileSync(statePath, "utf8");
-
     assert.equal(await main(["service", "install", "--dry-run", "--cwd", root]), 0);
 
-    assert.equal(readFileSync(statePath, "utf8"), before);
+    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as {
+      diagnosticsSecurityVersion?: number;
+      service?: { installed?: boolean; manager?: string };
+    };
+    assert.equal(persisted.diagnosticsSecurityVersion, 1);
+    assert.deepEqual(persisted.service, { installed: false, manager });
     assert.equal(existsSync(unitPath), false);
     assert.equal(logs.some(line => line.includes("Dry run:")), true);
     assert.equal(logs.some(line => line.includes("Installed Hunsu Bridge service artifact")), false);

@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { createDefaultCredentialStore } from "../auth.ts";
 import { FileRelayRegistry, type ProjectGrant } from "../relay.ts";
 import { bridgeCodexProviderSettings, type BridgeAppState, type BridgeToolStatus } from "../state/appState.ts";
-import { bridgeVersionInfo, listManagedRoadmapRegistry, sanitizeDiagnostics } from "@hunsu/bridge";
+import { assertDiagnosticsSafe, bridgeVersionInfo, listManagedRoadmapRegistry, sanitizeDiagnostics } from "@hunsu/bridge";
 import { currentProcessEnv, endpointUrl, resolveBridgeRuntimeConfig, unwrapConfigResult } from "@hunsu/config";
 
 type DiagnosticsCommandContext = {
@@ -71,7 +71,7 @@ export async function buildDiagnostics(context: DiagnosticsCommandContext): Prom
   const codexSettings = bridgeCodexProviderSettings(state);
   const credentialStore = createDefaultCredentialStore({ path: context.credentialPath() });
   const relayRegistry = new FileRelayRegistry(context.relayRegistryPath());
-  return sanitizeDiagnostics({
+  const diagnostics = {
     app: {
       statePath: context.appStatePath(),
       logPath: context.appLogPath(),
@@ -85,7 +85,7 @@ export async function buildDiagnostics(context: DiagnosticsCommandContext): Prom
         revokedAt: state.pairing.revokedAt
       } : undefined,
       account: state.account ?? { status: "signed-out" },
-      pendingAuth: state.pendingAuth ? { state: state.pendingAuth.state, startedAt: state.pendingAuth.startedAt } : undefined,
+      pendingAuth: state.pendingAuth ? { present: true, startedAt: state.pendingAuth.startedAt } : undefined,
       credentialBackend: credentialStore.backend,
       credentialsPresent: credentialStore.read() !== undefined,
       remoteAccess: state.remoteAccess,
@@ -119,5 +119,8 @@ export async function buildDiagnostics(context: DiagnosticsCommandContext): Prom
       status: device.status,
       lastSeenAt: device.lastSeenAt
     }))
-  });
+  };
+  const safeDiagnostics = sanitizeDiagnostics(diagnostics);
+  assertDiagnosticsSafe(safeDiagnostics);
+  return safeDiagnostics;
 }

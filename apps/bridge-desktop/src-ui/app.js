@@ -1179,9 +1179,36 @@ async function runConnectionAction(event) {
   await refresh();
 }
 
-document.querySelector("#copy-diagnostics").addEventListener("click", async () => {
-  await navigator.clipboard.writeText(diagnostics.textContent || "{}");
-});
+async function copyFreshDiagnostics() {
+  try {
+    const stdout = await run(["diagnostics"]);
+    const freshDiagnostics = JSON.stringify(JSON.parse(stdout), null, 2);
+    if (!diagnosticTextIsSafe(freshDiagnostics)) {
+      throw new Error("unsafe diagnostics");
+    }
+    await navigator.clipboard.writeText(freshDiagnostics);
+    diagnostics.textContent = freshDiagnostics;
+  } catch (_error) {
+    diagnostics.textContent = "Diagnostics could not be copied because sensitive data was detected.";
+  }
+}
+
+function diagnosticTextIsSafe(value) {
+  if (/Authorization\s*[:=]\s*Bearer\s+(?!\[redacted\])[^\s"']+/iu.test(value)) {
+    return false;
+  }
+  const sensitiveQuery = /[?&](?:hunsuBridgeToken|hunsuRelayToken|token|access_token|refresh_token|authorization|code|state)=([^&#\s"']*)/giu;
+  for (const match of value.matchAll(sensitiveQuery)) {
+    let candidate = match[1];
+    try { candidate = decodeURIComponent(candidate); } catch (_error) { }
+    if (!["", "[redacted]", "redacted", "***"].includes(candidate.toLowerCase())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+document.querySelector("#copy-diagnostics").addEventListener("click", () => void copyFreshDiagnostics());
 providerConfigSettingsOpen?.addEventListener("click", openProviderConfigDialog);
 providerConfigClose?.addEventListener("click", closeProviderConfigDialog);
 providerConfigDialog?.addEventListener("click", event => {

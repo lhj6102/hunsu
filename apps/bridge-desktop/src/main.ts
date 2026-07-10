@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isSea } from "node:sea";
@@ -99,6 +100,7 @@ import {
 } from "./relay.ts";
 import {
   applyStudioPort,
+  assertDiagnosticsSafe,
   createBridgeSupervisor,
   createRuntimeProviderRegistry,
   createStudioRoadmap,
@@ -116,6 +118,7 @@ import {
   openStudioInBrowser,
   openStudioRoadmap,
   removeRoadmapRegistryEntry,
+  redactDiagnosticText,
   resolveRoadmapRepositoryPath,
   resolveStudioBridgeWebUrl,
   sanitizeDiagnostics,
@@ -147,14 +150,21 @@ const PROJECT_GRANT_SCOPE_VALUES = ["execute.start", "artifactAction.run", "env.
 const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose"];
 const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
 const BRIDGE_STARTING_GRACE_MS = 15_000;
+const DIAGNOSTICS_SECURITY_VERSION = 1;
+const DIAGNOSTICS_SECURITY_MIGRATION_FETCH_TIMEOUT_MS = 1_500;
 
-async function main(argv = process.argv.slice(2)): Promise<number> {
+type BridgeAppMainOptions = {
+  diagnosticsSecurityMigration?: DiagnosticsSecurityMigrationOptions;
+};
+
+async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions = {}): Promise<number> {
   const parsed = parseArgs(normalizeBridgeAppArgv(argv));
   try {
     if (parsed.flags.has("version")) {
       console.log(`Hunsu Bridge ${HUNSU_BRIDGE_APP_VERSION}`);
       return 0;
     }
+    await applyDiagnosticsSecurityMigration(options.diagnosticsSecurityMigration);
     switch (parsed.command) {
       case "start":
         await supervisedStartCommand(parsed);
@@ -263,6 +273,251 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 }
 
+type DiagnosticsSecurityMigrationOptions = {
+  fetch?: typeof globalThis.fetch;
+  fetchTimeoutMs?: number;
+  probeTcpEndpoint?: (bridgeApiUrl: string) => Promise<boolean>;
+  processIsAlive?: (pid: number) => boolean;
+  configuredBridgeApiUrl?: string | null;
+};
+
+type DiagnosticsSecurityMigrationResponse = {
+  response: Response;
+  body: unknown;
+};
+
+async function applyDiagnosticsSecurityMigration(options: DiagnosticsSecurityMigrationOptions = {}): Promise<void> {
+  const state = readAppState();
+  if ((state.diagnosticsSecurityVersion ?? 0) >= DIAGNOSTICS_SECURITY_VERSION) {
+    return;
+  }
+  sanitizeExistingLogFile(appLogPath());
+  try {
+    writeAppState({
+      ...state,
+      pairing: undefined
+    });
+  } catch (_error) {
+    return;
+  }
+  const revocation = await revokeLegacyPairingOrProveNoReachableSession(state, options);
+  if (!revocation.complete) {
+    writeStructuredLog({
+      event: "diagnostics.security-migration.pending",
+      version: DIAGNOSTICS_SECURITY_VERSION,
+      reason: revocation.reason
+    });
+    return;
+  }
+  try {
+    writeAppState({
+      ...readAppState(),
+      pairing: undefined,
+      diagnosticsSecurityVersion: DIAGNOSTICS_SECURITY_VERSION
+    });
+  } catch (_error) {
+    return;
+  }
+  writeStructuredLog({
+    event: "diagnostics.security-migration.completed",
+    version: DIAGNOSTICS_SECURITY_VERSION,
+    pairingRevoked: revocation.pairingRevoked
+  });
+}
+
+async function revokeLegacyPairingOrProveNoReachableSession(
+  state: BridgeAppState,
+  options: DiagnosticsSecurityMigrationOptions
+): Promise<
+  | { complete: true; pairingRevoked: boolean }
+  | { complete: false; reason: "revocation-rejected" | "reachable-session-unowned" | "managed-process-reachability-uncertain" }
+> {
+  const fetchBridge = options.fetch ?? ((input, init) => fetch(input, init));
+  const fetchTimeoutMs = options.fetchTimeoutMs ?? DIAGNOSTICS_SECURITY_MIGRATION_FETCH_TIMEOUT_MS;
+  const probeTcpEndpoint = options.probeTcpEndpoint ?? probeBridgeTcpEndpoint;
+  const isAlive = options.processIsAlive ?? processIsAlive;
+  const configuredUrl = options.configuredBridgeApiUrl === null
+    ? undefined
+    : options.configuredBridgeApiUrl ?? configuredBridgeApiUrl();
+  const bridgeApiUrls = uniqueStringList([state.bridgeApiUrl, configuredUrl].filter((value): value is string => Boolean(value?.trim())));
+  const hasLiveManagedProcess = uniqueNumberList([state.supervisorPid, state.pid]).some(pid => isAlive(pid));
+  let pairingRevoked = false;
+  let revocationRejected = false;
+  let reachableSessionUnowned = false;
+  let reachabilityUncertain = hasLiveManagedProcess && bridgeApiUrls.length === 0;
+
+  for (const bridgeApiUrl of bridgeApiUrls) {
+    if (state.controlToken) {
+      let result: DiagnosticsSecurityMigrationResponse;
+      try {
+        result = await fetchDiagnosticsSecurityMigrationJson(
+          fetchBridge,
+          new URL("/api/bridge/pairing/revoke", bridgeApiUrl).toString(),
+          {
+            method: "POST",
+            headers: { "x-hunsu-bridge-control-token": state.controlToken }
+          },
+          fetchTimeoutMs
+        );
+      } catch (_error) {
+        reachabilityUncertain ||= await migrationEndpointReachabilityIsUncertain(
+          bridgeApiUrl,
+          state.bridgeApiUrl,
+          hasLiveManagedProcess,
+          probeTcpEndpoint
+        );
+        continue;
+      }
+      if (!result.response.ok) {
+        revocationRejected = true;
+        continue;
+      }
+      const body = result.body as { revoked?: unknown } | undefined;
+      if (body?.revoked !== true) {
+        revocationRejected = true;
+        continue;
+      }
+      pairingRevoked = true;
+      continue;
+    }
+
+    try {
+      const result = await fetchDiagnosticsSecurityMigrationJson(
+        fetchBridge,
+        new URL("/health", bridgeApiUrl).toString(),
+        { method: "GET" },
+        fetchTimeoutMs
+      );
+      if (result.response.ok && isHunsuBridgeHealthBody(result.body)) {
+        reachableSessionUnowned = true;
+      } else if (!result.response.ok || result.body === undefined) {
+        reachabilityUncertain = true;
+      }
+    } catch (_error) {
+      reachabilityUncertain ||= await migrationEndpointReachabilityIsUncertain(
+        bridgeApiUrl,
+        state.bridgeApiUrl,
+        hasLiveManagedProcess,
+        probeTcpEndpoint
+      );
+    }
+  }
+
+  if (revocationRejected) {
+    return { complete: false, reason: "revocation-rejected" };
+  }
+  if (reachableSessionUnowned) {
+    return { complete: false, reason: "reachable-session-unowned" };
+  }
+  if (reachabilityUncertain) {
+    return { complete: false, reason: "managed-process-reachability-uncertain" };
+  }
+  return { complete: true, pairingRevoked };
+}
+
+async function fetchDiagnosticsSecurityMigrationJson(
+  fetchBridge: typeof globalThis.fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<DiagnosticsSecurityMigrationResponse> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`Diagnostics security migration request timed out after ${timeoutMs} ms.`);
+      error.name = "AbortError";
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+  const request = (async () => {
+    const response = await fetchBridge(url, { ...init, signal: controller.signal });
+    return {
+      response,
+      body: response.ok ? await response.json() : undefined
+    };
+  })();
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function migrationEndpointReachabilityIsUncertain(
+  bridgeApiUrl: string,
+  persistedBridgeApiUrl: string | undefined,
+  hasLiveManagedProcess: boolean,
+  probeTcpEndpoint: (bridgeApiUrl: string) => Promise<boolean>
+): Promise<boolean> {
+  try {
+    if (await probeTcpEndpoint(bridgeApiUrl)) {
+      return true;
+    }
+  } catch (_error) {
+    return true;
+  }
+  return hasLiveManagedProcess
+    && normalizeBridgeOrigin(bridgeApiUrl) === normalizeBridgeOrigin(persistedBridgeApiUrl);
+}
+
+function normalizeBridgeOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    return new URL(value).origin;
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function probeBridgeTcpEndpoint(bridgeApiUrl: string): Promise<boolean> {
+  let url: URL;
+  try {
+    url = new URL(bridgeApiUrl);
+  } catch (_error) {
+    return Promise.resolve(false);
+  }
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    return Promise.resolve(false);
+  }
+  return new Promise(resolveProbe => {
+    const host = url.hostname.startsWith("[") && url.hostname.endsWith("]")
+      ? url.hostname.slice(1, -1)
+      : url.hostname;
+    const socket = createConnection({ host, port });
+    let settled = false;
+    const settle = (reachable: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolveProbe(reachable);
+    };
+    socket.setTimeout(500, () => settle(false));
+    socket.once("connect", () => settle(true));
+    socket.once("error", () => settle(false));
+  });
+}
+
+function sanitizeExistingLogFile(path: string): void {
+  if (!existsSync(path)) {
+    return;
+  }
+  try {
+    const safeText = readFileSync(path, "utf8")
+      .split(/\r?\n/)
+      .map(line => redactDiagnosticText(line))
+      .join("\n");
+    assertDiagnosticsSafe(safeText);
+    writeFileSync(path, safeText, { encoding: "utf8", mode: 0o600 });
+  } catch (_error) {
+    // Safe reads still redact each historical line if this best-effort rewrite fails.
+  }
+}
+
 async function supervisedStartCommand(parsed: ParsedArgs): Promise<void> {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
   const state = readAppState();
@@ -333,7 +588,7 @@ async function pairCommand(parsed: ParsedArgs): Promise<void> {
   const running = await rotateRunningBridgePairing({ webUrl });
   if (running.ok) {
     if (hasFlag(parsed, "no-open")) {
-      console.log(running.pairingUrl);
+      console.log("A fresh pairing was created without displaying its bearer URL.");
     } else {
       await openStudioManagedUrl(running.pairingUrl);
     }
@@ -350,11 +605,11 @@ async function pairCommand(parsed: ParsedArgs): Promise<void> {
   rememberRunningBridge(handle, cwd, webUrl);
   const pairingUrl = await supervisor.createPairingUrl({ webUrl });
   if (hasFlag(parsed, "no-open")) {
-    console.log(pairingUrl);
+    console.log("A fresh pairing was created without displaying its bearer URL.");
   } else {
     await supervisor.openStudio({ url: pairingUrl });
   }
-  printAppStatus({ ...handle, studioUrl: pairingUrl });
+  console.log("Hunsu Bridge pairing opened.");
   await waitForShutdown(supervisor.stop);
   clearManagedProcessState();
 }
@@ -390,6 +645,7 @@ async function rotateRunningBridgePairing(input: {
       bridgeApiUrl: body.bridgeApiUrl ?? state.bridgeApiUrl,
       studioUrl: body.studioUrl,
       allowedOrigin: new URL(input.webUrl).origin,
+      pairingState: "paired",
       authToken: body.authToken,
       controlToken: state.controlToken,
       pairing: body.pairing,
@@ -1234,7 +1490,7 @@ function printAppStatus(handle: BridgeRuntimeHandle): void {
   console.log(`  Remote Access: ${formatBridgeRemoteAccess(state.remoteAccess)}`);
   console.log("");
   console.log("Actions:");
-  console.log(`  Open in Studio: ${handle.studioUrl ?? "Unavailable"}`);
+  console.log(`  Hunsu Web pairing: ${handle.pairingState === "paired" ? "Ready" : "Not created"}`);
   console.log(`  Local API: ${handle.bridgeApiUrl}`);
 }
 
@@ -2057,8 +2313,14 @@ function roadmapRegistryOptions(): { roadmapRegistryPath?: string } {
 
 function writeStructuredLog(value: Record<string, unknown>): void {
   const path = appLogPath();
-  mkdirSync(dirname(path), { recursive: true });
-  appendFileSync(path, `${JSON.stringify({ ...value, at: new Date().toISOString() })}\n`, "utf8");
+  const safeValue = sanitizeDiagnostics({ ...value, at: new Date().toISOString() });
+  assertDiagnosticsSafe(safeValue);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(safeValue)}\n`, "utf8");
+  } catch (_error) {
+    // Logging must not make an otherwise safe command fail on a read-only or concurrently cleaned host.
+  }
 }
 
 async function authDevServerCommand(parsed: ParsedArgs): Promise<void> {
@@ -2076,7 +2338,15 @@ function readLogTail(path: string, maxLines: number): string[] {
     return [];
   }
   try {
-    return readFileSync(path, "utf8").trimEnd().split("\n").slice(-maxLines);
+    return readFileSync(path, "utf8")
+      .trimEnd()
+      .split("\n")
+      .slice(-maxLines)
+      .map(line => {
+        const safeLine = redactDiagnosticText(line);
+        assertDiagnosticsSafe(safeLine);
+        return safeLine;
+      });
   } catch (_error) {
     return [];
   }
@@ -2317,4 +2587,10 @@ function isRelayCommandName(value: string): value is RelayCommandName {
   ].includes(value);
 }
 
-export { main, normalizeBridgeAppArgv };
+export {
+  applyDiagnosticsSecurityMigration,
+  main,
+  normalizeBridgeAppArgv,
+  readLogTail,
+  writeStructuredLog
+};

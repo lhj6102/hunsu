@@ -3,6 +3,7 @@ import { accessSync, constants, existsSync, readdirSync, statSync } from "node:f
 import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { currentProcessEnv, resolveCodexAppServerConfig } from "@hunsu/config";
+import { redactDiagnosticText, sanitizeDiagnostics } from "../../diagnostics/redaction.ts";
 
 const execFileAsync = promisify(execFile);
 export const DEFAULT_CODEX_PROBE_TIMEOUT_MS = 3_500;
@@ -784,34 +785,12 @@ export class CodexAppServerProbeClient {
   }
 }
 
-export function sanitizeDiagnostics(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sanitizeDiagnostics);
-  }
-  if (typeof value !== "object" || value === null) {
-    return typeof value === "string" ? redactSecretText(value) : value;
-  }
-  const result: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value)) {
-    result[key] = isSecretKey(key) ? "[redacted]" : sanitizeDiagnostics(child);
-  }
-  return result;
-}
-
 export function redactSecretText(value: string): string {
-  return value
-    .replace(/sk-[A-Za-z0-9_-]{10,}/g, "[redacted]")
-    .replace(/(OPENAI_API_KEY|CODEX_ACCESS_TOKEN)=\S+/g, "$1=[redacted]")
-    .replace(/~\/\.codex\/auth\.json/g, "[redacted]")
-    .replace(/("(?:apiKey|refreshToken|accessToken|authorization)"\s*:\s*")[^"]+(")/gi, "$1[redacted]$2")
-    .replace(/\b(apiKey|refreshToken|accessToken|authorization)=(?:Bearer\s+)?\S+/gi, "$1=[redacted]")
-    .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[redacted]");
+  return redactDiagnosticText(value);
 }
 
 export function errorMessage(error: unknown): string {
   return redactSecretText(error instanceof Error ? error.message : String(error));
 }
 
-function isSecretKey(key: string): boolean {
-  return /token|secret|api.?key|authorization|credential|auth\.json/i.test(key);
-}
+export { sanitizeDiagnostics };

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { assertDiagnosticsSafe, sanitizeDiagnostics } from "@hunsu/bridge";
 
 export type SidecarStatus =
   | { status: "stopped"; restartCount: number }
@@ -110,6 +111,8 @@ export class BridgeSidecarSupervisor {
 
   private writeLog(value: unknown): void {
     mkdirSync(dirname(this.options.logPath), { recursive: true });
-    appendFileSync(this.options.logPath, `${JSON.stringify({ ...(value as object), at: new Date().toISOString() })}\n`, "utf8");
+    const safeValue = sanitizeDiagnostics({ ...(value as object), at: new Date().toISOString() });
+    assertDiagnosticsSafe(safeValue);
+    appendFileSync(this.options.logPath, `${JSON.stringify(safeValue)}\n`, "utf8");
   }
 }
