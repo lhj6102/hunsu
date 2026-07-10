@@ -75,6 +75,13 @@ export function normalizeBridgeAppArgv(argv: string[]): string[] {
       nextArgs.push("ui-intent", "provider");
       if (pathFromUrl === "codex") nextArgs.push("codex");
       break;
+    case "diagnostics":
+      if (pathFromUrl) {
+        nextArgs.push("protocol-error", "Unsupported hunsu://diagnostics path.");
+        break;
+      }
+      nextArgs.push("ui-intent", "diagnostics");
+      break;
     case "connection":
       if (pathFromUrl && pathFromUrl !== "remote") {
         nextArgs.push("protocol-error", "Unsupported hunsu://connection path.");

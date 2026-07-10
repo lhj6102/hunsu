@@ -25,6 +25,14 @@ Alias scope is explicit:
 Headless Bridge aliases use `{ kind: "local" }`. Web-authored aliases use user,
 workspace, or team scope.
 
+## Browser storage scope
+
+Model aliases configured in Web are currently saved only in this browser with
+`window.localStorage`. Their domain scope describes how Web applies an alias;
+it does not mean the alias is synchronized through a Hunsu account, Workspace,
+or Team. Account-, Workspace-, and Team-synchronized alias storage is a future
+follow-up.
+
 ## Web config assignment
 
 `/studio/settings/model-aliases` owns two Web-side settings:
@@ -41,7 +49,19 @@ the draft to browser local storage.
 
 ## APIs
 
-- `GET /api/providers/inventory` returns `{ backendId, providers }`.
+- `RuntimeProviderStatus.modelInventory` is provider-owned and required. It is
+  either `{ state: "available", models }` or an explicit unavailable state.
+- `GET /api/providers/inventory` returns a typed result:
+
+```ts
+{ ok: true, value: { backendId, providers } }
+{ ok: false, error: { code, backendId, providerId?, message } }
+```
+
+An explicit `backendId` must match one exact Bridge connection. Missing
+backends return `BACKEND_UNAVAILABLE`; a connected backend whose provider did
+not publish inventory returns `PROVIDER_INVENTORY_UNAVAILABLE`. Neither case
+borrows the local provider or model catalog.
 - `POST /api/model-aliases/validate` validates a selection and alias list.
 - `POST /api/model-aliases/resolve` validates and returns:
 
@@ -60,12 +80,19 @@ Web sends `aliases: []`, Bridge treats that as an explicit empty alias set, so
 `{ kind: "alias", aliasId: "PrimaryModel" }` fails with
 `MODEL_ALIAS_NOT_FOUND` unless Web includes that alias.
 
-Failures return `ok: false`, one of `MODEL_ALIAS_NOT_FOUND`,
+Failures return `{ ok: false, backendId, error, message, actions }`, where
+`error` is one of `BACKEND_UNAVAILABLE`, `PROVIDER_INVENTORY_UNAVAILABLE`, `MODEL_ALIAS_NOT_FOUND`,
 `PROVIDER_NOT_READY`, `PROVIDER_LOGIN_REQUIRED`, `MODEL_UNSUPPORTED`,
 `REASONING_UNSUPPORTED`, or `SERVICE_TIER_UNSUPPORTED`, plus actions.
 
-Execute preflight returns `area: "model"` for alias, provider, model, reasoning,
-or service-tier failures. Web maps the recommended action to
+Codex owns its catalog at the runtime-provider adapter boundary. Local status
+and Bridge App Remote publication serialize that same catalog. Remote Relay
+transport maps `remote:<deviceId>` to that device's local backend for the
+request and restores the remote backend id on the response.
+
+Execute preflight returns `area: "model"` with the selected `backendId` for
+inventory, alias, provider, model, reasoning, or service-tier failures. An
+unknown selected backend remains an `area: "connection"` failure. Web maps the recommended action to
 `/studio/settings/model-aliases`.
 
 Execute and HUNSU Draft start requests both use the same `aliases?: ModelAlias[]`

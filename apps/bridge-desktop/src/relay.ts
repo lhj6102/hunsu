@@ -721,6 +721,12 @@ function relayCommandProjectPathPayloadFields(command: RelayCommandName): Array<
 }
 
 function sanitizeRelayResponseBody(body: unknown, command: RelayCommand, projectGrants: ProjectGrant[]): unknown {
+  if (command.command === "provider.inventory") {
+    return externalizeProviderInventoryResult(body, command.deviceId);
+  }
+  if (command.command === "modelAlias.validate" || command.command === "modelAlias.resolve") {
+    return externalizeBackendId(body, command.deviceId);
+  }
   if (command.command === "bridge.status") {
     return redactBridgeStatusBody(body, projectGrants);
   }
@@ -731,6 +737,63 @@ function sanitizeRelayResponseBody(body: unknown, command: RelayCommand, project
     return filterRemoteRoadmapRegistryBody(body, projectGrants);
   }
   return body;
+}
+
+function relayLocalBackendPayload(command: RelayCommand): unknown {
+  const payload = objectPayload(command.payload);
+  if (!payload) {
+    return command.payload;
+  }
+  const workspace = objectPayload(payload.workspace);
+  const selectedBackendId = stringPayloadField(payload, "backendId") ?? stringPayloadField(workspace, "backendId");
+  const selectedMode = payload.connectionMode ?? workspace?.connectionMode;
+  const remoteBackendId = `remote:${command.deviceId}`;
+  const targetsDevice = selectedBackendId === remoteBackendId
+    || (selectedBackendId === undefined && selectedMode === "remote");
+  if (!targetsDevice) {
+    return command.payload;
+  }
+  return {
+    ...payload,
+    backendId: "local",
+    connectionMode: "local",
+    ...(workspace
+      ? {
+          workspace: {
+            ...workspace,
+            backendId: "local",
+            connectionMode: "local"
+          }
+        }
+      : {})
+  };
+}
+
+function externalizeProviderInventoryResult(body: unknown, deviceId: string): unknown {
+  const result = objectPayload(body);
+  if (!result) {
+    return body;
+  }
+  if (result.ok === true) {
+    const value = objectPayload(result.value);
+    return value?.backendId === "local"
+      ? { ...result, value: { ...value, backendId: `remote:${deviceId}` } }
+      : body;
+  }
+  if (result.ok === false) {
+    const error = objectPayload(result.error);
+    return error?.backendId === "local"
+      ? { ...result, error: { ...error, backendId: `remote:${deviceId}` } }
+      : body;
+  }
+  return body;
+}
+
+function externalizeBackendId(body: unknown, deviceId: string): unknown {
+  const result = objectPayload(body);
+  return result?.backendId === "local"
+    ? { ...result, backendId: `remote:${deviceId}` }
+    : body;
 }
 
 function redactBridgeStatusBody(body: unknown, projectGrants: ProjectGrant[]): unknown {
@@ -823,6 +886,7 @@ function projectPathIsGranted(path: string, requestedPath: string | undefined, p
 
 export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequest | undefined {
   const payload = objectPayload(command.payload);
+  const localBackendPayload = relayLocalBackendPayload(command);
   const roadmapId = stringPayloadField(payload, "roadmapId");
   const path = (suffix: string, query?: URLSearchParams) => {
     const base = roadmapId
@@ -838,12 +902,15 @@ export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequ
       return { method: "GET", path: "/api/bridge/status" };
     case "connection.status":
       return { method: "GET", path: "/api/connection/status" };
-    case "provider.inventory":
-      return { method: "GET", path: "/api/providers/inventory" };
+    case "provider.inventory": {
+      const backendId = stringPayloadField(objectPayload(localBackendPayload), "backendId");
+      const query = backendId ? new URLSearchParams({ backendId }) : undefined;
+      return { method: "GET", path: query ? `/api/providers/inventory?${query}` : "/api/providers/inventory" };
+    }
     case "modelAlias.validate":
-      return { method: "POST", path: "/api/model-aliases/validate", body: command.payload ?? {} };
+      return { method: "POST", path: "/api/model-aliases/validate", body: localBackendPayload ?? {} };
     case "modelAlias.resolve":
-      return { method: "POST", path: "/api/model-aliases/resolve", body: command.payload ?? {} };
+      return { method: "POST", path: "/api/model-aliases/resolve", body: localBackendPayload ?? {} };
     case "roadmap.registry.list":
       return { method: "GET", path: "/api/roadmaps/recent" };
     case "roadmap.registry.remove":
@@ -869,7 +936,7 @@ export function relayHttpRequestForCommand(command: RelayCommand): RelayHttpRequ
     case "live.events":
       return { method: "GET", path: path("/executes/events"), stream: true };
     case "execute.start":
-      return { method: "POST", path: path("/executes/start"), body: command.payload ?? {} };
+      return { method: "POST", path: path("/executes/start"), body: localBackendPayload ?? {} };
     case "execute.pause":
       return { method: "POST", path: path("/executes/pause"), body: command.payload ?? {} };
     case "execute.resume":

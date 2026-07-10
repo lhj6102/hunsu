@@ -98,6 +98,7 @@ test("Web Execute preflight contract exposes provider workspace connection and m
   assert.match(preflightContract, /area: "workspace"/);
   assert.match(preflightContract, /area: "connection"/);
   assert.match(preflightContract, /area: "model"/);
+  assert.match(preflightContract, /area: "model";\s+backendId: string;/);
   assert.doesNotMatch(preflightContract, /area: "codex"/);
   assert.doesNotMatch(preflightContract, /area: "roadmap"/);
   assert.doesNotMatch(preflightContract, /install_codex|codex_login|codex_recheck|open_prerequisites|open_roadmaps|activate_roadmap|CODEX_|ROADMAP_/);
@@ -133,6 +134,8 @@ test("Web model selection UX keeps alias and direct provider modes available", (
   assert.match(aliasSettingsSource, /readWebModelConfigDraft/);
   assert.match(aliasSettingsSource, /assignWebModelConfigDraft/);
   assert.match(aliasSettingsSource, /writeWebModelConfigDraft/);
+  assert.match(aliasSettingsSource, /Model aliases are currently saved in this browser/);
+  assert.match(aliasSettingsSource, /Account and workspace sync will be added later/);
   assert.match(configDraftSource, /assignManagerModelSelection/);
   assert.match(configDraftSource, /assignMemberModelSelection/);
   assert.match(configDraftSource, /assignExecutorModelSelection/);
@@ -1051,6 +1054,131 @@ test("Web Execute start uses selected remote backend even when local token exist
   }
 });
 
+test("Web backend-scoped transport lets explicit backend IDs override conflicting connection modes", async () => {
+  const calls: Array<{
+    transport: "local" | "relay";
+    body: Record<string, unknown>;
+    command?: string;
+  }> = [];
+  const previousFetch = globalThis.fetch;
+  const previousWindow = (globalThis as unknown as { window?: unknown }).window;
+  const storage = new Map<string, string>([
+    ["hunsu.remoteBridgeSession", JSON.stringify({
+      deviceId: "device_1",
+      deviceName: "Remote Devbox",
+      projectPath: "/tmp/hunsu-project",
+      webUserId: "user_1",
+      relayAccessToken: "relay-token"
+    })]
+  ]);
+  (globalThis as unknown as { window: unknown }).window = {
+    location: {
+      href: "https://studio.example.test/studio/roadmaps/roadmap_123",
+      origin: "https://studio.example.test"
+    },
+    history: {
+      replaceState() {}
+    },
+    localStorage: {
+      getItem(key: string) {
+        return storage.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        storage.set(key, value);
+      },
+      removeItem(key: string) {
+        storage.delete(key);
+      }
+    }
+  };
+  globalThis.fetch = async (url, init) => {
+    const requestUrl = new URL(String(url), "https://studio.example.test");
+    const parsed = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    if (requestUrl.pathname === "/v1/commands") {
+      const command = parsed as { command?: string; payload?: Record<string, unknown> };
+      calls.push({ transport: "relay", command: command.command, body: command.payload ?? {} });
+      if (command.command === "provider.inventory") {
+        return new Response(JSON.stringify({
+          ok: true,
+          status: 200,
+          body: { ok: true, value: { backendId: "remote:device_1", providers: [] } }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        status: 202,
+        body: { run: { runId: "run_remote", status: "running" } }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    calls.push({ transport: "local", body: parsed });
+    if (requestUrl.pathname === "/api/providers/inventory") {
+      return new Response(JSON.stringify({
+        ok: true,
+        value: { backendId: "local", providers: [] }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      run: { runId: "run_local", status: "running" }
+    }), { status: 202, headers: { "content-type": "application/json" } });
+  };
+
+  const { module, close } = await loadBridgeClientModule();
+  const start = (body: Record<string, unknown>) => module.postRunAction("roadmap_123", "start", {
+    requestId: "request_1",
+    lineId: "line_1",
+    selectedDestinationIds: ["destination_1"],
+    ...body
+  });
+  try {
+    await start({ backendId: "local", connectionMode: "remote" });
+    await start({
+      connectionMode: "remote",
+      workspace: { backendId: "local", connectionMode: "remote" }
+    });
+    await start({ backendId: "remote:device_1", connectionMode: "local" });
+    await start({
+      connectionMode: "local",
+      workspace: { backendId: "remote:device_1", connectionMode: "local" }
+    });
+    await module.fetchModelInventory("local");
+    await module.fetchModelInventory("remote:device_1");
+
+    assert.deepEqual(calls.map(call => call.transport), ["local", "local", "relay", "relay", "local", "relay"]);
+    assert.equal(calls.filter(call => call.transport === "local").some(call => call.command), false);
+    assert.equal(calls.slice(2, 4).every(call => call.command === "execute.start"), true);
+    for (const call of calls.slice(0, 2)) {
+      assert.equal(call.body.backendId, "local");
+      assert.equal(call.body.connectionMode, "local");
+      assert.deepEqual(call.body.workspace, {
+        workspaceId: "roadmap_123",
+        backendId: "local",
+        connectionMode: "local"
+      });
+    }
+    for (const call of calls.slice(2)) {
+      if (call.command === "provider.inventory" || call.transport === "local") {
+        continue;
+      }
+      assert.equal(call.body.backendId, "remote:device_1");
+      assert.equal(call.body.connectionMode, "remote");
+      assert.deepEqual(call.body.workspace, {
+        workspaceId: "roadmap_123",
+        backendId: "remote:device_1",
+        connectionMode: "remote"
+      });
+    }
+    assert.deepEqual(calls[5], {
+      transport: "relay",
+      command: "provider.inventory",
+      body: { backendId: "remote:device_1" }
+    });
+  } finally {
+    await close();
+    globalThis.fetch = previousFetch;
+    (globalThis as unknown as { window?: unknown }).window = previousWindow;
+  }
+});
+
 test("Web Bridge status keeps local and selected remote workspaces together", async () => {
   const calls: Array<{ origin: string; pathname: string; command?: string }> = [];
   const previousFetch = globalThis.fetch;
@@ -1835,6 +1963,7 @@ async function loadBridgeClientModule(): Promise<{
     fetchRemoteBridgeDevices: () => Promise<Array<{ deviceName: string }>>;
     postRemoteBridgeConnect: (input: { deviceId: string; webUserId?: string; projectPath?: string }) => Promise<{ connection: StudioConnectionStatus }>;
     fetchBridgeStatus: () => Promise<BridgeStatusResponse>;
+    fetchModelInventory: (backendId?: string) => Promise<unknown>;
     fetchRoadmapRegistry: () => Promise<unknown[]>;
     fetchBoard: (roadmapId: string) => Promise<unknown>;
     fetchWorktree: (roadmapId: string) => Promise<unknown>;

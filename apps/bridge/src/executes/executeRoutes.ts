@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Result } from "@hunsu/protocol";
 import type { RuntimeProviderRegistry } from "../runtime-providers/types.ts";
 import type { BridgeStatusResponse } from "../server/bridgeStatus.ts";
 import type { RoadmapRegistryWorkspaceEntry } from "../workspaces/workspaceRegistry.ts";
@@ -26,7 +27,7 @@ type ExecuteRouteContext = {
   modelPreflight?: (body: ExecuteStartBackendSelection) => Promise<ProviderAwareExecutePreflightError | undefined> | ProviderAwareExecutePreflightError | undefined;
   startRun: (body: unknown) => Promise<unknown> | unknown;
   pauseRun: (body: unknown) => Promise<unknown> | unknown;
-  resumeRun: (body: unknown) => Promise<unknown> | unknown;
+  resumeRun: (body: unknown) => Promise<Result<unknown, ProviderAwareExecutePreflightError>> | Result<unknown, ProviderAwareExecutePreflightError>;
   stopRun: (body: unknown) => Promise<unknown> | unknown;
   completeMove: (body: unknown) => Promise<unknown> | unknown;
   streamLiveEvents: () => void;
@@ -90,7 +91,12 @@ async function handleExecuteRouteWithPath(
   }
 
   if (request.method === "POST" && (routePath === `${apiPrefix}/runs/resume` || routePath === `${apiPrefix}/executes/resume`)) {
-    context.sendJson(response, 202, await context.resumeRun(await context.readJson(request)));
+    const result = await context.resumeRun(await context.readJson(request));
+    if (!result.ok) {
+      context.sendJson(response, 409, result.error);
+      return true;
+    }
+    context.sendJson(response, 202, result.value);
     return true;
   }
 

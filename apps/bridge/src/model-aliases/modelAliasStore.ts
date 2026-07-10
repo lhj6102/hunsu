@@ -5,19 +5,24 @@ import type {
   ModelAliasOverride,
   ModelSelection,
   ProviderInventory,
+  ProviderInventoryError,
+  ProviderInventoryResult,
   ProviderModelDescriptor,
   ProviderModelInventory,
-  ReasoningEffort,
+  Result,
   RuntimeProviderId,
   ServiceTier
 } from "@hunsu/protocol";
-import { makeNonEmptyText, unwrapDomainModelResult } from "@hunsu/protocol";
+import { err, makeNonEmptyText, ok, unwrapDomainModelResult } from "@hunsu/protocol";
 import type { RuntimeProviderStatus } from "../runtime-providers/types.ts";
 import type { BridgeBackendStatus } from "../connections/localConnection.ts";
 import type { ExecutePreflightAction, ProviderAwareExecutePreflightError } from "../executes/executePreflight.ts";
+import { codexProviderModelInventory } from "../runtime-providers/codex/codexModelInventory.ts";
 
 export type ModelAliasValidationErrorCode =
+  | "BACKEND_UNAVAILABLE"
   | "MODEL_ALIAS_NOT_FOUND"
+  | "PROVIDER_INVENTORY_UNAVAILABLE"
   | "PROVIDER_NOT_READY"
   | "PROVIDER_LOGIN_REQUIRED"
   | "MODEL_UNSUPPORTED"
@@ -45,7 +50,7 @@ export type ModelSelectionResolution =
       };
       model: ProviderModelDescriptor | { providerId: RuntimeProviderId; model: string; experimental: true };
     }
-  | { ok: false; error: ModelAliasValidationError };
+  | { ok: false; backendId: string; error: ModelAliasValidationError };
 
 const MODEL_ALIAS_SETTINGS_HREF = "/studio/settings/model-aliases";
 const MODEL_ALIAS_DEFAULT_TIMESTAMP = "1970-01-01T00:00:00.000Z";
@@ -78,14 +83,26 @@ export function defaultModelAliases(now = MODEL_ALIAS_DEFAULT_TIMESTAMP): ModelA
   ];
 }
 
-export function providerInventoryForStatus(provider: RuntimeProviderStatus): ProviderModelInventory {
-  return {
+export function providerInventoryForStatus(
+  provider: RuntimeProviderStatus,
+  backendId = "local"
+): Result<ProviderModelInventory, ProviderInventoryError> {
+  const selectedBackendId = nonEmpty(backendId.trim() || "local", "providerInventory.backendId");
+  if (provider.modelInventory.state === "unavailable") {
+    return err({
+      code: "PROVIDER_INVENTORY_UNAVAILABLE",
+      backendId: selectedBackendId,
+      providerId: provider.providerId,
+      message: provider.modelInventory.message
+    });
+  }
+  return ok({
     providerId: provider.providerId as RuntimeProviderId,
     label: nonEmpty(provider.label, "providerInventory.label"),
     ready: provider.ready,
     authState: provider.auth.state,
-    models: provider.providerId === "codex" ? codexModelInventory() : []
-  };
+    models: provider.modelInventory.models
+  });
 }
 
 export function defaultLocalProviderInventory(): ProviderInventory {
@@ -96,38 +113,60 @@ export function defaultLocalProviderInventory(): ProviderInventory {
       label: nonEmpty("Codex", "providerInventory.label"),
       ready: true,
       authState: "authenticated",
-      models: codexModelInventory()
+      models: codexProviderModelInventory()
     }]
   };
 }
 
-export function defaultLocalProviderModelInventories(): ProviderModelInventory[] {
-  return defaultLocalProviderInventory().providers;
-}
-
 export function providerInventoryForBridgeStatus(input: {
-  provider: RuntimeProviderStatus;
+  provider?: RuntimeProviderStatus;
   connections?: BridgeBackendStatus[];
   backendId?: string;
-}): ProviderInventory {
+}): ProviderInventoryResult {
   const selectedBackendId = input.backendId?.trim();
   const selectedConnection = selectedBackendId
     ? input.connections?.find(connection => connection.backendId === selectedBackendId)
-    : input.connections?.find(connection => connection.mode === "local") ?? input.connections?.[0];
-  const backendId = selectedConnection?.backendId ?? selectedBackendId ?? "local";
+    : input.connections?.find(connection => connection.mode === "local");
+  if (selectedBackendId && !selectedConnection) {
+    return providerInventoryBackendUnavailable(selectedBackendId);
+  }
+  const backendId = selectedConnection?.backendId ?? "local";
   const provider = selectedConnection?.provider ?? input.provider;
-  return {
+  if (!provider) {
+    return providerInventoryBackendUnavailable(backendId);
+  }
+  const providerInventory = providerInventoryForStatus(provider, backendId);
+  if (!providerInventory.ok) {
+    return providerInventory;
+  }
+  return ok({
     backendId: nonEmpty(backendId, "providerInventory.backendId"),
-    providers: [providerInventoryForStatus(provider)]
-  };
+    providers: [providerInventory.value]
+  });
 }
 
-export function providerInventoriesForBridgeStatus(input: {
-  provider: RuntimeProviderStatus;
-  connections?: BridgeBackendStatus[];
-  backendId?: string;
-}): ProviderModelInventory[] {
-  return providerInventoryForBridgeStatus(input).providers;
+export function providerInventoryBackendUnavailable(
+  backendId: string,
+  message = `Backend ${backendId.trim() || "local"} is not available on this Bridge.`
+): ProviderInventoryResult {
+  return err({
+    code: "BACKEND_UNAVAILABLE",
+    backendId: nonEmpty(backendId.trim() || "local", "providerInventory.backendId"),
+    message
+  });
+}
+
+export function providerInventoryUnavailable(
+  backendId: string,
+  providerId: string,
+  message: string
+): ProviderInventoryResult {
+  return err({
+    code: "PROVIDER_INVENTORY_UNAVAILABLE",
+    backendId: nonEmpty(backendId.trim() || "local", "providerInventory.backendId"),
+    providerId,
+    message
+  });
 }
 
 export function resolveModelSelection(input: {
@@ -137,22 +176,23 @@ export function resolveModelSelection(input: {
   backendId?: string;
   inventories: ProviderModelInventory[];
 }): ModelSelectionResolution {
+  const backendId = input.backendId?.trim() || "local";
   const selection = input.selection ?? { kind: "alias", aliasId: DEFAULT_MODEL_ALIAS_IDS.primary };
   const aliases = input.aliases === undefined ? defaultModelAliases() : input.aliases;
   if (selection.kind === "direct") {
-    return validateDirectModelSelection(selection, input.inventories, input.backendId);
+    return validateDirectModelSelection(selection, input.inventories, backendId);
   }
   const alias = aliases.find(candidate => candidate.aliasId === selection.aliasId);
   if (!alias) {
-    return { ok: false, error: modelError("MODEL_ALIAS_NOT_FOUND", `Model alias ${selection.aliasId} does not exist.`, {
+    return { ok: false, backendId, error: modelError("MODEL_ALIAS_NOT_FOUND", `Model alias ${selection.aliasId} does not exist.`, {
       aliasId: selection.aliasId,
       actions: [editModelAliasAction()]
     }) };
   }
   const override = input.overrides?.find(candidate =>
-    candidate.aliasId === alias.aliasId && candidate.backendId === input.backendId
+    candidate.aliasId === alias.aliasId && candidate.backendId === backendId
   );
-  return validateDirectModelSelection(override?.selection ?? alias.selection, input.inventories, input.backendId);
+  return validateDirectModelSelection(override?.selection ?? alias.selection, input.inventories, backendId);
 }
 
 export function validateDirectModelSelection(
@@ -160,22 +200,23 @@ export function validateDirectModelSelection(
   inventories: ProviderModelInventory[],
   backendId = "local"
 ): ModelSelectionResolution {
+  const selectedBackendId = backendId.trim() || "local";
   const provider = selection.provider;
   const inventory = inventories.find(candidate => candidate.providerId === provider.providerId);
   if (!inventory) {
-    return { ok: false, error: modelError("PROVIDER_NOT_READY", `Provider ${provider.providerId} is not available for model selection.`, {
+    return { ok: false, backendId: selectedBackendId, error: modelError("PROVIDER_NOT_READY", `Provider ${provider.providerId} is not available for model selection.`, {
       providerId: provider.providerId,
       actions: [openProviderSetupAction(provider.providerId)]
     }) };
   }
   if (inventory.authState === "not_authenticated" || inventory.authState === "expired" || inventory.authState === "invalid") {
-    return { ok: false, error: modelError("PROVIDER_LOGIN_REQUIRED", `${inventory.label} login is required before this model can run.`, {
+    return { ok: false, backendId: selectedBackendId, error: modelError("PROVIDER_LOGIN_REQUIRED", `${inventory.label} login is required before this model can run.`, {
       providerId: provider.providerId,
       actions: [loginProviderAction(provider.providerId, inventory.label)]
     }) };
   }
   if (!inventory.ready) {
-    return { ok: false, error: modelError("PROVIDER_NOT_READY", `${inventory.label} is not ready for Execute.`, {
+    return { ok: false, backendId: selectedBackendId, error: modelError("PROVIDER_NOT_READY", `${inventory.label} is not ready for Execute.`, {
       providerId: provider.providerId,
       actions: [openProviderSetupAction(provider.providerId)]
     }) };
@@ -185,14 +226,14 @@ export function validateDirectModelSelection(
     if (provider.experimental === true) {
       return {
         ok: true,
-        backendId,
+        backendId: selectedBackendId,
         selection,
         resolved: provider,
         provider: { providerId: provider.providerId, ready: inventory.ready },
         model: { providerId: provider.providerId, model: provider.model, experimental: true }
       };
     }
-    return { ok: false, error: modelError("MODEL_UNSUPPORTED", `${inventory.label} does not advertise model ${provider.model}.`, {
+    return { ok: false, backendId: selectedBackendId, error: modelError("MODEL_UNSUPPORTED", `${inventory.label} does not advertise model ${provider.model}.`, {
       providerId: provider.providerId,
       model: provider.model,
       actions: [editModelAliasAction()]
@@ -201,7 +242,7 @@ export function validateDirectModelSelection(
   const reasoningEfforts = model.capabilities.reasoningEfforts ?? [];
   const reasoningEffort = provider.reasoningEffort ?? model.defaultConfig?.reasoningEffort;
   if (reasoningEffort && reasoningEfforts.length > 0 && !reasoningEfforts.includes(reasoningEffort)) {
-    return { ok: false, error: modelError("REASONING_UNSUPPORTED", `${model.label} does not support ${reasoningEffort} reasoning.`, {
+    return { ok: false, backendId: selectedBackendId, error: modelError("REASONING_UNSUPPORTED", `${model.label} does not support ${reasoningEffort} reasoning.`, {
       providerId: provider.providerId,
       model: provider.model,
       actions: [editModelAliasAction()]
@@ -210,7 +251,7 @@ export function validateDirectModelSelection(
   const serviceTiers = model.capabilities.serviceTiers ?? [];
   const serviceTier = provider.serviceTier ?? model.defaultConfig?.serviceTier;
   if (serviceTier && serviceTiers.length > 0 && !serviceTiers.includes(serviceTier)) {
-    return { ok: false, error: modelError("SERVICE_TIER_UNSUPPORTED", `${model.label} does not support the ${serviceTier} service tier.`, {
+    return { ok: false, backendId: selectedBackendId, error: modelError("SERVICE_TIER_UNSUPPORTED", `${model.label} does not support the ${serviceTier} service tier.`, {
       providerId: provider.providerId,
       model: provider.model,
       actions: [editModelAliasAction()]
@@ -218,7 +259,7 @@ export function validateDirectModelSelection(
   }
   return {
     ok: true,
-    backendId,
+    backendId: selectedBackendId,
     selection,
     resolved: provider,
     provider: { providerId: provider.providerId, ready: inventory.ready },
@@ -226,9 +267,40 @@ export function validateDirectModelSelection(
   };
 }
 
-export function executePreflightErrorFromModelError(error: ModelAliasValidationError): ProviderAwareExecutePreflightError {
+export function modelSelectionResolutionFromInventoryError(
+  error: ProviderInventoryError
+): Extract<ModelSelectionResolution, { ok: false }> {
+  return {
+    ok: false,
+    backendId: error.backendId,
+    error: error.code === "BACKEND_UNAVAILABLE"
+      ? modelError(error.code, error.message, {
+          actions: [openConnectionAction(error.backendId)]
+        })
+      : modelError(error.code, error.message, {
+          providerId: error.providerId,
+          actions: [recheckProviderAction(error.providerId)]
+        })
+  };
+}
+
+export function executePreflightErrorFromModelError(
+  error: ModelAliasValidationError,
+  backendId: string
+): ProviderAwareExecutePreflightError {
+  if (error.error === "BACKEND_UNAVAILABLE") {
+    const remote = backendId.startsWith("remote:") || backendId === "remote";
+    return {
+      area: "connection",
+      backendId,
+      error: remote ? "REMOTE_NOT_CONNECTED" : "BRIDGE_NOT_CONNECTED",
+      message: error.message,
+      actions: error.actions
+    };
+  }
   return {
     area: "model",
+    backendId,
     providerId: error.providerId,
     aliasId: error.aliasId,
     model: error.model,
@@ -247,40 +319,6 @@ export function codexRunnerThreadOptionsForModelSelection(provider: DirectProvid
     model: provider.model === "codex-default" ? undefined : provider.model,
     modelReasoningEffort: provider.reasoningEffort && provider.reasoningEffort !== "default" ? provider.reasoningEffort : undefined,
     serviceTier: provider.serviceTier ?? "default"
-  };
-}
-
-function codexModelInventory(): ProviderModelDescriptor[] {
-  return [
-    codexModel("codex-default", "Codex Default", ["default", "low", "medium", "high"], ["default", "fast"], "default"),
-    codexModel("gpt-5.5-thinking", "GPT-5.5 Thinking", ["high", "xhigh"], ["default", "fast"], "high"),
-    codexModel("gpt-5.5", "GPT-5.5", ["default", "low", "medium", "high"], ["default", "fast"], "medium")
-  ];
-}
-
-function codexModel(
-  model: string,
-  label: string,
-  reasoningEfforts: ReasoningEffort[],
-  serviceTiers: ServiceTier[],
-  defaultReasoningEffort: ReasoningEffort
-): ProviderModelDescriptor {
-  return {
-    model: nonEmpty(model, "providerInventory.model"),
-    label: nonEmpty(label, "providerInventory.model.label"),
-    capabilities: {
-      reasoningEfforts,
-      serviceTiers,
-      supportsReasoning: reasoningEfforts.length > 0,
-      supportsFastTier: serviceTiers.includes("fast")
-    },
-    defaultConfig: {
-      providerId: "codex",
-      model: nonEmpty(model, "providerInventory.model.defaultConfig.model"),
-      reasoningEffort: defaultReasoningEffort,
-      serviceTier: "default",
-      ...(model === "codex-default" ? { experimental: true as const } : {})
-    } as DirectProviderModelSelection
   };
 }
 
@@ -310,6 +348,15 @@ function openProviderSetupAction(providerId: string): ExecutePreflightAction {
 
 function loginProviderAction(providerId: string, label: string): ExecutePreflightAction {
   return { type: "login_provider", label: `Sign in to ${label}`, href: `hunsu://provider/${providerId}`, providerId };
+}
+
+function recheckProviderAction(providerId: string): ExecutePreflightAction {
+  return { type: "recheck_provider", label: "Recheck Provider", href: `hunsu://provider/${providerId}`, providerId };
+}
+
+function openConnectionAction(backendId: string): ExecutePreflightAction {
+  const remote = backendId.startsWith("remote:") || backendId === "remote";
+  return { type: "open_connection", label: "Open Connection", href: remote ? "hunsu://connection/remote" : "hunsu://connection" };
 }
 
 function editModelAliasAction(): ExecutePreflightAction {

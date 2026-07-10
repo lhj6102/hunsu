@@ -19,6 +19,7 @@ import type {
   Summary
 } from "./primitives.ts";
 import type { PromptTemplate } from "./prompt-template.ts";
+import type { Result } from "./result.ts";
 
 export type { TeamName } from "./primitives.ts";
 
@@ -375,6 +376,21 @@ export type ProviderInventory = {
   backendId: NonEmptyText;
   providers: ProviderInventoryProvider[];
 };
+
+export type ProviderInventoryError =
+  | {
+      code: "BACKEND_UNAVAILABLE";
+      backendId: NonEmptyText;
+      message: string;
+    }
+  | {
+      code: "PROVIDER_INVENTORY_UNAVAILABLE";
+      backendId: NonEmptyText;
+      providerId: string;
+      message: string;
+    };
+
+export type ProviderInventoryResult = Result<ProviderInventory, ProviderInventoryError>;
 
 export type RuntimePolicy = {
   modelSelection?: ModelSelection;

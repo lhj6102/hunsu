@@ -22,6 +22,7 @@ import {
   getCodexRuntimeStatus,
   type CodexRuntimeStatus
 } from "./codexStatus.ts";
+import { codexProviderModelInventory } from "./codexModelInventory.ts";
 import type {
   RuntimeProviderAdapter,
   RuntimeProviderAuthKind,
@@ -323,6 +324,10 @@ export function normalizeCodexRuntimeStatus(
       error: codex.usage.error
     },
     capabilities: codexProviderCapabilities,
+    modelInventory: {
+      state: "available",
+      models: codexProviderModelInventory()
+    },
     recommendedAction: codexRecommendedAction(codex),
     diagnostics: {
       ...(options.effectiveEnv ? { effectiveEnv: options.effectiveEnv } : {}),

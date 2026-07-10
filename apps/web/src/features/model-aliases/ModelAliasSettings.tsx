@@ -171,6 +171,7 @@ export function ModelAliasSettings() {
           <div>
             <h1 className="text-2xl font-semibold tracking-normal text-[color:var(--apple-ink)]">Model Aliases</h1>
             <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">Configure the named models Web sends to Bridge before Execute starts.</p>
+            <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">Model aliases are currently saved in this browser. Account and workspace sync will be added later.</p>
           </div>
           <div className="flex gap-2">
             <Button type="button" variant="outline" size="sm" onClick={refreshInventory} disabled={status === "loading"}>

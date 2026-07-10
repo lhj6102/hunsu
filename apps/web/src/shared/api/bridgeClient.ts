@@ -47,6 +47,7 @@ import type {
   ModelAliasInventoryResult,
   ModelAliasResolutionResult,
   ModelAliasResolveRequest,
+  ProviderInventory,
   ProjectInspectionResult,
   RemoteBridgeConnectRequest,
   RemoteBridgeConnectResult,
@@ -70,7 +71,7 @@ export class BridgeRequestError extends Error {
 async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge API request"): Promise<T> {
   const method = init?.method?.toUpperCase() ?? "GET";
   const body = parseRequestBody(init?.body);
-  const remoteCommand = remoteBridgeCommandForRequest(path, method, body, currentRoutableRemoteBridgeSessionForRequest(body));
+  const remoteCommand = remoteBridgeCommandForRequest(path, method, body, currentRoutableRemoteBridgeSessionForRequest(path, body));
   if (remoteCommand) {
     return requestRemoteJson<T>(remoteCommand, label);
   }
@@ -259,8 +260,15 @@ export async function fetchBridgeStatus(): Promise<BridgeStatusResponse> {
   }
 }
 
-export function fetchModelInventory(): Promise<ModelAliasInventoryResult> {
-  return requestJson<ModelAliasInventoryResult>("/api/providers/inventory", undefined, "Provider model inventory request");
+export async function fetchModelInventory(backendId?: string): Promise<ProviderInventory> {
+  const path = backendId?.trim()
+    ? `/api/providers/inventory?backendId=${encodeURIComponent(backendId.trim())}`
+    : "/api/providers/inventory";
+  const result = await requestJson<ModelAliasInventoryResult>(path, undefined, "Provider model inventory request");
+  if (!result.ok) {
+    throw new BridgeRequestError(result.error.message, 409, result);
+  }
+  return result.value;
 }
 
 export function validateModelAliases(body: ModelAliasResolveRequest): Promise<ModelAliasResolutionResult> {
@@ -638,6 +646,10 @@ export function remoteBridgeCommandForRequest(
   if (!session || pathname.startsWith("/api/remote/")) {
     return undefined;
   }
+  const backendSelection = selectedWebBridgeBackend(requestUrl, body);
+  if (backendSelection.explicit && !selectionTargetsRemoteSession(backendSelection, session)) {
+    return undefined;
+  }
   const payload = objectBody(body);
   const roadmapMatch = pathname.match(/^\/api\/roadmaps\/([^/]+)(\/.*)?$/);
   const roadmapId = roadmapMatch ? decodeURIComponent(roadmapMatch[1] ?? "") : undefined;
@@ -650,7 +662,12 @@ export function remoteBridgeCommandForRequest(
     return { deviceId: session.deviceId, command: "bridge.status" };
   }
   if (method === "GET" && pathname === "/api/providers/inventory") {
-    return { deviceId: session.deviceId, command: "provider.inventory" };
+    const backendId = requestUrl.searchParams.get("backendId")?.trim();
+    return {
+      deviceId: session.deviceId,
+      command: "provider.inventory",
+      ...(backendId ? { payload: { backendId } } : {})
+    };
   }
   if (method === "POST" && pathname === "/api/model-aliases/validate") {
     return { deviceId: session.deviceId, command: "modelAlias.validate", payload: body };
@@ -856,10 +873,18 @@ function remoteBridgeCommandEventUrl(command: RemoteBridgeCommandRequest): strin
   return BRIDGE_API_BASE_URL ? url.toString() : `${url.pathname}${url.search}`;
 }
 
-function currentRoutableRemoteBridgeSessionForRequest(body: unknown): RemoteBridgeSession | undefined {
-  const selectedSession = selectedRemoteBridgeSessionFromRequestBody(body);
-  if (selectedSession) {
-    return selectedSession;
+type WebBridgeBackendSelection = {
+  backendId?: string;
+  connectionMode?: "local" | "remote";
+  remoteRequested: boolean;
+  explicit: boolean;
+};
+
+function currentRoutableRemoteBridgeSessionForRequest(path: string, body: unknown): RemoteBridgeSession | undefined {
+  const selection = selectedWebBridgeBackend(new URL(path, "http://hunsu.local"), body);
+  if (selection.explicit) {
+    const session = currentRemoteBridgeSession();
+    return session && selectionTargetsRemoteSession(selection, session) ? session : undefined;
   }
   return currentRoutableRemoteBridgeSession();
 }
@@ -874,8 +899,16 @@ function executeStartBodyWithSelectedBackend(roadmapId: string, body: unknown): 
     return body;
   }
   const session = currentRemoteBridgeSession();
-  const backendId = stringField(payload, "backendId") ?? (session?.deviceId ? `remote:${session.deviceId}` : "local");
-  const connectionMode = payload.connectionMode === "remote" || backendId.startsWith("remote:") ? "remote" : "local";
+  const selection = selectedWebBridgeBackend(new URL(`/api/roadmaps/${encodeURIComponent(roadmapId)}/runs/start`, "http://hunsu.local"), payload);
+  const backendId = selection.backendId
+    ?? (selection.connectionMode === "remote"
+      ? session?.deviceId ? `remote:${session.deviceId}` : undefined
+      : selection.connectionMode === "local"
+        ? "local"
+        : session?.deviceId ? `remote:${session.deviceId}` : "local");
+  const connectionMode = backendId
+    ? isRemoteBackendId(backendId) ? "remote" : "local"
+    : selection.connectionMode ?? "local";
   const existingWorkspace = objectBody(payload.workspace);
   return {
     ...payload,
@@ -884,23 +917,48 @@ function executeStartBodyWithSelectedBackend(roadmapId: string, body: unknown): 
     workspace: {
       ...(existingWorkspace ?? {}),
       workspaceId: stringField(existingWorkspace, "workspaceId") ?? roadmapId,
-      backendId: stringField(existingWorkspace, "backendId") ?? backendId,
-      connectionMode: existingWorkspace?.connectionMode === "remote" || connectionMode === "remote" ? "remote" : "local"
+      backendId,
+      connectionMode
     }
   };
 }
 
-function selectedRemoteBridgeSessionFromRequestBody(body: unknown): RemoteBridgeSession | undefined {
-  const session = currentRemoteBridgeSession();
-  if (!session?.deviceId) {
-    return undefined;
-  }
+function selectedWebBridgeBackend(requestUrl: URL, body: unknown): WebBridgeBackendSelection {
   const payload = objectBody(body);
   const workspace = objectBody(payload?.workspace);
-  const backendId = stringField(payload, "backendId") ?? stringField(workspace, "backendId");
-  const connectionMode = payload?.connectionMode ?? workspace?.connectionMode;
-  const selectedRemote = connectionMode === "remote" || backendId === `remote:${session.deviceId}`;
-  return selectedRemote ? session : undefined;
+  const queryBackendId = requestUrl.pathname === "/api/providers/inventory"
+    ? requestUrl.searchParams.get("backendId")?.trim() || undefined
+    : undefined;
+  const backendId = stringField(payload, "backendId") ?? stringField(workspace, "backendId") ?? queryBackendId;
+  const requestedMode = connectionModeField(payload) ?? connectionModeField(workspace);
+  const connectionMode = backendId
+    ? isRemoteBackendId(backendId) ? "remote" : "local"
+    : requestedMode;
+  return {
+    backendId,
+    connectionMode,
+    remoteRequested: connectionMode === "remote",
+    explicit: Boolean(backendId || requestedMode)
+  };
+}
+
+function selectionTargetsRemoteSession(selection: WebBridgeBackendSelection, session: RemoteBridgeSession): boolean {
+  if (!selection.remoteRequested) {
+    return false;
+  }
+  return !selection.backendId
+    || selection.backendId === "remote"
+    || selection.backendId === `remote:${session.deviceId}`;
+}
+
+function connectionModeField(value: Record<string, unknown> | undefined): "local" | "remote" | undefined {
+  return value?.connectionMode === "local" || value?.connectionMode === "remote"
+    ? value.connectionMode
+    : undefined;
+}
+
+function isRemoteBackendId(backendId: string): boolean {
+  return backendId === "remote" || backendId.startsWith("remote:");
 }
 
 function parseRequestBody(body: BodyInit | null | undefined): unknown {

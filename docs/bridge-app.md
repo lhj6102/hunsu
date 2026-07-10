@@ -47,6 +47,7 @@ hunsu://workspaces
 hunsu://add-workspace
 hunsu://connection
 hunsu://connection/remote
+hunsu://diagnostics
 hunsu://pair?next=/studio
 hunsu://open-project?path=/path/to/project
 hunsu://open-workspace?workspaceId=<id>
@@ -127,13 +128,14 @@ pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes
 ```
 
 `build` compiles the headless command package, bundles the sidecar entrypoint,
-creates a Node SEA blob, downloads the pinned Node runtime archives for each
-configured Tauri sidecar target, verifies them against Node's
-`SHASUMS256.txt`, injects the SEA blob with `postject`, and writes native
-ELF/Mach-O/PE sidecar artifacts plus `dist/sidecar-manifest.json`. Desktop
-packaging uses Tauri `externalBin` for the active sidecar and keeps resources
-limited to the sidecar manifest; see [Windows Packaging](windows-packaging.md).
-The packaged sidecar is a native executable and does not require `node` on the
+creates a Node SEA blob, downloads the pinned Node runtime archive for the
+selected Tauri target, verifies it against Node's `SHASUMS256.txt`, injects the
+SEA blob with `postject`, and writes that target's native ELF/Mach-O/PE sidecar
+plus `dist/sidecar-manifest.json`. The target defaults to the build host and can
+be selected with `HUNSU_BRIDGE_SIDECAR_TARGET` or `--target`. Desktop packaging
+uses Tauri `externalBin` for the active sidecar and keeps resources limited to
+the sidecar manifest; see [Windows Packaging](windows-packaging.md). The
+packaged sidecar is a native executable and does not require `node` on the
 installed user's `PATH`.
 
 `desktop:build` requires Rust/Cargo plus platform Tauri dependencies. The
@@ -148,8 +150,10 @@ passed to the sidecar.
 Tray Provider Setup, Add Workspace, Workspaces, Connection, Diagnostics, and
 cold-start `hunsu://` entries route through the same sidecar intent path and
 show/focus the Bridge window after routing. The tray summary is rebuilt from the
-sidecar snapshot on a periodic refresh so provider, local, remote, and workspace
-state do not stay at launch-time values.
+sidecar snapshot on an asynchronous periodic refresh so provider, local, remote,
+and workspace state do not stay at launch-time values. Diagnostics routes to
+`hunsu://diagnostics`; `hunsu://prerequisites` remains a Provider compatibility
+alias.
 
 Quit is explicit. The native menu confirms before exiting and honors the
 persisted background preference for keeping or stopping the supervised Local
@@ -314,7 +318,9 @@ Grant allows `remoteRelay.access`.
 
 When Remote Access is enabled, Bridge publishes the active Workspace set as
 remote workspace grants and marks those active Workspaces remote-enabled in the
-local registry. Inactive Workspaces are not published until activated.
+local registry. The same snapshot includes the current provider's explicit
+model-inventory state, so remote model validation uses the provider-owned
+catalog. Inactive Workspaces are not published until activated.
 
 ## Local Pairing And Security
 

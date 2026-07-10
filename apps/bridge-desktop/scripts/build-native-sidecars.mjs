@@ -12,9 +12,10 @@ import { gunzipSync, inflateRawSync } from "node:zlib";
 import * as esbuild from "esbuild";
 import { currentProcessEnv, resolveBridgeSidecarPackagingConfig, unwrapConfigResult } from "@hunsu/config";
 import {
+  currentSidecarTarget,
   prepareNativeSidecars,
   sidecarArtifactNameForTarget,
-  sidecarTargets,
+  sidecarTargetByName,
   validateNativeSidecarArtifact
 } from "./prepare-sidecars.mjs";
 
@@ -61,35 +62,38 @@ export async function buildNativeSidecars(options = {}) {
     };
   }
 
+  const target = options.target
+    ? sidecarTargetByName(options.target)
+    : packagingConfig.sidecarTarget
+      ? sidecarTargetByName(packagingConfig.sidecarTarget)
+      : currentSidecarTarget();
   const shasums = await loadNodeShasums({ nodeVersion, cacheDir });
   const builtArtifacts = [];
-  for (const target of sidecarTargets) {
-    const archiveName = nodeArchiveNameForTarget(target, nodeVersion);
-    const archivePath = await ensureNodeArchive({
-      nodeVersion,
-      cacheDir,
-      archiveName,
-      expectedSha256: shasums.get(archiveName)
-    });
-    const executable = extractNodeExecutable({ archivePath, target, nodeVersion });
-    const artifactPath = resolve(nativeDir, sidecarArtifactNameForTarget(target));
-    writeFileSync(artifactPath, executable);
-    if (target.extension === "") {
-      chmodSync(artifactPath, 0o755);
-    }
-    injectSeaBlob({ artifactPath, blobPath, target });
-    if (target.extension === "") {
-      chmodSync(artifactPath, 0o755);
-    }
-    validateNativeSidecarArtifact(artifactPath);
-    builtArtifacts.push({
-      target: target.target,
-      file: basename(artifactPath),
-      nodeRuntime: archiveName
-    });
+  const archiveName = nodeArchiveNameForTarget(target, nodeVersion);
+  const archivePath = await ensureNodeArchive({
+    nodeVersion,
+    cacheDir,
+    archiveName,
+    expectedSha256: shasums.get(archiveName)
+  });
+  const executable = extractNodeExecutable({ archivePath, target, nodeVersion });
+  const artifactPath = resolve(nativeDir, sidecarArtifactNameForTarget(target));
+  writeFileSync(artifactPath, executable);
+  if (target.extension === "") {
+    chmodSync(artifactPath, 0o755);
   }
+  injectSeaBlob({ artifactPath, blobPath, target });
+  if (target.extension === "") {
+    chmodSync(artifactPath, 0o755);
+  }
+  validateNativeSidecarArtifact(artifactPath);
+  builtArtifacts.push({
+    target: target.target,
+    file: basename(artifactPath),
+    nodeRuntime: archiveName
+  });
 
-  const manifest = prepareNativeSidecars({ nativeDir });
+  const manifest = prepareNativeSidecars({ nativeDir, target: target.target });
   smokeTestCurrentPlatformSidecar({ bundlePath, manifest });
   return {
     schema: "hunsu.bridge-sidecar-build.v1",
@@ -103,11 +107,15 @@ export async function buildNativeSidecars(options = {}) {
 }
 
 export function smokeTestCurrentPlatformSidecar(input) {
-  const currentPlatform = input.manifest.currentPlatform;
-  if (!currentPlatform) {
+  const artifact = input.manifest.artifacts[0];
+  if (!artifact) {
     return;
   }
-  const sidecarPath = resolve(dist, currentPlatform.file);
+  const target = sidecarTargetByName(artifact.target);
+  if (target.platform !== process.platform || target.arch !== process.arch) {
+    return;
+  }
+  const sidecarPath = resolve(dist, artifact.file);
   const smokeRoot = mkdtempSync(join(tmpdir(), "hunsu-bridge-sidecar-smoke-"));
   const smokeEnv = {
     ...currentProcessEnv(),
@@ -424,11 +432,13 @@ function parseArgs(argv) {
   const nativeDirArgIndex = argv.indexOf("--native-dir");
   const cacheDirArgIndex = argv.indexOf("--cache-dir");
   const nodeVersionArgIndex = argv.indexOf("--node-version");
+  const targetArgIndex = argv.indexOf("--target");
   return {
     bundleOnly: argv.includes("--bundle-only"),
     nativeDir: readRequiredArg(argv, nativeDirArgIndex, "--native-dir"),
     cacheDir: readRequiredArg(argv, cacheDirArgIndex, "--cache-dir"),
-    nodeVersion: readRequiredArg(argv, nodeVersionArgIndex, "--node-version")
+    nodeVersion: readRequiredArg(argv, nodeVersionArgIndex, "--node-version"),
+    target: readRequiredArg(argv, targetArgIndex, "--target")
   };
 }
 

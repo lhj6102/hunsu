@@ -101,8 +101,8 @@ import {
   codexProviderEnv,
   getCodexRuntimeStatus,
   defaultModelAliases,
-  defaultLocalProviderModelInventories,
-  providerInventoriesForBridgeStatus,
+  modelSelectionResolutionFromInventoryError,
+  providerInventoryForBridgeStatus,
   resolveModelSelection,
   inspectProject,
   listManagedRoadmapRegistry,
@@ -818,18 +818,17 @@ async function validateModelAliasSelection(
   aliases: ModelAlias[],
   overrides: ModelAliasOverride[] | undefined
 ) {
-  let inventories = defaultLocalProviderModelInventories();
-  try {
-    const snapshot = await runtimeProvidersSnapshot();
-    inventories = providerInventoriesForBridgeStatus({ provider: snapshot.current });
-  } catch (_error) {
-    // The static Codex inventory still gives useful schema validation when provider probing is unavailable.
+  const snapshot = await runtimeProvidersSnapshot();
+  const inventoryResult = providerInventoryForBridgeStatus({ provider: snapshot.current });
+  if (!inventoryResult.ok) {
+    return modelSelectionResolutionFromInventoryError(inventoryResult.error);
   }
   return resolveModelSelection({
     selection,
     aliases,
     overrides,
-    inventories
+    backendId: inventoryResult.value.backendId,
+    inventories: inventoryResult.value.providers
   });
 }
 
@@ -2205,6 +2204,7 @@ Deep links:
   hunsu://add-workspace
   hunsu://connection
   hunsu://connection/remote
+  hunsu://diagnostics
   hunsu://open-workspace?workspaceId=<id>
   hunsu://codex
   hunsu://add-roadmap

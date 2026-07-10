@@ -1,4 +1,5 @@
-use std::process::Command;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -7,9 +8,12 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_shell::{
+    process::{Command as ShellCommand, CommandEvent},
+    ShellExt,
+};
 
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const BRIDGE_SIDECAR_NAME: &str = "hunsu-bridge-sidecar";
 const BRIDGE_TRAY_ID: &str = "hunsu-bridge";
 const BRIDGE_TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -102,25 +106,20 @@ async fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String>
 
 #[tauri::command]
 async fn start_bridge_sidecar(app: tauri::AppHandle, cwd: Option<String>) -> Result<(), String> {
-    let mut command = sidecar_command(&app)?;
-    command.arg("start");
+    let mut args = vec!["start".to_string()];
     if let Some(cwd) = cwd {
         validate_path_arg(&cwd)?;
-        command.arg("--cwd").arg(cwd);
+        args.push("--cwd".to_string());
+        args.push(cwd);
     }
-    command.arg("--no-open");
-    command.spawn().map_err(|error| error.to_string())?;
-    Ok(())
+    args.push("--no-open".to_string());
+    spawn_sidecar_command(sidecar_command(&app)?.args(args))
 }
 
 #[tauri::command]
 async fn spawn_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInput) -> Result<(), String> {
     validate_bridge_command_args(&input.args)?;
-    sidecar_command(&app)?
-        .args(input.args)
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    spawn_sidecar_command(sidecar_command(&app)?.args(input.args))
 }
 
 #[tauri::command]
@@ -129,6 +128,7 @@ async fn run_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInput
     let output = sidecar_command(&app)?
         .args(input.args)
         .output()
+        .await
         .map_err(|error| error.to_string())?;
     Ok(BridgeCommandOutput {
         status: output.status.code().unwrap_or(-1),
@@ -137,31 +137,24 @@ async fn run_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInput
     })
 }
 
-fn sidecar_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    let resource_name = if cfg!(target_os = "windows") {
-        "hunsu-bridge-sidecar.exe"
-    } else {
-        "hunsu-bridge-sidecar"
-    };
-    app.path()
-        .resolve(resource_name, tauri::path::BaseDirectory::Resource)
+fn sidecar_command(app: &tauri::AppHandle) -> Result<ShellCommand, String> {
+    app.shell()
+        .sidecar(BRIDGE_SIDECAR_NAME)
         .map_err(|error| error.to_string())
 }
 
-fn sidecar_command(app: &tauri::AppHandle) -> Result<Command, String> {
-    let mut command = Command::new(sidecar_path(app)?);
-    hide_child_console_window(&mut command);
-    Ok(command)
+fn spawn_sidecar_command(command: ShellCommand) -> Result<(), String> {
+    let (mut events, child) = command.spawn().map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let CommandEvent::Error(error) = event {
+                eprintln!("Hunsu Bridge sidecar error: {error}");
+            }
+        }
+        drop(child);
+    });
+    Ok(())
 }
-
-#[cfg(target_os = "windows")]
-fn hide_child_console_window(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hide_child_console_window(_command: &mut Command) {}
 
 fn validate_external_url(value: &str) -> Result<(), String> {
     if value.len() > 4096 || value.contains('\0') {
@@ -615,8 +608,8 @@ fn handle_protocol_url(app: &tauri::AppHandle, url: &str) {
             return;
         }
     };
-    if let Ok(mut command) = sidecar_command(app) {
-        let _ = command.args(args).spawn();
+    if let Ok(command) = sidecar_command(app) {
+        let _ = spawn_sidecar_command(command.args(args));
     }
 }
 
@@ -626,8 +619,8 @@ fn handle_protocol_url_and_show(app: &tauri::AppHandle, url: &str) {
 }
 
 fn start_local_bridge_on_launch(app: &tauri::AppHandle) {
-    if let Ok(mut command) = sidecar_command(app) {
-        let _ = command.arg("start").arg("--no-open").spawn();
+    if let Ok(command) = sidecar_command(app) {
+        let _ = spawn_sidecar_command(command.args(["start", "--no-open"]));
     }
 }
 
@@ -639,20 +632,23 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 fn maybe_show_main_window_for_setup(app: &tauri::AppHandle) {
-    if should_open_main_window_on_launch(app) {
-        show_main_window(app);
-    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if should_open_main_window_on_launch(&app).await {
+            show_main_window(&app);
+        }
+    });
 }
 
-fn should_open_main_window_on_launch(app: &tauri::AppHandle) -> bool {
-    let Ok(snapshot) = bridge_snapshot(app) else {
+async fn should_open_main_window_on_launch(app: &tauri::AppHandle) -> bool {
+    let Ok(snapshot) = bridge_snapshot(app).await else {
         return true;
     };
     provider_needs_setup(&snapshot) || active_workspace_count(&snapshot) == 0 || snapshot["status"]["healthError"].is_string()
 }
 
 fn create_bridge_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let menu = bridge_tray_menu(app)?;
+    let menu = bridge_tray_menu(app, &TrayStatusSummary::checking())?;
     TrayIconBuilder::with_id(BRIDGE_TRAY_ID)
         .tooltip("Hunsu Bridge")
         .menu(&menu)
@@ -663,7 +659,7 @@ fn create_bridge_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             "add_workspace" => handle_protocol_url_and_show(app, "hunsu://add-workspace"),
             "workspaces" => handle_protocol_url_and_show(app, "hunsu://workspaces"),
             "connection" => handle_protocol_url_and_show(app, "hunsu://connection"),
-            "diagnostics" => handle_protocol_url_and_show(app, "hunsu://prerequisites"),
+            "diagnostics" => handle_protocol_url_and_show(app, "hunsu://diagnostics"),
             "quit" => quit_bridge_app(app),
             _ => {}
         })
@@ -681,13 +677,12 @@ fn create_bridge_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn bridge_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
-    let summary = tray_status_summary(app);
+fn bridge_tray_menu(app: &tauri::AppHandle, summary: &TrayStatusSummary) -> tauri::Result<Menu<tauri::Wry>> {
     let title = MenuItemBuilder::with_id("summary_title", "Hunsu Bridge").build(app)?;
-    let provider_status = MenuItemBuilder::with_id("summary_provider", summary.provider).build(app)?;
-    let local_status = MenuItemBuilder::with_id("summary_local", summary.local).build(app)?;
-    let remote_status = MenuItemBuilder::with_id("summary_remote", summary.remote).build(app)?;
-    let workspace_status = MenuItemBuilder::with_id("summary_workspaces", summary.workspaces).build(app)?;
+    let provider_status = MenuItemBuilder::with_id("summary_provider", summary.provider.as_str()).build(app)?;
+    let local_status = MenuItemBuilder::with_id("summary_local", summary.local.as_str()).build(app)?;
+    let remote_status = MenuItemBuilder::with_id("summary_remote", summary.remote.as_str()).build(app)?;
+    let workspace_status = MenuItemBuilder::with_id("summary_workspaces", summary.workspaces.as_str()).build(app)?;
     let open_web = MenuItemBuilder::with_id("open_web", "Open Hunsu Web").build(app)?;
     let provider = MenuItemBuilder::with_id("provider", "Provider Setup").build(app)?;
     let add_workspace = MenuItemBuilder::with_id("add_workspace", "Add Workspace").build(app)?;
@@ -713,20 +708,24 @@ fn bridge_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .build()
 }
 
-fn refresh_bridge_tray_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+async fn refresh_bridge_tray_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if app.tray_by_id(BRIDGE_TRAY_ID).is_none() {
+        return Ok(());
+    }
+    let summary = tray_status_summary(app).await;
     let Some(tray) = app.tray_by_id(BRIDGE_TRAY_ID) else {
         return Ok(());
     };
-    let menu = bridge_tray_menu(app)?;
+    let menu = bridge_tray_menu(app, &summary)?;
     tray.set_menu(Some(menu))?;
     Ok(())
 }
 
 fn start_bridge_tray_refresh(app: tauri::AppHandle) {
-    std::thread::spawn(move || {
+    tauri::async_runtime::spawn(async move {
         loop {
-            std::thread::sleep(BRIDGE_TRAY_REFRESH_INTERVAL);
-            let _ = refresh_bridge_tray_menu(&app);
+            let _ = refresh_bridge_tray_menu(&app).await;
+            tokio::time::sleep(BRIDGE_TRAY_REFRESH_INTERVAL).await;
         }
     });
 }
@@ -739,8 +738,19 @@ struct TrayStatusSummary {
     workspaces: String,
 }
 
-fn tray_status_summary(app: &tauri::AppHandle) -> TrayStatusSummary {
-    match bridge_snapshot(app) {
+impl TrayStatusSummary {
+    fn checking() -> Self {
+        Self {
+            provider: "Provider: Checking".to_string(),
+            local: "Local: Starting".to_string(),
+            remote: "Remote: Checking".to_string(),
+            workspaces: "Workspaces: Checking".to_string(),
+        }
+    }
+}
+
+async fn tray_status_summary(app: &tauri::AppHandle) -> TrayStatusSummary {
+    match bridge_snapshot(app).await {
         Ok(snapshot) => {
             let provider_label = snapshot["providers"]["current"]["label"].as_str().unwrap_or("Provider");
             let provider_ready = snapshot["providers"]["current"]["ready"].as_bool().unwrap_or(false);
@@ -762,11 +772,15 @@ fn tray_status_summary(app: &tauri::AppHandle) -> TrayStatusSummary {
     }
 }
 
-fn bridge_snapshot(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
+async fn bridge_snapshot(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
     let output = sidecar_command(app)?
         .arg("snapshot")
         .output()
+        .await
         .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
     serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
 }
 
@@ -816,7 +830,14 @@ fn remote_bridge_label(value: &str, snapshot: &serde_json::Value) -> &'static st
 }
 
 fn quit_bridge_app(app: &tauri::AppHandle) {
-    let preference = quit_background_preference(app);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        quit_bridge_app_async(app).await;
+    });
+}
+
+async fn quit_bridge_app_async(app: tauri::AppHandle) {
+    let preference = quit_background_preference(&app).await;
     let message = match preference {
         QuitBackgroundPreference::KeepBackground => "Quit Hunsu Bridge?\n\nYour quit preference keeps the background Bridge service running.",
         QuitBackgroundPreference::StopBackground => "Quit Hunsu Bridge?\n\nYour quit preference stops the background Bridge service.",
@@ -832,8 +853,8 @@ fn quit_bridge_app(app: &tauri::AppHandle) {
         return;
     }
     if matches!(preference, QuitBackgroundPreference::StopBackground) {
-        if let Ok(mut command) = sidecar_command(app) {
-            let _ = command.arg("stop").output();
+        if let Ok(command) = sidecar_command(&app) {
+            let _ = command.arg("stop").output().await;
         }
     }
     app.exit(0);
@@ -845,8 +866,9 @@ enum QuitBackgroundPreference {
     StopBackground,
 }
 
-fn quit_background_preference(app: &tauri::AppHandle) -> QuitBackgroundPreference {
+async fn quit_background_preference(app: &tauri::AppHandle) -> QuitBackgroundPreference {
     match bridge_snapshot(app)
+        .await
         .ok()
         .and_then(|snapshot| snapshot["status"]["quitBehavior"].as_str().map(str::to_string))
         .as_deref()
@@ -938,6 +960,12 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
                 args.push("codex".to_string());
             }
             args
+        }
+        "diagnostics" => {
+            if path_part.map(percent_decode).is_some_and(|path| !path.is_empty()) {
+                return Err("Unsupported hunsu://diagnostics path.".to_string());
+            }
+            vec!["ui-intent".to_string(), "diagnostics".to_string()]
         }
         "connection" => {
             let decoded_path = path_part.map(percent_decode);
@@ -1067,6 +1095,7 @@ mod tests {
 
     #[test]
     fn protocol_urls_and_sidecar_commands_are_allowlisted() {
+        assert_eq!(BRIDGE_SIDECAR_NAME, "hunsu-bridge-sidecar");
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://open").unwrap(),
             vec!["ui-intent", "provider"]
@@ -1134,6 +1163,10 @@ mod tests {
             vec!["ui-intent", "provider", "codex"]
         );
         assert_eq!(
+            bridge_args_for_protocol_url("hunsu://diagnostics").unwrap(),
+            vec!["ui-intent", "diagnostics"]
+        );
+        assert_eq!(
             bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=roadmap_123").unwrap(),
             vec!["activate-roadmap", "roadmap_123"]
         );
@@ -1155,6 +1188,7 @@ mod tests {
         assert!(bridge_args_for_protocol_url("hunsu://delete-everything").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://provider/other").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://prerequisites/other").is_err());
+        assert!(bridge_args_for_protocol_url("hunsu://diagnostics/other").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://connection/relay").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://open-roadmap").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://open-workspace").is_err());

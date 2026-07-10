@@ -1,3 +1,5 @@
+import type { ProviderModelDescriptor } from "@hunsu/protocol";
+
 export type RuntimeProviderKind =
   | "codex"
   | "claude_code"
@@ -98,6 +100,17 @@ export type RuntimeProviderCapabilities = {
   supportsAcp: boolean;
 };
 
+export type RuntimeProviderModelInventory =
+  | {
+      state: "available";
+      models: ProviderModelDescriptor[];
+    }
+  | {
+      state: "unavailable";
+      reason: "not_reported" | "not_supported";
+      message: string;
+    };
+
 export type RuntimeProviderStatus = {
   providerId: string;
   kind: RuntimeProviderKind;
@@ -146,6 +159,7 @@ export type RuntimeProviderStatus = {
     error?: string;
   };
   capabilities: RuntimeProviderCapabilities;
+  modelInventory: RuntimeProviderModelInventory;
   recommendedAction: RuntimeProviderRecommendedAction;
   diagnostics?: RuntimeProviderDiagnostics;
   safeMessage?: string;

@@ -114,6 +114,7 @@ export type BridgeSidecarPackagingConfig = {
   nativeSidecarDir?: string;
   sidecarCacheDir?: string;
   sidecarNodeVersion?: string;
+  sidecarTarget?: string;
 };
 
 export type BridgeRuntimeConfigOptions = {
@@ -279,7 +280,8 @@ export function resolveBridgeSidecarPackagingConfig(env: Env): ConfigResult<Brid
   return ok({
     nativeSidecarDir: firstNonEmpty(env, ["HUNSU_BRIDGE_NATIVE_SIDECAR_DIR"])?.value,
     sidecarCacheDir: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_CACHE_DIR"])?.value,
-    sidecarNodeVersion: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_NODE_VERSION"])?.value
+    sidecarNodeVersion: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_NODE_VERSION"])?.value,
+    sidecarTarget: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_TARGET"])?.value
   });
 }
 

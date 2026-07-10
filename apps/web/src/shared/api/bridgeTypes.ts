@@ -11,6 +11,7 @@ import type {
   ModelAlias,
   ModelSelection,
   ProviderInventory,
+  ProviderInventoryResult,
   ProviderModelDescriptor,
   ProviderModelInventory,
   SkillBinding
@@ -25,6 +26,7 @@ export type {
   MemberConfig,
   ModelSelection,
   ProviderInventory,
+  ProviderInventoryResult,
   ProviderModelDescriptor,
   ProviderModelInventory
 } from "@hunsu/protocol";
@@ -531,6 +533,16 @@ export type RuntimeProviderStatus = {
     supportsRemoteRelay: boolean;
     supportsAcp: boolean;
   };
+  modelInventory:
+    | {
+        state: "available";
+        models: ProviderModelDescriptor[];
+      }
+    | {
+        state: "unavailable";
+        reason: "not_reported" | "not_supported";
+        message: string;
+      };
   recommendedAction: "install" | "select_binary" | "login" | "connect" | "configure" | "recheck" | "none";
   safeMessage?: string;
 };
@@ -625,11 +637,13 @@ export type ExecutePreflightError = {
   actions: ExecutePreflightAction[];
 } | {
   area: "model";
+  backendId: string;
   providerId?: string;
   aliasId?: string;
   model?: string;
   error:
     | "MODEL_ALIAS_NOT_FOUND"
+    | "PROVIDER_INVENTORY_UNAVAILABLE"
     | "PROVIDER_NOT_READY"
     | "PROVIDER_LOGIN_REQUIRED"
     | "MODEL_UNSUPPORTED"
@@ -639,7 +653,7 @@ export type ExecutePreflightError = {
   actions: ExecutePreflightAction[];
 };
 
-export type ModelAliasInventoryResult = ProviderInventory;
+export type ModelAliasInventoryResult = ProviderInventoryResult;
 
 export type ModelAliasResolutionResult =
   | {
@@ -653,8 +667,11 @@ export type ModelAliasResolutionResult =
     }
   | {
       ok: false;
+      backendId: string;
       error:
+        | "BACKEND_UNAVAILABLE"
         | "MODEL_ALIAS_NOT_FOUND"
+        | "PROVIDER_INVENTORY_UNAVAILABLE"
         | "PROVIDER_NOT_READY"
         | "PROVIDER_LOGIN_REQUIRED"
         | "MODEL_UNSUPPORTED"

@@ -103,9 +103,15 @@ POST /api/model-aliases/validate
 POST /api/model-aliases/resolve
 ```
 
-`GET /api/providers/inventory` returns `{ backendId, providers }`; model
+Every runtime-provider status publishes a required model-inventory state.
+Codex publishes its provider-owned catalog even when its binary or login needs
+attention; providers without an inventory publish an explicit unavailable
+state. `GET /api/providers/inventory` returns
+`{ ok: true, value: { backendId, providers } }` or a typed
+`BACKEND_UNAVAILABLE` / `PROVIDER_INVENTORY_UNAVAILABLE` result. Model
 descriptors expose capabilities such as `reasoningEfforts` and `serviceTiers`
 so Web can render direct model controls without hardcoded reasoning choices.
+An explicit backend never falls back to the local provider.
 Alias resolve returns `{ ok: true, backendId, resolved, provider }` or one of
 the documented model/provider errors with actions. Web sends custom aliases
 with the public `aliases?: ModelAlias[]` request field; omitted aliases allow

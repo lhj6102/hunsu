@@ -13,6 +13,8 @@ on:
           - windows-arm64
           - macos-arm64
           - macos-intel
+          - linux
+          - linux-arm64
           - all
 
 permissions:
@@ -42,8 +44,14 @@ jobs:
             macos-intel)
               matrix='{"include":[{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"}]}'
               ;;
+            linux)
+              matrix='{"include":[{"platform":"linux","label":"Linux x64","runner":"ubuntu-22.04","rust_target":"x86_64-unknown-linux-gnu","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-unknown-linux-gnu","artifact":"hunsu-bridge-linux-x64"}]}'
+              ;;
+            linux-arm64)
+              matrix='{"include":[{"platform":"linux-arm64","label":"Linux ARM64","runner":"ubuntu-22.04-arm","rust_target":"aarch64-unknown-linux-gnu","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-unknown-linux-gnu","artifact":"hunsu-bridge-linux-arm64"}]}'
+              ;;
             all)
-              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"},{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"},{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"}]}'
+              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"},{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"},{"platform":"macos-intel","label":"macOS Intel","runner":"macos-15-intel","rust_target":"x86_64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-apple-darwin","artifact":"hunsu-bridge-macos-intel"},{"platform":"linux","label":"Linux x64","runner":"ubuntu-22.04","rust_target":"x86_64-unknown-linux-gnu","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-unknown-linux-gnu","artifact":"hunsu-bridge-linux-x64"},{"platform":"linux-arm64","label":"Linux ARM64","runner":"ubuntu-22.04-arm","rust_target":"aarch64-unknown-linux-gnu","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-unknown-linux-gnu","artifact":"hunsu-bridge-linux-arm64"}]}'
               ;;
             *)
               echo "Unsupported platform: ${{ inputs.platform }}" >&2
@@ -82,11 +90,24 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
+      - name: Install Linux desktop dependencies
+        if: startsWith(matrix.platform, 'linux')
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build desktop bundle
+        env:
+          HUNSU_BRIDGE_SIDECAR_TARGET: ${{ matrix.rust_target }}
         run: pnpm --filter @hunsu/bridge-desktop desktop:build
+
+      - name: Verify Windows app uses GUI subsystem
+        if: startsWith(matrix.platform, 'windows')
+        run: pnpm --filter @hunsu/bridge-desktop desktop:verify-windows-gui
 
       - name: Verify sidecar artifact
         shell: bash
@@ -134,7 +155,7 @@ jobs:
         run: find apps/bridge-desktop/src-tauri/target/release/bundle -maxdepth 4 -type f -print
 
       - name: Report artifact sizes
-        run: pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes
+        run: pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes -- --target "${{ matrix.rust_target }}"
 
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4

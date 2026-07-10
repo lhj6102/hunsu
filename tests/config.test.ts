@@ -204,12 +204,14 @@ test("Bridge sidecar packaging config resolves native artifact build inputs", ()
   const config = unwrapConfigResult(resolveBridgeSidecarPackagingConfig({
     HUNSU_BRIDGE_NATIVE_SIDECAR_DIR: "/tmp/hunsu-sidecars",
     HUNSU_BRIDGE_SIDECAR_CACHE_DIR: "/tmp/hunsu-sidecar-cache",
-    HUNSU_BRIDGE_SIDECAR_NODE_VERSION: "22.22.0"
+    HUNSU_BRIDGE_SIDECAR_NODE_VERSION: "22.22.0",
+    HUNSU_BRIDGE_SIDECAR_TARGET: "aarch64-apple-darwin"
   }));
 
   assert.equal(config.nativeSidecarDir, "/tmp/hunsu-sidecars");
   assert.equal(config.sidecarCacheDir, "/tmp/hunsu-sidecar-cache");
   assert.equal(config.sidecarNodeVersion, "22.22.0");
+  assert.equal(config.sidecarTarget, "aarch64-apple-darwin");
 });
 
 test("Bridge runtime config keeps process env separate from Codex app-server env overrides", () => {

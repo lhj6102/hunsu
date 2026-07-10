@@ -1,9 +1,11 @@
 import type { RuntimeProviderRegistry, RuntimeProviderStatus } from "../runtime-providers/types.ts";
 import type { BridgeBackendStatus } from "../connections/localConnection.ts";
-import type { ModelAlias, ModelSelection } from "@hunsu/protocol";
+import type { ModelAlias, ModelSelection, ProviderInventoryResult } from "@hunsu/protocol";
 import {
   executePreflightErrorFromModelError,
-  providerInventoriesForBridgeStatus,
+  modelSelectionResolutionFromInventoryError,
+  providerInventoryBackendUnavailable,
+  providerInventoryForBridgeStatus,
   resolveModelSelection
 } from "../model-aliases/modelAliasStore.ts";
 import {
@@ -29,6 +31,11 @@ export type ExecutePreflightBridgeStatus = {
     signedIn: boolean;
   };
   connections: BridgeBackendStatus[];
+};
+
+export type ExecuteModelSelectionCandidate = {
+  selection?: ModelSelection;
+  aliases?: ModelAlias[];
 };
 
 export type ExecutePreflightAction = {
@@ -85,11 +92,13 @@ export type ProviderAwareExecutePreflightError =
     }
   | {
       area: "model";
+      backendId: string;
       providerId?: string;
       aliasId?: string;
       model?: string;
       error:
         | "MODEL_ALIAS_NOT_FOUND"
+        | "PROVIDER_INVENTORY_UNAVAILABLE"
         | "PROVIDER_NOT_READY"
         | "PROVIDER_LOGIN_REQUIRED"
         | "MODEL_UNSUPPORTED"
@@ -171,11 +180,12 @@ export function providerWorkspaceExecutePreflightErrorForSelection(
 ): ProviderAwareExecutePreflightError | undefined {
   const selection = selectedExecuteBackend(input);
   const backend = selectedBridgeBackend(status.connections, selection);
-  const provider = backend?.mode === "remote" ? backend.provider : fallback.provider;
+  const provider = backend?.provider ?? fallback.provider;
   const workspaceId = firstNonEmpty(input.workspace?.workspaceId, fallback.workspace?.workspaceId);
-  const workspace = backend?.workspaces.find(candidate =>
+  const selectedWorkspace = backend?.workspaces.find(candidate =>
     candidate.workspaceId === workspaceId || candidate.roadmapId === workspaceId
-  ) ?? fallback.workspace;
+  );
+  const workspace = backend?.mode === "remote" ? selectedWorkspace : selectedWorkspace ?? fallback.workspace;
   return workspaceExecutePreflightError(workspace) ?? providerExecutePreflightError(provider);
 }
 
@@ -187,21 +197,95 @@ export function modelExecutePreflightErrorForSelection(
   if (!input.modelSelection && !aliases?.length) {
     return undefined;
   }
-  const selection = selectedExecuteBackend(input);
-  const provider = selectedBridgeBackend(status.connections, selection)?.provider ?? status.connections[0]?.provider;
-  if (!provider) {
-    return undefined;
+  const inventoryResult = providerInventoryForExecuteSelection(input, status);
+  if (!inventoryResult.ok) {
+    const resolution = modelSelectionResolutionFromInventoryError(inventoryResult.error);
+    return executePreflightErrorFromModelError(resolution.error, resolution.backendId);
   }
+  const inventory = inventoryResult.value;
   const resolution = resolveModelSelection({
     selection: input.modelSelection,
     aliases,
-    backendId: firstNonEmpty(input.backendId, input.workspace?.backendId),
-    inventories: providerInventoriesForBridgeStatus({
-      provider,
-      connections: status.connections
-    })
+    backendId: inventory.backendId,
+    inventories: inventory.providers
   });
-  return resolution.ok ? undefined : executePreflightErrorFromModelError(resolution.error);
+  return resolution.ok ? undefined : executePreflightErrorFromModelError(resolution.error, resolution.backendId);
+}
+
+export function providerInventoryForExecuteSelection(
+  input: ExecuteStartBackendSelection,
+  status: ExecutePreflightBridgeStatus
+): ProviderInventoryResult {
+  const selection = selectedExecuteBackend(input);
+  const backend = selectedBridgeBackend(status.connections, selection);
+  if (selection.backendId && !backend) {
+    return providerInventoryBackendUnavailable(
+      selection.backendId,
+      `Backend ${selection.backendId} is not connected to this Bridge.`
+    );
+  }
+  if (selection.remoteRequested && !backend) {
+    return providerInventoryBackendUnavailable(
+      "remote",
+      "No Remote Bridge backend is connected."
+    );
+  }
+  const localBackend = status.connections.find(connection => connection.mode === "local");
+  const selectedBackend = backend ?? localBackend;
+  return providerInventoryForBridgeStatus({
+    connections: status.connections,
+    backendId: selection.backendId ?? selectedBackend?.backendId ?? "local"
+  });
+}
+
+export async function resumeExecutePreflightErrorForSelection(
+  input: ExecuteStartBackendSelection,
+  status: ExecutePreflightBridgeStatus,
+  options: {
+    providerInventory: () => Promise<ProviderInventoryResult> | ProviderInventoryResult;
+    modelSelections: () => Promise<ExecuteModelSelectionCandidate[]> | ExecuteModelSelectionCandidate[];
+  }
+): Promise<ProviderAwareExecutePreflightError | undefined> {
+  const connectionError = connectionExecutePreflightErrorForSelection(input, status);
+  if (connectionError) {
+    return connectionError;
+  }
+
+  const selection = selectedExecuteBackend(input);
+  const selectedBackend = selectedBridgeBackend(status.connections, selection)
+    ?? (selection.remoteRequested ? undefined : status.connections.find(connection => connection.mode === "local"));
+  const providerError = selectedBackend ? providerExecutePreflightError(selectedBackend.provider) : undefined;
+  if (providerError) {
+    return providerError;
+  }
+
+  const inventoryResult = await options.providerInventory();
+  if (!inventoryResult.ok) {
+    const resolution = modelSelectionResolutionFromInventoryError(inventoryResult.error);
+    return executePreflightErrorFromModelError(resolution.error, resolution.backendId);
+  }
+
+  const seen = new Set<string>();
+  for (const candidate of await options.modelSelections()) {
+    if (!candidate.selection && !candidate.aliases?.length) {
+      continue;
+    }
+    const key = JSON.stringify(candidate);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const resolution = resolveModelSelection({
+      selection: candidate.selection,
+      aliases: candidate.aliases,
+      backendId: inventoryResult.value.backendId,
+      inventories: inventoryResult.value.providers
+    });
+    if (!resolution.ok) {
+      return executePreflightErrorFromModelError(resolution.error, resolution.backendId);
+    }
+  }
+  return undefined;
 }
 
 export function normalizeExecuteStartSelectionForLocalBridge<T extends ExecuteStartBackendSelection>(
@@ -263,8 +347,10 @@ export function selectedExecuteBackend(input: ExecuteStartBackendSelection): {
   remoteRequested: boolean;
 } {
   const backendId = firstNonEmpty(input.backendId, input.workspace?.backendId);
-  const connectionMode = input.connectionMode ?? input.workspace?.connectionMode;
-  const remoteRequested = connectionMode === "remote" || backendId?.startsWith("remote:") === true;
+  const connectionMode = backendId
+    ? isRemoteBackendId(backendId) ? "remote" : "local"
+    : input.connectionMode ?? input.workspace?.connectionMode;
+  const remoteRequested = connectionMode === "remote";
   return {
     backendId,
     connectionMode,
@@ -305,9 +391,14 @@ export function connectionExecutePreflightError(input: {
     ]);
   }
   if (!input.backend) {
-    return input.remoteRequested
-      ? connectionError(input.backendId, "REMOTE_NOT_CONNECTED", "Remote Bridge is not connected.", [
-          { type: "open_connection", label: "Open Connection", href: "hunsu://connection/remote" }
+    if (input.remoteRequested) {
+      return connectionError(input.backendId, "REMOTE_NOT_CONNECTED", "Remote Bridge is not connected.", [
+        { type: "open_connection", label: "Open Connection", href: "hunsu://connection/remote" }
+      ]);
+    }
+    return input.backendId
+      ? connectionError(input.backendId, "BRIDGE_NOT_CONNECTED", `Backend ${input.backendId} is not connected to this Bridge.`, [
+          { type: "open_connection", label: "Open Connection", href: "hunsu://connection" }
         ])
       : undefined;
   }
@@ -348,6 +439,10 @@ function selectedBridgeBackend(
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
   return values.find(value => value?.trim())?.trim();
+}
+
+function isRemoteBackendId(backendId: string): boolean {
+  return backendId === "remote" || backendId.startsWith("remote:");
 }
 
 function normalizeRepositoryPath(path: string): string {

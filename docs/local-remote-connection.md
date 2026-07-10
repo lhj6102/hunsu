@@ -40,14 +40,20 @@ Remote backend provider status is modeled separately from the local provider.
 If a Relay device reports a provider status, Bridge uses that status. If the
 device does not report provider status yet, `/api/bridge/status` returns an
 explicit unavailable remote-provider status instead of reusing the local Codex
-status.
+status. Provider status includes a required model-inventory availability union.
+Bridge App publishes the provider-owned inventory with each Remote snapshot;
+an older or incomplete snapshot without that field is treated as inventory
+unavailable and never receives the local catalog.
 
 Web model-alias validation follows the selected backend. Local validation calls
 `/api/providers/inventory` and `/api/model-aliases/validate` on the local
 Bridge; the inventory response names the backend with `backendId`. Remote
 validation uses the Relay command path for `provider.inventory`,
 `modelAlias.validate`, and `modelAlias.resolve`, and successful resolution
-returns the backend id that actually validated the model.
+returns the backend id that actually validated the model. Relay translates the
+selected `remote:<deviceId>` to `local` only at the target Bridge transport
+boundary, then restores the remote id in the response. Unknown explicit backend
+ids fail with `BACKEND_UNAVAILABLE` rather than being relabeled local results.
 
 Local Bridge child processes inherit the effective runtime provider env from
 Bridge App state. That includes saved Codex `binaryPath`, `codexHome`,

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { currentProcessEnv, resolveBridgeSidecarPackagingConfig, unwrapConfigResult } from "@hunsu/config";
@@ -21,8 +21,20 @@ export function sidecarArtifactNameForTarget(target) {
   return `hunsu-bridge-sidecar-${target.target}${target.extension}`;
 }
 
-export function genericSidecarNameForPlatform(platform = process.platform) {
-  return platform === "win32" ? "hunsu-bridge-sidecar.exe" : "hunsu-bridge-sidecar";
+export function sidecarTargetByName(targetName) {
+  const target = sidecarTargets.find(candidate => candidate.target === targetName);
+  if (!target) {
+    throw new Error(`Unsupported Hunsu Bridge sidecar target: ${targetName}. Expected one of: ${sidecarTargets.map(candidate => candidate.target).join(", ")}.`);
+  }
+  return target;
+}
+
+export function currentSidecarTarget(platform = process.platform, arch = process.arch) {
+  const target = sidecarTargets.find(candidate => candidate.platform === platform && candidate.arch === arch);
+  if (!target) {
+    throw new Error(`Hunsu Bridge does not define a sidecar target for ${platform}/${arch}. Pass --target explicitly.`);
+  }
+  return target;
 }
 
 export function validateNativeSidecarArtifact(path) {
@@ -50,45 +62,44 @@ export function prepareNativeSidecars(options = {}) {
   const packagingConfig = unwrapConfigResult(resolveBridgeSidecarPackagingConfig(currentProcessEnv()));
   const nativeDir = resolve(options.nativeDir ?? packagingConfig.nativeSidecarDir ?? defaultNativeDir);
   const outputDir = resolve(options.distDir ?? dist);
+  const target = options.target
+    ? sidecarTargetByName(options.target)
+    : packagingConfig.sidecarTarget
+      ? sidecarTargetByName(packagingConfig.sidecarTarget)
+      : currentSidecarTarget();
   mkdirSync(outputDir, { recursive: true });
+  cleanPreparedSidecars(outputDir);
   const manifest = {
     schema: "hunsu.bridge-sidecars.v1",
     source: nativeDir,
+    target: target.target,
     artifacts: []
   };
 
-  for (const target of sidecarTargets) {
-    const artifactName = sidecarArtifactNameForTarget(target);
-    const source = resolve(nativeDir, artifactName);
-    const destination = resolve(outputDir, artifactName);
-    validateNativeSidecarArtifact(source);
-    copyFileSync(source, destination);
-    if (target.extension === "") {
-      chmodSync(destination, 0o755);
-    }
-    manifest.artifacts.push({
-      target: target.target,
-      file: basename(destination),
-      kind: "native-executable"
-    });
+  const artifactName = sidecarArtifactNameForTarget(target);
+  const source = resolve(nativeDir, artifactName);
+  const destination = resolve(outputDir, artifactName);
+  validateNativeSidecarArtifact(source);
+  copyFileSync(source, destination);
+  if (target.extension === "") {
+    chmodSync(destination, 0o755);
   }
-
-  const currentTarget = sidecarTargets.find(target => target.platform === process.platform && target.arch === process.arch);
-  if (currentTarget) {
-    const source = resolve(outputDir, sidecarArtifactNameForTarget(currentTarget));
-    const destination = resolve(outputDir, genericSidecarNameForPlatform());
-    copyFileSync(source, destination);
-    if (currentTarget.extension === "") {
-      chmodSync(destination, 0o755);
-    }
-    manifest.currentPlatform = {
-      target: currentTarget.target,
-      file: basename(destination)
-    };
-  }
+  manifest.artifacts.push({
+    target: target.target,
+    file: basename(destination),
+    kind: "native-executable"
+  });
 
   writeFileSync(resolve(outputDir, "sidecar-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   return manifest;
+}
+
+function cleanPreparedSidecars(outputDir) {
+  for (const target of sidecarTargets) {
+    rmSync(resolve(outputDir, sidecarArtifactNameForTarget(target)), { force: true });
+  }
+  rmSync(resolve(outputDir, "hunsu-bridge-sidecar"), { force: true });
+  rmSync(resolve(outputDir, "hunsu-bridge-sidecar.exe"), { force: true });
 }
 
 function hasNativeExecutableMagic(bytes) {
@@ -136,8 +147,13 @@ function runCli(argv) {
   if (distDirArgIndex >= 0 && !distDir) {
     throw new Error("Usage: prepare-sidecars.mjs --dist-dir <directory>");
   }
-  const manifest = prepareNativeSidecars({ nativeDir, distDir });
-  console.log(`Prepared ${manifest.artifacts.length} native Hunsu Bridge sidecar artifacts in ${resolve(distDir ?? dist)}.`);
+  const targetArgIndex = argv.indexOf("--target");
+  const target = targetArgIndex >= 0 ? argv[targetArgIndex + 1] : undefined;
+  if (targetArgIndex >= 0 && !target) {
+    throw new Error("Usage: prepare-sidecars.mjs --target <target-triple>");
+  }
+  const manifest = prepareNativeSidecars({ nativeDir, distDir, target });
+  console.log(`Prepared native Hunsu Bridge sidecar for ${manifest.target} in ${resolve(distDir ?? dist)}.`);
 }
 
 function isCurrentScriptEntrypoint() {
