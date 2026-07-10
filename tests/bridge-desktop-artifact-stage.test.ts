@@ -22,6 +22,8 @@ type ArtifactStageModule = {
     outputDir: string;
     target: string;
     includeSizeReport?: boolean;
+    evidencePath?: string;
+    installedEvidencePath?: string;
   }): { files: string[] };
 };
 
@@ -93,6 +95,120 @@ test("desktop artifact staging omits a size report unless explicitly requested",
 
     assert.deepEqual(listFiles(outputDir), ["SHA256SUMS.txt", "dmg/Hunsu.dmg"]);
     assertChecksumsMatchEveryStagedFile(outputDir);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("desktop artifact staging retains safe passing Windows lifecycle evidence in the checksum manifest", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-desktop-artifact-stage-evidence-"));
+  const bundleDir = join(root, "bundle");
+  const outputDir = join(root, "staged");
+  const evidencePath = join(root, "managed-evidence.json");
+
+  try {
+    writeFixture(join(bundleDir, "nsis", "Hunsu.exe"), "windows-installer");
+    writeFixture(evidencePath, JSON.stringify({
+      schemaVersion: 1,
+      result: "passed",
+      scenarios: Object.fromEntries(["A", "B", "C", "D", "E", "F"].map(scenario => [scenario, { result: "passed" }]))
+    }));
+    artifactStage.stageDesktopArtifacts({
+      bundleDir,
+      outputDir,
+      target: "x86_64-pc-windows-msvc",
+      evidencePath
+    });
+
+    assert.deepEqual(listFiles(outputDir), [
+      "SHA256SUMS.txt",
+      "nsis/Hunsu.exe",
+      "windows-managed-bridge-e2e-evidence.json"
+    ]);
+    assertChecksumsMatchEveryStagedFile(outputDir);
+
+    writeFixture(evidencePath, JSON.stringify({
+      schemaVersion: 1,
+      result: "passed",
+      scenarios: Object.fromEntries(["A", "B", "C", "D", "E", "F"].map(scenario => [scenario, { result: "passed" }])),
+      unsafe: "https://example.invalid/?hunsuBridgeToken=raw"
+    }));
+    assert.throws(
+      () => artifactStage.stageDesktopArtifacts({
+        bundleDir,
+        outputDir,
+        target: "x86_64-pc-windows-msvc",
+        evidencePath
+      }),
+      /evidence contains a URL or credential parameter/
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("desktop artifact staging retains safe installed NSIS WebView evidence with a closed manual release gate", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-desktop-artifact-stage-installed-evidence-"));
+  const bundleDir = join(root, "bundle");
+  const outputDir = join(root, "staged");
+  const installedEvidencePath = join(root, "installed-evidence.json");
+  const checks = [
+    "silent-isolated-install",
+    "installed-webview-cdp",
+    "lifecycle-controls",
+    "open-handoff-once",
+    "diagnostics-copy-redaction",
+    "provider-validate-recheck-feedback",
+    "version-labels"
+  ];
+
+  try {
+    writeFixture(join(bundleDir, "nsis", "Hunsu.exe"), "windows-installer");
+    writeFixture(installedEvidencePath, JSON.stringify({
+      schemaVersion: 1,
+      result: "passed",
+      candidateKind: "installed-nsis",
+      checks,
+      releaseGate: {
+        automatedInstalledAppQa: "passed",
+        manualVisualQa: "required",
+        releaseEligible: false
+      }
+    }));
+    artifactStage.stageDesktopArtifacts({
+      bundleDir,
+      outputDir,
+      target: "x86_64-pc-windows-msvc",
+      installedEvidencePath
+    });
+
+    assert.deepEqual(listFiles(outputDir), [
+      "SHA256SUMS.txt",
+      "nsis/Hunsu.exe",
+      "windows-installed-app-e2e-evidence.json"
+    ]);
+    assertChecksumsMatchEveryStagedFile(outputDir);
+
+    writeFixture(installedEvidencePath, JSON.stringify({
+      schemaVersion: 1,
+      result: "passed",
+      candidateKind: "installed-nsis",
+      checks,
+      releaseGate: {
+        automatedInstalledAppQa: "passed",
+        manualVisualQa: "required",
+        releaseEligible: true
+      }
+    }));
+    assert.throws(
+      () => artifactStage.stageDesktopArtifacts({
+        bundleDir,
+        outputDir,
+        target: "x86_64-pc-windows-msvc",
+        installedEvidencePath
+      }),
+      /release gate closed pending manual QA/
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

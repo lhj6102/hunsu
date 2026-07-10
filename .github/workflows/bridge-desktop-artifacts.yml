@@ -165,9 +165,29 @@ jobs:
       - name: Run Windows managed Bridge lifecycle E2E
         if: matrix.platform == 'windows'
         shell: pwsh
-        run: >
-          ./apps/bridge-desktop/scripts/windows-managed-bridge-e2e.ps1
-          -SidecarPath "${{ matrix.sidecar }}"
+        env:
+          MANAGED_BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/windows-managed-bridge-e2e-evidence.json
+        run: |
+          ./apps/bridge-desktop/scripts/windows-managed-bridge-e2e.ps1 `
+            -SidecarPath "${{ matrix.sidecar }}" `
+            -EvidencePath $env:MANAGED_BRIDGE_EVIDENCE_PATH
+
+      - name: Run installed Windows Bridge App WebView E2E
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
+        run: |
+          $installer = Get-ChildItem `
+            -Path "apps/bridge-desktop/src-tauri/target/release/bundle/nsis" `
+            -Filter "*setup.exe" `
+            -File | Select-Object -First 1
+          if ($null -eq $installer) {
+            throw "The Windows NSIS installer was not produced."
+          }
+          ./apps/bridge-desktop/scripts/windows-installed-app-e2e.ps1 `
+            -InstallerPath $installer.FullName `
+            -EvidencePath $env:INSTALLED_APP_EVIDENCE_PATH
 
       - name: Verify final macOS application signature
         if: startsWith(matrix.platform, 'macos')
@@ -192,13 +212,23 @@ jobs:
         shell: bash
         env:
           ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
+          INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
+          MANAGED_BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/windows-managed-bridge-e2e-evidence.json
           SIDECAR_TARGET: ${{ matrix.rust_target }}
-        run: >
-          node apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs
-          --bundle-dir "apps/bridge-desktop/src-tauri/target/release/bundle"
-          --output-dir "${ARTIFACT_STAGE}"
-          --target "${SIDECAR_TARGET}"
-          ${{ inputs.platform == 'all' && '--include-size-report' || '' }}
+        run: |
+          stage_args=(
+            --bundle-dir "apps/bridge-desktop/src-tauri/target/release/bundle"
+            --output-dir "${ARTIFACT_STAGE}"
+            --target "${SIDECAR_TARGET}"
+          )
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            stage_args+=(--evidence-path "${MANAGED_BRIDGE_EVIDENCE_PATH}")
+            stage_args+=(--installed-evidence-path "${INSTALLED_APP_EVIDENCE_PATH}")
+          fi
+          if [[ "${{ inputs.platform }}" == "all" ]]; then
+            stage_args+=(--include-size-report)
+          fi
+          node apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs "${stage_args[@]}"
 
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4

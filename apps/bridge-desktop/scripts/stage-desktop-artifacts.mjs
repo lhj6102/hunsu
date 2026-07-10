@@ -14,6 +14,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const artifactSizeReportName = "artifact-size-report.json";
+const managedBridgeEvidenceName = "windows-managed-bridge-e2e-evidence.json";
+const installedAppEvidenceName = "windows-installed-app-e2e-evidence.json";
 const checksumFileName = "SHA256SUMS.txt";
 
 const targetArtifactRules = new Map([
@@ -91,6 +93,24 @@ export function stageDesktopArtifacts(input) {
     copyIntoStage(reportPath, outputRoot, artifactSizeReportName);
   }
 
+  const evidencePath = optionalSourceFile(input?.evidencePath, "managed Bridge E2E evidence");
+  if (evidencePath) {
+    if (containsPath(outputRoot, evidencePath)) {
+      throw new Error(`Managed Bridge E2E evidence must be outside the artifact output directory: ${evidencePath}`);
+    }
+    validateManagedBridgeEvidence(evidencePath);
+    copyIntoStage(evidencePath, outputRoot, managedBridgeEvidenceName);
+  }
+
+  const installedEvidencePath = optionalSourceFile(input?.installedEvidencePath, "installed Bridge App E2E evidence");
+  if (installedEvidencePath) {
+    if (containsPath(outputRoot, installedEvidencePath)) {
+      throw new Error(`Installed Bridge App E2E evidence must be outside the artifact output directory: ${installedEvidencePath}`);
+    }
+    validateInstalledAppEvidence(installedEvidencePath);
+    copyIntoStage(installedEvidencePath, outputRoot, installedAppEvidenceName);
+  }
+
   const stagedFiles = walkFiles(outputRoot)
     .map(path => portableRelativePath(outputRoot, path))
     .filter(path => path !== checksumFileName)
@@ -115,7 +135,9 @@ export function parseStageDesktopArtifactArguments(args) {
   const optionNames = new Map([
     ["--bundle-dir", "bundleDir"],
     ["--output-dir", "outputDir"],
-    ["--target", "target"]
+    ["--target", "target"],
+    ["--evidence-path", "evidencePath"],
+    ["--installed-evidence-path", "installedEvidencePath"]
   ]);
   const options = {};
 
@@ -144,6 +166,9 @@ export function parseStageDesktopArtifactArguments(args) {
   }
 
   for (const [option, property] of optionNames) {
+    if (property === "evidencePath" || property === "installedEvidencePath") {
+      continue;
+    }
     if (!Object.hasOwn(options, property)) {
       throw new Error(`Missing required desktop artifact staging option: ${option}`);
     }
@@ -197,6 +222,71 @@ function requiredValue(value, name) {
     throw new Error(`Desktop artifact staging requires a non-empty ${name}.`);
   }
   return value;
+}
+
+function optionalSourceFile(value, name) {
+  if (value === undefined) {
+    return undefined;
+  }
+  const path = resolve(requiredValue(value, name));
+  if (!existsSync(path) || !statSync(path).isFile()) {
+    throw new Error(`Missing ${name}: ${path}`);
+  }
+  return path;
+}
+
+function validateManagedBridgeEvidence(path) {
+  const text = readFileSync(path, "utf8");
+  let evidence;
+  try {
+    evidence = JSON.parse(text);
+  } catch {
+    throw new Error(`Managed Bridge E2E evidence is not valid JSON: ${path}`);
+  }
+  if (evidence?.schemaVersion !== 1 || evidence?.result !== "passed") {
+    throw new Error(`Managed Bridge E2E evidence did not record a passing schema-v1 run: ${path}`);
+  }
+  for (const scenario of ["A", "B", "C", "D", "E", "F"]) {
+    if (evidence?.scenarios?.[scenario]?.result !== "passed") {
+      throw new Error(`Managed Bridge E2E evidence is missing passing scenario ${scenario}: ${path}`);
+    }
+  }
+  if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken/iu.test(text)) {
+    throw new Error(`Managed Bridge E2E evidence contains a URL or credential parameter: ${path}`);
+  }
+}
+
+function validateInstalledAppEvidence(path) {
+  const text = readFileSync(path, "utf8");
+  let evidence;
+  try {
+    evidence = JSON.parse(text);
+  } catch {
+    throw new Error(`Installed Bridge App E2E evidence is not valid JSON: ${path}`);
+  }
+  const requiredChecks = [
+    "silent-isolated-install",
+    "installed-webview-cdp",
+    "lifecycle-controls",
+    "open-handoff-once",
+    "diagnostics-copy-redaction",
+    "provider-validate-recheck-feedback",
+    "version-labels"
+  ];
+  if (evidence?.schemaVersion !== 1 || evidence?.result !== "passed" || evidence?.candidateKind !== "installed-nsis") {
+    throw new Error(`Installed Bridge App E2E evidence did not record a passing schema-v1 NSIS run: ${path}`);
+  }
+  if (!Array.isArray(evidence.checks) || requiredChecks.some(check => !evidence.checks.includes(check))) {
+    throw new Error(`Installed Bridge App E2E evidence is missing required checks: ${path}`);
+  }
+  if (evidence?.releaseGate?.automatedInstalledAppQa !== "passed"
+    || evidence?.releaseGate?.manualVisualQa !== "required"
+    || evidence?.releaseGate?.releaseEligible !== false) {
+    throw new Error(`Installed Bridge App E2E evidence must keep the candidate release gate closed pending manual QA: ${path}`);
+  }
+  if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken|hunsuRelayToken|authorization|access_token|refresh_token/iu.test(text)) {
+    throw new Error(`Installed Bridge App E2E evidence contains a URL or credential parameter: ${path}`);
+  }
 }
 
 function comparePaths(left, right) {

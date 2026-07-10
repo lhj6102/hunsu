@@ -11,7 +11,13 @@ test("Bridge platform QA matrix is machine-checkable for native and browser targ
     schema: string;
     nativeHostResults: {
       status: string;
-      realRuns: unknown[];
+      realRuns: Array<{
+        target?: string;
+        runId?: number;
+        commit?: string;
+        status?: string;
+        evidenceUrl?: string;
+      }>;
       externalBlocker?: string;
     };
     targets: Array<{
@@ -25,9 +31,14 @@ test("Bridge platform QA matrix is machine-checkable for native and browser targ
   };
 
   assert.equal(matrix.schema, "hunsu.bridge-platform-qa.v1");
-  assert.equal(matrix.nativeHostResults.status, "not-run-in-this-workspace");
-  assert.deepEqual(matrix.nativeHostResults.realRuns, []);
-  assert.match(matrix.nativeHostResults.externalBlocker ?? "", /external hosts/);
+  assert.equal(matrix.nativeHostResults.status, "windows-x64-native-gate-passed");
+  assert.equal(matrix.nativeHostResults.realRuns.length >= 1, true);
+  const windowsRun = matrix.nativeHostResults.realRuns.find(run => run.target === "Windows x64");
+  assert.equal(windowsRun?.runId, 29110706034);
+  assert.match(windowsRun?.commit ?? "", /^[0-9a-f]{40}$/u);
+  assert.equal(windowsRun?.status, "passed");
+  assert.match(windowsRun?.evidenceUrl ?? "", /github\.com\/lhj6102\/hunsu\/actions\/runs\/29110706034/u);
+  assert.match(matrix.nativeHostResults.externalBlocker ?? "", /Manual installed-app visual QA/);
   assert.deepEqual(matrix.targets.map(target => target.target), [
     "macOS",
     "Windows",
@@ -51,4 +62,7 @@ test("Bridge platform QA matrix is machine-checkable for native and browser targ
 
   const browsers = matrix.targets.find(target => target.target === "Browsers")?.browsers;
   assert.deepEqual(browsers, ["Chrome", "Safari", "Edge", "Firefox"]);
+  const windows = matrix.targets.find(target => target.target === "Windows");
+  assert.equal(windows?.status, "windows-x64-native-gate-passed");
+  assert.equal(windows?.nativeHostExecuted, true);
 });

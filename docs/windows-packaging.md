@@ -15,11 +15,18 @@ never part of the Tauri `beforeBuildCommand` or native-sidecar preparation path.
 The Windows x64 job then runs the managed-runtime lifecycle E2E before staging
 or uploading the installer; ARM64 and non-Windows jobs do not run that x64 gate.
 
-Dogfood jobs stage only installable outputs and a matching `SHA256SUMS.txt`:
+Dogfood jobs stage installable outputs and a matching `SHA256SUMS.txt`:
 
 - Windows: `bundle/nsis/*.exe`
 - macOS: `bundle/dmg/*.dmg`
 - Linux: `bundle/deb/*.deb` and `bundle/appimage/*.AppImage`
+
+The gated Windows x64 artifact also includes
+`windows-managed-bridge-e2e-evidence.json` and
+`windows-installed-app-e2e-evidence.json`. The evidence contains only passing
+scenario flags and check names—never browser URLs or runtime credentials—and
+both files are included in `SHA256SUMS.txt`. Other targets do not stage these
+Windows-only files.
 
 The checksum entries are relative to the staged artifact, so every referenced
 file is present in the downloaded archive. Full recursive bundle outputs and
@@ -77,20 +84,40 @@ debugging or administrator-managed deployments.
 
 ## Managed Bridge QA gate
 
-Do not publish a dogfood installer unless the Windows x64 installed build passes
-the managed-runtime gate. Run the native script against the packaged sidecar in
-an isolated state directory:
+Do not publish a dogfood installer unless the Windows x64 packaged sidecar
+passes the managed-runtime gate before its installer is staged. The script uses
+an isolated state directory and creates a disposable fixture Workspace when
+`-WorkspaceFixture` is omitted:
 
 ```powershell
 pwsh -File apps/bridge-desktop/scripts/windows-managed-bridge-e2e.ps1 `
   -SidecarPath .\hunsu-bridge-sidecar.exe `
-  -WorkspaceFixture C:\path\to\fixture-roadmap
+  -EvidencePath .\windows-managed-bridge-e2e-evidence.json
 ```
 
-The script verifies repeated and concurrent `ensure-running`, Pair and Workspace
-Open reuse, authenticated Stop without supervisor restart, unmanaged-daemon
-refusal, non-Hunsu port conflict handling, browser handoff, and token redaction
-from Diagnostics and logs. After it passes, manually verify the installed app:
+Pass `-WorkspaceFixture C:\path\to\fixture-roadmap` only when deliberately
+testing a dedicated existing fixture; the command may initialize it as a Hunsu
+Roadmap. The script parses every concurrent `ensure-running` result, enumerates
+exactly one matching supervisor and daemon, and counts exactly one captured
+browser handoff for Pair, Open, Open Hunsu Web, and Workspace Open. It also
+verifies authenticated Stop without supervisor restart, unmanaged-daemon
+refusal, and a non-Hunsu port conflict without a lingering or restarting
+sidecar. Fresh Diagnostics are copied through the Windows clipboard and checked,
+along with the app log, for every captured runtime credential. The optional
+evidence file records safe per-scenario results; the Windows x64 artifact job
+always emits and checksum-stages it.
+
+The same Windows x64 job then silently installs the built NSIS candidate into an
+isolated temporary directory and attaches Playwright over a test-only WebView2
+CDP port. This installed-app gate exercises the actual Tauri WebView and bundled
+sidecar: lifecycle button states and transitions, one Open Hunsu Web handoff,
+fresh copied/displayed Diagnostics, legacy-token migration, Validate and Recheck
+feedback, and all five version labels. It uninstalls the candidate and removes
+its isolated runtime state afterward. The resulting evidence deliberately keeps
+`releaseEligible` false until the following human visual QA is attested; an
+Actions candidate artifact is not a dogfood release.
+
+After both automated gates pass, manually verify the installed app shell:
 
 - Connected/managed disables Start and enables Stop.
 - Stop reaches Not running, releases the configured Bridge port, and remains stopped.
