@@ -149,10 +149,11 @@ async function verifyLifecycleAction(page, input) {
 
 async function waitForLifecycle(page, expected) {
   await page.waitForFunction(value => {
-    const local = document.querySelector("#local-bridge")?.textContent?.trim();
+    const local = document.querySelector("#local-bridge")?.textContent?.trim().toLocaleLowerCase() ?? "";
+    const expectedLocal = `local · ${value.localLabel}`.toLocaleLowerCase();
     const start = document.querySelector("#start-bridge");
     const stop = document.querySelector("#stop-bridge");
-    return local === value.localLabel
+    return local.includes(expectedLocal)
       && start?.disabled === value.startDisabled
       && stop?.disabled === value.stopDisabled;
   }, expected, { timeout: 60_000 });

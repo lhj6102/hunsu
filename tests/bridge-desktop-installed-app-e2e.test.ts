@@ -35,6 +35,7 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
   assert.match(driver, /chromium\.connectOverCDP/u);
   assert.match(driver, /#start-bridge/u);
   assert.match(driver, /#stop-bridge/u);
+  assert.match(driver, /`local · \$\{value\.localLabel\}`/u);
   assert.match(driver, /Stopping Bridge/u);
   assert.match(driver, /Starting Bridge/u);
   assert.match(driver, /before\.length \+ 1/u);
