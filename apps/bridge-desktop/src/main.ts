@@ -30,7 +30,13 @@ import {
   runCodexDeviceLoginCli as runCodexDeviceLoginCliAction
 } from "./commands/codexCommands.ts";
 import { runAuthCallbackCommand, runLoginCommand, runLogoutCommand } from "./commands/authCommands.ts";
-import { buildDiagnostics, packageManagerStatus, runDiagnosticsCommand, toolStatus } from "./commands/diagnosticsCommands.ts";
+import {
+  buildDiagnostics,
+  currentNodeRuntimeStatus,
+  packageManagerStatus,
+  runDiagnosticsCommand,
+  toolStatus
+} from "./commands/diagnosticsCommands.ts";
 import {
   activeManagedProjectGrantsForRoadmaps,
   projectGrantsWithRemoteRelay,
@@ -145,6 +151,10 @@ const BRIDGE_STARTING_GRACE_MS = 15_000;
 async function main(argv = process.argv.slice(2)): Promise<number> {
   const parsed = parseArgs(normalizeBridgeAppArgv(argv));
   try {
+    if (parsed.flags.has("version")) {
+      console.log(`Hunsu Bridge ${HUNSU_BRIDGE_APP_VERSION}`);
+      return 0;
+    }
     switch (parsed.command) {
       case "start":
         await supervisedStartCommand(parsed);
@@ -1360,7 +1370,7 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
     codex,
     tools: {
       git: toolStatus("git", ["--version"]),
-      node: toolStatus(process.execPath, ["--version"]),
+      node: currentNodeRuntimeStatus(),
       packageManager: packageManagerStatus()
     },
     codexSettings: snapshotCodexSettings(state),

@@ -22,6 +22,7 @@ import {
 } from "../apps/bridge-desktop/src/auth.ts";
 import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts";
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
+import { currentNodeRuntimeStatus } from "../apps/bridge-desktop/src/commands/diagnosticsCommands.ts";
 import { currentBridgeCommandInvocation } from "../apps/bridge-desktop/src/processes/backgroundSpawn.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
@@ -113,6 +114,26 @@ test("Bridge App rejects unsupported browser deep links", async () => {
     else process.env.HUNSU_BRIDGE_APP_LOG_PATH = previousLogPath;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Bridge App version and Node runtime checks never start the packaged sidecar", async () => {
+  const output: string[] = [];
+  const previousLog = console.log;
+  console.log = (...values: unknown[]) => {
+    output.push(values.map(String).join(" "));
+  };
+  try {
+    assert.equal(await main(["--version"]), 0);
+  } finally {
+    console.log = previousLog;
+  }
+
+  assert.deepEqual(output, ["Hunsu Bridge 0.1.0"]);
+  assert.deepEqual(currentNodeRuntimeStatus("C:\\Hunsu\\hunsu-bridge.exe", "v22.22.0"), {
+    installed: true,
+    binaryPath: "C:\\Hunsu\\hunsu-bridge.exe",
+    version: "v22.22.0"
+  });
 });
 
 test("Bridge App Roadmap deep links record UI intents for native focus flows", async () => {
