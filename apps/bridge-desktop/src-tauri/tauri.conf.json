@@ -45,20 +45,16 @@
       "../dist/sidecar-manifest.json"
     ],
     "macOS": {
-      "minimumSystemVersion": "12.0",
-      "infoPlist": "Info.plist"
-    },
-    "windows": {
-      "wix": {
-        "language": "en-US",
-        "fragmentPaths": [
-          "windows/hunsu-protocol.wxs"
-        ],
-        "componentRefs": [
-          "HunsuProtocolRegistry"
+      "minimumSystemVersion": "12.0"
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "hunsu"
         ]
       }
     }
-  },
-  "plugins": {}
+  }
 }

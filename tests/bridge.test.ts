@@ -1457,7 +1457,7 @@ test("Bridge Execute resume revalidates remote backend inventory and models befo
     cwd: repo,
     roadmapRegistryPath: registryPath
   }));
-  const resumeRunState = {
+  const resumeRunState: StudioRunState = {
     ...studioRunFixture(),
     roadmapId: opened.roadmap.roadmapId,
     repositoryPath: repo,
@@ -1477,7 +1477,7 @@ test("Bridge Execute resume revalidates remote backend inventory and models befo
       serviceTier: "default" as const
     },
     status: "paused" as const
-  } satisfies StudioRunState;
+  };
   state.runs[resumeRunState.runId] = resumeRunState;
   const server = createStudioServer({
     cwd: repo,
@@ -5951,8 +5951,8 @@ test("Bridge server controls runtime pause, resume, and stop state", async () =>
     },
     providerInventory
   });
-  assert.equal(resumed.ok, true);
   if (!resumed.ok) assert.fail(resumed.error.message);
+  assert.equal(resumed.ok, true);
   assert.equal(resumed.value.run.status, "running");
   assert.equal(resumed.value.board.lines[0].status, "active");
   await waitFor(() => runner.resumed?.runId === "run/req_batch");

@@ -14,8 +14,9 @@
       "status": "validated-by-contract",
       "nativeHostExecuted": false,
       "evidence": [
-        "apps/bridge-desktop/src-tauri/Info.plist",
+        "apps/bridge-desktop/src-tauri/Cargo.toml",
         "apps/bridge-desktop/src-tauri/tauri.conf.json",
+        "apps/bridge-desktop/src-tauri/src/main.rs",
         "apps/bridge-desktop/scripts/build-native-sidecars.mjs",
         "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
         "tests/bridge-desktop.test.ts"
@@ -34,14 +35,15 @@
       "status": "validated-by-contract",
       "nativeHostExecuted": false,
       "evidence": [
-        "apps/bridge-desktop/src-tauri/windows/hunsu-protocol.wxs",
+        "apps/bridge-desktop/src-tauri/Cargo.toml",
         "apps/bridge-desktop/src-tauri/tauri.conf.json",
+        "apps/bridge-desktop/src-tauri/src/main.rs",
         "apps/bridge-desktop/scripts/build-native-sidecars.mjs",
         "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
         "tests/bridge-desktop.test.ts"
       ],
       "checks": [
-        "installer registers hunsu:// protocol through WiX fragment",
+        "active NSIS installer registers hunsu:// through Tauri desktop deep-link configuration",
         "native sidecar .exe artifacts are generated for x86_64-pc-windows-msvc and aarch64-pc-windows-msvc",
         "DPAPI-backed credential adapter command boundary is covered with mocks",
         "tray summary refresh and quit preference behavior are source-contract tested",
@@ -54,6 +56,8 @@
       "status": "validated-by-contract",
       "nativeHostExecuted": false,
       "evidence": [
+        "apps/bridge-desktop/src-tauri/Cargo.toml",
+        "apps/bridge-desktop/src-tauri/src/main.rs",
         "apps/bridge-desktop/src/native-shell.ts",
         "apps/bridge-desktop/src-tauri/tauri.conf.json",
         "apps/bridge-desktop/scripts/build-native-sidecars.mjs",
@@ -62,6 +66,7 @@
       ],
       "checks": [
         "native folder picker command is exposed",
+        "Tauri deep-link runtime registration writes an xdg handler with a URL argument for Linux GUI bundles",
         "xdg hunsu:// protocol registration plan is generated",
         "Secret Service credential adapter command boundary is covered with mocks",
         "native sidecar artifacts are generated for Linux GNU targets",

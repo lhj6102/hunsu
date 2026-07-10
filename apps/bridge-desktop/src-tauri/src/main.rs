@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::{
@@ -1037,11 +1038,10 @@ fn percent_decode(value: &str) -> String {
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(url) = argv.iter().find(|arg| arg.starts_with("hunsu://")) {
-                handle_protocol_url_and_show(app, url);
-            }
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
         }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -1052,13 +1052,25 @@ fn main() {
             }
         })
         .setup(|app| {
+            let protocol_app = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    handle_protocol_url_and_show(&protocol_app, url.as_str());
+                }
+            });
+            #[cfg(target_os = "linux")]
+            if let Err(error) = app.deep_link().register_all() {
+                eprintln!("Could not register Hunsu Bridge deep links: {error}");
+            }
             start_local_bridge_on_launch(&app.handle());
             create_bridge_tray(&app.handle())?;
             start_bridge_tray_refresh(app.handle().clone());
             let mut opened_protocol_url = false;
-            for arg in std::env::args().filter(|arg| arg.starts_with("hunsu://")) {
-                opened_protocol_url = true;
-                handle_protocol_url_and_show(&app.handle(), &arg);
+            if let Some(urls) = app.deep_link().get_current()? {
+                for url in urls {
+                    opened_protocol_url = true;
+                    handle_protocol_url_and_show(&app.handle(), url.as_str());
+                }
             }
             if !opened_protocol_url {
                 maybe_show_main_window_for_setup(&app.handle());

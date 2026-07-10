@@ -110,8 +110,9 @@ Hunsu Bridge App owns local runtime supervision:
   `dist-ui/` for packaging; it polls live status, recent projects,
   selected-folder inspection, diagnostics, and logs
 - a native folder picker command for macOS, Windows, and Linux GUI
-- `hunsu://` protocol registration through macOS `Info.plist`, a Windows WiX
-  registry fragment, and a Linux user-level `.desktop`/`xdg-mime` handler
+- `hunsu://` protocol registration through Tauri's desktop deep-link plugin for
+  packaged macOS and Windows apps, runtime registration for Linux GUI bundles,
+  and a Linux user-level `.desktop`/`xdg-mime` handler for headless installs
 - a supervised sidecar process that restarts a crashed Bridge daemon and writes
   structured logs
 - a tray-first lifecycle: the main window is hidden by default, closing the
