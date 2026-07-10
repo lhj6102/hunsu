@@ -3021,6 +3021,7 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(artifactWorkflow, /uses: Swatinem\/rust-cache@v2/);
     assert.match(artifactWorkflow, /workspaces: apps\/bridge-desktop\/src-tauri -> target/);
     assert.match(artifactWorkflow, /key: \$\{\{ matrix\.rust_target \}\}/);
+    assert.match(artifactWorkflow, /cache-on-failure: true/);
     assert.match(artifactWorkflow, /path: apps\/bridge-desktop\/\.sidecar-cache/);
     assert.match(artifactWorkflow, /bridge-sidecar-node-\$\{\{ runner\.os \}\}-\$\{\{ matrix\.rust_target \}\}-22\.22\.0/);
     assert.equal(

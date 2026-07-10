@@ -104,6 +104,7 @@ jobs:
         with:
           workspaces: apps/bridge-desktop/src-tauri -> target
           key: ${{ matrix.rust_target }}
+          cache-on-failure: true
 
       - name: Cache sidecar Node runtime
         uses: actions/cache@v4

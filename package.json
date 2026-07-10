@@ -13,6 +13,7 @@
     "test": "node --conditions=development --test tests/*.test.ts",
     "typecheck": "tsc -p tsconfig.json",
     "check": "pnpm run typecheck && pnpm test",
+    "check:desktop-rust": "cargo fmt --manifest-path apps/bridge-desktop/src-tauri/Cargo.toml -- --check && cargo check --locked --manifest-path apps/bridge-desktop/src-tauri/Cargo.toml",
     "hunsu": "pnpm --filter hunsu hunsu"
   },
   "engines": {

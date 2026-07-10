@@ -41,6 +41,19 @@ Cargo output, and the pinned target Node archive use separate caches; cached
 Node archives are still checked against the pinned Node release SHA-256 list
 before reuse.
 
+The desktop application commits `src-tauri/Cargo.lock` so local and GitHub
+builds resolve the same Rust dependency graph. Before pushing desktop Rust
+changes, run the lightweight source gate:
+
+```sh
+pnpm run check:desktop-rust
+```
+
+This checks Rust formatting and runs `cargo check --locked`; the artifact
+workflow still performs only one full Cargo/Tauri build. During prototype
+dogfooding, the target-specific Rust cache may be saved after a failed compile
+so a source-only correction can reuse already compiled dependencies.
+
 Release builds mark the parent Tauri executable as a Windows GUI application.
 Each Windows artifact job runs `desktop:verify-windows-gui` against Cargo's
 `src-tauri/target/release/hunsu-bridge.exe` output. The validator reads the PE
