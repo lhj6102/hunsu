@@ -14,6 +14,7 @@
     "desktop:dev": "pnpm run typecheck && pnpm run desktop:prepare && pnpm exec tauri dev",
     "desktop:build": "pnpm exec tauri build",
     "desktop:verify-windows-gui": "node scripts/verify-windows-gui-subsystem.mjs",
+    "e2e:windows-managed": "pwsh -File scripts/windows-managed-bridge-e2e.ps1",
     "build": "pnpm run build:ui && tsc -p tsconfig.build.json && node --conditions=development scripts/build-native-sidecars.mjs",
     "build:ui": "node scripts/build-ui.mjs",
     "sidecars:build": "node --conditions=development scripts/build-native-sidecars.mjs",

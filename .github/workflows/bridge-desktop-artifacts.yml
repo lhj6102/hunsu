@@ -162,6 +162,13 @@ jobs:
           --target "${SIDECAR_TARGET}"
           --timeout-ms 60000
 
+      - name: Run Windows managed Bridge lifecycle E2E
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: >
+          ./apps/bridge-desktop/scripts/windows-managed-bridge-e2e.ps1
+          -SidecarPath "${{ matrix.sidecar }}"
+
       - name: Verify final macOS application signature
         if: startsWith(matrix.platform, 'macos')
         shell: bash

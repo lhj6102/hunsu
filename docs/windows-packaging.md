@@ -12,6 +12,8 @@ matrix entry verifies the target sidecar path, builds the native bundle with
 `HUNSU_BRIDGE_SIDECAR_TARGET` set to that matrix target, and then runs exactly
 one native `status` smoke test with a 60-second timeout. Runtime smoke testing is
 never part of the Tauri `beforeBuildCommand` or native-sidecar preparation path.
+The Windows x64 job then runs the managed-runtime lifecycle E2E before staging
+or uploading the installer; ARM64 and non-Windows jobs do not run that x64 gate.
 
 Dogfood jobs stage only installable outputs and a matching `SHA256SUMS.txt`:
 
@@ -72,3 +74,28 @@ explicit full-matrix builds.
 Windows defaults to current-user startup for the Bridge service command surface.
 Use `hunsu-bridge service install --system` only for explicit system service
 debugging or administrator-managed deployments.
+
+## Managed Bridge QA gate
+
+Do not publish a dogfood installer unless the Windows x64 installed build passes
+the managed-runtime gate. Run the native script against the packaged sidecar in
+an isolated state directory:
+
+```powershell
+pwsh -File apps/bridge-desktop/scripts/windows-managed-bridge-e2e.ps1 `
+  -SidecarPath .\hunsu-bridge-sidecar.exe `
+  -WorkspaceFixture C:\path\to\fixture-roadmap
+```
+
+The script verifies repeated and concurrent `ensure-running`, Pair and Workspace
+Open reuse, authenticated Stop without supervisor restart, unmanaged-daemon
+refusal, non-Hunsu port conflict handling, browser handoff, and token redaction
+from Diagnostics and logs. After it passes, manually verify the installed app:
+
+- Connected/managed disables Start and enables Stop.
+- Stop reaches Not running, releases the configured Bridge port, and remains stopped.
+- Start returns to Connected with one daemon and one supervisor.
+- Open Hunsu Web and Workspace Open each open one expected browser tab.
+- Diagnostics and copied Diagnostics contain no bearer value.
+- Validate and Recheck show pending and terminal feedback.
+- App, runtime, protocol, embedded Node, and Codex versions are distinct and understandable.
