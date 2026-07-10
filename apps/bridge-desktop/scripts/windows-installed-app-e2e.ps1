@@ -91,7 +91,7 @@ $statePath = Join-Path $runtimeDir "bridge-app.json"
 $logPath = Join-Path $runtimeDir "bridge-app.log"
 $browserCapturePath = Join-Path $runtimeDir "browser-capture.log"
 $roadmapRegistryPath = Join-Path $runtimeDir "roadmaps.json"
-$fakeCodexPath = Join-Path $runtimeDir "codex-qa.cmd"
+$fakeCodexPath = Join-Path $runtimeDir "codex-qa.exe"
 $workspaceFixturePath = Join-Path $root "fixture-roadmap"
 $driverPath = Join-Path $PSScriptRoot "windows-installed-app-webview-e2e.mjs"
 $legacySecret = "qa_legacy_" + [guid]::NewGuid().ToString("N")
@@ -115,14 +115,27 @@ New-Item -ItemType Directory -Path $installDir, $runtimeDir, $webViewDataDir, $w
 Set-Content -LiteralPath $logPath -Encoding utf8 -Value (
   "{`"event`":`"legacy.qa`",`"url`":`"http://127.0.0.1/bridge?hunsuBridgeToken=$legacySecret&access_token=$legacySecret`"}"
 )
-Set-Content -LiteralPath $fakeCodexPath -Encoding ascii -Value @(
-  "@echo off",
-  "if `"%~1`"==`"--version`" (",
-  "  echo codex-qa 0.0.0",
-  "  exit /b 0",
-  ")",
-  "exit /b 1"
-)
+$fakeCodexSource = @"
+using System;
+
+public static class CodexQaFixture
+{
+    public static int Main(string[] args)
+    {
+        if (args.Length == 1 && args[0] == "--version")
+        {
+            Console.WriteLine("codex-qa 0.0.0");
+            return 0;
+        }
+        return 1;
+    }
+}
+"@
+Add-Type `
+  -TypeDefinition $fakeCodexSource `
+  -Language CSharp `
+  -OutputAssembly $fakeCodexPath `
+  -OutputType ConsoleApplication
 
 $fixtureVersionOutput = & $fakeCodexPath --version 2>&1 | Out-String
 Assert-True ($LASTEXITCODE -eq 0 -and $fixtureVersionOutput.Trim() -eq "codex-qa 0.0.0") "The controlled Codex CLI fixture did not return its expected version."
