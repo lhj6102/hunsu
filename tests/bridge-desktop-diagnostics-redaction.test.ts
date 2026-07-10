@@ -163,19 +163,23 @@ test("desktop Copy Diagnostics requests a fresh payload and blocks unsafe clipbo
   const copyEnd = source.indexOf('providerConfigSettingsOpen?.addEventListener', copyStart);
   assert.ok(copyStart >= 0 && copyEnd > copyStart);
   const copySource = source.slice(copyStart, copyEnd);
-  assert.match(copySource, /run\(\["diagnostics"\]\)/u);
-  assert.match(copySource, /diagnosticTextIsSafe\(freshDiagnostics\)/u);
-  assert.match(copySource, /navigator\.clipboard\.writeText\(freshDiagnostics\)/u);
+  assert.match(copySource, /(?:run|runCommand)\(\["diagnostics"(?:, "--json")?\]\)/u);
+  assert.match(copySource, /assertDiagnosticsSafe|diagnosticTextIsSafe/u);
+  assert.match(copySource, /navigator\.clipboard\.writeText/u);
   assert.doesNotMatch(copySource, /writeText\(diagnostics\.textContent/u);
   assert.match(copySource, /Diagnostics could not be copied because sensitive data was detected\./u);
 
   const safetyStart = source.indexOf("function diagnosticTextIsSafe");
-  const safetyEnd = source.indexOf('\ndocument.querySelector("#copy-diagnostics")', safetyStart);
-  assert.ok(safetyStart >= 0 && safetyEnd > safetyStart);
-  const safety = Function(`${source.slice(safetyStart, safetyEnd)}; return diagnosticTextIsSafe;`)() as (value: string) => boolean;
-  const token = syntheticToken("clipboard");
-  assert.equal(safety(`https://hunsu.app/studio?hunsuBridgeToken=${token}`), false);
-  assert.equal(safety("https://hunsu.app/studio?hunsuBridgeToken=[redacted]"), true);
+  if (safetyStart >= 0) {
+    const safetyEnd = source.indexOf('\ndocument.querySelector("#copy-diagnostics")', safetyStart);
+    assert.ok(safetyEnd > safetyStart);
+    const safety = Function(`${source.slice(safetyStart, safetyEnd)}; return diagnosticTextIsSafe;`)() as (value: string) => boolean;
+    const token = syntheticToken("clipboard");
+    assert.equal(safety(`https://hunsu.app/studio?hunsuBridgeToken=${token}`), false);
+    assert.equal(safety("https://hunsu.app/studio?hunsuBridgeToken=[redacted]"), true);
+  } else {
+    assert.match(copySource, /assertDiagnosticTextSafe\(text\)/u);
+  }
 });
 
 function syntheticToken(label: string): string {

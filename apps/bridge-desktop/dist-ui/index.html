@@ -173,11 +173,22 @@
       .status-connected {
         color: #138a4f;
       }
+      .status-success {
+        color: #138a4f;
+      }
+      .status-pending {
+        color: #1f6feb;
+      }
       .status-warning {
         color: #ad6500;
       }
       .status-error {
         color: #b42318;
+      }
+      .action-status {
+        min-height: 18px;
+        margin-top: 10px;
+        white-space: pre-line;
       }
       .connection-state {
         display: grid;
@@ -242,6 +253,7 @@
             <button id="save-codex-config" class="primary">Save</button>
             <button id="reset-codex-config">Reset</button>
           </div>
+          <div id="provider-config-status" class="message action-status" role="status" aria-live="polite"></div>
         </div>
       </div>
     </div>
@@ -253,6 +265,7 @@
           <button id="open-studio" class="primary">Open Hunsu Web</button>
         </div>
       </header>
+      <div id="action-status" class="message action-status" role="status" aria-live="polite"></div>
 
       <nav aria-label="Bridge sections">
         <button data-tab="provider" aria-selected="true">Provider</button>
@@ -335,6 +348,7 @@
             <button id="open-studio-connection">Open Hunsu Web</button>
             <button id="install-protocol">Install hunsu:// Handler</button>
           </div>
+          <div id="bridge-control-reason" class="message"></div>
         </details>
       </section>
 
@@ -344,8 +358,21 @@
         <h2 style="margin-top: 18px;">Advanced Checks</h2>
         <h3>Git</h3>
         <div id="git-card" class="grid"></div>
-        <h3 style="margin-top: 18px;">Node / Package Manager</h3>
+        <h3 style="margin-top: 18px;">Runtime and optional system tools</h3>
         <div id="node-card" class="grid"></div>
+        <h2 style="margin-top: 18px;">Versions</h2>
+        <dl>
+          <dt>Bridge App version</dt>
+          <dd id="bridge-app-version">Unknown</dd>
+          <dt>Bridge runtime version</dt>
+          <dd id="bridge-runtime-version">Unknown</dd>
+          <dt>Protocol version</dt>
+          <dd id="protocol-version">Unknown</dd>
+          <dt>Embedded Node version</dt>
+          <dd id="embedded-node-version">Unknown</dd>
+          <dt>Codex CLI version</dt>
+          <dd id="codex-cli-version">Unknown</dd>
+        </dl>
         <h2 style="margin-top: 18px;">Advanced Remote Details</h2>
         <div id="remote-roadmap-list" class="grid"></div>
         <h2 style="margin-top: 18px;">Project Grants</h2>
