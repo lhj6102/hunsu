@@ -72,3 +72,15 @@ explicit full-matrix builds.
 Windows defaults to current-user startup for the Bridge service command surface.
 Use `hunsu-bridge service install --system` only for explicit system service
 debugging or administrator-managed deployments.
+
+The Windows NSIS bundle also installs in current-user mode. Its pre-install and
+pre-uninstall hooks use Tauri's current-user process check for both the desktop
+executable and `hunsu-bridge-sidecar.exe`. This stops the background supervisor
+and daemon before NSIS replaces or removes the packaged sidecar, avoiding
+locked-file failures when a user upgrades while the Bridge remains in its
+default keep-background mode.
+
+Each Windows artifact job exercises that contract with a silent install,
+launches the installed sidecar, silently reinstalls over the locked executable,
+then launches it again and silently uninstalls. Artifact staging runs only after
+that reinstall/uninstall smoke succeeds.

@@ -162,6 +162,15 @@ jobs:
           --target "${SIDECAR_TARGET}"
           --timeout-ms 60000
 
+      - name: Verify Windows installer replaces a running sidecar
+        if: startsWith(matrix.platform, 'windows')
+        shell: bash
+        timeout-minutes: 10
+        run: >
+          node --conditions=development apps/bridge-desktop/scripts/smoke-windows-installer-reinstall.mjs
+          --bundle-dir "apps/bridge-desktop/src-tauri/target/release/bundle"
+          --timeout-ms 60000
+
       - name: Verify final macOS application signature
         if: startsWith(matrix.platform, 'macos')
         shell: bash
