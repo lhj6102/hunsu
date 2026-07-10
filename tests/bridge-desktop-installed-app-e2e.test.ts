@@ -31,7 +31,8 @@ test("installed Windows app gate silently installs an isolated NSIS candidate an
   assert.match(powershell, /existing managed daemon verifies reuse/u);
   assert.match(powershell, /\[string\]\$EvidencePath/u);
   assert.match(powershell, /qa_legacy_.*NewGuid/u);
-  assert.match(powershell, /Add-Type[\s\S]*-OutputType ConsoleApplication/u);
+  assert.match(powershell, /Get-Command rustc/u);
+  assert.match(powershell, /--crate-name codex_qa_fixture/u);
   assert.match(powershell, /codex-qa\.exe/u);
   assert.match(powershell, /fixtureVersionOutput/u);
   assert.match(powershell, /installedSnapshot\.versions\.codexCli/u);

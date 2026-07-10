@@ -92,6 +92,7 @@ $logPath = Join-Path $runtimeDir "bridge-app.log"
 $browserCapturePath = Join-Path $runtimeDir "browser-capture.log"
 $roadmapRegistryPath = Join-Path $runtimeDir "roadmaps.json"
 $fakeCodexPath = Join-Path $runtimeDir "codex-qa.exe"
+$fakeCodexSourcePath = Join-Path $runtimeDir "codex-qa.rs"
 $workspaceFixturePath = Join-Path $root "fixture-roadmap"
 $driverPath = Join-Path $PSScriptRoot "windows-installed-app-webview-e2e.mjs"
 $legacySecret = "qa_legacy_" + [guid]::NewGuid().ToString("N")
@@ -115,27 +116,19 @@ New-Item -ItemType Directory -Path $installDir, $runtimeDir, $webViewDataDir, $w
 Set-Content -LiteralPath $logPath -Encoding utf8 -Value (
   "{`"event`":`"legacy.qa`",`"url`":`"http://127.0.0.1/bridge?hunsuBridgeToken=$legacySecret&access_token=$legacySecret`"}"
 )
-$fakeCodexSource = @"
-using System;
-
-public static class CodexQaFixture
-{
-    public static int Main(string[] args)
-    {
-        if (args.Length == 1 && args[0] == "--version")
-        {
-            Console.WriteLine("codex-qa 0.0.0");
-            return 0;
-        }
-        return 1;
-    }
-}
-"@
-Add-Type `
-  -TypeDefinition $fakeCodexSource `
-  -Language CSharp `
-  -OutputAssembly $fakeCodexPath `
-  -OutputType ConsoleApplication
+Set-Content -LiteralPath $fakeCodexSourcePath -Encoding utf8 -Value @(
+  "fn main() {",
+  "    let mut args = std::env::args().skip(1);",
+  "    if args.next().as_deref() == Some(`"--version`") && args.next().is_none() {",
+  "        println!(`"codex-qa 0.0.0`");",
+  "        return;",
+  "    }",
+  "    std::process::exit(1);",
+  "}"
+)
+$rustc = (Get-Command rustc -ErrorAction Stop).Source
+& $rustc --crate-name codex_qa_fixture $fakeCodexSourcePath -o $fakeCodexPath
+Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $fakeCodexPath -PathType Leaf)) "Could not compile the native Codex CLI fixture."
 
 $fixtureVersionOutput = & $fakeCodexPath --version 2>&1 | Out-String
 Assert-True ($LASTEXITCODE -eq 0 -and $fixtureVersionOutput.Trim() -eq "codex-qa 0.0.0") "The controlled Codex CLI fixture did not return its expected version."
