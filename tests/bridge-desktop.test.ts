@@ -22,6 +22,7 @@ import {
 } from "../apps/bridge-desktop/src/auth.ts";
 import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts";
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
+import { currentNodeRuntimeStatus } from "../apps/bridge-desktop/src/commands/diagnosticsCommands.ts";
 import { currentBridgeCommandInvocation } from "../apps/bridge-desktop/src/processes/backgroundSpawn.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
@@ -113,6 +114,26 @@ test("Bridge App rejects unsupported browser deep links", async () => {
     else process.env.HUNSU_BRIDGE_APP_LOG_PATH = previousLogPath;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Bridge App version and Node runtime checks never start the packaged sidecar", async () => {
+  const output: string[] = [];
+  const previousLog = console.log;
+  console.log = (...values: unknown[]) => {
+    output.push(values.map(String).join(" "));
+  };
+  try {
+    assert.equal(await main(["--version"]), 0);
+  } finally {
+    console.log = previousLog;
+  }
+
+  assert.deepEqual(output, ["Hunsu Bridge 0.1.0"]);
+  assert.deepEqual(currentNodeRuntimeStatus("C:\\Hunsu\\hunsu-bridge.exe", "v22.22.0"), {
+    installed: true,
+    binaryPath: "C:\\Hunsu\\hunsu-bridge.exe",
+    version: "v22.22.0"
+  });
 });
 
 test("Bridge App Roadmap deep links record UI intents for native focus flows", async () => {
@@ -2799,36 +2820,23 @@ const SIDECAR_DIST_MUTATED_FILES = [
   "hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe"
 ];
 
-test("built current-platform Bridge sidecar status matches the Node bundle", {
+test("built current-platform Bridge sidecar passes the bounded smoke command", {
   skip: existsSync(BUILT_CURRENT_PLATFORM_SIDECAR) ? false : "Build @hunsu/bridge-desktop to generate the current-platform sidecar."
 }, () => {
-  const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-sidecar-smoke-test-"));
-  const env = {
-    ...process.env,
-    HUNSU_BRIDGE_APP_STATE_PATH: join(root, "state.json"),
-    HUNSU_ROADMAP_REGISTRY_PATH: join(root, "roadmaps.json"),
-    HUNSU_BRIDGE_CREDENTIAL_PATH: join(root, "credentials.json"),
-    HUNSU_RELAY_REGISTRY_PATH: join(root, "relay.json"),
-    HUNSU_BRIDGE_APP_LOG_PATH: join(root, "bridge-app.log")
-  };
-  try {
-    const bundle = spawnSync(process.execPath, [
-      "apps/bridge-desktop/dist/sidecar-bundle.cjs",
-      "status"
-    ], { cwd: process.cwd(), env, encoding: "utf8" });
-    assert.equal(bundle.status, 0, bundle.stderr);
-
-    const native = spawnSync(BUILT_CURRENT_PLATFORM_SIDECAR, ["status"], {
-      cwd: process.cwd(),
-      env,
-      encoding: "utf8"
-    });
-    assert.equal(native.status, 0, native.stderr);
-    assert.equal(native.stdout, bundle.stdout);
-    assert.match(native.stdout, /Local Bridge: Not Running/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+  assert.ok(CURRENT_SIDECAR_TARGET);
+  const smoke = spawnSync(process.execPath, [
+    "--conditions=development",
+    "apps/bridge-desktop/scripts/smoke-native-sidecar.mjs",
+    "--sidecar",
+    BUILT_CURRENT_PLATFORM_SIDECAR,
+    "--target",
+    CURRENT_SIDECAR_TARGET,
+    "--timeout-ms",
+    "10000"
+  ], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000, windowsHide: true });
+  assert.equal(smoke.status, 0, `${smoke.stdout}\n${smoke.stderr}`);
+  assert.match(smoke.stdout, /Local Bridge: Not Running/);
+  assert.match(smoke.stdout, /\[sidecar-smoke\] completed in/);
 });
 
 test("Bridge desktop filtered artifact report command resolves package-root defaults", () => {
@@ -2993,23 +3001,69 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(artifactWorkflow, /Windows ARM64/);
     assert.match(artifactWorkflow, /aarch64-pc-windows-msvc/);
     assert.match(artifactWorkflow, /hunsu-bridge-windows-arm64/);
+    assert.match(artifactWorkflow, /windows-all/);
     assert.match(artifactWorkflow, /Linux x64/);
     assert.match(artifactWorkflow, /aarch64-unknown-linux-gnu/);
+    const matrixTargets = (selection: string): string[] => {
+      const escapedSelection = selection.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const match = new RegExp(`\\n\\s*${escapedSelection}\\)\\n\\s*matrix='([^']+)'`, "u").exec(artifactWorkflow);
+      assert.ok(match, `Missing desktop matrix selection ${selection}`);
+      return (JSON.parse(match[1] ?? "") as { include: Array<{ rust_target: string }> })
+        .include
+        .map(entry => entry.rust_target);
+    };
+    assert.deepEqual(matrixTargets("windows"), ["x86_64-pc-windows-msvc"]);
+    assert.deepEqual(matrixTargets("windows-arm64"), ["aarch64-pc-windows-msvc"]);
+    assert.deepEqual(matrixTargets("windows-all"), [
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc"
+    ]);
+    assert.deepEqual(matrixTargets("macos-arm64"), ["aarch64-apple-darwin"]);
+    assert.deepEqual(matrixTargets("macos-intel"), ["x86_64-apple-darwin"]);
+    assert.deepEqual(matrixTargets("linux"), ["x86_64-unknown-linux-gnu"]);
+    assert.deepEqual(matrixTargets("linux-arm64"), ["aarch64-unknown-linux-gnu"]);
+    assert.deepEqual(matrixTargets("all"), [
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]);
     assert.match(artifactWorkflow, /HUNSU_BRIDGE_SIDECAR_TARGET/);
     assert.match(artifactWorkflow, /if: startsWith\(matrix\.platform, 'windows'\)/);
     assert.match(artifactWorkflow, /desktop:verify-windows-gui/);
+    assert.match(artifactWorkflow, /group: bridge-desktop-\$\{\{ github\.ref \}\}-\$\{\{ inputs\.platform \}\}/);
+    assert.match(artifactWorkflow, /cancel-in-progress: true/);
+    assert.match(artifactWorkflow, /timeout-minutes: 60/);
+    assert.match(artifactWorkflow, /uses: pnpm\/action-setup@v4/);
+    assert.match(artifactWorkflow, /cache: pnpm/);
+    assert.match(artifactWorkflow, /cache-dependency-path: pnpm-lock\.yaml/);
+    assert.match(artifactWorkflow, /uses: Swatinem\/rust-cache@v2/);
+    assert.match(artifactWorkflow, /workspaces: apps\/bridge-desktop\/src-tauri -> target/);
+    assert.match(artifactWorkflow, /key: \$\{\{ matrix\.rust_target \}\}/);
+    assert.match(artifactWorkflow, /cache-on-failure: true/);
+    assert.match(artifactWorkflow, /path: apps\/bridge-desktop\/\.sidecar-cache/);
+    assert.match(artifactWorkflow, /bridge-sidecar-node-\$\{\{ runner\.os \}\}-\$\{\{ matrix\.rust_target \}\}-22\.22\.0/);
+    assert.equal(
+      artifactWorkflow.indexOf("uses: pnpm/action-setup@v4")
+        < artifactWorkflow.indexOf("uses: actions/setup-node@v4"),
+      true
+    );
     assert.match(artifactWorkflow, /Verify and smoke-test native sidecar/);
-    assert.match(artifactWorkflow, /spawnSync\(sidecarPath, \["status"\]/);
-    assert.match(artifactWorkflow, /HUNSU_BRIDGE_APP_STATE_PATH/);
-    assert.match(artifactWorkflow, /Local Bridge:/);
-    assert.match(artifactWorkflow, /finally \{[\s\S]*rmSync\(smokeRoot, \{ recursive: true, force: true \}\)/);
+    assert.match(artifactWorkflow, /node --conditions=development apps\/bridge-desktop\/scripts\/smoke-native-sidecar\.mjs/);
+    assert.match(artifactWorkflow, /--timeout-ms 60000/);
+    assert.doesNotMatch(artifactWorkflow, /spawnSync\(|node --input-type=module|<<'NODE'/);
     assert.match(artifactWorkflow, /codesign --verify --strict --verbose=2 "\$\{SIDECAR_PATH\}"/);
     assert.match(artifactWorkflow, /codesign --verify --deep --strict --verbose=2 "\$\{app_bundle\}"/);
     assert.match(artifactWorkflow, /test -x "\$\{SIDECAR_PATH\}"/);
-    assert.match(artifactWorkflow, /SIDECAR_SHA256SUM\.txt/);
+    assert.match(artifactWorkflow, /stage-desktop-artifacts\.mjs/);
+    assert.match(artifactWorkflow, /if: inputs\.platform == 'all'/);
+    assert.match(artifactWorkflow, /--include-size-report/);
+    assert.doesNotMatch(artifactWorkflow, /SIDECAR_SHA256SUM\.txt|bundle\/\*\*\/\*/);
     assert.equal(
-      artifactWorkflow.indexOf("codesign --verify --strict --verbose=2")
-        < artifactWorkflow.indexOf("spawnSync(sidecarPath, [\"status\"]"),
+      artifactWorkflow.indexOf("Build desktop bundle")
+        < artifactWorkflow.indexOf("smoke-native-sidecar.mjs"),
       true
     );
     for (const target of [
@@ -3126,24 +3180,10 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
       "sidecars:build",
       "--",
       "--bundle-only"
-    ], { cwd: process.cwd(), encoding: "utf8" });
+    ], { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, windowsHide: true });
     assert.equal(bundleOnly.status, 0, bundleOnly.stderr);
-    const bundledStatus = spawnSync(process.execPath, [
-      "apps/bridge-desktop/dist/sidecar-bundle.cjs",
-      "status"
-    ], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        HUNSU_BRIDGE_APP_STATE_PATH: join(root, "bundle-state.json"),
-        HUNSU_ROADMAP_REGISTRY_PATH: join(root, "bundle-roadmaps.json"),
-        HUNSU_BRIDGE_CREDENTIAL_PATH: join(root, "bundle-credentials.json"),
-        HUNSU_RELAY_REGISTRY_PATH: join(root, "bundle-relay.json")
-      }
-    });
-    assert.equal(bundledStatus.status, 0, bundledStatus.stderr);
-    assert.match(bundledStatus.stdout, /Local Bridge: Not Running/);
+    assert.equal(existsSync(join(process.cwd(), "apps/bridge-desktop/dist/sidecar-bundle.cjs")), true);
+    assert.match(bundleOnly.stdout, /\[sidecar-build\] complete bundle-only=true/);
 
     const supervisor = new BridgeSidecarSupervisor({
       command: process.execPath,

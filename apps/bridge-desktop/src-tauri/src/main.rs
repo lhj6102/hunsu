@@ -7,7 +7,7 @@ use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::{
     process::{Command as ShellCommand, CommandEvent},
@@ -118,13 +118,19 @@ async fn start_bridge_sidecar(app: tauri::AppHandle, cwd: Option<String>) -> Res
 }
 
 #[tauri::command]
-async fn spawn_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInput) -> Result<(), String> {
+async fn spawn_bridge_app_command(
+    app: tauri::AppHandle,
+    input: BridgeCommandInput,
+) -> Result<(), String> {
     validate_bridge_command_args(&input.args)?;
     spawn_sidecar_command(sidecar_command(&app)?.args(input.args))
 }
 
 #[tauri::command]
-async fn run_bridge_app_command(app: tauri::AppHandle, input: BridgeCommandInput) -> Result<BridgeCommandOutput, String> {
+async fn run_bridge_app_command(
+    app: tauri::AppHandle,
+    input: BridgeCommandInput,
+) -> Result<BridgeCommandOutput, String> {
     validate_bridge_command_args(&input.args)?;
     let output = sidecar_command(&app)?
         .args(input.args)
@@ -197,12 +203,14 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
     }
     let command = args[0].as_str();
     let allowed = match command {
-        "snapshot" | "status" | "stop" | "diagnostics" | "choose-folder" | "logout" => args.len() == 1,
+        "snapshot" | "status" | "stop" | "diagnostics" | "choose-folder" | "logout" => {
+            args.len() == 1
+        }
         "prerequisites" => args.len() == 2 && args[1] == "status",
         "ui-intent" => validate_ui_intent_args(args),
         "activate-roadmap" => {
             args.len() == 1 || (args.len() == 2 && validate_identifier_arg(&args[1]).is_ok())
-        },
+        }
         "pair" => {
             args.len() == 1
                 || (args.len() == 3 && args[1] == "--next" && validate_next_arg(&args[2]).is_ok())
@@ -264,7 +272,9 @@ fn validate_service_args(args: &[String]) -> bool {
     while index < args.len() {
         match args[index].as_str() {
             "--dry-run" | "--user" | "--system" => index += 1,
-            "--cwd" if index + 1 < args.len() && validate_path_arg(&args[index + 1]).is_ok() => index += 2,
+            "--cwd" if index + 1 < args.len() && validate_path_arg(&args[index + 1]).is_ok() => {
+                index += 2
+            }
             _ => return false,
         }
     }
@@ -275,7 +285,10 @@ fn validate_model_alias_args(args: &[String]) -> bool {
     if args.len() < 2 || args[0] != "model-alias" {
         return false;
     }
-    matches!(args[1].as_str(), "list" | "get" | "set" | "delete" | "validate" | "override")
+    matches!(
+        args[1].as_str(),
+        "list" | "get" | "set" | "delete" | "validate" | "override"
+    )
 }
 
 fn validate_roadmaps_args(args: &[String]) -> bool {
@@ -285,7 +298,8 @@ fn validate_roadmaps_args(args: &[String]) -> bool {
             validate_path_arg(path).is_ok()
         }
         [command, subcommand, roadmap_id]
-            if command == "roadmaps" && matches!(subcommand.as_str(), "activate" | "deactivate" | "remove") =>
+            if command == "roadmaps"
+                && matches!(subcommand.as_str(), "activate" | "deactivate" | "remove") =>
         {
             validate_identifier_arg(roadmap_id).is_ok()
         }
@@ -302,7 +316,8 @@ fn validate_roadmaps_args(args: &[String]) -> bool {
                 && mode == "enable"
                 && matches!(flag.as_str(), "--scope" | "--scopes") =>
         {
-            validate_identifier_arg(roadmap_id).is_ok() && validate_project_grant_scopes_arg(scopes).is_ok()
+            validate_identifier_arg(roadmap_id).is_ok()
+                && validate_project_grant_scopes_arg(scopes).is_ok()
         }
         _ => false,
     }
@@ -310,36 +325,92 @@ fn validate_roadmaps_args(args: &[String]) -> bool {
 
 fn validate_codex_args(args: &[String]) -> bool {
     match args {
-        [command, subcommand] if command == "codex" && matches!(subcommand.as_str(), "status" | "install" | "recheck" | "logout") => true,
-        [command, subcommand, flag] if command == "codex" && subcommand == "install" && matches!(flag.as_str(), "--confirm" | "--dry-run" | "--json") => true,
+        [command, subcommand]
+            if command == "codex"
+                && matches!(
+                    subcommand.as_str(),
+                    "status" | "install" | "recheck" | "logout"
+                ) =>
+        {
+            true
+        }
+        [command, subcommand, flag]
+            if command == "codex"
+                && subcommand == "install"
+                && matches!(flag.as_str(), "--confirm" | "--dry-run" | "--json") =>
+        {
+            true
+        }
         [command, subcommand, first_flag, second_flag]
             if command == "codex"
                 && subcommand == "install"
-                && valid_codex_install_flags(&[first_flag.as_str(), second_flag.as_str()]) => true,
+                && valid_codex_install_flags(&[first_flag.as_str(), second_flag.as_str()]) =>
+        {
+            true
+        }
         [command, subcommand, first_flag, second_flag, third_flag]
             if command == "codex"
                 && subcommand == "install"
-                && valid_codex_install_flags(&[first_flag.as_str(), second_flag.as_str(), third_flag.as_str()]) => true,
+                && valid_codex_install_flags(&[
+                    first_flag.as_str(),
+                    second_flag.as_str(),
+                    third_flag.as_str(),
+                ]) =>
+        {
+            true
+        }
         [command, subcommand] if command == "codex" && subcommand == "login" => true,
-        [command, subcommand, flag] if command == "codex" && subcommand == "login" && flag == "--api-key" => true,
-        [command, subcommand, flag] if command == "codex" && subcommand == "login" && flag == "--device" => true,
+        [command, subcommand, flag]
+            if command == "codex" && subcommand == "login" && flag == "--api-key" =>
+        {
+            true
+        }
+        [command, subcommand, flag]
+            if command == "codex" && subcommand == "login" && flag == "--device" =>
+        {
+            true
+        }
         [command, subcommand, first_flag, second_flag]
             if command == "codex"
                 && subcommand == "login"
-                && valid_codex_login_flags(&[first_flag.as_str(), second_flag.as_str()]) => true,
+                && valid_codex_login_flags(&[first_flag.as_str(), second_flag.as_str()]) =>
+        {
+            true
+        }
         [command, subcommand, first_flag, second_flag, third_flag]
             if command == "codex"
                 && subcommand == "login"
-                && valid_codex_login_flags(&[first_flag.as_str(), second_flag.as_str(), third_flag.as_str()]) => true,
-        [command, subcommand, action] if command == "codex" && subcommand == "path" && action == "reset" => true,
-        [command, subcommand, action, path] if command == "codex" && subcommand == "path" && action == "set" => {
+                && valid_codex_login_flags(&[
+                    first_flag.as_str(),
+                    second_flag.as_str(),
+                    third_flag.as_str(),
+                ]) =>
+        {
+            true
+        }
+        [command, subcommand, action]
+            if command == "codex" && subcommand == "path" && action == "reset" =>
+        {
+            true
+        }
+        [command, subcommand, action, path]
+            if command == "codex" && subcommand == "path" && action == "set" =>
+        {
             validate_path_arg(path).is_ok()
         }
-        [command, subcommand, action] if command == "codex" && subcommand == "home" && action == "reset" => true,
-        [command, subcommand, action, path] if command == "codex" && subcommand == "home" && action == "set" => {
+        [command, subcommand, action]
+            if command == "codex" && subcommand == "home" && action == "reset" =>
+        {
+            true
+        }
+        [command, subcommand, action, path]
+            if command == "codex" && subcommand == "home" && action == "set" =>
+        {
             validate_path_arg(path).is_ok()
         }
-        [command, subcommand, action, ..] if command == "codex" && subcommand == "settings" && action == "set" => {
+        [command, subcommand, action, ..]
+            if command == "codex" && subcommand == "settings" && action == "set" =>
+        {
             validate_codex_settings_set_args(args)
         }
         _ => false,
@@ -398,7 +469,10 @@ fn validate_codex_settings_set_args(args: &[String]) -> bool {
                 saw_install_channel = true;
             }
             "--auth-preference" if !saw_auth_preference => {
-                if !matches!(args[index + 1].as_str(), "chatgpt" | "api_key" | "device_code") {
+                if !matches!(
+                    args[index + 1].as_str(),
+                    "chatgpt" | "api_key" | "device_code"
+                ) {
                     return false;
                 }
                 saw_auth_preference = true;
@@ -431,12 +505,26 @@ fn validate_codex_settings_set_args(args: &[String]) -> bool {
 fn validate_provider_args(args: &[String]) -> bool {
     let compact: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "--json").collect();
     match compact.as_slice() {
-        [command, subcommand] if command.as_str() == "provider" && matches!(subcommand.as_str(), "status" | "metadata") => true,
-        [command, subcommand, flag] if command.as_str() == "provider" && subcommand.as_str() == "status" && flag.as_str() == "--recheck" => true,
+        [command, subcommand]
+            if command.as_str() == "provider"
+                && matches!(subcommand.as_str(), "status" | "metadata") =>
+        {
+            true
+        }
+        [command, subcommand, flag]
+            if command.as_str() == "provider"
+                && subcommand.as_str() == "status"
+                && flag.as_str() == "--recheck" =>
+        {
+            true
+        }
         [command, subcommand, action]
             if command.as_str() == "provider"
                 && subcommand.as_str() == "config"
-                && matches!(action.as_str(), "get" | "reset" | "validate") => true,
+                && matches!(action.as_str(), "get" | "reset" | "validate") =>
+        {
+            true
+        }
         [command, subcommand, action, value]
             if command.as_str() == "provider"
                 && subcommand.as_str() == "config"
@@ -451,11 +539,20 @@ fn validate_provider_args(args: &[String]) -> bool {
         {
             validate_plain_arg(key).is_ok() && validate_plain_arg(value).is_ok()
         }
-        [command, subcommand] if command.as_str() == "provider" && matches!(subcommand.as_str(), "authenticate" | "login") => true,
-        [command, subcommand, method]
-            if command.as_str() == "provider" && matches!(subcommand.as_str(), "authenticate" | "login") =>
+        [command, subcommand]
+            if command.as_str() == "provider"
+                && matches!(subcommand.as_str(), "authenticate" | "login") =>
         {
-            matches!(method.as_str(), "default" | "chatgpt" | "device" | "device_code" | "api_key")
+            true
+        }
+        [command, subcommand, method]
+            if command.as_str() == "provider"
+                && matches!(subcommand.as_str(), "authenticate" | "login") =>
+        {
+            matches!(
+                method.as_str(),
+                "default" | "chatgpt" | "device" | "device_code" | "api_key"
+            )
         }
         _ => false,
     }
@@ -480,14 +577,24 @@ fn validate_ui_intent_args(args: &[String]) -> bool {
 
 fn validate_projects_args(args: &[String]) -> bool {
     match args {
-        [command, subcommand] if command == "projects" && matches!(subcommand.as_str(), "list" | "recent") => true,
-        [command, subcommand, path] if command == "projects" && matches!(subcommand.as_str(), "grant" | "revoke") => {
+        [command, subcommand]
+            if command == "projects" && matches!(subcommand.as_str(), "list" | "recent") =>
+        {
+            true
+        }
+        [command, subcommand, path]
+            if command == "projects" && matches!(subcommand.as_str(), "grant" | "revoke") =>
+        {
             validate_path_arg(path).is_ok()
         }
-        [command, subcommand, flag, value] if command == "projects" && subcommand == "remove" && flag == "--roadmap-id" => {
+        [command, subcommand, flag, value]
+            if command == "projects" && subcommand == "remove" && flag == "--roadmap-id" =>
+        {
             validate_identifier_arg(value).is_ok()
         }
-        [command, subcommand, flag, value] if command == "projects" && subcommand == "remove" && flag == "--path" => {
+        [command, subcommand, flag, value]
+            if command == "projects" && subcommand == "remove" && flag == "--path" =>
+        {
             validate_path_arg(value).is_ok()
         }
         [command, subcommand, value] if command == "projects" && subcommand == "remove" => {
@@ -645,7 +752,9 @@ async fn should_open_main_window_on_launch(app: &tauri::AppHandle) -> bool {
     let Ok(snapshot) = bridge_snapshot(app).await else {
         return true;
     };
-    provider_needs_setup(&snapshot) || active_workspace_count(&snapshot) == 0 || snapshot["status"]["healthError"].is_string()
+    provider_needs_setup(&snapshot)
+        || active_workspace_count(&snapshot) == 0
+        || snapshot["status"]["healthError"].is_string()
 }
 
 fn create_bridge_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -654,7 +763,8 @@ fn create_bridge_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .tooltip("Hunsu Bridge")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "summary_title" | "summary_provider" | "summary_local" | "summary_remote" | "summary_workspaces" => show_main_window(app),
+            "summary_title" | "summary_provider" | "summary_local" | "summary_remote"
+            | "summary_workspaces" => show_main_window(app),
             "open_web" => handle_protocol_url_and_show(app, "hunsu://pair"),
             "provider" => handle_protocol_url_and_show(app, "hunsu://provider"),
             "add_workspace" => handle_protocol_url_and_show(app, "hunsu://add-workspace"),
@@ -678,12 +788,19 @@ fn create_bridge_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn bridge_tray_menu(app: &tauri::AppHandle, summary: &TrayStatusSummary) -> tauri::Result<Menu<tauri::Wry>> {
+fn bridge_tray_menu(
+    app: &tauri::AppHandle,
+    summary: &TrayStatusSummary,
+) -> tauri::Result<Menu<tauri::Wry>> {
     let title = MenuItemBuilder::with_id("summary_title", "Hunsu Bridge").build(app)?;
-    let provider_status = MenuItemBuilder::with_id("summary_provider", summary.provider.as_str()).build(app)?;
-    let local_status = MenuItemBuilder::with_id("summary_local", summary.local.as_str()).build(app)?;
-    let remote_status = MenuItemBuilder::with_id("summary_remote", summary.remote.as_str()).build(app)?;
-    let workspace_status = MenuItemBuilder::with_id("summary_workspaces", summary.workspaces.as_str()).build(app)?;
+    let provider_status =
+        MenuItemBuilder::with_id("summary_provider", summary.provider.as_str()).build(app)?;
+    let local_status =
+        MenuItemBuilder::with_id("summary_local", summary.local.as_str()).build(app)?;
+    let remote_status =
+        MenuItemBuilder::with_id("summary_remote", summary.remote.as_str()).build(app)?;
+    let workspace_status =
+        MenuItemBuilder::with_id("summary_workspaces", summary.workspaces.as_str()).build(app)?;
     let open_web = MenuItemBuilder::with_id("open_web", "Open Hunsu Web").build(app)?;
     let provider = MenuItemBuilder::with_id("provider", "Provider Setup").build(app)?;
     let add_workspace = MenuItemBuilder::with_id("add_workspace", "Add Workspace").build(app)?;
@@ -706,7 +823,9 @@ fn bridge_tray_menu(app: &tauri::AppHandle, summary: &TrayStatusSummary) -> taur
             &diagnostics,
             &quit,
         ])
-        .build()
+        .build()?;
+
+    Ok(menu)
 }
 
 async fn refresh_bridge_tray_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -753,12 +872,25 @@ impl TrayStatusSummary {
 async fn tray_status_summary(app: &tauri::AppHandle) -> TrayStatusSummary {
     match bridge_snapshot(app).await {
         Ok(snapshot) => {
-            let provider_label = snapshot["providers"]["current"]["label"].as_str().unwrap_or("Provider");
-            let provider_ready = snapshot["providers"]["current"]["ready"].as_bool().unwrap_or(false);
-            let local = snapshot["status"]["localBridge"].as_str().unwrap_or("not-running");
+            let provider_label = snapshot["providers"]["current"]["label"]
+                .as_str()
+                .unwrap_or("Provider");
+            let provider_ready = snapshot["providers"]["current"]["ready"]
+                .as_bool()
+                .unwrap_or(false);
+            let local = snapshot["status"]["localBridge"]
+                .as_str()
+                .unwrap_or("not-running");
             let remote = snapshot["status"]["remoteAccess"].as_str().unwrap_or("Off");
             TrayStatusSummary {
-                provider: format!("Provider: {provider_label} {}", if provider_ready { "Ready" } else { "Needs Setup" }),
+                provider: format!(
+                    "Provider: {provider_label} {}",
+                    if provider_ready {
+                        "Ready"
+                    } else {
+                        "Needs Setup"
+                    }
+                ),
                 local: format!("Local: {}", local_bridge_label(local)),
                 remote: format!("Remote: {}", remote_bridge_label(remote, &snapshot)),
                 workspaces: format!("Workspaces: {} active", active_workspace_count(&snapshot)),
@@ -786,7 +918,9 @@ async fn bridge_snapshot(app: &tauri::AppHandle) -> Result<serde_json::Value, St
 }
 
 fn provider_needs_setup(snapshot: &serde_json::Value) -> bool {
-    !snapshot["providers"]["current"]["ready"].as_bool().unwrap_or(false)
+    !snapshot["providers"]["current"]["ready"]
+        .as_bool()
+        .unwrap_or(false)
 }
 
 fn active_workspace_count(snapshot: &serde_json::Value) -> usize {
@@ -794,14 +928,12 @@ fn active_workspace_count(snapshot: &serde_json::Value) -> usize {
         .as_array()
         .map(|items| items.len())
         .or_else(|| {
-            snapshot["managedRoadmaps"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter(|item| item["lifecycle"].as_str() == Some("active"))
-                        .count()
-                })
+            snapshot["managedRoadmaps"].as_array().map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["lifecycle"].as_str() == Some("active"))
+                    .count()
+            })
         })
         .unwrap_or(0)
 }
@@ -850,7 +982,7 @@ async fn quit_bridge_app_async(app: tauri::AppHandle) {
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancel)
         .blocking_show();
-    if !matches!(should_quit, MessageDialogResult::Ok) {
+    if !should_quit {
         return;
     }
     if matches!(preference, QuitBackgroundPreference::StopBackground) {
@@ -871,7 +1003,11 @@ async fn quit_background_preference(app: &tauri::AppHandle) -> QuitBackgroundPre
     match bridge_snapshot(app)
         .await
         .ok()
-        .and_then(|snapshot| snapshot["status"]["quitBehavior"].as_str().map(str::to_string))
+        .and_then(|snapshot| {
+            snapshot["status"]["quitBehavior"]
+                .as_str()
+                .map(str::to_string)
+        })
         .as_deref()
     {
         Some("stop-background") => QuitBackgroundPreference::StopBackground,
@@ -896,7 +1032,9 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
     let args = match command {
         "open" => vec!["ui-intent".to_string(), "provider".to_string()],
         "pair" => {
-            if let (Some(code), Some(state)) = (query_value(&query, "code"), query_value(&query, "state")) {
+            if let (Some(code), Some(state)) =
+                (query_value(&query, "code"), query_value(&query, "state"))
+            {
                 vec![
                     "auth-callback".to_string(),
                     "--code".to_string(),
@@ -935,11 +1073,19 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
             if let Some(path) = query_value(&query, "path") {
                 vec!["roadmaps".to_string(), "add".to_string(), path]
             } else {
-                vec!["ui-intent".to_string(), "workspaces".to_string(), "add-workspace".to_string()]
+                vec![
+                    "ui-intent".to_string(),
+                    "workspaces".to_string(),
+                    "add-workspace".to_string(),
+                ]
             }
         }
         "workspaces" | "roadmaps" => vec!["ui-intent".to_string(), "workspaces".to_string()],
-        "codex" => vec!["ui-intent".to_string(), "provider".to_string(), "codex".to_string()],
+        "codex" => vec![
+            "ui-intent".to_string(),
+            "provider".to_string(),
+            "codex".to_string(),
+        ],
         "provider" => {
             let decoded_path = path_part.map(percent_decode);
             if !matches!(decoded_path.as_deref(), None | Some("codex")) {
@@ -963,7 +1109,10 @@ fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
             args
         }
         "diagnostics" => {
-            if path_part.map(percent_decode).is_some_and(|path| !path.is_empty()) {
+            if path_part
+                .map(percent_decode)
+                .is_some_and(|path| !path.is_empty())
+            {
                 return Err("Unsupported hunsu://diagnostics path.".to_string());
             }
             vec!["ui-intent".to_string(), "diagnostics".to_string()]
@@ -1112,7 +1261,10 @@ mod tests {
             bridge_args_for_protocol_url("hunsu://open").unwrap(),
             vec!["ui-intent", "provider"]
         );
-        assert_eq!(bridge_args_for_protocol_url("hunsu://pair").unwrap(), vec!["pair"]);
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://pair").unwrap(),
+            vec!["pair"]
+        );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://pair?next=/studio").unwrap(),
             vec!["pair", "--next", "/studio"]
@@ -1165,7 +1317,10 @@ mod tests {
             bridge_args_for_protocol_url("hunsu://add-roadmap?path=/tmp/example").unwrap(),
             vec!["roadmaps", "add", "/tmp/example"]
         );
-        assert_eq!(bridge_args_for_protocol_url("hunsu://roadmaps").unwrap(), vec!["ui-intent", "workspaces"]);
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://roadmaps").unwrap(),
+            vec!["ui-intent", "workspaces"]
+        );
         assert_eq!(
             bridge_args_for_protocol_url("hunsu://prerequisites").unwrap(),
             vec!["ui-intent", "provider"]
@@ -1183,7 +1338,8 @@ mod tests {
             vec!["activate-roadmap", "roadmap_123"]
         );
         assert_eq!(
-            bridge_args_for_protocol_url("hunsu://activate-workspace?workspaceId=roadmap_123").unwrap(),
+            bridge_args_for_protocol_url("hunsu://activate-workspace?workspaceId=roadmap_123")
+                .unwrap(),
             vec!["activate-roadmap", "roadmap_123"]
         );
         assert_eq!(
@@ -1194,9 +1350,18 @@ mod tests {
             bridge_args_for_protocol_url("hunsu://open-workspace?workspaceId=roadmap_123").unwrap(),
             vec!["open-roadmap", "roadmap_123"]
         );
-        assert_eq!(bridge_args_for_protocol_url("hunsu://sign-in").unwrap(), vec!["login", "--gui"]);
-        assert_eq!(bridge_args_for_protocol_url("hunsu://sign-out").unwrap(), vec!["logout"]);
-        assert_eq!(bridge_args_for_protocol_url("hunsu://remote-disable").unwrap(), vec!["remote", "disable"]);
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://sign-in").unwrap(),
+            vec!["login", "--gui"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://sign-out").unwrap(),
+            vec!["logout"]
+        );
+        assert_eq!(
+            bridge_args_for_protocol_url("hunsu://remote-disable").unwrap(),
+            vec!["remote", "disable"]
+        );
         assert!(bridge_args_for_protocol_url("hunsu://delete-everything").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://provider/other").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://prerequisites/other").is_err());
@@ -1214,56 +1379,137 @@ mod tests {
     #[test]
     fn codex_sidecar_commands_cannot_pass_arbitrary_arguments() {
         assert!(validate_bridge_command_args(&["codex".into(), "login".into()]).is_ok());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into()]).is_ok());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--background".into()]).is_ok());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--json".into()]).is_ok());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--json".into(), "--device".into(), "--background".into()]).is_ok());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--background".into()]).is_err());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--json".into()]).is_err());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--background".into(), "--json".into()]).is_err());
-        assert!(validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into(), "--danger".into()]).is_err());
-        assert!(validate_bridge_command_args(&["codex".into(), "exec".into(), "rm -rf /".into()]).is_err());
-        assert!(validate_bridge_command_args(&["codex".into(), "home".into(), "set".into(), "/tmp/codex-home".into()]).is_ok());
-        assert!(validate_bridge_command_args(&["codex".into(), "home".into(), "reset".into()]).is_ok());
+        assert!(
+            validate_bridge_command_args(&["codex".into(), "login".into(), "--device".into()])
+                .is_ok()
+        );
+        assert!(validate_bridge_command_args(&[
+            "codex".into(),
+            "login".into(),
+            "--device".into(),
+            "--background".into()
+        ])
+        .is_ok());
+        assert!(validate_bridge_command_args(&[
+            "codex".into(),
+            "login".into(),
+            "--device".into(),
+            "--json".into()
+        ])
+        .is_ok());
+        assert!(validate_bridge_command_args(&[
+            "codex".into(),
+            "login".into(),
+            "--json".into(),
+            "--device".into(),
+            "--background".into()
+        ])
+        .is_ok());
+        assert!(validate_bridge_command_args(&[
+            "codex".into(),
+            "login".into(),
+            "--background".into()
+        ])
+        .is_err());
+        assert!(
+            validate_bridge_command_args(&["codex".into(), "login".into(), "--json".into()])
+                .is_err()
+        );
+        assert!(validate_bridge_command_args(&[
+            "codex".into(),
+            "login".into(),
+            "--background".into(),
+            "--json".into()
+        ])
+        .is_err());
+        assert!(validate_bridge_command_args(&[
+            "codex".into(),
+            "login".into(),
+            "--device".into(),
+            "--danger".into()
+        ])
+        .is_err());
+        assert!(
+            validate_bridge_command_args(&["codex".into(), "exec".into(), "rm -rf /".into()])
+                .is_err()
+        );
+        assert!(validate_bridge_command_args(&[
+            "codex".into(),
+            "home".into(),
+            "set".into(),
+            "/tmp/codex-home".into()
+        ])
+        .is_ok());
+        assert!(
+            validate_bridge_command_args(&["codex".into(), "home".into(), "reset".into()]).is_ok()
+        );
         assert!(validate_bridge_command_args(&[
             "provider".into(),
             "metadata".into(),
             "--json".into()
-        ]).is_ok());
+        ])
+        .is_ok());
         assert!(validate_bridge_command_args(&[
             "provider".into(),
             "config".into(),
             "validate-json".into(),
-            r#"[{"key":"codexHome","value":"/tmp/codex-home","isSet":true,"isSecret":false}]"#.into(),
+            r#"[{"key":"codexHome","value":"/tmp/codex-home","isSet":true,"isSecret":false}]"#
+                .into(),
             "--json".into()
-        ]).is_ok());
+        ])
+        .is_ok());
         assert!(validate_bridge_command_args(&[
             "provider".into(),
             "config".into(),
             "save-json".into(),
             r#"[{"key":"binaryPath","value":"/tmp/codex","isSet":true,"isSecret":false}]"#.into()
-        ]).is_ok());
-        assert!(validate_bridge_command_args(&["provider".into(), "config".into(), "reset".into()]).is_ok());
-        assert!(validate_bridge_command_args(&["provider".into(), "config".into(), "save-json".into(), "\0".into()]).is_err());
-        assert!(validate_bridge_command_args(&["provider".into(), "shell".into(), "rm -rf /".into()]).is_err());
-        assert!(validate_bridge_command_args(&["settings".into(), "quit-behavior".into(), "get".into()]).is_ok());
+        ])
+        .is_ok());
+        assert!(validate_bridge_command_args(&[
+            "provider".into(),
+            "config".into(),
+            "reset".into()
+        ])
+        .is_ok());
+        assert!(validate_bridge_command_args(&[
+            "provider".into(),
+            "config".into(),
+            "save-json".into(),
+            "\0".into()
+        ])
+        .is_err());
+        assert!(validate_bridge_command_args(&[
+            "provider".into(),
+            "shell".into(),
+            "rm -rf /".into()
+        ])
+        .is_err());
+        assert!(validate_bridge_command_args(&[
+            "settings".into(),
+            "quit-behavior".into(),
+            "get".into()
+        ])
+        .is_ok());
         assert!(validate_bridge_command_args(&[
             "settings".into(),
             "quit-behavior".into(),
             "set".into(),
             "keep-background".into()
-        ]).is_ok());
+        ])
+        .is_ok());
         assert!(validate_bridge_command_args(&[
             "settings".into(),
             "quit-behavior".into(),
             "set".into(),
             "stop-background".into()
-        ]).is_ok());
+        ])
+        .is_ok());
         assert!(validate_bridge_command_args(&[
             "settings".into(),
             "quit-behavior".into(),
             "set".into(),
             "delete-state".into()
-        ]).is_err());
+        ])
+        .is_err());
     }
 }

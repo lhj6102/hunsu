@@ -36,6 +36,7 @@ type SidecarBuilderModule = {
       commandRunner?: CommandRunner;
       bundleSidecar?: (bundlePath: string) => Promise<string>;
       createSeaBlob?: (input: { nodeExecutable: string; bundlePath: string; blobPath: string; seaConfigPath: string }) => string;
+      logger?: (message: string) => void;
     };
   }): Promise<unknown>;
   createSeaBlob(input: {
@@ -48,7 +49,6 @@ type SidecarBuilderModule = {
   finalizeNativeSidecar(input: {
     artifactPath: string;
     blobPath: string;
-    bundlePath: string;
     distDir?: string;
     nativeDir: string;
     target: SidecarTarget;
@@ -56,7 +56,7 @@ type SidecarBuilderModule = {
     hostPlatform?: string;
     validateArtifact?: (artifactPath: string) => void;
     prepareSidecars?: (input: { nativeDir: string; target: string }) => SidecarManifest;
-    smokeTest?: (input: { bundlePath: string; manifest: SidecarManifest }) => void;
+    onStage?: (stage: string) => void;
   }): SidecarManifest;
   normalizeNodeVersion(version: string): string;
   resolveSeaBuilderNodeExecutable(input: {
@@ -193,6 +193,32 @@ test("SEA builder routes bundle-only output through an explicit dist directory",
   }
 });
 
+test("SEA builder emits ordered, timed bundle-only stage markers", async () => {
+  const messages: string[] = [];
+  await sidecarBuilder.buildNativeSidecars({
+    bundleOnly: true,
+    nodeVersion: "22.22.0",
+    dependencies: {
+      versionRunner: () => ({ stdout: "v22.22.0\n", stderr: "" }),
+      bundleSidecar: async bundlePath => bundlePath,
+      createSeaBlob: input => input.blobPath,
+      logger: message => messages.push(message)
+    }
+  });
+
+  assert.deepEqual(
+    messages.map(message => message.replace(/ elapsed-ms=\d+$/u, "")),
+    [
+      "[sidecar-build] sea-version:verified",
+      "[sidecar-build] bundle:start",
+      "[sidecar-build] bundle:done",
+      "[sidecar-build] sea-blob:done",
+      "[sidecar-build] complete bundle-only=true"
+    ]
+  );
+  assert.equal(messages.every(message => / elapsed-ms=\d+$/u.test(message)), true);
+});
+
 test("SEA builder rejects an explicitly configured mismatched Node executable", () => {
   const explicitNode = "/opt/node-22.21.0/bin/node";
   assert.throws(() => sidecarBuilder.resolveSeaBuilderNodeExecutable({
@@ -264,9 +290,10 @@ test("createSeaBlob invokes the explicitly supplied Node executable", () => {
   }
 });
 
-test("Darwin sidecar finalization orders postject, sign, verify, validation, and smoke", () => {
+test("Darwin sidecar finalization orders postject, sign, verify, validation, and preparation", () => {
   const fixture = createArtifactFixture();
   const operations: string[] = [];
+  const stages: string[] = [];
   const codesignCalls: Array<{ command: string; args: string[] }> = [];
   const manifest = testManifest(darwinTarget);
   try {
@@ -289,13 +316,13 @@ test("Darwin sidecar finalization orders postject, sign, verify, validation, and
         operations.push("prepare");
         return manifest;
       },
-      smokeTest: () => operations.push("smoke")
+      onStage: stage => stages.push(stage)
     });
 
-    assert.deepEqual(operations, ["postject", "sign", "verify", "validate", "prepare", "smoke"]);
+    assert.deepEqual(operations, ["postject", "sign", "verify", "validate", "prepare"]);
     assert.deepEqual(
       operations.filter(operation => operation !== "prepare"),
-      ["postject", "sign", "verify", "validate", "smoke"]
+      ["postject", "sign", "verify", "validate"]
     );
     assert.deepEqual(codesignCalls, [
       {
@@ -307,8 +334,52 @@ test("Darwin sidecar finalization orders postject, sign, verify, validation, and
         args: ["--verify", "--strict", "--verbose=2", fixture.artifactPath]
       }
     ]);
+    assert.deepEqual(stages, [
+      "postject:start",
+      "postject:done",
+      "codesign:done",
+      "validate:done",
+      "prepare:done"
+    ]);
   } finally {
     fixture.cleanup();
+  }
+});
+
+test("finalizeNativeSidecar does not execute a runtime smoke callback", () => {
+  const fixture = createArtifactFixture();
+  let smokeInvocations = 0;
+  try {
+    sidecarBuilder.finalizeNativeSidecar({
+      ...fixture,
+      target: linuxTarget,
+      runner: () => undefined,
+      validateArtifact: () => undefined,
+      prepareSidecars: () => testManifest(linuxTarget),
+      smokeTest: () => {
+        smokeInvocations += 1;
+      }
+    } as Parameters<SidecarBuilderModule["finalizeNativeSidecar"]>[0] & { smokeTest: () => void });
+    assert.equal(smokeInvocations, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("native sidecar builder contains no runtime status launch", () => {
+  const source = readFileSync(
+    new URL("../apps/bridge-desktop/scripts/build-native-sidecars.mjs", import.meta.url),
+    "utf8"
+  );
+  assert.doesNotMatch(source, /smokeTestCurrentPlatformSidecar|sidecar-bundle\.cjs.*status|\[\s*["'](?:status|snapshot)["']\s*\]/u);
+  for (const marker of [
+    "node-archive:cache-hit",
+    "download:start",
+    "download:done",
+    "extract:done",
+    "complete target="
+  ]) {
+    assert.match(source, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   }
 });
 
@@ -342,8 +413,7 @@ test("Darwin sidecar signing failure stops finalization", () => {
         if (args[0] === "--force") throw new Error("signing failed");
       },
       validateArtifact: () => operations.push("validate"),
-      prepareSidecars: () => testManifest(darwinTarget),
-      smokeTest: () => operations.push("smoke")
+      prepareSidecars: () => testManifest(darwinTarget)
     }), /signing failed/);
     assert.deepEqual(operations, ["postject", "sign"]);
   } finally {
@@ -369,8 +439,7 @@ test("Darwin sidecar signature verification failure stops finalization", () => {
         if (operation === "verify") throw new Error("verification failed");
       },
       validateArtifact: () => operations.push("validate"),
-      prepareSidecars: () => testManifest(darwinTarget),
-      smokeTest: () => operations.push("smoke")
+      prepareSidecars: () => testManifest(darwinTarget)
     }), /verification failed/);
     assert.deepEqual(operations, ["postject", "sign", "verify"]);
   } finally {

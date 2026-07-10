@@ -11,6 +11,7 @@ on:
         options:
           - windows
           - windows-arm64
+          - windows-all
           - macos-arm64
           - macos-intel
           - linux
@@ -19,6 +20,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: bridge-desktop-${{ github.ref }}-${{ inputs.platform }}
+  cancel-in-progress: true
 
 jobs:
   select:
@@ -33,10 +38,13 @@ jobs:
         run: |
           case "${{ inputs.platform }}" in
             windows)
-              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"}]}'
+              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"}]}'
               ;;
             windows-arm64)
               matrix='{"include":[{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"}]}'
+              ;;
+            windows-all)
+              matrix='{"include":[{"platform":"windows","label":"Windows x64","runner":"windows-latest","rust_target":"x86_64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-x86_64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-x64"},{"platform":"windows-arm64","label":"Windows ARM64","runner":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-pc-windows-msvc.exe","artifact":"hunsu-bridge-windows-arm64"}]}'
               ;;
             macos-arm64)
               matrix='{"include":[{"platform":"macos-arm64","label":"macOS arm64","runner":"macos-latest","rust_target":"aarch64-apple-darwin","sidecar":"apps/bridge-desktop/dist/hunsu-bridge-sidecar-aarch64-apple-darwin","artifact":"hunsu-bridge-macos-arm64"}]}'
@@ -64,6 +72,7 @@ jobs:
     name: Build ${{ matrix.label }}
     needs: select
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.select.outputs.matrix) }}
@@ -72,23 +81,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.2
+          run_install: false
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22.22.0
-
-      - name: Enable pnpm
-        shell: bash
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.30.2 --activate
-          node --version
-          pnpm --version
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/bridge-desktop/src-tauri -> target
+          key: ${{ matrix.rust_target }}
+          cache-on-failure: true
+
+      - name: Cache sidecar Node runtime
+        uses: actions/cache@v4
+        with:
+          path: apps/bridge-desktop/.sidecar-cache
+          key: bridge-sidecar-node-${{ runner.os }}-${{ matrix.rust_target }}-22.22.0
+
+      - name: Report tool versions
+        shell: bash
+        run: |
+          node --version
+          pnpm --version
 
       - name: Install Linux desktop dependencies
         if: startsWith(matrix.platform, 'linux')
@@ -128,82 +156,11 @@ jobs:
         env:
           SIDECAR_PATH: ${{ matrix.sidecar }}
           SIDECAR_TARGET: ${{ matrix.rust_target }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { spawnSync } from "node:child_process";
-          import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
-          import { tmpdir } from "node:os";
-          import { basename, join, resolve } from "node:path";
-
-          const targetHosts = new Map([
-            ["x86_64-apple-darwin", { platform: "darwin", arch: "x64", extension: "" }],
-            ["aarch64-apple-darwin", { platform: "darwin", arch: "arm64", extension: "" }],
-            ["x86_64-unknown-linux-gnu", { platform: "linux", arch: "x64", extension: "" }],
-            ["aarch64-unknown-linux-gnu", { platform: "linux", arch: "arm64", extension: "" }],
-            ["x86_64-pc-windows-msvc", { platform: "win32", arch: "x64", extension: ".exe" }],
-            ["aarch64-pc-windows-msvc", { platform: "win32", arch: "arm64", extension: ".exe" }]
-          ]);
-          const target = process.env.SIDECAR_TARGET;
-          const expectedHost = targetHosts.get(target);
-          if (!expectedHost) {
-            throw new Error(`Unsupported sidecar target: ${String(target)}`);
-          }
-          if (process.platform !== expectedHost.platform || process.arch !== expectedHost.arch) {
-            throw new Error(
-              `Sidecar target ${target} requires ${expectedHost.platform}/${expectedHost.arch}, `
-              + `but this runner is ${process.platform}/${process.arch}.`
-            );
-          }
-
-          const sidecarPath = resolve(process.env.SIDECAR_PATH ?? "");
-          const expectedName = `hunsu-bridge-sidecar-${target}${expectedHost.extension}`;
-          if (basename(sidecarPath) !== expectedName) {
-            throw new Error(`Expected sidecar ${expectedName}, found ${basename(sidecarPath)}.`);
-          }
-          if (!existsSync(sidecarPath) || !statSync(sidecarPath).isFile()) {
-            throw new Error(`Expected native sidecar is missing: ${sidecarPath}`);
-          }
-
-          const smokeRoot = mkdtempSync(join(tmpdir(), "hunsu-bridge-artifact-smoke-"));
-          try {
-            const result = spawnSync(sidecarPath, ["status"], {
-              cwd: process.cwd(),
-              encoding: "utf8",
-              timeout: 60_000,
-              windowsHide: true,
-              env: {
-                ...process.env,
-                HUNSU_BRIDGE_APP_STATE_PATH: join(smokeRoot, "state.json"),
-                HUNSU_ROADMAP_REGISTRY_PATH: join(smokeRoot, "roadmaps.json"),
-                HUNSU_BRIDGE_CREDENTIAL_PATH: join(smokeRoot, "credentials.json"),
-                HUNSU_RELAY_REGISTRY_PATH: join(smokeRoot, "relay.json"),
-                HUNSU_BRIDGE_APP_LOG_PATH: join(smokeRoot, "bridge-app.log")
-              }
-            });
-            if (result.error) {
-              throw result.error;
-            }
-            if (result.status !== 0) {
-              throw new Error([
-                `Sidecar status failed with exit code ${result.status ?? "unknown"}.`,
-                result.stdout,
-                result.stderr
-              ].join("\n"));
-            }
-            const statusMarkers = [/^Hunsu Bridge\r?$/mu, /^Status:\r?$/mu, /^\s+Local Bridge:/mu];
-            if (statusMarkers.some(marker => !marker.test(result.stdout))) {
-              throw new Error([
-                "Sidecar status output did not contain the expected Hunsu Bridge status markers.",
-                result.stdout,
-                result.stderr
-              ].join("\n"));
-            }
-            process.stdout.write(result.stdout);
-            console.log(`Verified ${target} sidecar status with isolated state.`);
-          } finally {
-            rmSync(smokeRoot, { recursive: true, force: true });
-          }
-          NODE
+        run: >
+          node --conditions=development apps/bridge-desktop/scripts/smoke-native-sidecar.mjs
+          --sidecar "${SIDECAR_PATH}"
+          --target "${SIDECAR_TARGET}"
+          --timeout-ms 60000
 
       - name: Verify final macOS application signature
         if: startsWith(matrix.platform, 'macos')
@@ -221,65 +178,25 @@ jobs:
           fi
 
       - name: Report artifact sizes
+        if: inputs.platform == 'all'
         run: pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes -- --target "${{ matrix.rust_target }}"
 
-      - name: Generate checksums
+      - name: Stage installer artifacts and checksums
         shell: bash
         env:
-          SIDECAR_PATH: ${{ matrix.sidecar }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { createHash } from "node:crypto";
-          import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-          import { basename, join, relative, resolve } from "node:path";
-
-          const bundleDir = "apps/bridge-desktop/src-tauri/target/release/bundle";
-          if (!existsSync(bundleDir)) {
-            throw new Error(`Missing bundle directory: ${bundleDir}`);
-          }
-          const sidecarPath = resolve(process.env.SIDECAR_PATH ?? "");
-          if (!existsSync(sidecarPath) || !statSync(sidecarPath).isFile()) {
-            throw new Error(`Missing sidecar for checksum generation: ${sidecarPath}`);
-          }
-
-          const sidecarHash = createHash("sha256").update(readFileSync(sidecarPath)).digest("hex");
-          writeFileSync(
-            join(bundleDir, "SIDECAR_SHA256SUM.txt"),
-            `${sidecarHash}  ${basename(sidecarPath)}\n`
-          );
-
-          function walk(directory) {
-            const files = [];
-            for (const entry of readdirSync(directory)) {
-              const path = join(directory, entry);
-              const stat = statSync(path);
-              if (stat.isDirectory()) {
-                files.push(...walk(path));
-              } else if (stat.isFile() && !path.endsWith("SHA256SUMS.txt")) {
-                files.push(path);
-              }
-            }
-            return files;
-          }
-
-          const lines = walk(bundleDir)
-            .sort()
-            .map(path => {
-              const hash = createHash("sha256").update(readFileSync(path)).digest("hex");
-              const name = relative(bundleDir, path).split("\\").join("/");
-              return `${hash}  ${name}`;
-            });
-          writeFileSync(join(bundleDir, "SHA256SUMS.txt"), `${lines.join("\n")}\n`);
-          NODE
-
-      - name: List bundle outputs
-        shell: bash
-        run: find apps/bridge-desktop/src-tauri/target/release/bundle -maxdepth 4 -type f -print
+          ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
+          SIDECAR_TARGET: ${{ matrix.rust_target }}
+        run: >
+          node apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs
+          --bundle-dir "apps/bridge-desktop/src-tauri/target/release/bundle"
+          --output-dir "${ARTIFACT_STAGE}"
+          --target "${SIDECAR_TARGET}"
+          ${{ inputs.platform == 'all' && '--include-size-report' || '' }}
 
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: apps/bridge-desktop/src-tauri/target/release/bundle/**/*
+          path: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
           if-no-files-found: error
           retention-days: 14

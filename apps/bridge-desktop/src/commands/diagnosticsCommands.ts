@@ -36,6 +36,18 @@ export function toolStatus(command: string, args: string[]): BridgeToolStatus {
   }
 }
 
+export function currentNodeRuntimeStatus(
+  execPath = process.execPath,
+  version = process.version
+): BridgeToolStatus {
+  // In a Node SEA, execPath is the sidecar itself; spawning it would re-enter the Bridge CLI.
+  return {
+    installed: true,
+    binaryPath: execPath,
+    version
+  };
+}
+
 export function packageManagerStatus(commands: readonly string[] = ["pnpm", "npm", "yarn"]): BridgeToolStatus {
   for (const command of commands) {
     const status = toolStatus(command, ["--version"]);

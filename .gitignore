@@ -6,6 +6,8 @@ dist/
 **/dist/
 apps/bridge-desktop/.sidecar-cache/
 apps/bridge-desktop/native-sidecars/
+apps/bridge-desktop/src-tauri/target/
+apps/bridge-desktop/src-tauri/gen/schemas/
 .playwright-cli/
 handoffs/*
 **/.wrangler/
