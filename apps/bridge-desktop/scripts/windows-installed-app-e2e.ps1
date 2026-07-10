@@ -146,9 +146,6 @@ try {
   $installedSidecar = Get-ChildItem -LiteralPath $installDir -Recurse -File -Filter "hunsu-bridge-sidecar*.exe" |
     Select-Object -First 1
   Assert-True ($null -ne $installedSidecar) "The installed Bridge sidecar was not found."
-  $appProcess = Start-Process -FilePath $appExecutable -WorkingDirectory (Split-Path -Parent $appExecutable) -PassThru
-  $cdpEndpoint = "http://127.0.0.1:$CdpPort"
-  Wait-CdpEndpoint -Endpoint $cdpEndpoint -AppProcess $appProcess
 
   $fixtureOutput = & $installedSidecar.FullName create $workspaceFixturePath --no-open --json 2>&1 | Out-String
   $fixtureExitCode = $LASTEXITCODE
@@ -157,8 +154,16 @@ try {
   } catch {
     throw "The installed sidecar returned invalid JSON while preparing the fixture Workspace (exit $fixtureExitCode)."
   }
-  Assert-True ($fixtureExitCode -eq 0 -and $fixtureResult.ok -eq $true) "The installed sidecar could not prepare the fixture Workspace."
+  if ($fixtureExitCode -ne 0 -or $fixtureResult.ok -ne $true) {
+    $fixtureCode = if ([string]::IsNullOrWhiteSpace([string]$fixtureResult.code)) { "UNKNOWN" } else { [string]$fixtureResult.code }
+    throw "The installed sidecar could not prepare the fixture Workspace (exit $fixtureExitCode, code $fixtureCode)."
+  }
   Assert-True (-not (Test-Path -LiteralPath $browserCapturePath -PathType Leaf)) "No-open fixture preparation unexpectedly handed off to a browser."
+
+  # Launching the installed App against this existing managed daemon verifies reuse at the native boundary.
+  $appProcess = Start-Process -FilePath $appExecutable -WorkingDirectory (Split-Path -Parent $appExecutable) -PassThru
+  $cdpEndpoint = "http://127.0.0.1:$CdpPort"
+  Wait-CdpEndpoint -Endpoint $cdpEndpoint -AppProcess $appProcess
 
   $node = (Get-Command node -ErrorAction Stop).Source
   & $node $driverPath `

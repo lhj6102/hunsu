@@ -23,6 +23,12 @@ test("installed Windows app gate silently installs an isolated NSIS candidate an
   assert.match(powershell, /windows-installed-app-webview-e2e\.mjs/u);
   assert.match(powershell, /create \$workspaceFixturePath --no-open --json/u);
   assert.match(powershell, /No-open fixture preparation unexpectedly handed off/u);
+  assert.equal(
+    powershell.indexOf("create $workspaceFixturePath --no-open --json")
+      < powershell.indexOf("Start-Process -FilePath $appExecutable"),
+    true
+  );
+  assert.match(powershell, /existing managed daemon verifies reuse/u);
   assert.match(powershell, /\[string\]\$EvidencePath/u);
   assert.match(powershell, /qa_legacy_.*NewGuid/u);
   assert.match(powershell, /--evidence-path \$EvidencePath/u);
