@@ -36,9 +36,10 @@ try {
   await verifyProviderRecheck(page);
   await verifyProviderValidation(page);
   const pairingToken = await verifyOpenHunsuWebHandoff(page, options.capturePath);
+  const workspaceToken = await verifyWorkspaceOpenHandoff(page, options.capturePath);
   await verifyDiagnosticsCopy(page, {
     legacySecret: options.legacySecret,
-    pairingToken,
+    runtimeTokens: [pairingToken, workspaceToken],
     logPath: options.logPath
   });
 
@@ -61,7 +62,9 @@ try {
       "installed-webview-cdp",
       "lifecycle-controls",
       "open-handoff-once",
+      "workspace-open-handoff-once",
       "diagnostics-copy-redaction",
+      "no-eaddrinuse-log",
       "provider-validate-recheck-feedback",
       "version-labels"
     ],
@@ -230,6 +233,34 @@ async function verifyOpenHunsuWebHandoff(page, capturePath) {
   return pairingToken;
 }
 
+async function verifyWorkspaceOpenHandoff(page, capturePath) {
+  await page.locator("#refresh").click();
+  await waitForTerminalFeedback(page, "#action-status", "Bridge status refreshed", 60_000);
+  await page.locator('nav button[data-tab="workspaces"]').click();
+  const openButton = page.locator("#active-roadmap-list button", { hasText: "Open" }).first();
+  await openButton.waitFor({ state: "visible", timeout: 30_000 });
+  const before = nonemptyFileLines(capturePath);
+  await armTransitionTrace(page, "#action-status");
+  await openButton.click();
+  await waitForTerminalFeedback(page, "#action-status", "Workspace opened", 60_000);
+  const deadline = Date.now() + 15_000;
+  let after = nonemptyFileLines(capturePath);
+  while (after.length !== before.length + 1 && Date.now() < deadline) {
+    await delay(100);
+    after = nonemptyFileLines(capturePath);
+  }
+  assert(after.length === before.length + 1, "Workspace Open did not produce exactly one browser handoff.");
+  const capturedUrl = new URL(after.at(-1));
+  const workspaceToken = capturedUrl.searchParams.get("hunsuBridgeToken");
+  assert(workspaceToken, "Workspace Open did not receive a transient pairing token.");
+  const trace = await readTransitionTrace(page);
+  assert(trace.some(entry => entry.state === "pending" && entry.text.includes("Opening Workspace")),
+    "Workspace Open did not expose pending feedback.");
+  const documentText = await page.locator("body").innerText();
+  assert(!documentText.includes(workspaceToken), "The installed WebView exposed the Workspace pairing token.");
+  return workspaceToken;
+}
+
 async function verifyDiagnosticsCopy(page, input) {
   await openAdvancedPanel(page, "diagnostics");
   await page.evaluate(() => {
@@ -247,17 +278,20 @@ async function verifyDiagnosticsCopy(page, input) {
   const displayedText = await page.locator("#diagnostics").textContent() ?? "";
   assert(clipboardText.length > 0, "Copy Diagnostics did not write a payload.");
   assert(clipboardText === displayedText, "The displayed and copied fresh Diagnostics payloads diverged.");
-  assertSafeDiagnosticsText(clipboardText, input.legacySecret, input.pairingToken);
+  assertSafeDiagnosticsText(clipboardText, input.legacySecret, input.runtimeTokens);
   const sanitizedLog = readFileSync(input.logPath, "utf8");
-  assertSafeDiagnosticsText(sanitizedLog, input.legacySecret, input.pairingToken);
+  assertSafeDiagnosticsText(sanitizedLog, input.legacySecret, input.runtimeTokens);
+  assert(!sanitizedLog.includes("EADDRINUSE"), "The installed-app log contains EADDRINUSE.");
   const trace = await readTransitionTrace(page);
   assert(trace.some(entry => entry.state === "pending" && entry.text.includes("Preparing fresh diagnostics")),
     "Copy Diagnostics did not expose pending feedback.");
 }
 
-function assertSafeDiagnosticsText(text, legacySecret, pairingToken) {
+function assertSafeDiagnosticsText(text, legacySecret, runtimeTokens) {
   assert(!text.includes(legacySecret), "Diagnostics retained the seeded legacy secret.");
-  assert(!text.includes(pairingToken), "Diagnostics exposed a transient pairing token.");
+  for (const token of runtimeTokens) {
+    assert(!text.includes(token), "Diagnostics exposed a transient pairing token.");
+  }
   assert(!/Authorization\s*[:=]\s*Bearer\s+(?!\[redacted\])[^\s"']+/iu.test(text),
     "Diagnostics exposed a bearer credential.");
   const sensitiveQuery = /[?&](?:hunsuBridgeToken|hunsuRelayToken|token|access_token|refresh_token|authorization|code|state)=([^&#\s"']*)/giu;

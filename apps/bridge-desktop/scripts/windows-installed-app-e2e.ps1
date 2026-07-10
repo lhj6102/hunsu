@@ -92,12 +92,14 @@ $logPath = Join-Path $runtimeDir "bridge-app.log"
 $browserCapturePath = Join-Path $runtimeDir "browser-capture.log"
 $roadmapRegistryPath = Join-Path $runtimeDir "roadmaps.json"
 $fakeCodexPath = Join-Path $runtimeDir "codex-qa.cmd"
+$workspaceFixturePath = Join-Path $root "fixture-roadmap"
 $driverPath = Join-Path $PSScriptRoot "windows-installed-app-webview-e2e.mjs"
 $legacySecret = "qa_legacy_" + [guid]::NewGuid().ToString("N")
 $appProcess = $null
 $appExecutable = $null
+$installedSidecar = $null
 
-New-Item -ItemType Directory -Path $installDir, $runtimeDir, $webViewDataDir -Force | Out-Null
+New-Item -ItemType Directory -Path $installDir, $runtimeDir, $webViewDataDir, $workspaceFixturePath -Force | Out-Null
 
 @{
   schema = "hunsu.bridge-app-state.v1"
@@ -141,9 +143,22 @@ try {
   Assert-True ($installer.ExitCode -eq 0) "Silent NSIS install failed with exit code $($installer.ExitCode)."
 
   $appExecutable = Find-InstalledAppExecutable $installDir
+  $installedSidecar = Get-ChildItem -LiteralPath $installDir -Recurse -File -Filter "hunsu-bridge-sidecar*.exe" |
+    Select-Object -First 1
+  Assert-True ($null -ne $installedSidecar) "The installed Bridge sidecar was not found."
   $appProcess = Start-Process -FilePath $appExecutable -WorkingDirectory (Split-Path -Parent $appExecutable) -PassThru
   $cdpEndpoint = "http://127.0.0.1:$CdpPort"
   Wait-CdpEndpoint -Endpoint $cdpEndpoint -AppProcess $appProcess
+
+  $fixtureOutput = & $installedSidecar.FullName create $workspaceFixturePath --no-open --json 2>&1 | Out-String
+  $fixtureExitCode = $LASTEXITCODE
+  try {
+    $fixtureResult = $fixtureOutput | ConvertFrom-Json
+  } catch {
+    throw "The installed sidecar returned invalid JSON while preparing the fixture Workspace (exit $fixtureExitCode)."
+  }
+  Assert-True ($fixtureExitCode -eq 0 -and $fixtureResult.ok -eq $true) "The installed sidecar could not prepare the fixture Workspace."
+  Assert-True (-not (Test-Path -LiteralPath $browserCapturePath -PathType Leaf)) "No-open fixture preparation unexpectedly handed off to a browser."
 
   $node = (Get-Command node -ErrorAction Stop).Source
   & $node $driverPath `
@@ -158,11 +173,8 @@ try {
 
   Write-Host "Windows installed Hunsu Bridge WebView2 E2E passed."
 } finally {
-  if ($null -ne $appExecutable) {
-    $installedSidecars = @(Get-ChildItem -LiteralPath $installDir -Recurse -File -Filter "hunsu-bridge-sidecar*.exe" -ErrorAction SilentlyContinue)
-    foreach ($sidecar in $installedSidecars) {
-      try { & $sidecar.FullName stop --json 2>$null | Out-Null } catch { }
-    }
+  if ($null -ne $installedSidecar) {
+    try { & $installedSidecar.FullName stop --json 2>$null | Out-Null } catch { }
   }
   if ($null -ne $appProcess -and -not $appProcess.HasExited) {
     Stop-Process -Id $appProcess.Id -Force -ErrorAction SilentlyContinue

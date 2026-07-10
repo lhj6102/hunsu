@@ -21,6 +21,8 @@ test("installed Windows app gate silently installs an isolated NSIS candidate an
   assert.match(powershell, /--remote-debugging-port=\$CdpPort/u);
   assert.match(powershell, /\/json\/list/u);
   assert.match(powershell, /windows-installed-app-webview-e2e\.mjs/u);
+  assert.match(powershell, /create \$workspaceFixturePath --no-open --json/u);
+  assert.match(powershell, /No-open fixture preparation unexpectedly handed off/u);
   assert.match(powershell, /\[string\]\$EvidencePath/u);
   assert.match(powershell, /qa_legacy_.*NewGuid/u);
   assert.match(powershell, /--evidence-path \$EvidencePath/u);
@@ -36,10 +38,13 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
   assert.match(driver, /Stopping Bridge/u);
   assert.match(driver, /Starting Bridge/u);
   assert.match(driver, /before\.length \+ 1/u);
+  assert.match(driver, /verifyWorkspaceOpenHandoff/u);
+  assert.match(driver, /#active-roadmap-list button/u);
   assert.match(driver, /hunsuBridgeToken/u);
   assert.match(driver, /#copy-diagnostics/u);
   assert.match(driver, /__hunsuQaClipboardText/u);
   assert.match(driver, /legacySecret/u);
+  assert.match(driver, /EADDRINUSE/u);
   assert.match(driver, /#validate-codex-config/u);
   assert.match(driver, /Recheck complete/u);
   assert.match(driver, /#bridge-app-version, #bridge-runtime-version, #protocol-version, #embedded-node-version, #codex-cli-version/u);
@@ -66,4 +71,6 @@ test("Windows x64 workflow gates upload on installed WebView evidence and checks
   assert.match(artifactStage, /windows-installed-app-e2e-evidence\.json/u);
   assert.match(artifactStage, /validateInstalledAppEvidence\(installedEvidencePath\)/u);
   assert.match(artifactStage, /releaseEligible !== false/u);
+  assert.match(artifactStage, /workspace-open-handoff-once/u);
+  assert.match(artifactStage, /no-eaddrinuse-log/u);
 });

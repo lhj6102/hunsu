@@ -269,7 +269,9 @@ function validateInstalledAppEvidence(path) {
     "installed-webview-cdp",
     "lifecycle-controls",
     "open-handoff-once",
+    "workspace-open-handoff-once",
     "diagnostics-copy-redaction",
+    "no-eaddrinuse-log",
     "provider-validate-recheck-feedback",
     "version-labels"
   ];

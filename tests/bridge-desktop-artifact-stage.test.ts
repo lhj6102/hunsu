@@ -157,7 +157,9 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
     "installed-webview-cdp",
     "lifecycle-controls",
     "open-handoff-once",
+    "workspace-open-handoff-once",
     "diagnostics-copy-redaction",
+    "no-eaddrinuse-log",
     "provider-validate-recheck-feedback",
     "version-labels"
   ];

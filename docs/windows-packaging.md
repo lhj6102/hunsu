@@ -111,7 +111,8 @@ The same Windows x64 job then silently installs the built NSIS candidate into an
 isolated temporary directory and attaches Playwright over a test-only WebView2
 CDP port. This installed-app gate exercises the actual Tauri WebView and bundled
 sidecar: lifecycle button states and transitions, one Open Hunsu Web handoff,
-fresh copied/displayed Diagnostics, legacy-token migration, Validate and Recheck
+one fixture Workspace Open handoff, fresh copied/displayed Diagnostics,
+legacy-token migration, an EADDRINUSE-free app log, Validate and Recheck
 feedback, and all five version labels. It uninstalls the candidate and removes
 its isolated runtime state afterward. The resulting evidence deliberately keeps
 `releaseEligible` false until the following human visual QA is attested; an
