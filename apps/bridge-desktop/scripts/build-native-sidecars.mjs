@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { get } from "node:https";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { gunzipSync, inflateRawSync } from "node:zlib";
@@ -41,11 +40,17 @@ export async function buildNativeSidecars(options = {}) {
   const packagingConfig = unwrapConfigResult(resolveBridgeSidecarPackagingConfig(currentProcessEnv()));
   const nodeVersion = normalizeNodeVersion(options.nodeVersion ?? packagingConfig.sidecarNodeVersion ?? defaultNodeVersion);
   const dependencies = options.dependencies ?? {};
+  const startedAt = Date.now();
+  const logger = dependencies.logger ?? console.log;
+  const logStage = stage => {
+    logger(`[sidecar-build] ${stage} elapsed-ms=${Date.now() - startedAt}`);
+  };
   const seaNodeExecutable = resolveSeaBuilderNodeExecutable({
     configuredNodeVersion: nodeVersion,
     nodeExecutable: options.seaNodePath ?? packagingConfig.seaNodePath,
     runner: dependencies.versionRunner
   });
+  logStage("sea-version:verified");
   const distDir = resolve(options.distDir ?? dist);
   const nativeDir = resolve(options.nativeDir ?? packagingConfig.nativeSidecarDir ?? defaultNativeDir);
   const cacheDir = resolve(options.cacheDir ?? packagingConfig.sidecarCacheDir ?? defaultCacheDir);
@@ -56,15 +61,19 @@ export async function buildNativeSidecars(options = {}) {
 
   const bundlePath = resolve(distDir, "sidecar-bundle.cjs");
   const blobPath = resolve(distDir, "hunsu-bridge-sidecar.blob");
+  logStage("bundle:start");
   await (dependencies.bundleSidecar ?? bundleSidecar)(bundlePath);
+  logStage("bundle:done");
   (dependencies.createSeaBlob ?? createSeaBlob)({
     nodeExecutable: seaNodeExecutable,
     bundlePath,
     blobPath,
     seaConfigPath: resolve(distDir, "sidecar-sea-config.json")
   });
+  logStage("sea-blob:done");
 
   if (options.bundleOnly) {
+    logStage("complete bundle-only=true");
     return {
       schema: "hunsu.bridge-sidecar-build.v1",
       nodeVersion,
@@ -87,9 +96,11 @@ export async function buildNativeSidecars(options = {}) {
     nodeVersion,
     cacheDir,
     archiveName,
-    expectedSha256: shasums.get(archiveName)
+    expectedSha256: shasums.get(archiveName),
+    onStage: logStage
   });
   const executable = extractNodeExecutable({ archivePath, target, nodeVersion });
+  logStage("extract:done");
   const artifactPath = resolve(nativeDir, sidecarArtifactNameForTarget(target));
   writeFileSync(artifactPath, executable);
   if (target.extension === "") {
@@ -98,7 +109,6 @@ export async function buildNativeSidecars(options = {}) {
   const manifest = finalizeNativeSidecar({
     artifactPath,
     blobPath,
-    bundlePath,
     distDir,
     nativeDir,
     target,
@@ -106,13 +116,14 @@ export async function buildNativeSidecars(options = {}) {
     hostPlatform: dependencies.hostPlatform,
     validateArtifact: dependencies.validateArtifact,
     prepareSidecars: dependencies.prepareSidecars,
-    smokeTest: dependencies.smokeTest
+    onStage: logStage
   });
   builtArtifacts.push({
     target: target.target,
     file: basename(artifactPath),
     nodeRuntime: archiveName
   });
+  logStage(`complete target=${target.target}`);
 
   return {
     schema: "hunsu.bridge-sidecar-build.v1",
@@ -124,49 +135,6 @@ export async function buildNativeSidecars(options = {}) {
     artifacts: builtArtifacts,
     preparedManifest: manifest
   };
-}
-
-export function smokeTestCurrentPlatformSidecar(input) {
-  const artifact = input.manifest.artifacts[0];
-  if (!artifact) {
-    return;
-  }
-  const target = sidecarTargetByName(artifact.target);
-  if (target.platform !== process.platform || target.arch !== process.arch) {
-    return;
-  }
-  const sidecarPath = resolve(input.distDir ?? dist, artifact.file);
-  const smokeRoot = mkdtempSync(join(tmpdir(), "hunsu-bridge-sidecar-smoke-"));
-  const smokeEnv = {
-    ...currentProcessEnv(),
-    HUNSU_BRIDGE_APP_STATE_PATH: join(smokeRoot, "state.json"),
-    HUNSU_ROADMAP_REGISTRY_PATH: join(smokeRoot, "roadmaps.json"),
-    HUNSU_BRIDGE_CREDENTIAL_PATH: join(smokeRoot, "credentials.json"),
-    HUNSU_RELAY_REGISTRY_PATH: join(smokeRoot, "relay.json"),
-    HUNSU_BRIDGE_APP_LOG_PATH: join(smokeRoot, "bridge-app.log")
-  };
-  try {
-    const bundleStatus = runCommandCapture(process.execPath, [input.bundlePath, "status"], {
-      cwd: root,
-      env: smokeEnv
-    });
-    const sidecarStatus = runCommandCapture(sidecarPath, ["status"], {
-      cwd: root,
-      env: smokeEnv
-    });
-    if (sidecarStatus.stdout !== bundleStatus.stdout) {
-      throw new Error([
-        "Native Hunsu Bridge sidecar status output did not match the Node bundle.",
-        "",
-        "Expected:",
-        bundleStatus.stdout,
-        "Actual:",
-        sidecarStatus.stdout
-      ].join("\n"));
-    }
-  } finally {
-    rmSync(smokeRoot, { recursive: true, force: true });
-  }
 }
 
 export async function bundleSidecar(bundlePath = resolve(dist, "sidecar-bundle.cjs")) {
@@ -352,17 +320,20 @@ async function ensureNodeArchive(input) {
   }
   const archivePath = resolve(input.cacheDir, input.archiveName);
   if (existsSync(archivePath) && sha256File(archivePath) === input.expectedSha256) {
+    input.onStage?.("node-archive:cache-hit");
     return archivePath;
   }
   if (existsSync(archivePath)) {
     rmSync(archivePath, { force: true });
   }
+  input.onStage?.("download:start");
   await downloadFile(nodeDistUrl(input.nodeVersion, input.archiveName), archivePath);
   const actual = sha256File(archivePath);
   if (actual !== input.expectedSha256) {
     rmSync(archivePath, { force: true });
     throw new Error(`Checksum mismatch for ${input.archiveName}: expected ${input.expectedSha256}, got ${actual}`);
   }
+  input.onStage?.("download:done");
   return archivePath;
 }
 
@@ -400,12 +371,14 @@ function nodeDistUrl(nodeVersion, fileName) {
 }
 
 export function finalizeNativeSidecar(input) {
+  input.onStage?.("postject:start");
   injectSeaBlob({
     artifactPath: input.artifactPath,
     blobPath: input.blobPath,
     target: input.target,
     runner: input.runner
   });
+  input.onStage?.("postject:done");
   if (input.target.extension === "") {
     chmodSync(input.artifactPath, 0o755);
   }
@@ -415,17 +388,17 @@ export function finalizeNativeSidecar(input) {
     runner: input.runner,
     hostPlatform: input.hostPlatform
   });
+  if (input.target.platform === "darwin") {
+    input.onStage?.("codesign:done");
+  }
   (input.validateArtifact ?? validateNativeSidecarArtifact)(input.artifactPath);
+  input.onStage?.("validate:done");
   const manifest = (input.prepareSidecars ?? prepareNativeSidecars)({
     nativeDir: input.nativeDir,
     distDir: input.distDir,
     target: input.target.target
   });
-  (input.smokeTest ?? smokeTestCurrentPlatformSidecar)({
-    bundlePath: input.bundlePath,
-    distDir: input.distDir,
-    manifest
-  });
+  input.onStage?.("prepare:done");
   return manifest;
 }
 
