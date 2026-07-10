@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
@@ -28,7 +28,7 @@ struct BinarySelection {
     path: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct BridgeCommandOutput {
     status: i32,
     stdout: String,
@@ -107,14 +107,23 @@ async fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String>
 
 #[tauri::command]
 async fn start_bridge_sidecar(app: tauri::AppHandle, cwd: Option<String>) -> Result<(), String> {
-    let mut args = vec!["start".to_string()];
+    let mut args = vec!["ensure-running".to_string()];
     if let Some(cwd) = cwd {
         validate_path_arg(&cwd)?;
         args.push("--cwd".to_string());
         args.push(cwd);
     }
-    args.push("--no-open".to_string());
-    spawn_sidecar_command(sidecar_command(&app)?.args(args))
+    args.push("--json".to_string());
+    let output = sidecar_command(&app)?
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(safe_command_failure(&output.stderr, &output.stdout))
+    }
 }
 
 #[tauri::command]
@@ -122,7 +131,7 @@ async fn spawn_bridge_app_command(
     app: tauri::AppHandle,
     input: BridgeCommandInput,
 ) -> Result<(), String> {
-    validate_bridge_command_args(&input.args)?;
+    validate_background_bridge_command_args(&input.args)?;
     spawn_sidecar_command(sidecar_command(&app)?.args(input.args))
 }
 
@@ -161,6 +170,49 @@ fn spawn_sidecar_command(command: ShellCommand) -> Result<(), String> {
         drop(child);
     });
     Ok(())
+}
+
+fn run_observable_sidecar_command(app: &tauri::AppHandle, args: Vec<String>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let output = match sidecar_command(&app) {
+            Ok(command) => command.args(args).output().await,
+            Err(error) => {
+                let _ = app.emit(
+                    "bridge-operation-completed",
+                    BridgeCommandOutput {
+                        status: -1,
+                        stdout: String::new(),
+                        stderr: error,
+                    },
+                );
+                return;
+            }
+        };
+        let result = match output {
+            Ok(output) => BridgeCommandOutput {
+                status: output.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            },
+            Err(error) => BridgeCommandOutput {
+                status: -1,
+                stdout: String::new(),
+                stderr: error.to_string(),
+            },
+        };
+        let _ = app.emit("bridge-operation-completed", result);
+    });
+}
+
+fn safe_command_failure(stderr: &[u8], stdout: &[u8]) -> String {
+    let value = if stderr.is_empty() { stdout } else { stderr };
+    let text = String::from_utf8_lossy(value).trim().to_string();
+    if text.is_empty() {
+        "Bridge command failed.".to_string()
+    } else {
+        text
+    }
 }
 
 fn validate_external_url(value: &str) -> Result<(), String> {
@@ -203,9 +255,11 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
     }
     let command = args[0].as_str();
     let allowed = match command {
-        "snapshot" | "status" | "stop" | "diagnostics" | "choose-folder" | "logout" => {
-            args.len() == 1
+        "snapshot" | "status" | "choose-folder" | "logout" => args.len() == 1,
+        "stop" | "diagnostics" | "diagnostics-redaction-blocked" => {
+            args.len() == 1 || (args.len() == 2 && args[1] == "--json")
         }
+        "ensure-running" => validate_ensure_running_args(args),
         "prerequisites" => args.len() == 2 && args[1] == "status",
         "ui-intent" => validate_ui_intent_args(args),
         "activate-roadmap" => {
@@ -213,7 +267,12 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
         }
         "pair" => {
             args.len() == 1
+                || (args.len() == 2 && args[1] == "--json")
                 || (args.len() == 3 && args[1] == "--next" && validate_next_arg(&args[2]).is_ok())
+                || (args.len() == 4
+                    && args[1] == "--next"
+                    && validate_next_arg(&args[2]).is_ok()
+                    && args[3] == "--json")
         }
         "login" => args.len() == 2 && args[1] == "--gui",
         "remote" => args.len() == 2 && matches!(args[1].as_str(), "enable" | "disable"),
@@ -223,9 +282,14 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
         "model-alias" => validate_model_alias_args(args),
         "inspect" => args.len() == 3 && args[2] == "--json" && validate_path_arg(&args[1]).is_ok(),
         "open-project" | "port" | "create" => {
-            args.len() == 1 || (args.len() == 2 && validate_path_arg(&args[1]).is_ok())
+            args.len() == 1
+                || (args.len() == 2 && (args[1] == "--json" || validate_path_arg(&args[1]).is_ok()))
+                || (args.len() == 3 && validate_path_arg(&args[1]).is_ok() && args[2] == "--json")
         }
-        "open-roadmap" => args.len() == 2 && validate_identifier_arg(&args[1]).is_ok(),
+        "open-roadmap" => {
+            (args.len() == 2 || (args.len() == 3 && args[2] == "--json"))
+                && validate_identifier_arg(&args[1]).is_ok()
+        }
         "projects" => validate_projects_args(args),
         "roadmaps" => validate_roadmaps_args(args),
         "codex" => validate_codex_args(args),
@@ -237,6 +301,44 @@ fn validate_bridge_command_args(args: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("Bridge command is not allowed: {}", command))
+    }
+}
+
+fn validate_background_bridge_command_args(args: &[String]) -> Result<(), String> {
+    let allowed = matches!(args, [command, action] if command == "codex" && action == "login")
+        || matches!(
+            args,
+            [command, action, device, background]
+                if command == "codex"
+                    && action == "login"
+                    && device == "--device"
+                    && background == "--background"
+        );
+    if allowed {
+        Ok(())
+    } else {
+        Err("Only long-lived background login commands may be spawned.".to_string())
+    }
+}
+
+fn validate_ensure_running_args(args: &[String]) -> bool {
+    match args {
+        [command] if command == "ensure-running" => true,
+        [command, json] if command == "ensure-running" && json == "--json" => true,
+        [command, cwd, path]
+            if command == "ensure-running" && cwd == "--cwd" && validate_path_arg(path).is_ok() =>
+        {
+            true
+        }
+        [command, cwd, path, json]
+            if command == "ensure-running"
+                && cwd == "--cwd"
+                && validate_path_arg(path).is_ok()
+                && json == "--json" =>
+        {
+            true
+        }
+        _ => false,
     }
 }
 
@@ -338,6 +440,13 @@ fn validate_codex_args(args: &[String]) -> bool {
             if command == "codex"
                 && subcommand == "install"
                 && matches!(flag.as_str(), "--confirm" | "--dry-run" | "--json") =>
+        {
+            true
+        }
+        [command, subcommand, flag]
+            if command == "codex"
+                && matches!(subcommand.as_str(), "status" | "recheck" | "logout")
+                && flag == "--json" =>
         {
             true
         }
@@ -709,16 +818,20 @@ fn validate_next_arg(value: &str) -> Result<(), String> {
 }
 
 fn handle_protocol_url(app: &tauri::AppHandle, url: &str) {
-    let args = match bridge_args_for_protocol_url(url) {
+    let mut args = match bridge_args_for_protocol_url(url) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("{error}");
             return;
         }
     };
-    if let Ok(command) = sidecar_command(app) {
-        let _ = spawn_sidecar_command(command.args(args));
+    if matches!(
+        args.first().map(String::as_str),
+        Some("pair" | "open-project" | "open-roadmap")
+    ) {
+        args.push("--json".to_string());
     }
+    run_observable_sidecar_command(app, args);
 }
 
 fn handle_protocol_url_and_show(app: &tauri::AppHandle, url: &str) {
@@ -727,9 +840,10 @@ fn handle_protocol_url_and_show(app: &tauri::AppHandle, url: &str) {
 }
 
 fn start_local_bridge_on_launch(app: &tauri::AppHandle) {
-    if let Ok(command) = sidecar_command(app) {
-        let _ = spawn_sidecar_command(command.args(["start", "--no-open"]));
-    }
+    run_observable_sidecar_command(
+        app,
+        vec!["ensure-running".to_string(), "--json".to_string()],
+    );
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -1374,6 +1488,24 @@ mod tests {
         assert!(bridge_args_for_protocol_url("hunsu://activate-roadmap?roadmapId=bad/id").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://open-project?path=%00tmp").is_err());
         assert!(bridge_args_for_protocol_url("hunsu://add-roadmap?path=").is_err());
+    }
+
+    #[test]
+    fn only_long_lived_login_commands_can_use_background_spawn() {
+        assert!(validate_background_bridge_command_args(&["codex".into(), "login".into()]).is_ok());
+        assert!(validate_background_bridge_command_args(&[
+            "codex".into(),
+            "login".into(),
+            "--device".into(),
+            "--background".into()
+        ])
+        .is_ok());
+        assert!(validate_background_bridge_command_args(&["pair".into()]).is_err());
+        assert!(validate_background_bridge_command_args(&[
+            "open-roadmap".into(),
+            "roadmap_123".into()
+        ])
+        .is_err());
     }
 
     #[test]
