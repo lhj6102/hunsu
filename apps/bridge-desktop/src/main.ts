@@ -742,11 +742,12 @@ async function openProjectCommand(parsed: ParsedArgs, forcedAction: "open" | "po
   }
 
   const state = createStudioState();
+  const registryOptions = roadmapRegistryOptions();
   const result = forcedAction === "create" || project.kind === "new-project"
-    ? createStudioRoadmap({ path, title: basename(path) }, state)
+    ? createStudioRoadmap({ path, title: basename(path) }, state, { persist: true, ...registryOptions })
     : forcedAction === "port" || project.kind === "git-project"
-      ? applyStudioPort({ path, title: basename(project.path), goal: `Port ${basename(project.path)} into Hunsu.` }, state)
-      : openStudioRoadmap({ path: project.path }, state);
+      ? applyStudioPort({ path, title: basename(project.path), goal: `Port ${basename(project.path)} into Hunsu.` }, state, registryOptions)
+      : openStudioRoadmap({ path: project.path }, state, { persist: true, ...registryOptions });
 
   const opened = await managedBridgeRuntime().openManagedRoadmap(result.roadmap.roadmapId, {
     cwd: result.repository.root,

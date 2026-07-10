@@ -6,6 +6,7 @@ const script = readFileSync("apps/bridge-desktop/scripts/windows-managed-bridge-
 const artifactStage = readFileSync("apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs", "utf8");
 const artifactWorkflow = readFileSync(".github/workflows/bridge-desktop-artifacts.yml", "utf8");
 const packageJson = JSON.parse(readFileSync("apps/bridge-desktop/package.json", "utf8")) as { scripts?: Record<string, string> };
+const desktopMain = readFileSync("apps/bridge-desktop/src/main.ts", "utf8");
 
 function between(source: string, start: string, end: string): string {
   const startIndex = source.indexOf(start);
@@ -14,6 +15,14 @@ function between(source: string, start: string, end: string): string {
   assert.notEqual(endIndex, -1, `Missing section end: ${end}`);
   return source.slice(startIndex, endIndex);
 }
+
+test("desktop create, port, and open persist through the isolated Roadmap registry", () => {
+  const command = between(desktopMain, "async function openProjectCommand", "async function resolveChosenProjectPath");
+  assert.match(command, /const registryOptions = roadmapRegistryOptions\(\)/u);
+  assert.match(command, /createStudioRoadmap\([\s\S]*\{ persist: true, \.\.\.registryOptions \}\)/u);
+  assert.match(command, /applyStudioPort\([\s\S]*state, registryOptions\)/u);
+  assert.match(command, /openStudioRoadmap\([\s\S]*\{ persist: true, \.\.\.registryOptions \}\)/u);
+});
 
 test("Windows managed Bridge E2E always prepares and opens an isolated Workspace fixture", () => {
   const setup = between(script, "if ([string]::IsNullOrWhiteSpace($WorkspaceFixture))", "$env:HUNSU_BRIDGE_APP_STATE_PATH");
