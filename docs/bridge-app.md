@@ -124,6 +124,8 @@ Build commands:
 
 ```sh
 pnpm --filter @hunsu/bridge-desktop build
+pnpm --filter @hunsu/bridge-desktop desktop:prepare
+pnpm --filter @hunsu/bridge-desktop desktop:dev
 pnpm --filter @hunsu/bridge-desktop desktop:build
 pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes
 ```
@@ -138,6 +140,18 @@ uses Tauri `externalBin` for the active sidecar and keeps resources limited to
 the sidecar manifest; see [Windows Packaging](windows-packaging.md). The
 packaged sidecar is a native executable and does not require `node` on the
 installed user's `PATH`.
+
+SEA generation verifies that its Node executable reports exactly the pinned
+embedded runtime version before creating the blob. Local builds can set
+`HUNSU_BRIDGE_SEA_NODE_PATH` to an exact-version Node executable; mismatches
+fail before bundling or injection. After `postject` modifies a macOS sidecar,
+the build ad-hoc signs it and verifies the new signature before native
+validation and the `status` smoke test.
+
+`desktop:prepare` builds the UI and command package, removes stale prepared
+sidecars, and builds only the current host target plus its manifest. Therefore
+`desktop:dev` can start from a clean checkout without generated `dist/`,
+`native-sidecars/`, or `.sidecar-cache/` content.
 
 `desktop:build` requires Rust/Cargo plus platform Tauri dependencies. The
 TypeScript sidecar/headless package can be built and tested without those native

@@ -10,7 +10,8 @@
   },
   "scripts": {
     "bridge-app": "node --conditions=development src/main.ts",
-    "desktop:dev": "pnpm run typecheck && pnpm exec tauri dev",
+    "desktop:prepare": "pnpm run build:ui && tsc -p tsconfig.build.json && node --conditions=development scripts/prepare-desktop.mjs",
+    "desktop:dev": "pnpm run typecheck && pnpm run desktop:prepare && pnpm exec tauri dev",
     "desktop:build": "pnpm exec tauri build",
     "desktop:verify-windows-gui": "node scripts/verify-windows-gui-subsystem.mjs",
     "build": "pnpm run build:ui && tsc -p tsconfig.build.json && node --conditions=development scripts/build-native-sidecars.mjs",

@@ -94,12 +94,13 @@ export function prepareNativeSidecars(options = {}) {
   return manifest;
 }
 
-function cleanPreparedSidecars(outputDir) {
+export function cleanPreparedSidecars(outputDir) {
   for (const target of sidecarTargets) {
     rmSync(resolve(outputDir, sidecarArtifactNameForTarget(target)), { force: true });
   }
   rmSync(resolve(outputDir, "hunsu-bridge-sidecar"), { force: true });
   rmSync(resolve(outputDir, "hunsu-bridge-sidecar.exe"), { force: true });
+  rmSync(resolve(outputDir, "sidecar-manifest.json"), { force: true });
 }
 
 function hasNativeExecutableMagic(bytes) {

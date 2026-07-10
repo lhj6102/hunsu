@@ -2998,6 +2998,30 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(artifactWorkflow, /HUNSU_BRIDGE_SIDECAR_TARGET/);
     assert.match(artifactWorkflow, /if: startsWith\(matrix\.platform, 'windows'\)/);
     assert.match(artifactWorkflow, /desktop:verify-windows-gui/);
+    assert.match(artifactWorkflow, /Verify and smoke-test native sidecar/);
+    assert.match(artifactWorkflow, /spawnSync\(sidecarPath, \["status"\]/);
+    assert.match(artifactWorkflow, /HUNSU_BRIDGE_APP_STATE_PATH/);
+    assert.match(artifactWorkflow, /Local Bridge:/);
+    assert.match(artifactWorkflow, /finally \{[\s\S]*rmSync\(smokeRoot, \{ recursive: true, force: true \}\)/);
+    assert.match(artifactWorkflow, /codesign --verify --strict --verbose=2 "\$\{SIDECAR_PATH\}"/);
+    assert.match(artifactWorkflow, /codesign --verify --deep --strict --verbose=2 "\$\{app_bundle\}"/);
+    assert.match(artifactWorkflow, /test -x "\$\{SIDECAR_PATH\}"/);
+    assert.match(artifactWorkflow, /SIDECAR_SHA256SUM\.txt/);
+    assert.equal(
+      artifactWorkflow.indexOf("codesign --verify --strict --verbose=2")
+        < artifactWorkflow.indexOf("spawnSync(sidecarPath, [\"status\"]"),
+      true
+    );
+    for (const target of [
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]) {
+      assert.match(artifactWorkflow, new RegExp(target));
+    }
     assert.deepEqual(
       JSON.parse(readFileSync(join(process.cwd(), "apps/bridge-desktop/src-tauri/tauri.macos.conf.json"), "utf8")).bundle.targets,
       ["app", "dmg"]
