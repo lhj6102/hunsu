@@ -161,17 +161,24 @@ async function waitForLifecycle(page, expected) {
 
 async function verifyVersionLabels(page) {
   await openAdvancedPanel(page, "advanced");
-  const labels = await page.locator("#bridge-app-version, #bridge-runtime-version, #protocol-version, #embedded-node-version, #codex-cli-version")
-    .evaluateAll(elements => elements.map(element => element.textContent?.trim() ?? ""));
-  assert(labels.length === 5, "The installed app did not render all five version labels.");
-  for (const [index, label] of labels.entries()) {
-    assert(label.length > 0 && label !== "Unknown", `Installed app version label ${index + 1} was not resolved.`);
+  const labels = {
+    bridgeApp: (await page.locator("#bridge-app-version").textContent())?.trim() ?? "",
+    bridgeRuntime: (await page.locator("#bridge-runtime-version").textContent())?.trim() ?? "",
+    protocol: (await page.locator("#protocol-version").textContent())?.trim() ?? "",
+    embeddedNode: (await page.locator("#embedded-node-version").textContent())?.trim() ?? "",
+    codexCli: (await page.locator("#codex-cli-version").textContent())?.trim() ?? ""
+  };
+  for (const [name, label] of Object.entries(labels)) {
+    assert(label.length > 0 && label !== "Unknown" && label !== "Unavailable",
+      `Installed app version label ${name} was not resolved (received ${JSON.stringify(label)}).`);
   }
-  assert(/^v?\d+\.\d+\.\d+/u.test(labels[0]), "Bridge App version label is not a semantic version.");
-  assert(/^v?\d+\.\d+\.\d+/u.test(labels[1]), "Bridge runtime version label is not a semantic version.");
-  assert(labels[2].includes("local-bridge"), "Protocol version label did not identify the local Bridge protocol.");
-  assert(/^v\d+\.\d+\.\d+/u.test(labels[3]), "Embedded Node version label is not exact.");
-  assert(labels[4].includes("codex-qa 0.0.0"), "Codex CLI version did not come from the controlled installed-app fixture.");
+  assert(/^v?\d+\.\d+\.\d+/u.test(labels.bridgeApp), "Bridge App version label is not a semantic version.");
+  assert(/^v?\d+\.\d+\.\d+/u.test(labels.bridgeRuntime), "Bridge runtime version label is not a semantic version.");
+  assert(labels.protocol.includes("local-bridge"), "Protocol version label did not identify the local Bridge protocol.");
+  assert(/^v\d+\.\d+\.\d+/u.test(labels.embeddedNode), "Embedded Node version label is not exact.");
+  assert(labels.codexCli.includes("codex-qa 0.0.0"),
+    `Codex CLI version did not come from the controlled installed-app fixture (received ${JSON.stringify(labels.codexCli)}).`);
+  console.log(`[installed-app-e2e] version labels passed: ${JSON.stringify(labels)}`);
 }
 
 async function verifyProviderRecheck(page) {

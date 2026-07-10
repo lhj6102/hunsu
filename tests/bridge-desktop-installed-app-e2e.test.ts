@@ -31,6 +31,8 @@ test("installed Windows app gate silently installs an isolated NSIS candidate an
   assert.match(powershell, /existing managed daemon verifies reuse/u);
   assert.match(powershell, /\[string\]\$EvidencePath/u);
   assert.match(powershell, /qa_legacy_.*NewGuid/u);
+  assert.match(powershell, /fixtureVersionOutput/u);
+  assert.match(powershell, /installedSnapshot\.versions\.codexCli/u);
   assert.match(powershell, /--evidence-path \$EvidencePath/u);
   assert.match(powershell, /Stop-InstalledProcesses/u);
   assert.match(powershell, /uninst\|uninstall/u);
@@ -54,7 +56,10 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
   assert.match(driver, /EADDRINUSE/u);
   assert.match(driver, /#validate-codex-config/u);
   assert.match(driver, /Recheck complete/u);
-  assert.match(driver, /#bridge-app-version, #bridge-runtime-version, #protocol-version, #embedded-node-version, #codex-cli-version/u);
+  for (const selector of ["#bridge-app-version", "#bridge-runtime-version", "#protocol-version", "#embedded-node-version", "#codex-cli-version"]) {
+    assert.match(driver, new RegExp(selector));
+  }
+  assert.match(driver, /version labels passed/u);
   assert.match(driver, /pageErrors\.length === 0/u);
   assert.match(driver, /silent-isolated-install/u);
   assert.match(driver, /candidateKind: "installed-nsis"/u);

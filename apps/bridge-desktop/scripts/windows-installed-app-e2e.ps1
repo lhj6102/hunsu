@@ -124,6 +124,9 @@ Set-Content -LiteralPath $fakeCodexPath -Encoding ascii -Value @(
   "exit /b 1"
 )
 
+$fixtureVersionOutput = & $fakeCodexPath --version 2>&1 | Out-String
+Assert-True ($LASTEXITCODE -eq 0 -and $fixtureVersionOutput.Trim() -eq "codex-qa 0.0.0") "The controlled Codex CLI fixture did not return its expected version."
+
 $env:HUNSU_BRIDGE_APP_STATE_PATH = $statePath
 $env:HUNSU_BRIDGE_APP_LOG_PATH = $logPath
 $env:HUNSU_BRIDGE_TEST_MODE = "1"
@@ -159,6 +162,17 @@ try {
     throw "The installed sidecar could not prepare the fixture Workspace (exit $fixtureExitCode, code $fixtureCode)."
   }
   Assert-True (-not (Test-Path -LiteralPath $browserCapturePath -PathType Leaf)) "No-open fixture preparation unexpectedly handed off to a browser."
+
+  $snapshotOutput = & $installedSidecar.FullName snapshot 2>&1 | Out-String
+  $snapshotExitCode = $LASTEXITCODE
+  try {
+    $installedSnapshot = $snapshotOutput | ConvertFrom-Json
+  } catch {
+    throw "The installed sidecar returned invalid JSON while checking candidate versions (exit $snapshotExitCode)."
+  }
+  Assert-True (
+    $snapshotExitCode -eq 0 -and [string]$installedSnapshot.versions.codexCli -eq "codex-qa 0.0.0"
+  ) "The installed sidecar did not resolve the controlled Codex CLI version."
 
   # Launching the installed App against this existing managed daemon verifies reuse at the native boundary.
   $appProcess = Start-Process -FilePath $appExecutable -WorkingDirectory (Split-Path -Parent $appExecutable) -PassThru
