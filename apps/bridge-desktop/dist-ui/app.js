@@ -82,6 +82,7 @@ const uiErrorMessages = {
   BROWSER_OPEN_FAILED: "The browser could not be opened.",
   ROADMAP_NOT_FOUND: "That Workspace could not be found.",
   DIAGNOSTICS_SENSITIVE_DATA_DETECTED: "Diagnostics were not copied because sensitive data was detected.",
+  CLIPBOARD_WRITE_FAILED: "Diagnostics are safe, but Windows could not write them to the clipboard.",
   CODEX_INSTALL_PREREQUISITE_MISSING: "npm is required to install Codex. Install npm and retry, or use Select Existing Codex.",
   PROVIDER_CONFIG_INVALID: "Configuration is invalid.",
   PROVIDER_RECHECK_FAILED: "Recheck failed."
@@ -1830,14 +1831,13 @@ copyDiagnosticsButton.addEventListener("click", () => void runUiAction({
 async function copyFreshDiagnostics() {
   const result = await runCommand(["diagnostics", "--json"]);
   if (!result.ok) return result;
+
+  let text;
   try {
     const payload = typeof result.value === "string" ? parseJsonResult(result.value) ?? result.value : result.value;
     assertDiagnosticsSafe(payload);
-    const text = typeof payload === "string" ? payload : JSON.stringify(payload ?? {}, null, 2);
+    text = typeof payload === "string" ? payload : JSON.stringify(payload ?? {}, null, 2);
     assertDiagnosticTextSafe(text);
-    await navigator.clipboard.writeText(text);
-    diagnostics.textContent = text;
-    return result;
   } catch (_error) {
     await runCommand(["diagnostics-redaction-blocked", "--json"]);
     return {
@@ -1846,6 +1846,19 @@ async function copyFreshDiagnostics() {
       message: "Diagnostics could not be copied because sensitive data was detected."
     };
   }
+
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_error) {
+    return {
+      ok: false,
+      code: "CLIPBOARD_WRITE_FAILED",
+      message: "Diagnostics are safe, but Windows could not write them to the clipboard."
+    };
+  }
+
+  diagnostics.textContent = text;
+  return result;
 }
 providerConfigSettingsOpen?.addEventListener("click", openProviderConfigDialog);
 providerConfigClose?.addEventListener("click", closeProviderConfigDialog);

@@ -189,11 +189,15 @@ test("runUiAction retains visible success and safe failure feedback", async () =
   assert.equal(button.disabled, false);
 });
 
-test("fresh diagnostics copy blocks raw sensitive query values", async () => {
+test("fresh diagnostics copy writes a safe payload without recording a redaction event", async () => {
   let clipboard = "";
-  let unsafe = false;
+  let clipboardWrites = 0;
+  let redactionEvents = 0;
   const ui = loadUi({
-    clipboardWrite: value => { clipboard = value; },
+    clipboardWrite: value => {
+      clipboardWrites += 1;
+      clipboard = value;
+    },
     invoke: async (command, payload) => {
       assert.equal(command, "run_bridge_app_command");
       const args = payload.input.args as string[];
@@ -201,15 +205,14 @@ test("fresh diagnostics copy blocks raw sensitive query values", async () => {
         return { status: 0, stdout: JSON.stringify(snapshotFixture()), stderr: "" };
       }
       if (args[0] === "diagnostics-redaction-blocked") {
+        redactionEvents += 1;
         return {
           status: 0,
           stdout: JSON.stringify({ ok: true, code: "OK", message: "Sensitive diagnostics copy was blocked." }),
           stderr: ""
         };
       }
-      const value = unsafe
-        ? { url: "https://example.test/?hunsuBridgeToken=synthetic-unsafe-token" }
-        : { url: "https://example.test/?hunsuBridgeToken=[redacted]", status: "ok" };
+      const value = { url: "https://example.test/?hunsuBridgeToken=[redacted]", status: "ok" };
       return {
         status: 0,
         stdout: JSON.stringify({ ok: true, code: "OK", message: "Diagnostics ready.", value }),
@@ -217,13 +220,115 @@ test("fresh diagnostics copy blocks raw sensitive query values", async () => {
       };
     }
   });
-  await ui.copyFreshDiagnostics();
+  const result = await ui.copyFreshDiagnostics();
+  assert.equal(result.ok, true);
+  assert.equal(clipboardWrites, 1);
   assert.match(clipboard, /\[redacted\]/);
-  unsafe = true;
+  assert.equal(redactionEvents, 0);
+});
+
+test("fresh diagnostics copy blocks an unsafe payload and records one redaction event", async () => {
+  const previousClipboard = "previous safe clipboard text";
+  let clipboard = previousClipboard;
+  let clipboardWrites = 0;
+  let redactionEvents = 0;
+  const ui = loadUi({
+    clipboardWrite: value => {
+      clipboardWrites += 1;
+      clipboard = value;
+    },
+    invoke: async (command, payload) => {
+      assert.equal(command, "run_bridge_app_command");
+      const args = payload.input.args as string[];
+      if (args[0] === "snapshot") {
+        return { status: 0, stdout: JSON.stringify(snapshotFixture()), stderr: "" };
+      }
+      if (args[0] === "diagnostics-redaction-blocked") {
+        redactionEvents += 1;
+        return {
+          status: 0,
+          stdout: JSON.stringify({ ok: true, code: "OK", message: "Sensitive diagnostics copy was blocked." }),
+          stderr: ""
+        };
+      }
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          code: "OK",
+          message: "Diagnostics ready.",
+          value: { url: "https://example.test/?hunsuBridgeToken=synthetic-unsafe-token" }
+        }),
+        stderr: ""
+      };
+    }
+  });
+
   const blocked = await ui.copyFreshDiagnostics();
   assert.equal(blocked.ok, false);
   assert.equal(blocked.code, "DIAGNOSTICS_SENSITIVE_DATA_DETECTED");
+  assert.equal(clipboardWrites, 0);
+  assert.equal(redactionEvents, 1);
+  assert.equal(clipboard, previousClipboard);
   assert.doesNotMatch(clipboard, /synthetic-unsafe-token/);
+});
+
+test("fresh diagnostics copy reports a safe clipboard rejection without recording a redaction event", async () => {
+  const previousClipboard = "previous safe clipboard text";
+  const rawClipboardError = "raw Windows clipboard service error synthetic-secret";
+  let clipboard = previousClipboard;
+  let clipboardWrites = 0;
+  let redactionEvents = 0;
+  const ui = loadUi({
+    clipboardWrite: async value => {
+      clipboardWrites += 1;
+      await Promise.reject(new Error(`${rawClipboardError}: ${value.length}`));
+      clipboard = value;
+    },
+    invoke: async (command, payload) => {
+      assert.equal(command, "run_bridge_app_command");
+      const args = payload.input.args as string[];
+      if (args[0] === "snapshot") {
+        return { status: 0, stdout: JSON.stringify(snapshotFixture()), stderr: "" };
+      }
+      if (args[0] === "diagnostics-redaction-blocked") {
+        redactionEvents += 1;
+        return {
+          status: 0,
+          stdout: JSON.stringify({ ok: true, code: "OK", message: "Sensitive diagnostics copy was blocked." }),
+          stderr: ""
+        };
+      }
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          code: "OK",
+          message: "Diagnostics ready.",
+          value: { url: "https://example.test/?hunsuBridgeToken=[redacted]", status: "ok" }
+        }),
+        stderr: ""
+      };
+    }
+  });
+
+  const rejected = await ui.runUiAction({
+    id: "copy-diagnostics-rejected",
+    pendingMessage: "Preparing fresh diagnostics…",
+    failureMessage: "Diagnostics were not copied.",
+    refreshAfter: false,
+    execute: ui.copyFreshDiagnostics
+  });
+
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, "CLIPBOARD_WRITE_FAILED");
+  assert.equal(clipboardWrites, 1);
+  assert.equal(redactionEvents, 0);
+  assert.equal(clipboard, previousClipboard);
+  const feedback = ui.element("#action-status").textContent;
+  assert.match(feedback, /Diagnostics are safe, but Windows could not write them to the clipboard\./u);
+  assert.doesNotMatch(feedback, /sensitive data was detected/iu);
+  assert.doesNotMatch(feedback, new RegExp(rawClipboardError, "u"));
 });
 
 test("Codex install UI enables only for npm and retains Select Existing Codex", () => {
@@ -467,7 +572,7 @@ type Element = {
 
 function loadUi(options: {
   invoke?: (command: string, payload: { input: { args: unknown[] } }) => Promise<unknown>;
-  clipboardWrite?: (value: string) => void;
+  clipboardWrite?: (value: string) => void | Promise<void>;
 } = {}) {
   const elements = new Map<string, Element>();
   const document = {
@@ -493,7 +598,7 @@ function loadUi(options: {
   const context = {
     window,
     document,
-    navigator: { clipboard: { writeText: async (value: string) => { options.clipboardWrite?.(value); } } },
+    navigator: { clipboard: { writeText: async (value: string) => { await options.clipboardWrite?.(value); } } },
     console,
     Promise,
     JSON,

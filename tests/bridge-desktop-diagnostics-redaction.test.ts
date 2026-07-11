@@ -168,6 +168,13 @@ test("desktop Copy Diagnostics requests a fresh payload and blocks unsafe clipbo
   assert.match(copySource, /navigator\.clipboard\.writeText/u);
   assert.doesNotMatch(copySource, /writeText\(diagnostics\.textContent/u);
   assert.match(copySource, /Diagnostics could not be copied because sensitive data was detected\./u);
+  assert.match(copySource, /CLIPBOARD_WRITE_FAILED/u);
+  assert.match(copySource, /Diagnostics are safe, but Windows could not write them to the clipboard\./u);
+  assert.equal(copySource.match(/diagnostics-redaction-blocked/gu)?.length, 1);
+  const clipboardWrite = copySource.indexOf("navigator.clipboard.writeText");
+  assert.ok(clipboardWrite >= 0);
+  assert.doesNotMatch(copySource.slice(clipboardWrite), /diagnostics-redaction-blocked/u);
+  assert.match(source, /CLIPBOARD_WRITE_FAILED:\s*"Diagnostics are safe, but Windows could not write them to the clipboard\."/u);
 
   const safetyStart = source.indexOf("function diagnosticTextIsSafe");
   if (safetyStart >= 0) {
