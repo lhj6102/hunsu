@@ -25,10 +25,12 @@ type ArtifactStageModule = {
     evidencePath?: string;
     installedEvidencePath?: string;
     installedScreenshotPath?: string;
+    upgradeEvidencePath?: string;
   }): { files: string[] };
 };
 
 const scriptPath = join(process.cwd(), "apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs");
+const checksumVerifierPath = join(process.cwd(), "apps/bridge-desktop/scripts/verify-desktop-artifact-checksums.mjs");
 const artifactStage = await import(pathToFileURL(scriptPath).href) as ArtifactStageModule;
 
 test("desktop artifact staging selects only installers for each supported target and checksums exactly what it stages", () => {
@@ -47,7 +49,7 @@ test("desktop artifact staging selects only installers for each supported target
     writeFixture(join(bundleDir, "appimage", "hunsu_0.1.0_amd64.AppImage"), "appimage-installer");
     writeFixture(join(bundleDir, "appimage", "hunsu_0.1.0_amd64.AppImage.tar.gz"), "not-an-appimage");
     writeFixture(join(bundleDir, "rpm", "hunsu-0.1.0.x86_64.rpm"), "other-linux-bundle");
-    writeFixture(join(bundleDir, "artifact-size-report.json"), "{\"totalBytes\":123}\n");
+    writeFixture(join(bundleDir, "artifact-size-report.json"), JSON.stringify(sizeReportFixture("x86_64-pc-windows-msvc")));
 
     const expectations = new Map<string, string[]>([
       ["x86_64-pc-windows-msvc", ["artifact-size-report.json", "nsis/Hunsu_0.1.0_x64-setup.exe"]],
@@ -67,6 +69,7 @@ test("desktop artifact staging selects only installers for each supported target
     assert.deepEqual([...artifactStage.supportedDesktopArtifactTargets].sort(), [...expectations.keys()].sort());
     for (const [target, expectedFiles] of expectations) {
       writeFixture(join(outputDir, "stale-unpacked-output", "Hunsu.exe"), "stale");
+      writeFixture(join(bundleDir, "artifact-size-report.json"), JSON.stringify(sizeReportFixture(target)));
 
       artifactStage.stageDesktopArtifacts({ bundleDir, outputDir, target, includeSizeReport: true });
 
@@ -270,6 +273,51 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
   }
 });
 
+test("desktop artifact staging validates and checksums passing same-directory installer upgrade evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-desktop-artifact-stage-upgrade-evidence-"));
+  const bundleDir = join(root, "bundle");
+  const outputDir = join(root, "staged");
+  const upgradeEvidencePath = join(root, "upgrade-evidence.json");
+
+  try {
+    writeFixture(join(bundleDir, "nsis", "Hunsu Bridge_0.1.1_x64-setup.exe"), "windows-installer");
+    writeFixture(join(bundleDir, "artifact-size-report.json"), JSON.stringify(sizeReportFixture("x86_64-pc-windows-msvc")));
+    writeFixture(upgradeEvidencePath, JSON.stringify(upgradeEvidenceFixture()));
+    artifactStage.stageDesktopArtifacts({
+      bundleDir,
+      outputDir,
+      target: "x86_64-pc-windows-msvc",
+      includeSizeReport: true,
+      upgradeEvidencePath
+    });
+
+    assert.deepEqual(listFiles(outputDir), [
+      "SHA256SUMS.txt",
+      "artifact-size-report.json",
+      "nsis/Hunsu Bridge_0.1.1_x64-setup.exe",
+      "windows-installer-upgrade-e2e-evidence.json"
+    ]);
+    assertChecksumsMatchEveryStagedFile(outputDir);
+
+    writeFixture(upgradeEvidencePath, JSON.stringify({
+      ...upgradeEvidenceFixture(),
+      unsafe: "C:\\Users\\qa\\bridge-app.json"
+    }));
+    assert.throws(
+      () => artifactStage.stageDesktopArtifacts({
+        bundleDir,
+        outputDir,
+        target: "x86_64-pc-windows-msvc",
+        includeSizeReport: true,
+        upgradeEvidencePath
+      }),
+      /full user-profile path/
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("desktop artifact staging clears stale output and fails when the target has no installer", () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-desktop-artifact-stage-empty-"));
   const bundleDir = join(root, "bundle");
@@ -320,6 +368,31 @@ test("desktop artifact staging CLI accepts bundle, output, and target options", 
   }
 });
 
+test("desktop artifact checksum verification rejects corruption after staging", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-desktop-artifact-checksum-verify-"));
+  const bundleDir = join(root, "bundle");
+  const outputDir = join(root, "staged");
+
+  try {
+    writeFixture(join(bundleDir, "deb", "hunsu.deb"), "debian-installer");
+    artifactStage.stageDesktopArtifacts({
+      bundleDir,
+      outputDir,
+      target: "x86_64-unknown-linux-gnu"
+    });
+    const verified = spawnSync(process.execPath, [checksumVerifierPath, outputDir], { encoding: "utf8" });
+    assert.equal(verified.status, 0, verified.stderr);
+    assert.match(verified.stdout, /Verified 1 staged desktop artifact checksum/u);
+
+    writeFixture(join(outputDir, "deb", "hunsu.deb"), "corrupted-installer");
+    const rejected = spawnSync(process.execPath, [checksumVerifierPath, outputDir], { encoding: "utf8" });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /checksum mismatch/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function writeFixture(path: string, contents: string) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, contents, "utf8");
@@ -328,6 +401,82 @@ function writeFixture(path: string, contents: string) {
 function writePngFixture(path: string) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, Buffer.from("89504e470d0a1a0a00", "hex"));
+}
+
+function sizeReportFixture(target: string) {
+  const windowsGuard = target === "x86_64-pc-windows-msvc"
+    ? {
+        measurements: {
+          installer: { sizeBytes: 1 },
+          artifactZip: { sizeBytes: 1 },
+          installedApp: { sizeBytes: 1 },
+          installedSidecar: { sizeBytes: 1 },
+          installerLifecycleHelpers: { sizeBytes: 1 }
+        },
+        policy: {
+          status: "passed",
+          maximumGrowthPercent: 5,
+          minimumGrowthAllowanceBytes: 1_048_576,
+          reviewedException: null,
+          baselineSource: {
+            workflowRunId: "29147290486",
+            artifactId: "8247220443"
+          },
+          checks: [
+            { metric: "installerBytes", baselineBytes: 24_997_090, currentBytes: 1, status: "passed" },
+            { metric: "artifactZipBytes", baselineBytes: 25_065_843, currentBytes: 1, status: "passed" }
+          ]
+        }
+      }
+    : {};
+  return {
+    schema: "hunsu.bridge-desktop-artifact-sizes.v3",
+    target,
+    totalBytes: 123,
+    packaging: {
+      configurationChecked: target === "x86_64-pc-windows-msvc",
+      fixedWebViewRuntimeBundled: false,
+      fixedWebViewRuntimeAllowedForThisChange: false
+    },
+    ...windowsGuard
+  };
+}
+
+function upgradeEvidenceFixture() {
+  const sidecarSha256 = "d".repeat(64);
+  return {
+    schema: "hunsu.windows-installer-upgrade-e2e.v1",
+    schemaVersion: 1,
+    result: "passed",
+    provenance: {
+      runId: "123456",
+      runAttempt: "1",
+      candidateSha: "b".repeat(40),
+      target: "x86_64-pc-windows-msvc",
+      runnerOs: "Windows Server QA",
+      runnerImage: "windows-latest",
+      startedAt: "2026-07-11T00:00:00.000Z",
+      completedAt: "2026-07-11T00:01:00.000Z",
+      installerSha256: "c".repeat(64),
+      candidateSidecarSha256: sidecarSha256,
+      installDirectoryId: "e".repeat(64),
+      expectedAppVersion: "0.1.1"
+    },
+    scenarios: {
+      A: { result: "passed", candidateVersion: "0.1.1", installedSidecarSha256: sidecarSha256 },
+      B: { result: "passed" },
+      C: { result: "passed" },
+      D: { result: "passed" },
+      E: { result: "passed", launchReportedCode: "BRIDGE_PORT_IN_USE" },
+      F: { result: "passed", similarExecutableOutsideTargetPreserved: true }
+    },
+    measurements: {
+      installerBytes: 100,
+      installedAppBytes: 200,
+      installedSidecarBytes: 300,
+      installedSidecarSha256: sidecarSha256
+    }
+  };
 }
 
 function artifactProvenance(digestName: "sidecarSha256" | "installerSha256") {

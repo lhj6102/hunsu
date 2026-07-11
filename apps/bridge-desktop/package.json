@@ -1,6 +1,6 @@
 {
   "name": "@hunsu/bridge-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Hunsu Bridge companion app and headless command surface.",
   "type": "module",
@@ -16,11 +16,13 @@
     "desktop:verify-windows-gui": "node scripts/verify-windows-gui-subsystem.mjs",
     "e2e:windows-managed": "pwsh -File scripts/windows-managed-bridge-e2e.ps1",
     "e2e:windows-installed": "pwsh -File scripts/windows-installed-app-e2e.ps1",
+    "e2e:windows-upgrade": "pwsh -File scripts/windows-installer-upgrade-e2e.ps1",
     "build": "pnpm run build:ui && tsc -p tsconfig.build.json && node --conditions=development scripts/build-native-sidecars.mjs",
     "build:ui": "node scripts/build-ui.mjs",
     "sidecars:build": "node --conditions=development scripts/build-native-sidecars.mjs",
     "sidecars:prepare": "node --conditions=development scripts/prepare-sidecars.mjs",
     "artifacts:report-sizes": "node scripts/report-artifact-sizes.mjs",
+    "artifacts:verify-checksums": "node scripts/verify-desktop-artifact-checksums.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

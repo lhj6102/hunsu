@@ -247,6 +247,25 @@ jobs:
             -EvidencePath $env:INSTALLED_APP_EVIDENCE_PATH `
             -ScreenshotPath $env:INSTALLED_APP_SCREENSHOT_PATH
 
+      - name: Run Windows same-directory installer upgrade E2E
+        if: matrix.platform == 'windows'
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          INSTALLER_UPGRADE_EVIDENCE_PATH: ${{ runner.temp }}/windows-installer-upgrade-e2e-evidence.json
+        run: |
+          $installer = Get-ChildItem `
+            -Path "apps/bridge-desktop/src-tauri/target/release/bundle/nsis" `
+            -Filter "*setup.exe" `
+            -File | Select-Object -First 1
+          if ($null -eq $installer) {
+            throw "The Windows NSIS installer was not produced."
+          }
+          ./apps/bridge-desktop/scripts/windows-installer-upgrade-e2e.ps1 `
+            -InstallerPath $installer.FullName `
+            -CandidateSidecarPath "${{ matrix.sidecar }}" `
+            -EvidencePath $env:INSTALLER_UPGRADE_EVIDENCE_PATH
+
       - name: Verify final macOS application signature
         if: startsWith(matrix.platform, 'macos')
         shell: bash
@@ -262,9 +281,48 @@ jobs:
             echo "No final macOS .app bundle was produced; skipping final app signature verification."
           fi
 
-      - name: Report artifact sizes
-        if: inputs.platform == 'all'
+      - name: Report non-Windows artifact sizes
+        if: inputs.platform == 'all' && matrix.platform != 'windows'
         run: pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes -- --target "${{ matrix.rust_target }}"
+
+      - name: Guard Windows artifact sizes
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          ARTIFACT_ZIP_PREVIEW: ${{ runner.temp }}/hunsu-bridge-windows-x64-size-preview.zip
+          INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
+          INSTALLED_APP_SCREENSHOT_PATH: ${{ runner.temp }}/windows-installed-app-e2e-screenshot.png
+          INSTALLER_UPGRADE_EVIDENCE_PATH: ${{ runner.temp }}/windows-installer-upgrade-e2e-evidence.json
+          MANAGED_BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/windows-managed-bridge-e2e-evidence.json
+        run: |
+          $previewRoot = Join-Path $env:RUNNER_TEMP "hunsu-bridge-windows-x64-size-preview"
+          Remove-Item -LiteralPath $previewRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $env:ARTIFACT_ZIP_PREVIEW -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path (Join-Path $previewRoot "nsis") -Force | Out-Null
+          $installer = Get-ChildItem `
+            -Path "apps/bridge-desktop/src-tauri/target/release/bundle/nsis" `
+            -Filter "*setup.exe" `
+            -File | Select-Object -First 1
+          if ($null -eq $installer) {
+            throw "The Windows NSIS installer was not produced."
+          }
+          Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $previewRoot "nsis" $installer.Name)
+          Copy-Item -LiteralPath $env:MANAGED_BRIDGE_EVIDENCE_PATH -Destination $previewRoot
+          Copy-Item -LiteralPath $env:INSTALLED_APP_EVIDENCE_PATH -Destination $previewRoot
+          Copy-Item -LiteralPath $env:INSTALLED_APP_SCREENSHOT_PATH -Destination $previewRoot
+          Copy-Item -LiteralPath $env:INSTALLER_UPGRADE_EVIDENCE_PATH -Destination $previewRoot
+          Compress-Archive `
+            -Path (Join-Path $previewRoot "*") `
+            -DestinationPath $env:ARTIFACT_ZIP_PREVIEW `
+            -CompressionLevel Optimal
+          pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes -- `
+            --target "${{ matrix.rust_target }}" `
+            --upgrade-evidence $env:INSTALLER_UPGRADE_EVIDENCE_PATH `
+            --artifact-zip $env:ARTIFACT_ZIP_PREVIEW `
+            --baseline apps/bridge-desktop/windows-artifact-size-baseline.json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows artifact size guard failed."
+          }
 
       - name: Stage installer artifacts and checksums
         shell: bash
@@ -272,6 +330,7 @@ jobs:
           ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
           INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
           INSTALLED_APP_SCREENSHOT_PATH: ${{ runner.temp }}/windows-installed-app-e2e-screenshot.png
+          INSTALLER_UPGRADE_EVIDENCE_PATH: ${{ runner.temp }}/windows-installer-upgrade-e2e-evidence.json
           MANAGED_BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/windows-managed-bridge-e2e-evidence.json
           SIDECAR_TARGET: ${{ matrix.rust_target }}
         run: |
@@ -284,11 +343,55 @@ jobs:
             stage_args+=(--evidence-path "${MANAGED_BRIDGE_EVIDENCE_PATH}")
             stage_args+=(--installed-evidence-path "${INSTALLED_APP_EVIDENCE_PATH}")
             stage_args+=(--installed-screenshot-path "${INSTALLED_APP_SCREENSHOT_PATH}")
+            stage_args+=(--upgrade-evidence-path "${INSTALLER_UPGRADE_EVIDENCE_PATH}")
           fi
-          if [[ "${{ inputs.platform }}" == "all" ]]; then
+          if [[ "${{ matrix.platform }}" == "windows" || "${{ inputs.platform }}" == "all" ]]; then
             stage_args+=(--include-size-report)
           fi
           node apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs "${stage_args[@]}"
+
+      - name: Finalize Windows artifact ZIP size measurement
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
+          ARTIFACT_ZIP_PREVIEW: ${{ runner.temp }}/hunsu-bridge-windows-x64-size-preview.zip
+          INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
+          INSTALLED_APP_SCREENSHOT_PATH: ${{ runner.temp }}/windows-installed-app-e2e-screenshot.png
+          INSTALLER_UPGRADE_EVIDENCE_PATH: ${{ runner.temp }}/windows-installer-upgrade-e2e-evidence.json
+          MANAGED_BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/windows-managed-bridge-e2e-evidence.json
+        run: |
+          Remove-Item -LiteralPath $env:ARTIFACT_ZIP_PREVIEW -Force -ErrorAction SilentlyContinue
+          Compress-Archive `
+            -Path (Join-Path $env:ARTIFACT_STAGE "*") `
+            -DestinationPath $env:ARTIFACT_ZIP_PREVIEW `
+            -CompressionLevel Optimal
+          pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes -- `
+            --target "${{ matrix.rust_target }}" `
+            --upgrade-evidence $env:INSTALLER_UPGRADE_EVIDENCE_PATH `
+            --artifact-zip $env:ARTIFACT_ZIP_PREVIEW `
+            --baseline apps/bridge-desktop/windows-artifact-size-baseline.json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Final Windows artifact ZIP size guard failed."
+          }
+          node apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs `
+            --bundle-dir "apps/bridge-desktop/src-tauri/target/release/bundle" `
+            --output-dir $env:ARTIFACT_STAGE `
+            --target "${{ matrix.rust_target }}" `
+            --evidence-path $env:MANAGED_BRIDGE_EVIDENCE_PATH `
+            --installed-evidence-path $env:INSTALLED_APP_EVIDENCE_PATH `
+            --installed-screenshot-path $env:INSTALLED_APP_SCREENSHOT_PATH `
+            --upgrade-evidence-path $env:INSTALLER_UPGRADE_EVIDENCE_PATH `
+            --include-size-report
+          if ($LASTEXITCODE -ne 0) {
+            throw "Final Windows artifact staging failed."
+          }
+
+      - name: Verify staged artifact checksums
+        shell: bash
+        env:
+          ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
+        run: node apps/bridge-desktop/scripts/verify-desktop-artifact-checksums.mjs "${ARTIFACT_STAGE}"
 
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4

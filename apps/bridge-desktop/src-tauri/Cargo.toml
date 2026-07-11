@@ -1,6 +1,6 @@
 [package]
 name = "hunsu-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Hunsu Bridge desktop companion app"
 edition = "2021"
 

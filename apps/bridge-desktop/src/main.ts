@@ -156,7 +156,7 @@ const DEFAULT_LAUNCHD_USER_PLIST_PATH = join(homedir(), "Library", "LaunchAgents
 const WINDOWS_USER_TASK_NAME = "Hunsu Bridge";
 const PROJECT_GRANT_SCOPE_VALUES = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"] as const satisfies readonly BridgeCommandScope[];
 const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose"];
-const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
+const HUNSU_BRIDGE_APP_VERSION = "0.1.1";
 const DIAGNOSTICS_SECURITY_VERSION = 1;
 const DIAGNOSTICS_SECURITY_MIGRATION_FETCH_TIMEOUT_MS = 1_500;
 

@@ -17,6 +17,12 @@ use tauri_plugin_shell::{
 const BRIDGE_SIDECAR_NAME: &str = "hunsu-bridge-sidecar";
 const BRIDGE_TRAY_ID: &str = "hunsu-bridge";
 const BRIDGE_TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const QUIT_PREFERENCE_TIMEOUT: Duration = Duration::from_secs(1);
+const QUIT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const QUIT_PREFERENCE_ARGS: [&str; 3] = ["settings", "quit-behavior", "get"];
+const QUIT_STOP_ARGS: [&str; 2] = ["stop", "--json"];
+const QUIT_CONFIRMATION_MESSAGE: &str =
+    "Quit Hunsu Bridge?\n\nYour configured background-service preference will be applied.";
 
 #[derive(Serialize)]
 struct FolderSelection {
@@ -1079,29 +1085,45 @@ fn remote_bridge_label(value: &str, snapshot: &serde_json::Value) -> &'static st
 fn quit_bridge_app(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        quit_bridge_app_async(app).await;
+        let confirmed_app = app.clone();
+        let confirmed_quit = confirm_before_resolving_quit_preference(
+            || {
+                app.dialog()
+                    .message(QUIT_CONFIRMATION_MESSAGE)
+                    .title("Hunsu Bridge")
+                    .kind(MessageDialogKind::Warning)
+                    .buttons(MessageDialogButtons::OkCancel)
+                    .blocking_show()
+            },
+            || finish_confirmed_quit(confirmed_app),
+        );
+        if let Some(confirmed_quit) = confirmed_quit {
+            confirmed_quit.await;
+        }
     });
 }
 
-async fn quit_bridge_app_async(app: tauri::AppHandle) {
-    let preference = quit_background_preference(&app).await;
-    let message = match preference {
-        QuitBackgroundPreference::KeepBackground => "Quit Hunsu Bridge?\n\nYour quit preference keeps the background Bridge service running.",
-        QuitBackgroundPreference::StopBackground => "Quit Hunsu Bridge?\n\nYour quit preference stops the background Bridge service.",
-    };
-    let should_quit = app
-        .dialog()
-        .message(message)
-        .title("Hunsu Bridge")
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancel)
-        .blocking_show();
-    if !should_quit {
-        return;
+fn confirm_before_resolving_quit_preference<ShowConfirmation, ResolvePreference, Continuation>(
+    show_confirmation: ShowConfirmation,
+    resolve_preference: ResolvePreference,
+) -> Option<Continuation>
+where
+    ShowConfirmation: FnOnce() -> bool,
+    ResolvePreference: FnOnce() -> Continuation,
+{
+    if show_confirmation() {
+        Some(resolve_preference())
+    } else {
+        None
     }
+}
+
+async fn finish_confirmed_quit(app: tauri::AppHandle) {
+    let preference = quit_background_preference(&app).await;
     if matches!(preference, QuitBackgroundPreference::StopBackground) {
-        if let Ok(command) = sidecar_command(&app) {
-            let _ = command.arg("stop").output().await;
+        if let Err(failure) = stop_background_bridge(&app).await {
+            show_stop_background_failure(&app, failure);
+            return;
         }
     }
     app.exit(0);
@@ -1114,19 +1136,77 @@ enum QuitBackgroundPreference {
 }
 
 async fn quit_background_preference(app: &tauri::AppHandle) -> QuitBackgroundPreference {
-    match bridge_snapshot(app)
-        .await
-        .ok()
-        .and_then(|snapshot| {
-            snapshot["status"]["quitBehavior"]
-                .as_str()
-                .map(str::to_string)
-        })
-        .as_deref()
+    let command = match sidecar_command(app) {
+        Ok(command) => command,
+        Err(_) => return QuitBackgroundPreference::KeepBackground,
+    };
+    match tokio::time::timeout(
+        QUIT_PREFERENCE_TIMEOUT,
+        command.args(QUIT_PREFERENCE_ARGS).output(),
+    )
+    .await
     {
-        Some("stop-background") => QuitBackgroundPreference::StopBackground,
-        _ => QuitBackgroundPreference::KeepBackground,
+        Ok(Ok(output)) => quit_background_preference_from_output(
+            output.status.success(),
+            output.stdout.as_slice(),
+        ),
+        Ok(Err(_)) | Err(_) => QuitBackgroundPreference::KeepBackground,
     }
+}
+
+fn quit_background_preference_from_output(
+    status_success: bool,
+    stdout: &[u8],
+) -> QuitBackgroundPreference {
+    if status_success && String::from_utf8_lossy(stdout).trim() == "stop-background" {
+        QuitBackgroundPreference::StopBackground
+    } else {
+        QuitBackgroundPreference::KeepBackground
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopBackgroundFailure {
+    TimedOut,
+    CommandFailed,
+}
+
+async fn stop_background_bridge(app: &tauri::AppHandle) -> Result<(), StopBackgroundFailure> {
+    let command = sidecar_command(app).map_err(|_| StopBackgroundFailure::CommandFailed)?;
+    let output = tokio::time::timeout(QUIT_STOP_TIMEOUT, command.args(QUIT_STOP_ARGS).output())
+        .await
+        .map_err(|_| StopBackgroundFailure::TimedOut)?
+        .map_err(|_| StopBackgroundFailure::CommandFailed)?;
+    if stop_command_result_is_success(output.status.success(), output.stdout.as_slice()) {
+        Ok(())
+    } else {
+        Err(StopBackgroundFailure::CommandFailed)
+    }
+}
+
+fn stop_command_result_is_success(status_success: bool, stdout: &[u8]) -> bool {
+    status_success
+        && serde_json::from_slice::<serde_json::Value>(stdout)
+            .ok()
+            .and_then(|result| result["ok"].as_bool())
+            == Some(true)
+}
+
+fn show_stop_background_failure(app: &tauri::AppHandle, failure: StopBackgroundFailure) {
+    let message = match failure {
+        StopBackgroundFailure::TimedOut => {
+            "The background Bridge service did not stop within 10 seconds.\n\nHunsu Bridge will stay open. Wait for active work to finish, then try Quit again."
+        }
+        StopBackgroundFailure::CommandFailed => {
+            "The background Bridge service could not be stopped.\n\nHunsu Bridge will stay open. Open Connection, stop the Bridge, then try Quit again."
+        }
+    };
+    app.dialog()
+        .message(message)
+        .title("Could not quit Hunsu Bridge")
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::Ok)
+        .blocking_show();
 }
 
 fn bridge_args_for_protocol_url(value: &str) -> Result<Vec<String>, String> {
@@ -1356,6 +1436,82 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn confirmed_tray_quit_shows_dialog_before_resolving_preference() {
+        let calls = RefCell::new(Vec::new());
+
+        let continuation = confirm_before_resolving_quit_preference(
+            || {
+                calls.borrow_mut().push("dialog shown");
+                true
+            },
+            || calls.borrow_mut().push("preference resolver invoked"),
+        );
+
+        assert_eq!(continuation, Some(()));
+        assert_eq!(
+            calls.into_inner(),
+            vec!["dialog shown", "preference resolver invoked"]
+        );
+    }
+
+    #[test]
+    fn cancelled_tray_quit_has_no_post_confirmation_side_effects() {
+        let calls = RefCell::new(Vec::new());
+
+        let continuation = confirm_before_resolving_quit_preference(
+            || {
+                calls.borrow_mut().push("dialog shown");
+                false
+            },
+            || calls.borrow_mut().push("preference resolver invoked"),
+        );
+
+        assert_eq!(continuation, None);
+        assert_eq!(calls.into_inner(), vec!["dialog shown"]);
+    }
+
+    #[test]
+    fn tray_quit_uses_neutral_copy_and_bounded_post_confirmation_commands() {
+        assert_eq!(
+            QUIT_CONFIRMATION_MESSAGE,
+            "Quit Hunsu Bridge?\n\nYour configured background-service preference will be applied."
+        );
+        assert_eq!(QUIT_PREFERENCE_TIMEOUT, Duration::from_secs(1));
+        assert_eq!(QUIT_STOP_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(QUIT_PREFERENCE_ARGS, ["settings", "quit-behavior", "get"]);
+        assert_eq!(QUIT_STOP_ARGS, ["stop", "--json"]);
+    }
+
+    #[test]
+    fn quit_preference_read_defaults_safely_to_keep_background() {
+        assert_eq!(
+            quit_background_preference_from_output(true, b"stop-background\n"),
+            QuitBackgroundPreference::StopBackground
+        );
+        assert_eq!(
+            quit_background_preference_from_output(true, b"keep-background\n"),
+            QuitBackgroundPreference::KeepBackground
+        );
+        assert_eq!(
+            quit_background_preference_from_output(false, b"stop-background\n"),
+            QuitBackgroundPreference::KeepBackground
+        );
+        assert_eq!(
+            quit_background_preference_from_output(true, b"unexpected"),
+            QuitBackgroundPreference::KeepBackground
+        );
+    }
+
+    #[test]
+    fn stop_background_requires_a_successful_exit_and_json_result() {
+        assert!(stop_command_result_is_success(true, br#"{"ok":true}"#));
+        assert!(!stop_command_result_is_success(false, br#"{"ok":true}"#));
+        assert!(!stop_command_result_is_success(true, br#"{"ok":false}"#));
+        assert!(!stop_command_result_is_success(true, b"not json"));
+    }
 
     #[test]
     fn external_url_allowlist_rejects_arbitrary_web_origins() {

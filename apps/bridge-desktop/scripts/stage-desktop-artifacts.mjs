@@ -17,6 +17,7 @@ const artifactSizeReportName = "artifact-size-report.json";
 const managedBridgeEvidenceName = "windows-managed-bridge-e2e-evidence.json";
 const installedAppEvidenceName = "windows-installed-app-e2e-evidence.json";
 const installedAppScreenshotName = "windows-installed-app-e2e-screenshot.png";
+const installerUpgradeEvidenceName = "windows-installer-upgrade-e2e-evidence.json";
 const checksumFileName = "SHA256SUMS.txt";
 
 const targetArtifactRules = new Map([
@@ -91,6 +92,7 @@ export function stageDesktopArtifacts(input) {
     throw new Error(`Missing requested desktop artifact size report: ${reportPath}`);
   }
   if (includeSizeReport) {
+    validateArtifactSizeReport(reportPath, target);
     copyIntoStage(reportPath, outputRoot, artifactSizeReportName);
   }
 
@@ -121,6 +123,18 @@ export function stageDesktopArtifacts(input) {
     copyIntoStage(installedScreenshotPath, outputRoot, installedAppScreenshotName);
   }
 
+  const upgradeEvidencePath = optionalSourceFile(input?.upgradeEvidencePath, "Windows installer upgrade E2E evidence");
+  if (upgradeEvidencePath) {
+    if (containsPath(outputRoot, upgradeEvidencePath)) {
+      throw new Error(`Windows installer upgrade E2E evidence must be outside the artifact output directory: ${upgradeEvidencePath}`);
+    }
+    if (!includeSizeReport) {
+      throw new Error("Windows installer upgrade E2E evidence requires the artifact size report to be staged.");
+    }
+    validateInstallerUpgradeEvidence(upgradeEvidencePath);
+    copyIntoStage(upgradeEvidencePath, outputRoot, installerUpgradeEvidenceName);
+  }
+
   const stagedFiles = walkFiles(outputRoot)
     .map(path => portableRelativePath(outputRoot, path))
     .filter(path => path !== checksumFileName)
@@ -148,7 +162,8 @@ export function parseStageDesktopArtifactArguments(args) {
     ["--target", "target"],
     ["--evidence-path", "evidencePath"],
     ["--installed-evidence-path", "installedEvidencePath"],
-    ["--installed-screenshot-path", "installedScreenshotPath"]
+    ["--installed-screenshot-path", "installedScreenshotPath"],
+    ["--upgrade-evidence-path", "upgradeEvidencePath"]
   ]);
   const options = {};
 
@@ -177,7 +192,7 @@ export function parseStageDesktopArtifactArguments(args) {
   }
 
   for (const [option, property] of optionNames) {
-    if (property === "evidencePath" || property === "installedEvidencePath" || property === "installedScreenshotPath") {
+    if (property === "evidencePath" || property === "installedEvidencePath" || property === "installedScreenshotPath" || property === "upgradeEvidencePath") {
       continue;
     }
     if (!Object.hasOwn(options, property)) {
@@ -343,6 +358,121 @@ function validateInstalledAppEvidence(path, screenshotPath) {
   }
   if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken|hunsuRelayToken|authorization|access_token|refresh_token/iu.test(text)) {
     throw new Error(`Installed Bridge App E2E evidence contains a URL or credential parameter: ${path}`);
+  }
+}
+
+function validateInstallerUpgradeEvidence(path) {
+  const text = readFileSync(path, "utf8");
+  let evidence;
+  try {
+    evidence = JSON.parse(text);
+  } catch {
+    throw new Error(`Windows installer upgrade E2E evidence is not valid JSON: ${path}`);
+  }
+  if (evidence?.schema !== "hunsu.windows-installer-upgrade-e2e.v1"
+    || evidence?.schemaVersion !== 1
+    || evidence?.result !== "passed") {
+    throw new Error(`Windows installer upgrade E2E evidence did not record a passing schema-v1 run: ${path}`);
+  }
+  for (const scenario of ["A", "B", "C", "D", "E", "F"]) {
+    if (evidence?.scenarios?.[scenario]?.result !== "passed") {
+      throw new Error(`Windows installer upgrade E2E evidence is missing passing scenario ${scenario}: ${path}`);
+    }
+  }
+  const provenance = evidence?.provenance;
+  if (!provenance || typeof provenance !== "object"
+    || !/^(?:local|\d+)$/u.test(provenance.runId ?? "")
+    || !/^(?:local|\d+)$/u.test(provenance.runAttempt ?? "")
+    || !/^(?:local|[a-f0-9]{40,64})$/u.test(provenance.candidateSha ?? "")
+    || provenance.target !== "x86_64-pc-windows-msvc"
+    || provenance.expectedAppVersion !== "0.1.1"
+    || !isSha256(provenance.installerSha256)
+    || !isSha256(provenance.candidateSidecarSha256)
+    || !isSha256(provenance.installDirectoryId)
+    || !Number.isFinite(Date.parse(provenance.startedAt ?? ""))
+    || !Number.isFinite(Date.parse(provenance.completedAt ?? ""))
+    || Date.parse(provenance.completedAt) < Date.parse(provenance.startedAt)) {
+    throw new Error(`Windows installer upgrade E2E evidence has invalid provenance: ${path}`);
+  }
+  for (const measurement of ["installerBytes", "installedAppBytes", "installedSidecarBytes"]) {
+    if (!Number.isSafeInteger(evidence?.measurements?.[measurement]) || evidence.measurements[measurement] <= 0) {
+      throw new Error(`Windows installer upgrade E2E evidence has invalid ${measurement}: ${path}`);
+    }
+  }
+  if (!isSha256(evidence?.measurements?.installedSidecarSha256)
+    || evidence.measurements.installedSidecarSha256 !== provenance.candidateSidecarSha256
+    || evidence?.scenarios?.A?.candidateVersion !== "0.1.1"
+    || evidence?.scenarios?.A?.installedSidecarSha256 !== provenance.candidateSidecarSha256
+    || evidence?.scenarios?.E?.launchReportedCode !== "BRIDGE_PORT_IN_USE"
+    || evidence?.scenarios?.F?.similarExecutableOutsideTargetPreserved !== true) {
+    throw new Error(`Windows installer upgrade E2E evidence is missing required upgrade observations: ${path}`);
+  }
+  if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken|hunsuRelayToken|authorization|access_token|refresh_token|controlToken/iu.test(text)
+    || containsFullUserProfilePath(evidence)) {
+    throw new Error(`Windows installer upgrade E2E evidence contains a URL, credential parameter, or full user-profile path: ${path}`);
+  }
+}
+
+function containsFullUserProfilePath(value) {
+  if (typeof value === "string") return /[a-z]:\\users\\/iu.test(value);
+  if (Array.isArray(value)) return value.some(containsFullUserProfilePath);
+  if (value && typeof value === "object") return Object.values(value).some(containsFullUserProfilePath);
+  return false;
+}
+
+function validateArtifactSizeReport(path, target) {
+  let report;
+  try {
+    report = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    throw new Error(`Desktop artifact size report is not valid JSON: ${path}`);
+  }
+  if (report?.schema !== "hunsu.bridge-desktop-artifact-sizes.v3"
+    || report?.target !== target
+    || !Number.isSafeInteger(report?.totalBytes)
+    || report.totalBytes < 0
+    || report?.packaging?.fixedWebViewRuntimeBundled !== false
+    || report?.packaging?.fixedWebViewRuntimeAllowedForThisChange !== false) {
+    throw new Error(`Desktop artifact size report has an invalid v3 contract: ${path}`);
+  }
+  if (target === "x86_64-pc-windows-msvc") {
+    const measurements = report?.measurements;
+    const policy = report?.policy;
+    const policyChecks = Array.isArray(policy?.checks) ? policy.checks : [];
+    const installerCheck = policyChecks.find(check => check?.metric === "installerBytes");
+    const artifactZipCheck = policyChecks.find(check => check?.metric === "artifactZipBytes");
+    const hasExceptedCheck = policyChecks.some(check => check?.status === "excepted");
+    const validException = policy?.status !== "passed-with-reviewed-exception"
+      ? policy?.reviewedException === null && !hasExceptedCheck
+      : typeof policy?.reviewedException === "string"
+        && policy.reviewedException.trim().length >= 12
+        && policy.reviewedException.length <= 300
+        && hasExceptedCheck;
+    if (!Number.isSafeInteger(measurements?.installer?.sizeBytes)
+      || measurements.installer.sizeBytes <= 0
+      || !Number.isSafeInteger(measurements?.artifactZip?.sizeBytes)
+      || measurements.artifactZip.sizeBytes <= 0
+      || !Number.isSafeInteger(measurements?.installedApp?.sizeBytes)
+      || measurements.installedApp.sizeBytes <= 0
+      || !Number.isSafeInteger(measurements?.installedSidecar?.sizeBytes)
+      || measurements.installedSidecar.sizeBytes <= 0
+      || !Number.isSafeInteger(measurements?.installerLifecycleHelpers?.sizeBytes)
+      || measurements.installerLifecycleHelpers.sizeBytes <= 0
+      || report?.packaging?.configurationChecked !== true
+      || !["passed", "passed-with-reviewed-exception"].includes(policy?.status)
+      || policy?.maximumGrowthPercent !== 5
+      || policy?.minimumGrowthAllowanceBytes !== 1_048_576
+      || policy?.baselineSource?.workflowRunId !== "29147290486"
+      || policy?.baselineSource?.artifactId !== "8247220443"
+      || installerCheck?.baselineBytes !== 24_997_090
+      || installerCheck?.currentBytes !== measurements.installer.sizeBytes
+      || !["passed", "excepted"].includes(installerCheck?.status)
+      || artifactZipCheck?.baselineBytes !== 25_065_843
+      || artifactZipCheck?.currentBytes !== measurements.artifactZip.sizeBytes
+      || !["passed", "excepted"].includes(artifactZipCheck?.status)
+      || !validException) {
+      throw new Error(`Windows x64 artifact size report is missing guarded installer measurements: ${path}`);
+    }
   }
 }
 

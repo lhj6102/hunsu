@@ -131,7 +131,7 @@ test("Bridge App version and Node runtime checks never start the packaged sideca
     console.log = previousLog;
   }
 
-  assert.deepEqual(output, ["Hunsu Bridge 0.1.0"]);
+  assert.deepEqual(output, ["Hunsu Bridge 0.1.1"]);
   assert.deepEqual(currentNodeRuntimeStatus("C:\\Hunsu\\hunsu-bridge.exe", "v22.22.0"), {
     installed: true,
     binaryPath: "C:\\Hunsu\\hunsu-bridge.exe",
@@ -206,7 +206,12 @@ test("Bridge App Tauri tray routes focus, refreshes summaries, and uses persiste
   assert.match(source, /fn refresh_bridge_tray_menu/);
   assert.match(source, /tray\.set_menu\(Some\(menu\)\)/);
   assert.match(source, /quit_background_preference/);
-  assert.match(source, /snapshot\["status"\]\["quitBehavior"\]/);
+  assert.match(source, /QUIT_PREFERENCE_ARGS: \[&str; 3\] = \["settings", "quit-behavior", "get"\]/);
+  const quitPreferenceRead = source.match(
+    /async fn quit_background_preference\([\s\S]*?\n\}\n\nfn quit_background_preference_from_output/
+  )?.[0];
+  assert.ok(quitPreferenceRead);
+  assert.doesNotMatch(quitPreferenceRead, /bridge_snapshot|snapshot/);
   assert.doesNotMatch(source, /HUNSU_BRIDGE_QUIT_BACKGROUND/);
 });
 
@@ -2912,12 +2917,12 @@ test("Bridge desktop filtered artifact report command resolves package-root defa
     assert.equal(reported.status, 0, `${reported.stdout}\n${reported.stderr}`);
     const report = JSON.parse(readFileSync(join(bundleDir, "artifact-size-report.json"), "utf8")) as {
       schema: string;
-      directory: string;
+      target: string;
       artifacts: Array<{ path: string }>;
       sidecars: Array<{ target: string; file: string }>;
     };
-    assert.equal(report.schema, "hunsu.bridge-desktop-artifact-sizes.v2");
-    assert.equal(report.directory, bundleDir);
+    assert.equal(report.schema, "hunsu.bridge-desktop-artifact-sizes.v3");
+    assert.equal(report.target, target);
     assert.deepEqual(report.artifacts.map(artifact => artifact.path), ["Hunsu Bridge.test-bundle"]);
     assert.deepEqual(report.sidecars, [{
       target,
@@ -3003,7 +3008,12 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(tauriSource, /Add Workspace/);
     assert.match(tauriSource, /MessageDialogButtons::OkCancel/);
     assert.match(tauriSource, /quit_background_preference/);
-    assert.match(tauriSource, /status"\]\["quitBehavior"\]/);
+    assert.match(tauriSource, /QUIT_PREFERENCE_ARGS: \[&str; 3\] = \["settings", "quit-behavior", "get"\]/);
+    const quitPreferenceRead = tauriSource.match(
+      /async fn quit_background_preference\([\s\S]*?\n\}\n\nfn quit_background_preference_from_output/
+    )?.[0];
+    assert.ok(quitPreferenceRead);
+    assert.doesNotMatch(quitPreferenceRead, /bridge_snapshot|snapshot/);
     assert.doesNotMatch(tauriSource, /HUNSU_BRIDGE_QUIT_BACKGROUND/);
     const sidecarScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/prepare-sidecars.mjs"), "utf8");
     const buildScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/build-native-sidecars.mjs"), "utf8");
@@ -3200,7 +3210,7 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
       schema: string;
       sidecars: Array<{ target: string; file: string }>;
     };
-    assert.equal(sizeReport.schema, "hunsu.bridge-desktop-artifact-sizes.v2");
+    assert.equal(sizeReport.schema, "hunsu.bridge-desktop-artifact-sizes.v3");
     assert.deepEqual(sizeReport.sidecars.map(sidecar => sidecar.target), [sidecarArtifacts[0][0]]);
     assert.match(reported.stdout, new RegExp(`sidecar:${sidecarArtifacts[0][0]}`));
 

@@ -1,0 +1,17 @@
+{
+  "schema": "hunsu.bridge-desktop-windows-size-baseline.v1",
+  "source": {
+    "workflowRunId": "29147290486",
+    "artifactId": "8247220443",
+    "candidateSha": "3df55aa058736baacf6635515112ccd6f165ffd3",
+    "installerSha256": "200ebc9d7c5ce95e0d64772f4d42eb9eb877a4ecd78865db2f8cbe10c3fb378c"
+  },
+  "measurements": {
+    "installerBytes": 24997090,
+    "artifactZipBytes": 25065843
+  },
+  "policy": {
+    "maximumGrowthPercent": 5,
+    "minimumGrowthAllowanceBytes": 1048576
+  }
+}

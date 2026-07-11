@@ -54,7 +54,7 @@ test("Bridge desktop UI renders lifecycle ownership controls and runtime semanti
   assert.match(text(ui.element("#node-card")), /Embedded runtime[\s\S]*Node v22\.22\.0[\s\S]*Bundled with Hunsu Bridge/);
   assert.match(text(ui.element("#node-card")), /System Node[\s\S]*Not installed · Optional/);
   assert.doesNotMatch(text(ui.element("#node-card")), /hunsu-bridge-sidecar\.exe/);
-  assert.equal(ui.element("#bridge-app-version").textContent, "0.1.0");
+  assert.equal(ui.element("#bridge-app-version").textContent, "0.1.1");
   assert.equal(ui.element("#bridge-runtime-version").textContent, "0.1.2");
   assert.equal(ui.element("#protocol-version").textContent, "local-bridge-v1");
   assert.equal(ui.element("#embedded-node-version").textContent, "v22.22.0");
@@ -741,7 +741,7 @@ function snapshotFixture() {
       }
     },
     versions: {
-      bridgeApp: "0.1.0",
+      bridgeApp: "0.1.1",
       bridgeRuntime: "0.1.2",
       protocol: "local-bridge-v1",
       embeddedNode: "v22.22.0",

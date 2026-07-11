@@ -179,9 +179,14 @@ and workspace state do not stay at launch-time values. Diagnostics routes to
 `hunsu://diagnostics`; `hunsu://prerequisites` remains a Provider compatibility
 alias.
 
-Quit is explicit. The native menu confirms before exiting and honors the
-persisted background preference for keeping or stopping the supervised Local
-Bridge. The preference is exposed in Bridge App Settings and through
+Quit is explicit. The native menu shows preference-neutral confirmation before
+reading Bridge state, so snapshot, provider, and diagnostics work cannot delay
+the dialog. Cancel performs no preference lookup or lifecycle action. After
+confirmation, the shell reads only `settings quit-behavior get` with a one-second
+bound and safely falls back to keep-background. Stop-background uses bounded
+`stop --json` verification; failure keeps the desktop app open with an
+actionable message instead of silently ignoring the preference. The preference
+is exposed in Bridge App Settings and through
 `hunsu-bridge settings quit-behavior`.
 
 Studio remains the main product UI for Roadmaps, Execute, Hunsu Drafts,
