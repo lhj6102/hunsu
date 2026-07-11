@@ -81,9 +81,14 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
   assert.match(driver, /safeConsoleErrorSummary/u);
   assert.match(driver, /redactConsoleError/u);
   assert.match(driver, /verifyPortConflictFeedback/u);
+  assert.match(driver, /verifyAdvancedPresentation/u);
   assert.match(driver, /The configured Bridge port is in use by another process\./u);
-  assert.match(driver, /Bridge port \$\{bridgePort\}.*select Start Bridge again/u);
+  assert.match(driver, /Bridge port \$\{bridgePort\}.*Connection section.*select Start Bridge/u);
   assert.match(driver, /configuredPort: bridgePort/u);
+  assert.match(driver, /selectedStylingDistinct/u);
+  assert.match(driver, /globalRemoteControlCount === 0/u);
+  assert.match(driver, /workspaceRemoteActionCount === 1/u);
+  assert.match(driver, /gitHeadingCount === 0 && gitLabelCount === 1/u);
   assert.match(driver, /capturedUrl\.pathname === `\/studio\/roadmaps\/\$\{encodeURIComponent\(roadmapId\)\}`/u);
   assert.match(driver, /page\.screenshot/u);
   assert.match(driver, /silent-isolated-install/u);

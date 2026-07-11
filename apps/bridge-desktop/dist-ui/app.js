@@ -1670,20 +1670,6 @@ selectedProjectAction.addEventListener("click", () => void runUiAction({
   controls: [selectedProjectAction],
   execute: runSelectedAction
 }));
-document.querySelector("#enable-remote").addEventListener("click", event => void runUiAction({
-  id: "enable-remote",
-  pendingMessage: "Enabling Remote Access…",
-  successMessage: "Remote Access enabled.",
-  controls: [event.currentTarget],
-  execute: () => runCommand(["remote", "enable"])
-}));
-document.querySelector("#disable-remote").addEventListener("click", event => void runUiAction({
-  id: "disable-remote",
-  pendingMessage: "Disabling Remote Access…",
-  successMessage: "Remote Access disabled.",
-  controls: [event.currentTarget],
-  execute: () => runCommand(["remote", "disable"])
-}));
 connectionEls.primaryAction.addEventListener("click", event => void runConnectionActionWithFeedback(event));
 connectionEls.secondaryAction.addEventListener("click", event => void runConnectionActionWithFeedback(event));
 document.querySelector("#install-protocol").addEventListener("click", event => void runUiAction({

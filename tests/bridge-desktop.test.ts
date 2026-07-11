@@ -631,10 +631,10 @@ test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGP
 
 test("Bridge App desktop UI keeps Local/Remote connection primary and provider placeholders Advanced", () => {
   const html = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/index.html"), "utf8");
-  const primaryNav = html.match(/<nav aria-label="Bridge sections">([\s\S]*?)<\/nav>/)?.[1] ?? "";
+  const primaryNav = html.match(/<nav\b[^>]*aria-label="Bridge sections"[^>]*>([\s\S]*?)<\/nav>/)?.[1] ?? "";
   assert.deepEqual([...primaryNav.matchAll(/<button[^>]*>([^<]+)<\/button>/g)].map(match => match[1]), ["Provider", "Workspaces", "Connection"]);
   assert.doesNotMatch(primaryNav, /Overview|Advanced|Diagnostics|Settings/);
-  const providerPanel = html.match(/<section data-panel="provider">([\s\S]*?)<\/section>/)?.[1] ?? "";
+  const providerPanel = html.match(/<section\b[^>]*data-panel="provider"[^>]*>([\s\S]*?)<\/section>/)?.[1] ?? "";
   assert.match(providerPanel, /<dt>Provider<\/dt>[\s\S]*<dt>Workspaces<\/dt>[\s\S]*<dt>Connection<\/dt>/);
   assert.doesNotMatch(providerPanel, /Account|Remote Access|Device|Service/);
   assert.match(html, /id="provider-config-form"/);

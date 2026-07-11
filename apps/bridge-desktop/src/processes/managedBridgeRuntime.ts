@@ -769,8 +769,8 @@ function portConflictRecovery(bridgeApiUrl: string): { label: string; action: st
     || (endpoint.protocol === "http:" ? "80" : endpoint.protocol === "https:" ? "443" : "");
   return {
     label: configuredPort
-      ? `Stop the other process using Bridge port ${configuredPort}, then select Start Bridge again.`
-      : "Stop the other process using the configured Bridge port, then select Start Bridge again.",
+      ? `Stop the other process using Bridge port ${configuredPort}, then open the Connection section and select Start Bridge.`
+      : "Stop the other process using the configured Bridge port, then open the Connection section and select Start Bridge.",
     action: "retry-start-bridge"
   };
 }

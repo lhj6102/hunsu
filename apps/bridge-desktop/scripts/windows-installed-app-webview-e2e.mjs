@@ -65,6 +65,7 @@ try {
   await waitForLifecycle(page, { localLabel: "Not Running", startDisabled: false, stopDisabled: true });
   const portConflictFeedback = await verifyPortConflictFeedback(page, options.bridgePort);
   await openAdvancedPanel(page, "advanced");
+  const advancedPresentation = await verifyAdvancedPresentation(page);
   mkdirSync(dirname(options.screenshotPath), { recursive: true });
   await page.screenshot({ path: options.screenshotPath, fullPage: true });
 
@@ -94,11 +95,13 @@ try {
       "no-webview-console-errors",
       "visual-screenshot",
       "provider-validate-recheck-feedback",
-      "version-labels"
+      "version-labels",
+      "advanced-presentation"
     ],
     observations: {
       lifecycleTransitions: ["connected-managed", "not-running", "connected-managed", "not-running"],
       portConflictFeedback,
+      advancedPresentation,
       workspaceRoadmapIdMatched: true,
       browserHandoffs: { web: 1, workspace: 1 },
       diagnosticsSha256: diagnosticsObservation.diagnosticsSha256,
@@ -366,7 +369,7 @@ function assertSafeDiagnosticsText(text, legacySecret, runtimeTokens) {
 
 async function verifyPortConflictFeedback(page, bridgePort) {
   const summary = "The configured Bridge port is in use by another process.";
-  const retryInstruction = `Stop the other process using Bridge port ${bridgePort}, then select Start Bridge again.`;
+  const retryInstruction = `Stop the other process using Bridge port ${bridgePort}, then open the Connection section and select Start Bridge.`;
   const server = createServer(socket => socket.destroy());
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -388,8 +391,8 @@ async function verifyPortConflictFeedback(page, bridgePort) {
     const visibleFeedback = await page.locator("#action-status").textContent();
     assert(visibleFeedback?.includes(`Bridge port ${bridgePort}`),
       "Port-conflict feedback did not identify the configured Bridge port.");
-    assert(visibleFeedback?.includes("select Start Bridge again"),
-      "Port-conflict feedback did not tell the user how to retry.");
+    assert(visibleFeedback?.includes("open the Connection section and select Start Bridge"),
+      "Port-conflict feedback did not direct the user to the lifecycle controls.");
     assert(!(await page.locator("#start-bridge").isDisabled()), "Start did not recover after actionable port-conflict feedback.");
     assert(await page.locator("#stop-bridge").isDisabled(), "Stop became available for an unrelated port owner.");
     const trace = await readTransitionTrace(page);
@@ -414,6 +417,46 @@ async function openAdvancedPanel(page, panelName) {
   }
   await page.locator(`main > details button[data-tab="${panelName}"]`).click();
   await page.locator(`section[data-panel="${panelName}"]`).waitFor({ state: "visible" });
+}
+
+async function verifyAdvancedPresentation(page) {
+  const selected = page.locator('main > details button[data-tab="advanced"]');
+  const unselected = page.locator('main > details button[data-tab="diagnostics"]');
+  assert(await selected.getAttribute("aria-selected") === "true",
+    "The active Advanced tab did not expose its selected state.");
+  const [selectedStyle, unselectedStyle] = await Promise.all([
+    selected.evaluate(element => ({
+      backgroundColor: getComputedStyle(element).backgroundColor,
+      color: getComputedStyle(element).color
+    })),
+    unselected.evaluate(element => ({
+      backgroundColor: getComputedStyle(element).backgroundColor,
+      color: getComputedStyle(element).color
+    }))
+  ]);
+  const selectedStylingDistinct = selectedStyle.backgroundColor !== unselectedStyle.backgroundColor
+    && selectedStyle.color !== unselectedStyle.color;
+  assert(selectedStylingDistinct, "The active Advanced tab was not visually distinct.");
+
+  const advancedButtons = await page.locator('section[data-panel="advanced"] button').allTextContents();
+  const globalRemoteControlCount = await page.locator("#enable-remote, #disable-remote").count();
+  const workspaceRemoteActionCount = advancedButtons.filter(label => label.trim() === "Enable Remote Access").length;
+  assert(globalRemoteControlCount === 0, "Advanced still exposed redundant global Remote Access controls.");
+  assert(workspaceRemoteActionCount === 1, "Advanced did not expose exactly one applicable Workspace Remote Access action.");
+
+  const gitHeadingCount = await page.locator('section[data-panel="advanced"] h3').evaluateAll(elements =>
+    elements.filter(element => element.textContent?.trim() === "Git").length);
+  const gitLabelCount = await page.locator("#git-card .project-title").evaluateAll(elements =>
+    elements.filter(element => element.textContent?.trim() === "Git").length);
+  assert(gitHeadingCount === 0 && gitLabelCount === 1, "Advanced repeated or omitted the Git diagnostic label.");
+
+  return {
+    selectedTab: "Runtime Providers",
+    selectedStylingDistinct,
+    globalRemoteControlCount,
+    workspaceRemoteActionCount,
+    gitLabelCount
+  };
 }
 
 async function waitForTerminalFeedback(page, selector, terminalText, timeout) {

@@ -293,7 +293,8 @@ function validateInstalledAppEvidence(path, screenshotPath) {
     "no-webview-console-errors",
     "visual-screenshot",
     "provider-validate-recheck-feedback",
-    "version-labels"
+    "version-labels",
+    "advanced-presentation"
   ];
   if (evidence?.schemaVersion !== 1 || evidence?.result !== "passed" || evidence?.candidateKind !== "installed-nsis") {
     throw new Error(`Installed Bridge App E2E evidence did not record a passing schema-v1 NSIS run: ${path}`);
@@ -329,8 +330,16 @@ function validateInstalledAppEvidence(path, screenshotPath) {
     || portConflictFeedback.configuredPort < 1
     || portConflictFeedback.configuredPort > 65_535
     || portConflictFeedback.retryInstruction
-      !== `Stop the other process using Bridge port ${portConflictFeedback.configuredPort}, then select Start Bridge again.`) {
+      !== `Stop the other process using Bridge port ${portConflictFeedback.configuredPort}, then open the Connection section and select Start Bridge.`) {
     throw new Error(`Installed Bridge App E2E evidence is missing actionable configured-port feedback: ${path}`);
+  }
+  const advancedPresentation = evidence?.observations?.advancedPresentation;
+  if (advancedPresentation?.selectedTab !== "Runtime Providers"
+    || advancedPresentation?.selectedStylingDistinct !== true
+    || advancedPresentation?.globalRemoteControlCount !== 0
+    || advancedPresentation?.workspaceRemoteActionCount !== 1
+    || advancedPresentation?.gitLabelCount !== 1) {
+    throw new Error(`Installed Bridge App E2E evidence is missing unambiguous Advanced presentation: ${path}`);
   }
   if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken|hunsuRelayToken|authorization|access_token|refresh_token/iu.test(text)) {
     throw new Error(`Installed Bridge App E2E evidence contains a URL or credential parameter: ${path}`);

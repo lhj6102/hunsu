@@ -173,7 +173,8 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
     "no-webview-console-errors",
     "visual-screenshot",
     "provider-validate-recheck-feedback",
-    "version-labels"
+    "version-labels",
+    "advanced-presentation"
   ];
 
   try {
@@ -198,7 +199,14 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
         portConflictFeedback: {
           code: "BRIDGE_PORT_IN_USE",
           configuredPort: 43127,
-          retryInstruction: "Stop the other process using Bridge port 43127, then select Start Bridge again."
+          retryInstruction: "Stop the other process using Bridge port 43127, then open the Connection section and select Start Bridge."
+        },
+        advancedPresentation: {
+          selectedTab: "Runtime Providers",
+          selectedStylingDistinct: true,
+          globalRemoteControlCount: 0,
+          workspaceRemoteActionCount: 1,
+          gitLabelCount: 1
         },
         screenshotFile: "windows-installed-app-e2e-screenshot.png"
       },

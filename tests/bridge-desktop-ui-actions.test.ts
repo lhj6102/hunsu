@@ -18,6 +18,15 @@ test("Bridge desktop UI exposes awaited feedback and fresh diagnostics contracts
   assert.doesNotMatch(html, /\sstyle=/u);
   assert.doesNotMatch(source, /\.style\.|setAttribute\(["']style["']/u);
   assert.match(source, /actions\.className = "actions space-top-10"/u);
+  assert.match(html, /button\[data-tab\]\[aria-selected="true"\][^{]*\{[^}]*background:\s*#1f6feb;[^}]*color:\s*#ffffff;/su);
+  assert.equal(html.match(/role="tablist"/gu)?.length, 2);
+  assert.equal(html.match(/data-tab="[^"]+" role="tab" aria-selected="(?:true|false)" aria-controls="panel-[^"]+"/gu)?.length, 6);
+  assert.equal(html.match(/data-panel="[^"]+" role="tabpanel"/gu)?.length, 6);
+  assert.doesNotMatch(html, /id="(?:enable|disable)-remote"/u);
+  assert.doesNotMatch(source, /querySelector\("#(?:enable|disable)-remote"\)/u);
+  assert.match(source, /configureConnectionButton\(connectionEls\.primaryAction, "Enable Remote Access", "enable-remote", true\)/u);
+  assert.match(source, /remoteButton\.textContent = remote\.enabled \? "Disable Remote Access" : "Enable Remote Access"/u);
+  assert.doesNotMatch(html, /<h3[^>]*>\s*Git\s*<\/h3>/u);
 });
 
 test("Validate, Save, Recheck, and provider install expose explicit feedback and prerequisite copy", () => {
@@ -128,6 +137,7 @@ test("Bridge desktop UI keeps missing Git and planned provider copy concise", ()
   });
 
   const gitCopy = text(ui.element("#git-card"));
+  assert.equal(gitCopy.split("\n").filter(line => line === "Git").length, 1);
   assert.match(gitCopy, /Missing[\s\S]*Install Git and make sure it is available on PATH\./);
   assert.doesNotMatch(gitCopy, /--version|not recognized|[\\"]/u);
 
@@ -372,7 +382,7 @@ test("failed Pair, Open, Start, and Stop feedback is safe and survives snapshot 
       code: "BRIDGE_PORT_IN_USE",
       message: "Start failed access_token=synthetic-action-secret",
       recovery: {
-        label: "Stop the other process using Bridge port 43127, then select Start Bridge again.",
+        label: "Stop the other process using Bridge port 43127, then open the Connection section and select Start Bridge.",
         action: "retry-start-bridge"
       }
     },
@@ -404,7 +414,7 @@ test("failed Pair, Open, Start, and Stop feedback is safe and survives snapshot 
     {
       label: "Start",
       target: "#start-bridge",
-      expected: /Bridge could not be started.*configured Bridge port is in use.*Bridge port 43127.*select Start Bridge again/is,
+      expected: /Bridge could not be started.*configured Bridge port is in use.*Bridge port 43127.*Connection section.*select Start Bridge/is,
       snapshot: () => providerConfigSnapshotFixture({ bridgeState: "not-running" })
     },
     {

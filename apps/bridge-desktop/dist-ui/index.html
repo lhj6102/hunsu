@@ -43,9 +43,10 @@
         gap: 8px;
         margin-top: 18px;
       }
-      nav button[aria-selected="true"] {
+      button[data-tab][aria-selected="true"] {
         border-color: #1f6feb;
-        background: #eaf2ff;
+        background: #1f6feb;
+        color: #ffffff;
       }
       section[hidden] {
         display: none;
@@ -276,21 +277,21 @@
       </header>
       <div id="action-status" class="message action-status" role="status" aria-live="polite"></div>
 
-      <nav aria-label="Bridge sections">
-        <button data-tab="provider" aria-selected="true">Provider</button>
-        <button data-tab="workspaces">Workspaces</button>
-        <button data-tab="connection">Connection</button>
+      <nav role="tablist" aria-label="Bridge sections">
+        <button data-tab="provider" role="tab" aria-selected="true" aria-controls="panel-provider">Provider</button>
+        <button data-tab="workspaces" role="tab" aria-selected="false" aria-controls="panel-workspaces">Workspaces</button>
+        <button data-tab="connection" role="tab" aria-selected="false" aria-controls="panel-connection">Connection</button>
       </nav>
       <details>
         <summary>Advanced</summary>
-        <div class="actions space-top-10">
-          <button data-tab="advanced">Runtime Providers</button>
-          <button data-tab="diagnostics">Diagnostics</button>
-          <button data-tab="settings">Settings</button>
+        <div class="actions space-top-10" role="tablist" aria-label="Advanced Bridge sections">
+          <button data-tab="advanced" role="tab" aria-selected="false" aria-controls="panel-advanced">Runtime Providers</button>
+          <button data-tab="diagnostics" role="tab" aria-selected="false" aria-controls="panel-diagnostics">Diagnostics</button>
+          <button data-tab="settings" role="tab" aria-selected="false" aria-controls="panel-settings">Settings</button>
         </div>
       </details>
 
-      <section data-panel="provider">
+      <section id="panel-provider" data-panel="provider" role="tabpanel">
         <h2>Provider</h2>
         <dl>
           <dt>Provider</dt>
@@ -303,7 +304,7 @@
         <div id="codex-card" class="grid"></div>
       </section>
 
-      <section data-panel="workspaces" hidden>
+      <section id="panel-workspaces" data-panel="workspaces" role="tabpanel" hidden>
         <h2>Workspaces</h2>
         <div class="actions">
           <button id="choose-folder" class="primary">Add Workspace</button>
@@ -316,7 +317,7 @@
         <div id="inactive-roadmap-list" class="grid"></div>
       </section>
 
-      <section data-panel="connection" hidden>
+      <section id="panel-connection" data-panel="connection" role="tabpanel" hidden>
         <h2>Connection</h2>
         <div class="connection-state">
           <div class="project-row">
@@ -361,11 +362,10 @@
         </details>
       </section>
 
-      <section data-panel="advanced" hidden>
+      <section id="panel-advanced" data-panel="advanced" role="tabpanel" hidden>
         <h2>Runtime Providers</h2>
         <div id="runtime-provider-list" class="grid"></div>
         <h2 class="space-top-18">Advanced Checks</h2>
-        <h3>Git</h3>
         <div id="git-card" class="grid"></div>
         <h3 class="space-top-18">Runtime and optional system tools</h3>
         <div id="node-card" class="grid"></div>
@@ -386,13 +386,9 @@
         <div id="remote-roadmap-list" class="grid"></div>
         <h2 class="space-top-18">Project Grants</h2>
         <div id="project-grants" class="grid"></div>
-        <div class="actions">
-          <button id="enable-remote">Enable Remote Access</button>
-          <button id="disable-remote">Disable Remote Access</button>
-        </div>
       </section>
 
-      <section data-panel="diagnostics" hidden>
+      <section id="panel-diagnostics" data-panel="diagnostics" role="tabpanel" hidden>
         <h2>Diagnostics</h2>
         <div class="actions">
           <button id="copy-diagnostics">Copy Diagnostics</button>
@@ -400,7 +396,7 @@
         <pre id="diagnostics">{}</pre>
       </section>
 
-      <section data-panel="settings" hidden>
+      <section id="panel-settings" data-panel="settings" role="tabpanel" hidden>
         <h2>Settings</h2>
         <div class="grid">
           <label>
