@@ -963,6 +963,7 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
   }, null, 2)}\n`, "utf8");
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(root, "missing-path"),
+    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath,
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
     HUNSU_BRIDGE_DEVICE_ID: "device_local",
     HUNSU_BRIDGE_DEVICE_NAME: "Local Devbox"
