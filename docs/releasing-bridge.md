@@ -54,12 +54,14 @@ push workflow:
 git tag -a v0.2.0-next.0 -m "Release @hunsu/bridge 0.2.0-next.0"
 git push origin v0.2.0-next.0
 gh workflow run publish-bridge.yml \
-  --ref v0.2.0-next.0 \
+  --ref main \
   -f version_tag=v0.2.0-next.0 \
   -f dist_tag=next \
   -f confirm_stable=false
 ~~~
 
+The protected workflow definition always runs from `main`, checks out the
+selected immutable tag, and verifies that its commit is already in `main`.
 Approve the protected environment only after the verification and clean
 tarball jobs pass. The workflow publishes the checksum-pinned,
 pnpm-normalized tarball that passed the package job, not a newly packed source

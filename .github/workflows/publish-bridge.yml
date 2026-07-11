@@ -49,8 +49,8 @@ jobs:
           CONFIRM_STABLE: ${{ inputs.confirm_stable }}
         shell: bash
         run: |
-          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
-            echo "Dispatch this workflow from the exact tag $VERSION_TAG." >&2
+          if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "Dispatch this protected workflow from main; version_tag selects the exact release tag." >&2
             exit 1
           fi
           node --input-type=module -e '
@@ -72,8 +72,9 @@ jobs:
             }
           '
           verified_sha=$(git rev-parse "${VERSION_TAG}^{commit}")
-          if [[ "$verified_sha" != "$GITHUB_SHA" ]]; then
-            echo "The dispatched tag does not resolve to the checked-out commit." >&2
+          checked_out_sha=$(git rev-parse HEAD)
+          if [[ "$verified_sha" != "$checked_out_sha" ]]; then
+            echo "The selected tag does not resolve to the checked-out commit." >&2
             exit 1
           fi
           git fetch --no-tags origin main
@@ -204,11 +205,12 @@ jobs:
           sha256sum --check bridge-release/SHA256SUMS
           git fetch --force origin "refs/tags/${VERSION_TAG}:refs/tags/hunsu-release-candidate"
           current_tag_sha=$(git rev-parse "refs/tags/hunsu-release-candidate^{commit}")
-          if [[ "$current_tag_sha" != "$VERIFIED_SHA" || "$GITHUB_SHA" != "$VERIFIED_SHA" ]]; then
+          checked_out_sha=$(git rev-parse HEAD)
+          if [[ "$current_tag_sha" != "$VERIFIED_SHA" || "$checked_out_sha" != "$VERIFIED_SHA" ]]; then
             echo "The release tag moved after verification." >&2
             exit 1
           fi
       - name: Publish exact version with provenance
         env:
           DIST_TAG: ${{ inputs.dist_tag }}
-        run: npm publish bridge-release/*.tgz --tag "$DIST_TAG" --provenance
+        run: npm publish ./bridge-release/*.tgz --tag "$DIST_TAG" --provenance
