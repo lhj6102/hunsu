@@ -24,7 +24,7 @@ export type BridgeProcessCommandIdentity = {
 
 export type BridgeProcessStartMetadata = {
   platform: NodeJS.Platform;
-  source: "proc-stat" | "ps-lstart";
+  source: "proc-stat" | "ps-lstart" | "windows-cim-creation-date";
   value: string;
 };
 
@@ -33,6 +33,8 @@ export type BridgeProcessRuntimeMetadata = {
   processNonce?: string;
   commandIdentity: BridgeProcessCommandIdentity;
   startMetadata?: BridgeProcessStartMetadata;
+  parentPid?: number;
+  executablePath?: string;
   recordedAt: string;
 };
 

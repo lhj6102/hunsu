@@ -55,6 +55,8 @@ export type ManagedBridgeErrorCode =
   | "BRIDGE_START_COORDINATION_TIMEOUT"
   | "BRIDGE_START_TIMEOUT"
   | "BRIDGE_CONTROL_UNAVAILABLE"
+  | "BRIDGE_NOT_OWNED"
+  | "BRIDGE_STOP_TIMEOUT"
   | "PAIRING_ROTATION_FAILED"
   | "BROWSER_OPEN_FAILED"
   | "ROADMAP_NOT_FOUND";
@@ -72,6 +74,11 @@ export type ManagedBridgeResult<T> =
 export type ManagedBridgeEnsureResult = ManagedBridgeResult<ManagedBridgeIdentity & {
   state: "running-managed";
   transition: "reused" | "started";
+}>;
+
+export type ManagedBridgeStopResult = ManagedBridgeResult<{
+  previousState: "running-managed" | "not-running";
+  state: "stopped";
 }>;
 
 export type ManagedBridgeBrowserResult = ManagedBridgeResult<{
@@ -121,6 +128,7 @@ export type ManagedBridgeRuntimeOptions = {
   probeTimeoutMs?: number;
   coordinationTimeoutMs?: number;
   startTimeoutMs?: number;
+  stopTimeoutMs?: number;
   pollIntervalMs?: number;
   writeStructuredLog?: (event: Record<string, unknown>) => void;
 };
@@ -128,6 +136,7 @@ export type ManagedBridgeRuntimeOptions = {
 export type ManagedBridgeRuntime = {
   discoverManagedBridge(): Promise<ManagedBridgeDiscovery>;
   ensureManagedBridgeRunning(input?: ManagedBridgeEnsureInput): Promise<ManagedBridgeEnsureResult>;
+  stopManagedBridge(): Promise<ManagedBridgeStopResult>;
   createManagedPairing(input?: ManagedBridgePairingInput): Promise<ManagedBridgeBrowserResult>;
   openManagedRoadmap(roadmapId: string, input?: Omit<ManagedBridgePairingInput, "roadmapId">): Promise<ManagedBridgeBrowserResult>;
 };
@@ -185,6 +194,7 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
   const probeTimeoutMs = options.probeTimeoutMs ?? 1_500;
   const coordinationTimeoutMs = options.coordinationTimeoutMs ?? 8_000;
   const startTimeoutMs = options.startTimeoutMs ?? 12_000;
+  const stopTimeoutMs = options.stopTimeoutMs ?? 8_000;
   const pollIntervalMs = options.pollIntervalMs ?? 100;
   const configuredEndpoint = resolveBridgeApiServerConfig(env);
   const canonicalBridgeApiUrl = normalizeBridgeApiUrl(
@@ -453,6 +463,50 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
     }
   }
 
+  async function stopManagedBridge(): Promise<ManagedBridgeStopResult> {
+    const discovery = await discoverInternal();
+    if (discovery.state === "not-running" || discovery.state === "stale") {
+      return success({ previousState: "not-running", state: "stopped" });
+    }
+    if (discovery.state === "running-unmanaged" || discovery.state === "port-conflict") {
+      return fail("BRIDGE_NOT_OWNED", "The running process is not managed by this Bridge App.", false);
+    }
+    if (discovery.state === "starting") {
+      return fail("BRIDGE_CONTROL_UNAVAILABLE", "Bridge ownership is still being established.", false);
+    }
+    const stateRead = safelyReadState(readState);
+    const controlToken = stateRead.ok ? stateRead.value.controlToken : undefined;
+    if (!controlToken) {
+      return fail("BRIDGE_NOT_OWNED", "The managed Bridge control credential is unavailable.", false);
+    }
+    options.writeStructuredLog?.({ event: "bridge.stop.requested", instanceId: discovery.instanceId, bridgeApiUrl: discovery.bridgeApiUrl });
+    const response = await safeFetch(new URL("/api/bridge/control/shutdown", discovery.bridgeApiUrl).toString(), {
+      method: "POST",
+      headers: { [CONTROL_TOKEN_HEADER]: controlToken }
+    });
+    if (!response?.ok) {
+      options.writeStructuredLog?.({ event: "bridge.stop.failed", instanceId: discovery.instanceId, reason: "control-unavailable" });
+      return fail("BRIDGE_CONTROL_UNAVAILABLE", "The managed Bridge did not accept the shutdown request.", false);
+    }
+    const deadline = now().getTime() + stopTimeoutMs;
+    while (now().getTime() <= deadline) {
+      const current = await discoverInternal();
+      const daemonExited = !processIsAlive(discovery.daemonPid);
+      const supervisorExited = discovery.supervisorPid === undefined || !processIsAlive(discovery.supervisorPid);
+      if ((current.state === "not-running" || current.state === "stale") && daemonExited && supervisorExited) {
+        const latest = safelyReadState(readState);
+        if (latest.ok) {
+          safelyWriteState(writeState, clearManagedBridgeRuntimeState(latest.value));
+        }
+        options.writeStructuredLog?.({ event: "bridge.stop.completed", instanceId: discovery.instanceId });
+        return success({ previousState: "running-managed", state: "stopped" });
+      }
+      await sleep(pollIntervalMs);
+    }
+    options.writeStructuredLog?.({ event: "bridge.stop.failed", instanceId: discovery.instanceId, reason: "timeout" });
+    return fail("BRIDGE_STOP_TIMEOUT", "Timed out waiting for the managed Bridge to stop.", false);
+  }
+
   async function pairingOperation(
     action: "pair" | "open-roadmap",
     input: ManagedBridgePairingInput
@@ -544,6 +598,7 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
   return {
     discoverManagedBridge: () => discoverInternal(),
     ensureManagedBridgeRunning,
+    stopManagedBridge,
     createManagedPairing: (input = {}) => pairingOperation("pair", input),
     openManagedRoadmap: (roadmapId, input = {}) => {
       const normalizedRoadmapId = roadmapId.trim();
@@ -566,6 +621,10 @@ export function ensureManagedBridgeRunning(
   input: ManagedBridgeEnsureInput = {}
 ): Promise<ManagedBridgeEnsureResult> {
   return createManagedBridgeRuntime(options).ensureManagedBridgeRunning(input);
+}
+
+export function stopManagedBridge(options: ManagedBridgeRuntimeOptions = {}): Promise<ManagedBridgeStopResult> {
+  return createManagedBridgeRuntime(options).stopManagedBridge();
 }
 
 export function createManagedPairing(

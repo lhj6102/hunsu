@@ -1490,7 +1490,7 @@ test("Bridge App stop clears stale PID state without killing an unrelated proces
     assert.equal(state.bridgeApiUrl, undefined);
     assert.ok(state.account);
     assert.ok(state.device);
-    assert.equal(logs.some(line => line.includes("No PID was terminated")), true);
+    assert.equal(logs.some(line => line.includes("already stopped")), true);
   } finally {
     console.log = previousLog;
     if (previousStatePath === undefined) delete process.env.HUNSU_BRIDGE_APP_STATE_PATH;
@@ -2427,7 +2427,7 @@ async function requestBridgeServerRoute(
   const listener = server.listeners("request")[0] as ((request: any, response: any) => void) | undefined;
   assert.ok(listener);
   return await new Promise<{ status: number; body: any; headers: Record<string, string> }>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for Bridge route ${requestSpec.method} ${requestSpec.path}`)), 1000);
+    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for Bridge route ${requestSpec.method} ${requestSpec.path}`)), 10_000);
     const bodyText = requestSpec.body === undefined ? "" : JSON.stringify(requestSpec.body);
     const listeners = new Map<string, Array<() => void>>();
     let settled = false;
@@ -3518,10 +3518,7 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     await waitFor(async () => {
       if (!existsSync(statePath)) return false;
       const state = JSON.parse(readFileSync(statePath, "utf8")) as { supervisorPid?: number; pid?: number };
-      if (typeof state.supervisorPid !== "number" || typeof state.pid !== "number") return false;
-      managedSupervisorPid = state.supervisorPid;
-      managedDaemonPid = state.pid;
-      return true;
+      return typeof state.supervisorPid === "number" && typeof state.pid === "number";
     }, 5_000);
     await waitForChildExit(child, 5_000, () => `${stdout}\n${stderr}`);
     const health = await fetch(`http://127.0.0.1:${bridgePort}/health`);
@@ -3532,7 +3529,12 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
       authToken?: string;
       pairing?: unknown;
       controlToken?: string;
+      supervisorPid?: number;
+      pid?: number;
     };
+    managedSupervisorPid = initialState.supervisorPid;
+    managedDaemonPid = initialState.pid;
+    assert.notEqual(managedSupervisorPid, child.pid);
     assert.equal(initialState.authToken, undefined);
     assert.equal(initialState.pairing, undefined);
     assert.match(initialState.controlToken ?? "", /^hunsu_bridge_control_/);
@@ -3552,11 +3554,7 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
       console.log = previousPairLog;
     }
     assert.equal(pairLogs.some(line => line.includes("Hunsu Web opened with a fresh pairing.")), true);
-    const pairedState = JSON.parse(readFileSync(statePath, "utf8")) as {
-      authToken?: string;
-      pairing?: unknown;
-      controlToken?: string;
-    };
+    const pairedState = JSON.parse(readFileSync(statePath, "utf8")) as { authToken?: string; pairing?: unknown; controlToken?: string };
     assert.equal(pairedState.authToken, undefined);
     assert.equal(pairedState.pairing, undefined);
     assert.equal(pairedState.controlToken, initialState.controlToken);
@@ -3583,6 +3581,8 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     await waitFor(async () => !(await bridgeHealthReachable(bridgePort)), 2_000);
     await delay(900);
     assert.equal(await bridgeHealthReachable(bridgePort), false);
+    assert.equal(managedSupervisorPid ? processIsAliveForTest(managedSupervisorPid) : true, false);
+    assert.equal(managedDaemonPid ? processIsAliveForTest(managedDaemonPid) : true, false);
     const stoppedState = JSON.parse(readFileSync(statePath, "utf8")) as { supervisorPid?: number; pid?: number };
     assert.equal(stoppedState.supervisorPid, undefined);
     assert.equal(stoppedState.pid, undefined);

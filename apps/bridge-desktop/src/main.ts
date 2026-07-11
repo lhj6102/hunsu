@@ -65,6 +65,7 @@ import {
   currentBridgeCommandInvocation,
   currentBridgeProcessCommandIdentity,
   handleToRuntimeState,
+  inspectWindowsProcess,
   processCommandLine,
   processEnvironmentValue,
   processIsAlive,
@@ -72,11 +73,13 @@ import {
   sameProcessStartMetadata
 } from "./processes/backgroundSpawn.ts";
 import {
+  clearManagedBridgeRuntimeState,
   createManagedBridgeRuntime,
   type ManagedBridgeDiscovery,
   type ManagedBridgeIdentity,
   type ManagedBridgeOperationError,
   type ManagedBridgeStartContext,
+  type ManagedBridgeStopResult
 } from "./processes/managedBridgeRuntime.ts";
 import {
   canonicalBridgeUiIntentTab,
@@ -224,7 +227,7 @@ async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions 
         await statusCommand();
         return 0;
       case "stop":
-        await stopCommand();
+        await stopCommand(parsed);
         return 0;
       case "diagnostics":
         await runDiagnosticsCommand(diagnosticsCommandContext());
@@ -701,10 +704,11 @@ async function daemonCommand(parsed: ParsedArgs): Promise<void> {
   }
   rememberRunningBridge(handle, cwd, getFlag(parsed, "web-url"));
   printAppStatus(handle);
-  await waitForShutdown(async () => {
+  await waitForBridgeSupervisorTerminal(supervisor, async () => {
     relayClient?.stop();
     await supervisor.stop();
   });
+  relayClient?.stop();
   clearManagedProcessState();
 }
 
@@ -885,60 +889,24 @@ function codexStatusLabel(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus
   return "Not Ready";
 }
 
-async function stopCommand(): Promise<void> {
-  const state = readAppState();
-  const controlStop = await stopBridgeThroughControlEndpoint(state);
-  if (controlStop.ok) {
-    for (const targetPid of uniqueNumberList([state.supervisorPid, state.pid])) {
-      const verification = verifyManagedBridgePid(targetPid, state);
-      if (verification.ok) {
-        try {
-          process.kill(targetPid, "SIGTERM");
-        } catch (error) {
-          writeStructuredLog({
-            event: "bridge.stop.post-control-signal-failed",
-            pid: targetPid,
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
-      }
-    }
-    writeAppState(clearBridgeProcessRuntimeState(readAppState()));
-    console.log("Hunsu Bridge stopped.");
-    return;
+async function stopCommand(parsed: ParsedArgs): Promise<void> {
+  const runtime = managedBridgeRuntime();
+  const discovery = await runtime.discoverManagedBridge();
+  let result = await runtime.stopManagedBridge();
+  if (!result.ok && result.error.code === "BRIDGE_CONTROL_UNAVAILABLE" && discovery.state === "running-managed") {
+    result = await stopManagedBridgeWithVerifiedWindowsFallback(discovery);
   }
-  const targetPids = uniqueNumberList([state.supervisorPid, state.pid]);
-  if (targetPids.length === 0) {
-    console.log("Hunsu Bridge is not managed by this Bridge App process.");
-    return;
+  if (!result.ok) {
+    throw managedBridgeError(result.error);
   }
-  let stopped = false;
-  let stopError: unknown;
-  let verifiedAny = false;
-  for (const targetPid of targetPids) {
-    const verification = verifyManagedBridgePid(targetPid, state);
-    if (!verification.ok) {
-      writeStructuredLog({ event: "bridge.stop.pid-verification-failed", pid: targetPid, reason: verification.reason });
-      continue;
-    }
-    verifiedAny = true;
-    try {
-      process.kill(targetPid, "SIGTERM");
-      stopped = true;
-      break;
-    } catch (error) {
-      stopError = error;
-    }
-  }
-  writeAppState(clearBridgeProcessRuntimeState(state));
-  if (!verifiedAny) {
-    console.log("Removed stale Hunsu Bridge process state. No PID was terminated.");
-    return;
-  }
-  if (!stopped) {
-    throw new Error(stopError instanceof Error ? stopError.message : "Unable to stop Hunsu Bridge.");
-  }
-  console.log("Hunsu Bridge stopped.");
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: result.value.previousState === "not-running"
+      ? "Hunsu Bridge is already stopped."
+      : "Hunsu Bridge stopped.",
+    value: result.value
+  });
 }
 
 function diagnosticsCommandContext() {
@@ -1461,9 +1429,7 @@ async function superviseCommand(parsed: ParsedArgs): Promise<void> {
   supervisor.start();
   writeStructuredLog({ event: "bridge.supervisor.started", status: supervisor.status() });
   try {
-    await waitForShutdown(async () => {
-      await supervisor.stop();
-    });
+    await waitForSidecarSupervisorTerminal(supervisor);
   } finally {
     clearSupervisorProcessState();
   }
@@ -2014,41 +1980,63 @@ function configuredBridgeApiUrl(): string | undefined {
   }
 }
 
-async function stopBridgeThroughControlEndpoint(state: BridgeAppState): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (!state.bridgeApiUrl || !state.controlToken) {
-    return { ok: false, error: "No Bridge control endpoint is known." };
-  }
-  try {
-    const response = await fetch(new URL("/api/bridge/control/shutdown", state.bridgeApiUrl), {
-      method: "POST",
-      headers: {
-        "x-hunsu-bridge-control-token": state.controlToken
+async function stopManagedBridgeWithVerifiedWindowsFallback(
+  discovery: Extract<ManagedBridgeDiscovery, { state: "running-managed" }>
+): Promise<ManagedBridgeStopResult> {
+  if (process.platform !== "win32") {
+    return {
+      ok: false,
+      error: {
+        code: "BRIDGE_CONTROL_UNAVAILABLE",
+        message: "The managed Bridge control endpoint is unavailable.",
+        canForceStop: false
       }
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
-      return { ok: false, error: body?.error ?? `Bridge shutdown returned HTTP ${response.status}.` };
-    }
-    await new Promise(resolve => setTimeout(resolve, 150));
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : "Unable to reach Bridge control endpoint." };
+    };
   }
-}
-
-function clearBridgeProcessRuntimeState(state: BridgeAppState): BridgeAppState {
+  const state = readAppState();
+  const targetPids = uniqueNumberList([discovery.supervisorPid, discovery.daemonPid]);
+  if (targetPids.length === 0) {
+    return {
+      ok: false,
+      error: { code: "BRIDGE_NOT_OWNED", message: "No verified managed Bridge process is available.", canForceStop: false }
+    };
+  }
+  for (const pid of targetPids) {
+    const verification = verifyManagedBridgePid(pid, state);
+    if (!verification.ok) {
+      writeStructuredLog({ event: "bridge.stop.pid-verification-failed", pid, reason: verification.reason });
+      return {
+        ok: false,
+        error: { code: "BRIDGE_NOT_OWNED", message: "Bridge process ownership could not be verified.", canForceStop: false }
+      };
+    }
+  }
+  const treeRootPid = discovery.supervisorPid ?? discovery.daemonPid;
+  try {
+    execFileSync("taskkill", ["/PID", String(treeRootPid), "/T"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    });
+  } catch (_error) {
+    return {
+      ok: false,
+      error: { code: "BRIDGE_CONTROL_UNAVAILABLE", message: "Verified Bridge process termination failed.", canForceStop: false }
+    };
+  }
+  const deadline = Date.now() + 8_000;
+  while (Date.now() <= deadline) {
+    const health = await readBridgeHealth(state);
+    if (!health.ok) {
+      writeAppState(clearManagedBridgeRuntimeState(readAppState()));
+      writeStructuredLog({ event: "bridge.stop.completed", instanceId: discovery.instanceId, method: "verified-windows-taskkill" });
+      return { ok: true, value: { previousState: "running-managed", state: "stopped" } };
+    }
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
+  }
   return {
-    ...state,
-    supervisorPid: undefined,
-    pid: undefined,
-    supervisorProcess: undefined,
-    bridgeProcess: undefined,
-    bridgeApiUrl: undefined,
-    processNonce: undefined,
-    commandIdentity: undefined,
-    controlToken: undefined,
-    pairing: undefined,
-    startedAt: undefined
+    ok: false,
+    error: { code: "BRIDGE_STOP_TIMEOUT", message: "Timed out waiting for the managed Bridge to stop.", canForceStop: false }
   };
 }
 
@@ -2068,6 +2056,19 @@ function verifyManagedBridgePid(pid: number, state: BridgeAppState): { ok: true 
     const currentNonce = processEnvironmentValue(pid, BRIDGE_PROCESS_NONCE_ENV);
     if (currentNonce !== metadata.processNonce) {
       return { ok: false, reason: currentNonce ? "process_nonce_mismatch" : "process_nonce_unavailable" };
+    }
+  }
+  if (process.platform === "win32") {
+    const identity = inspectWindowsProcess(pid);
+    if (!identity) {
+      return { ok: false, reason: "windows_process_identity_unavailable" };
+    }
+    if (metadata.parentPid === undefined || identity.parentProcessId !== metadata.parentPid) {
+      return { ok: false, reason: "windows_parent_pid_mismatch" };
+    }
+    if (!metadata.executablePath || !identity.executablePath
+      || metadata.executablePath.toLowerCase() !== identity.executablePath.toLowerCase()) {
+      return { ok: false, reason: "windows_executable_path_mismatch" };
     }
   }
   const commandLine = processCommandLine(pid);
@@ -2545,6 +2546,34 @@ async function waitForShutdown(stop: () => Promise<void>): Promise<void> {
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
   });
+}
+
+async function waitForBridgeSupervisorTerminal(
+  supervisor: { waitForTerminal(): Promise<unknown>; stop(): Promise<unknown> },
+  stop: () => Promise<void> = async () => { await supervisor.stop(); }
+): Promise<void> {
+  let stopping = false;
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    void stop().catch(error => {
+      writeStructuredLog({ event: "bridge.stop.failed", error: error instanceof Error ? error.message : String(error) });
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  try {
+    await supervisor.waitForTerminal();
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+  }
+}
+
+async function waitForSidecarSupervisorTerminal(
+  supervisor: { waitForTerminal(): Promise<unknown>; stop(): Promise<unknown> }
+): Promise<void> {
+  await waitForBridgeSupervisorTerminal(supervisor);
 }
 
 function parseArgs(argv: string[]): ParsedArgs {

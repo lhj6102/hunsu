@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -10,6 +10,7 @@ import {
   createManagedBridgeRuntime,
   type ManagedBridgeFetch
 } from "../apps/bridge-desktop/src/processes/managedBridgeRuntime.ts";
+import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
 import {
   defaultBridgeAppState,
   type BridgeAppState
@@ -233,6 +234,90 @@ test("Pair and Open Roadmap reuse one daemon, rotate once per action, and return
     assert.doesNotMatch(JSON.stringify([paired, openedRoadmap]), /synthetic-pairing|hunsuBridgeToken|studioUrl|authToken/);
     assert.equal("token" in (state.pairing ?? {}), false);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed Stop is authenticated and idempotent while unmanaged Stop is refused", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-stop-"));
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL,
+    controlToken: CONTROL_TOKEN,
+    pid: 4321
+  };
+  const service = fakeBridgeService(() => state);
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath: join(root, "bridge-start.lock"),
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    pollIntervalMs: 1,
+    stopTimeoutMs: 200
+  });
+
+  try {
+    const stopped = await runtime.stopManagedBridge();
+    assert.deepEqual(stopped, { ok: true, value: { previousState: "running-managed", state: "stopped" } });
+    assert.equal(service.shutdowns, 1);
+    const repeated = await runtime.stopManagedBridge();
+    assert.deepEqual(repeated, { ok: true, value: { previousState: "not-running", state: "stopped" } });
+    assert.equal(service.shutdowns, 1);
+
+    service.online = true;
+    state = { ...defaultBridgeAppState(), bridgeApiUrl: BRIDGE_URL, controlToken: "foreign-token" };
+    const refused = await runtime.stopManagedBridge();
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.equal(refused.error.code, "BRIDGE_NOT_OWNED");
+    assert.equal(service.shutdowns, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sidecar supervisor treats a clean daemon exit as terminal without restart", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-sidecar-clean-exit-"));
+  const logPath = join(root, "sidecar.log");
+  try {
+    const supervisor = new BridgeSidecarSupervisor({
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      logPath,
+      restartLimit: 3,
+      restartDelayMs: 1
+    });
+    supervisor.start();
+    const terminal = await supervisor.waitForTerminal();
+    assert.equal(terminal.status, "stopped");
+    assert.equal(terminal.restartCount, 0);
+    assert.equal(supervisor.status().status, "stopped");
+    assert.match(readFileSync(logPath, "utf8"), /clean-exit/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("deterministic EADDRINUSE exits are terminal and never enter a restart loop", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-sidecar-port-terminal-"));
+  const logPath = join(root, "sidecar.log");
+  const supervisor = new BridgeSidecarSupervisor({
+    command: process.execPath,
+    args: ["-e", "process.stderr.write('EADDRINUSE BRIDGE_PORT_IN_USE\\n'); process.exit(1)"],
+    logPath,
+    restartLimit: 3,
+    restartDelayMs: 10
+  });
+  try {
+    supervisor.start();
+    const terminal = await supervisor.waitForTerminal();
+    await delay(40);
+    assert.equal(terminal.status, "crashed");
+    assert.equal(terminal.restartCount, 0);
+    assert.equal(supervisor.status().restartCount, 0);
+    assert.match(readFileSync(logPath, "utf8"), /sidecar\.terminal-failure/);
+  } finally {
+    await supervisor.stop();
     rmSync(root, { recursive: true, force: true });
   }
 });
