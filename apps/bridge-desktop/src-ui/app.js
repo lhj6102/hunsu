@@ -1008,8 +1008,7 @@ function providerAdvancedDetails(provider) {
     `Rate limit summary: ${formatProviderRateLimit(provider)}`
   ].filter(Boolean).join("\n");
   const actions = document.createElement("div");
-  actions.className = "actions";
-  actions.setAttribute("style", "margin-top: 10px;");
+  actions.className = "actions space-top-10";
   const apiKey = document.createElement("button");
   apiKey.textContent = "Use API Key - Advanced";
   apiKey.addEventListener("click", () => void startCodexApiKeyLogin());

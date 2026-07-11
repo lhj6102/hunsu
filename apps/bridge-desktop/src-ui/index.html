@@ -76,6 +76,15 @@
         flex-wrap: wrap;
         gap: 8px;
       }
+      .space-top-10 {
+        margin-top: 10px;
+      }
+      .space-top-14 {
+        margin-top: 14px;
+      }
+      .space-top-18 {
+        margin-top: 18px;
+      }
       button:disabled {
         cursor: not-allowed;
         opacity: 0.55;
@@ -238,7 +247,7 @@
           <h2 id="provider-config-title">Configure Codex</h2>
           <button id="close-provider-config" aria-label="Close provider setup">Close</button>
         </header>
-        <div class="grid" style="margin-top: 14px;">
+        <div class="grid space-top-14">
           <label>
             <span class="project-meta">Install channel</span>
             <select id="codex-install-channel">
@@ -274,7 +283,7 @@
       </nav>
       <details>
         <summary>Advanced</summary>
-        <div class="actions" style="margin-top: 10px;">
+        <div class="actions space-top-10">
           <button data-tab="advanced">Runtime Providers</button>
           <button data-tab="diagnostics">Diagnostics</button>
           <button data-tab="settings">Settings</button>
@@ -301,9 +310,9 @@
           <button id="selected-project-action" disabled>Select a Folder</button>
         </div>
         <div id="selected-project" class="message">No folder selected.</div>
-        <h2 style="margin-top: 18px;">Active Workspaces</h2>
+        <h2 class="space-top-18">Active Workspaces</h2>
         <div id="active-roadmap-list" class="grid"></div>
-        <h2 style="margin-top: 18px;">Inactive Workspaces</h2>
+        <h2 class="space-top-18">Inactive Workspaces</h2>
         <div id="inactive-roadmap-list" class="grid"></div>
       </section>
 
@@ -330,7 +339,7 @@
         </div>
         <details>
           <summary>Advanced connection details</summary>
-          <dl style="margin-top: 10px;">
+          <dl class="space-top-10">
             <dt>Account</dt>
             <dd id="account">Signed out</dd>
             <dt>Remote Access</dt>
@@ -342,7 +351,7 @@
             <dt>Quit Behavior</dt>
             <dd id="quit-behavior">Keep background service running</dd>
           </dl>
-          <div class="actions" style="margin-top: 10px;">
+          <div class="actions space-top-10">
             <button id="start-bridge">Start Bridge</button>
             <button id="stop-bridge">Stop Bridge</button>
             <button id="open-studio-connection">Open Hunsu Web</button>
@@ -355,12 +364,12 @@
       <section data-panel="advanced" hidden>
         <h2>Runtime Providers</h2>
         <div id="runtime-provider-list" class="grid"></div>
-        <h2 style="margin-top: 18px;">Advanced Checks</h2>
+        <h2 class="space-top-18">Advanced Checks</h2>
         <h3>Git</h3>
         <div id="git-card" class="grid"></div>
-        <h3 style="margin-top: 18px;">Runtime and optional system tools</h3>
+        <h3 class="space-top-18">Runtime and optional system tools</h3>
         <div id="node-card" class="grid"></div>
-        <h2 style="margin-top: 18px;">Versions</h2>
+        <h2 class="space-top-18">Versions</h2>
         <dl>
           <dt>Bridge App version</dt>
           <dd id="bridge-app-version">Unknown</dd>
@@ -373,9 +382,9 @@
           <dt>Codex CLI version</dt>
           <dd id="codex-cli-version">Unknown</dd>
         </dl>
-        <h2 style="margin-top: 18px;">Advanced Remote Details</h2>
+        <h2 class="space-top-18">Advanced Remote Details</h2>
         <div id="remote-roadmap-list" class="grid"></div>
-        <h2 style="margin-top: 18px;">Project Grants</h2>
+        <h2 class="space-top-18">Project Grants</h2>
         <div id="project-grants" class="grid"></div>
         <div class="actions">
           <button id="enable-remote">Enable Remote Access</button>
@@ -402,7 +411,7 @@
             </select>
           </label>
         </div>
-        <div class="actions" style="margin-top: 10px;">
+        <div class="actions space-top-10">
           <button id="open-provider-config-settings">Configure Codex</button>
         </div>
       </section>

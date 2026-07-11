@@ -15,6 +15,9 @@ test("Bridge desktop UI exposes awaited feedback and fresh diagnostics contracts
   assert.match(source, /runCommand\(\["stop", "--json"\]\)/);
   assert.match(source, /runCommand\(\["diagnostics", "--json"\]\)/);
   assert.doesNotMatch(source, /spawn\(\["(?:pair|open-roadmap|open-project|port|create)"/);
+  assert.doesNotMatch(html, /\sstyle=/u);
+  assert.doesNotMatch(source, /\.style\.|setAttribute\(["']style["']/u);
+  assert.match(source, /actions\.className = "actions space-top-10"/u);
 });
 
 test("Validate, Save, Recheck, and provider install expose explicit feedback and prerequisite copy", () => {
