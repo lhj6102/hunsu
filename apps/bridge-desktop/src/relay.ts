@@ -140,7 +140,7 @@ export type RelayOutboundClientOptions = {
   device: RemoteBridgeDevice;
   projectGrants: ProjectGrant[] | (() => ProjectGrant[]);
   bridgeApiUrl?: string;
-  bridgeAuthToken?: string;
+  bridgeControlToken?: string;
   websocketFactory?: (url: string) => RelayWebSocket;
   fetchImpl?: typeof fetch;
   heartbeatIntervalMs?: number;
@@ -413,7 +413,7 @@ export class RelayOutboundClient {
     const result = request?.stream
       ? await forwardRelayCommandStream({
           bridgeApiUrl: this.options.bridgeApiUrl,
-          bridgeAuthToken: this.options.bridgeAuthToken,
+          bridgeControlToken: this.options.bridgeControlToken,
           command: envelope.command,
           projectGrants,
           fetchImpl: this.options.fetchImpl,
@@ -426,7 +426,7 @@ export class RelayOutboundClient {
         })
       : await forwardRelayCommand({
       bridgeApiUrl: this.options.bridgeApiUrl,
-      bridgeAuthToken: this.options.bridgeAuthToken,
+      bridgeControlToken: this.options.bridgeControlToken,
       command: envelope.command,
       projectGrants,
       fetchImpl: this.options.fetchImpl
@@ -545,7 +545,7 @@ function requiredScopesForRelayCommand(command: RelayCommand): BridgeCommandScop
 
 export async function forwardRelayCommand(input: {
   bridgeApiUrl: string;
-  bridgeAuthToken?: string;
+  bridgeControlToken?: string;
   command: RelayCommand;
   projectGrants?: ProjectGrant[];
   fetchImpl?: typeof fetch;
@@ -560,7 +560,7 @@ export async function forwardRelayCommand(input: {
   const fetcher = input.fetchImpl ?? fetch;
   const validation = await validateRelayCommandProjectGrant({
     bridgeApiUrl: input.bridgeApiUrl,
-    bridgeAuthToken: input.bridgeAuthToken,
+    bridgeControlToken: input.bridgeControlToken,
     command: input.command,
     fetchImpl: fetcher
   });
@@ -568,8 +568,8 @@ export async function forwardRelayCommand(input: {
     return validation;
   }
   const headers: Record<string, string> = {};
-  if (input.bridgeAuthToken) {
-    headers["x-hunsu-bridge-token"] = input.bridgeAuthToken;
+  if (input.bridgeControlToken) {
+    headers["x-hunsu-bridge-control-token"] = input.bridgeControlToken;
   }
   if (request.body !== undefined) {
     headers["content-type"] = "application/json";
@@ -594,7 +594,7 @@ export async function forwardRelayCommand(input: {
 
 export async function forwardRelayCommandStream(input: {
   bridgeApiUrl: string;
-  bridgeAuthToken?: string;
+  bridgeControlToken?: string;
   command: RelayCommand;
   projectGrants?: ProjectGrant[];
   fetchImpl?: typeof fetch;
@@ -610,7 +610,7 @@ export async function forwardRelayCommandStream(input: {
   const fetcher = input.fetchImpl ?? fetch;
   const validation = await validateRelayCommandProjectGrant({
     bridgeApiUrl: input.bridgeApiUrl,
-    bridgeAuthToken: input.bridgeAuthToken,
+    bridgeControlToken: input.bridgeControlToken,
     command: input.command,
     fetchImpl: fetcher
   });
@@ -618,8 +618,8 @@ export async function forwardRelayCommandStream(input: {
     return validation;
   }
   const headers: Record<string, string> = {};
-  if (input.bridgeAuthToken) {
-    headers["x-hunsu-bridge-token"] = input.bridgeAuthToken;
+  if (input.bridgeControlToken) {
+    headers["x-hunsu-bridge-control-token"] = input.bridgeControlToken;
   }
   const response = await fetcher(new URL(request.path, input.bridgeApiUrl), {
     method: request.method,
@@ -640,7 +640,7 @@ export async function forwardRelayCommandStream(input: {
 
 async function validateRelayCommandProjectGrant(input: {
   bridgeApiUrl: string;
-  bridgeAuthToken?: string;
+  bridgeControlToken?: string;
   command: RelayCommand;
   fetchImpl: typeof fetch;
 }): Promise<{ ok: true } | RelayCommandForwardResult> {
@@ -662,8 +662,8 @@ async function validateRelayCommandProjectGrant(input: {
       : { ok: true };
   }
   const headers: Record<string, string> = {};
-  if (input.bridgeAuthToken) {
-    headers["x-hunsu-bridge-token"] = input.bridgeAuthToken;
+  if (input.bridgeControlToken) {
+    headers["x-hunsu-bridge-control-token"] = input.bridgeControlToken;
   }
   const response = await input.fetchImpl(new URL("/api/roadmaps/recent", input.bridgeApiUrl), {
     method: "GET",

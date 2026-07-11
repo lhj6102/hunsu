@@ -116,11 +116,14 @@ export function createBridgeAppSidecarSupervisor(input: {
     command: invocation.command,
     args: invocation.args,
     cwd: input.cwd,
-    env: bridgeProcessEnvWithNonce({
-      state: input.state,
-      nonce: daemonNonce,
-      activeProjectGrants: input.activeProjectGrants
-    }),
+    env: {
+      ...bridgeProcessEnvWithNonce({
+        state: input.state,
+        nonce: daemonNonce,
+        activeProjectGrants: input.activeProjectGrants
+      }),
+      HUNSU_BRIDGE_SUPERVISOR_PID: String(process.pid)
+    },
     logPath: input.appLogPath,
     restartLimit: input.restartLimit,
     restartDelayMs: 750
@@ -284,9 +287,12 @@ export function handleToRuntimeState(state: BridgeAppState, handle: BridgeRuntim
     bridgeApiUrl: handle.bridgeApiUrl,
     processNonce: commandIdentity.nonce,
     commandIdentity,
-    authToken: handle.authToken,
     controlToken: handle.controlToken,
-    pairing: handle.pairing,
+    pairing: handle.pairing ? {
+      issuedAt: handle.pairing.issuedAt,
+      expiresAt: handle.pairing.expiresAt,
+      revokedAt: handle.pairing.revokedAt
+    } : undefined,
     cwd,
     webUrl,
     startedAt: handle.startedAt,

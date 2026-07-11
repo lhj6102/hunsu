@@ -107,10 +107,35 @@ export type BridgeToolStatus = {
   error?: string;
 };
 
+export type BridgeEmbeddedRuntimeStatus = {
+  kind: "node-sea";
+  installed: true;
+  version: string;
+  bundled: true;
+};
+
+export type BridgePackageManagerStatus = BridgeToolStatus & {
+  name?: "pnpm" | "npm" | "yarn";
+  optional: true;
+  requiredFor?: string[];
+};
+
 export type BridgePairingMetadata = {
   issuedAt: string;
   expiresAt: string;
   revokedAt?: string;
+};
+
+export type LocalBridgeControl = {
+  state: "not-running" | "starting" | "connected" | "stopping" | "error";
+  ownership: "managed" | "unmanaged" | "unknown";
+  canStart: boolean;
+  canStop: boolean;
+  startReason?: string;
+  stopReason?: string;
+  instanceId?: string;
+  daemonPid?: number;
+  supervisorPid?: number;
 };
 
 export type BridgeAppState = {
@@ -127,6 +152,7 @@ export type BridgeAppState = {
   controlToken?: string;
   pairing?: BridgePairingMetadata;
   diagnosticsSecurityVersion?: number;
+  instanceId?: string;
   cwd?: string;
   webUrl?: string;
   startedAt?: string;
@@ -179,6 +205,7 @@ export type BridgeAppSnapshot = {
     startedAt?: string;
     healthError?: string;
   };
+  localBridgeControl: LocalBridgeControl;
   providers: {
     currentProviderId: string;
     current: RuntimeProviderStatus;
@@ -213,9 +240,17 @@ export type BridgeAppSnapshot = {
     codex: unknown;
     tools: {
       git: BridgeToolStatus;
-      node: BridgeToolStatus;
-      packageManager: BridgeToolStatus;
+      embeddedRuntime: BridgeEmbeddedRuntimeStatus;
+      systemNode: BridgeToolStatus & { optional: true };
+      packageManager: BridgePackageManagerStatus;
     };
+  };
+  versions: {
+    bridgeApp: string;
+    bridgeRuntime: string;
+    protocol: string;
+    embeddedNode: string;
+    codexCli?: string;
   };
   codexSettings: BridgeCodexSettings & {
     environment: {
@@ -312,6 +347,7 @@ export function recordBridgeUiIntent(
 export function createBridgeAppSnapshot(input: {
   state: BridgeAppState;
   localBridge: BridgeAppSnapshot["status"]["localBridge"];
+  localBridgeControl: LocalBridgeControl;
   accountLabel: string;
   remoteAccessLabel: BridgeAppSnapshot["status"]["remoteAccess"];
   bridgeApiUrl?: string;
@@ -327,6 +363,7 @@ export function createBridgeAppSnapshot(input: {
   codexSettings: BridgeAppSnapshot["codexSettings"];
   diagnostics: unknown;
   logLines: string[];
+  versions: BridgeAppSnapshot["versions"];
 }): BridgeAppSnapshot {
   return {
     schema: "hunsu.bridge-app-snapshot.v1",
@@ -343,6 +380,7 @@ export function createBridgeAppSnapshot(input: {
       startedAt: input.state.startedAt,
       healthError: input.healthError
     },
+    localBridgeControl: input.localBridgeControl,
     providers: input.runtimeProviders,
     providerConfig: input.providerConfig,
     workspaces: {
@@ -369,6 +407,7 @@ export function createBridgeAppSnapshot(input: {
       codex: input.codex,
       tools: input.tools
     },
+    versions: input.versions,
     codexSettings: input.codexSettings,
     codexLogin: input.state.codexLogin,
     runtimeProviders: input.runtimeProviders,

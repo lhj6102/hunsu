@@ -1544,9 +1544,9 @@ test("Bridge App health check rejects non-Hunsu health responses", async () => {
     const snapshot = JSON.parse(logs.at(-1) ?? "{}") as {
       status?: { localBridge?: string; healthError?: string };
     };
-    assert.equal(snapshot.status?.localBridge, "not-running");
+    assert.equal(snapshot.status?.localBridge, "error");
     assert.notEqual(snapshot.status?.localBridge, "connected");
-    assert.match(snapshot.status?.healthError ?? "", /Bridge is not reachable/);
+    assert.match(snapshot.status?.healthError ?? "", /owned by another service/);
   } finally {
     console.log = previousLog;
     restoreEnv(previousEnv);
@@ -2030,7 +2030,7 @@ test("Bridge App validates remote roadmapId against the granted local project pa
   const calls: string[] = [];
   const result = await forwardRelayCommand({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "execute.start",
@@ -2114,7 +2114,7 @@ test("Bridge App allows Relay move file payload paths as repo-relative file path
   const calls: string[] = [];
   const result = await forwardRelayCommand({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "moveFile.blob",
@@ -2162,7 +2162,7 @@ test("Bridge App validates remote registry removal roadmapId against the granted
   const calls: string[] = [];
   const result = await forwardRelayCommand({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "roadmap.registry.remove",
@@ -2194,7 +2194,7 @@ test("Bridge App forwards remote event streams incrementally", async () => {
   const events: Array<{ event?: string; data?: string }> = [];
   const result = await forwardRelayCommandStream({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "live.events",
@@ -2571,15 +2571,15 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
     },
     projectGrants: [grant],
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     websocketFactory: () => socket,
     fetchImpl: async (url, init) => {
       const requestUrl = new URL(String(url));
       const headers = init?.headers as Record<string, string> | undefined;
-      forwardedRequests.push({ path: requestUrl.pathname, method: init?.method, token: headers?.["x-hunsu-bridge-token"] });
+      forwardedRequests.push({ path: requestUrl.pathname, method: init?.method, token: headers?.["x-hunsu-bridge-control-token"] });
       if (requestUrl.pathname === "/api/bridge/status") {
         assert.equal(init?.method, "GET");
-        assert.equal(headers?.["x-hunsu-bridge-token"], "token");
+        assert.equal(headers?.["x-hunsu-bridge-control-token"], "token");
         return new Response(JSON.stringify({ provider: { providerId: "codex" }, connections: [], workspaces: { active: [], managed: [] } }), {
           status: 200,
           headers: { "content-type": "application/json" }
@@ -2587,7 +2587,7 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
       }
       assert.equal(requestUrl.pathname, "/api/roadmaps/open");
       assert.equal(init?.method, "POST");
-      assert.equal(headers?.["x-hunsu-bridge-token"], "token");
+      assert.equal(headers?.["x-hunsu-bridge-control-token"], "token");
       return new Response(JSON.stringify({ ok: true }), {
         status: 202,
         headers: { "content-type": "application/json" }
@@ -3507,47 +3507,30 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     "HUNSU_BRIDGE_PORT"
   ];
   const previousEnv = snapshotEnv(envKeys);
+  let managedSupervisorPid: number | undefined;
+  let managedDaemonPid: number | undefined;
   try {
     await waitFor(async () => {
       if (!existsSync(statePath)) return false;
       const state = JSON.parse(readFileSync(statePath, "utf8")) as { supervisorPid?: number; pid?: number };
-      return state.supervisorPid === child.pid && typeof state.pid === "number";
+      if (typeof state.supervisorPid !== "number" || typeof state.pid !== "number") return false;
+      managedSupervisorPid = state.supervisorPid;
+      managedDaemonPid = state.pid;
+      return true;
     }, 5_000);
+    await waitForChildExit(child, 5_000, () => `${stdout}\n${stderr}`);
     const health = await fetch(`http://127.0.0.1:${bridgePort}/health`);
     assert.equal(health.status, 200);
 
     applyEnv(childEnv, envKeys);
-    const initialState = JSON.parse(readFileSync(statePath, "utf8")) as { authToken?: string; controlToken?: string };
-    assert.match(initialState.authToken ?? "", /^hunsu_bridge_/);
-    assert.match(initialState.controlToken ?? "", /^hunsu_bridge_control_/);
-
-    const pairLogs: string[] = [];
-    const previousPairLog = console.log;
-    console.log = (...values: unknown[]) => {
-      pairLogs.push(values.map(String).join(" "));
+    const initialState = JSON.parse(readFileSync(statePath, "utf8")) as {
+      authToken?: string;
+      pairing?: unknown;
+      controlToken?: string;
     };
-    try {
-      assert.equal(await main([
-        "pair",
-        "--web-url",
-        "http://127.0.0.1:19688/studio",
-        "--no-open"
-      ]), 0);
-    } finally {
-      console.log = previousPairLog;
-    }
-    assert.equal(pairLogs.some(line => line.includes("Hunsu Bridge pairing refreshed on the running managed Bridge.")), true);
-    const pairedState = JSON.parse(readFileSync(statePath, "utf8")) as { authToken?: string; controlToken?: string };
-    assert.notEqual(pairedState.authToken, initialState.authToken);
-    assert.equal(pairedState.controlToken, initialState.controlToken);
-    const oldTokenResponse = await fetch(`http://127.0.0.1:${bridgePort}/api/roadmaps/recent`, {
-      headers: { "x-hunsu-bridge-token": initialState.authToken ?? "" }
-    });
-    assert.equal(oldTokenResponse.status, 401);
-    const newTokenResponse = await fetch(`http://127.0.0.1:${bridgePort}/api/roadmaps/recent`, {
-      headers: { "x-hunsu-bridge-token": pairedState.authToken ?? "" }
-    });
-    assert.equal(newTokenResponse.status, 200);
+    assert.equal(initialState.authToken, undefined);
+    assert.equal(initialState.pairing, undefined);
+    assert.match(initialState.controlToken ?? "", /^hunsu_bridge_control_/);
 
     const logs: string[] = [];
     const previousLog = console.log;
@@ -3560,7 +3543,6 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
       console.log = previousLog;
     }
     assert.equal(logs.some(line => line.includes("Hunsu Bridge stopped.")), true);
-    await waitForChildExit(child, 5_000, () => `${stdout}\n${stderr}`);
     await waitFor(async () => !(await bridgeHealthReachable(bridgePort)), 2_000);
     await delay(900);
     assert.equal(await bridgeHealthReachable(bridgePort), false);
@@ -3569,13 +3551,21 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     assert.equal(stoppedState.pid, undefined);
   } finally {
     restoreEnv(previousEnv);
-    if (child.exitCode === null) {
-      child.kill("SIGTERM");
-      await Promise.race([waitForChildExit(child, 1_000), delay(1_000)]).catch(() => undefined);
-    }
+    if (child.exitCode === null) child.kill("SIGTERM");
+    if (managedSupervisorPid && processIsAliveForTest(managedSupervisorPid)) process.kill(managedSupervisorPid, "SIGTERM");
+    if (managedDaemonPid && processIsAliveForTest(managedDaemonPid)) process.kill(managedDaemonPid, "SIGTERM");
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function processIsAliveForTest(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
 
 async function waitForSidecarStatus(
   supervisor: BridgeSidecarSupervisor,

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { homedir, platform } from "node:os";
@@ -33,7 +33,6 @@ import {
 import { runAuthCallbackCommand, runLoginCommand, runLogoutCommand } from "./commands/authCommands.ts";
 import {
   buildDiagnostics,
-  currentNodeRuntimeStatus,
   packageManagerStatus,
   runDiagnosticsCommand,
   toolStatus
@@ -49,7 +48,6 @@ import {
 } from "./commands/workspaceCommands.ts";
 import {
   enableRemoteAccessIfSignedIn,
-  localBridgeStatusFromProcessState,
   publishProjectGrantsToRelay,
   runRemoteCommand,
   startRelayIfConfigured,
@@ -59,6 +57,8 @@ import {
 import {
   BRIDGE_PROCESS_NONCE_ENV,
   bridgeNodeExecArgs,
+  bridgeProcessCommandIdentityForSpawn,
+  bridgeProcessEnvWithNonce,
   bridgeProcessRuntimeMetadata,
   commandLineLooksLikeBridgeApp,
   createBridgeAppSidecarSupervisor as createBridgeAppSidecarSupervisorFromProcess,
@@ -71,6 +71,13 @@ import {
   processStartMetadata,
   sameProcessStartMetadata
 } from "./processes/backgroundSpawn.ts";
+import {
+  createManagedBridgeRuntime,
+  type ManagedBridgeDiscovery,
+  type ManagedBridgeIdentity,
+  type ManagedBridgeOperationError,
+  type ManagedBridgeStartContext,
+} from "./processes/managedBridgeRuntime.ts";
 import {
   canonicalBridgeUiIntentTab,
   bridgeAppStatePath as appStatePath,
@@ -90,6 +97,7 @@ import {
   type BridgeProcessRuntimeMetadata,
   type BridgeRoadmapAccessSnapshot,
   type BridgeServiceState,
+  type LocalBridgeControl,
   type BridgeUiIntent,
   bridgeCodexProviderSettings
 } from "./state/appState.ts";
@@ -101,6 +109,7 @@ import {
 import {
   applyStudioPort,
   assertDiagnosticsSafe,
+  bridgeVersionInfo,
   createBridgeSupervisor,
   createRuntimeProviderRegistry,
   createStudioRoadmap,
@@ -149,9 +158,29 @@ const WINDOWS_USER_TASK_NAME = "Hunsu Bridge";
 const PROJECT_GRANT_SCOPE_VALUES = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"] as const satisfies readonly BridgeCommandScope[];
 const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose"];
 const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
-const BRIDGE_STARTING_GRACE_MS = 15_000;
 const DIAGNOSTICS_SECURITY_VERSION = 1;
 const DIAGNOSTICS_SECURITY_MIGRATION_FETCH_TIMEOUT_MS = 1_500;
+
+type UiCommandResult<T = unknown> =
+  | { ok: true; code: "OK" | string; message: string; value?: T }
+  | {
+      ok: false;
+      code: string;
+      message: string;
+      recovery?: { label: string; action: string };
+    };
+
+class BridgeAppCommandError extends Error {
+  readonly code: string;
+  readonly recovery?: { label: string; action: string };
+
+  constructor(code: string, message: string, recovery?: { label: string; action: string }) {
+    super(message);
+    this.name = "BridgeAppCommandError";
+    this.code = code;
+    this.recovery = recovery;
+  }
+}
 
 type BridgeAppMainOptions = {
   diagnosticsSecurityMigration?: DiagnosticsSecurityMigrationOptions;
@@ -167,7 +196,8 @@ async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions 
     await applyDiagnosticsSecurityMigration(options.diagnosticsSecurityMigration);
     switch (parsed.command) {
       case "start":
-        await supervisedStartCommand(parsed);
+      case "ensure-running":
+        await ensureRunningCommand(parsed);
         return 0;
       case "pair":
         await pairCommand(parsed);
@@ -199,6 +229,14 @@ async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions 
         return 0;
       case "diagnostics":
         await runDiagnosticsCommand(diagnosticsCommandContext());
+        return 0;
+      case "diagnostics-redaction-blocked":
+        writeStructuredLog({ event: "diagnostics.redaction.blocked-copy" });
+        printUiCommandResult(parsed, {
+          ok: true,
+          code: "OK",
+          message: "Sensitive diagnostics copy was blocked."
+        });
         return 0;
       case "snapshot":
         await snapshotCommand();
@@ -267,8 +305,15 @@ async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions 
         return 1;
     }
   } catch (error) {
-    writeStructuredLog({ event: "command.failed", command: parsed.command, error: error instanceof Error ? error.message : String(error) });
-    console.error(error instanceof Error ? error.message : String(error));
+    const result = uiFailureFromError(error);
+    writeStructuredLog({ event: "command.failed", command: parsed.command, code: result.code, error: result.message });
+    writeStructuredLog({ event: "ui.operation.failed", action: parsed.command, code: result.code, message: result.message });
+    if (hasFlag(parsed, "json")) {
+      assertDiagnosticsSafe(result);
+      console.log(JSON.stringify(result));
+    } else {
+      console.error(result.message);
+    }
     return 1;
   }
 }
@@ -518,53 +563,135 @@ function sanitizeExistingLogFile(path: string): void {
   }
 }
 
-async function supervisedStartCommand(parsed: ParsedArgs): Promise<void> {
-  const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
-  const state = readAppState();
-  const supervisor = createBridgeAppSidecarSupervisorFromProcess({
-    cwd,
-    webUrl: getFlag(parsed, "web-url"),
-    remote: hasFlag(parsed, "remote"),
-    noOpen: hasFlag(parsed, "no-open"),
-    restartLimit: Number(getFlag(parsed, "restart-limit") ?? 3),
-    appLogPath: appLogPath(),
-    state,
-    activeProjectGrants: activeManagedProjectGrants(state.projectGrants)
+function managedBridgeRuntime() {
+  return createManagedBridgeRuntime({
+    readState: readAppState,
+    writeState: writeAppState,
+    startSupervisor: startDetachedManagedSupervisor,
+    processIsAlive,
+    writeStructuredLog
   });
-  const commandIdentity = currentBridgeProcessCommandIdentity("start");
+}
+
+async function startDetachedManagedSupervisor(context: ManagedBridgeStartContext): Promise<void> {
+  const cwd = resolve(context.cwd ?? readAppState().cwd ?? process.cwd());
+  const commandArgs = [
+    "supervise",
+    "--cwd",
+    cwd,
+    "--attempt-id",
+    context.attemptId,
+    ...(context.webUrl ? ["--web-url", context.webUrl] : [])
+  ];
+  const invocation = currentBridgeCommandInvocation({ commandArgs });
+  const commandIdentity = bridgeProcessCommandIdentityForSpawn("supervise", [invocation.command, ...invocation.args]);
+  const state = readAppState();
+  const child = spawn(invocation.command, invocation.args, {
+    cwd,
+    env: {
+      ...bridgeProcessEnvWithNonce({
+        state,
+        nonce: commandIdentity.nonce,
+        activeProjectGrants: activeManagedProjectGrants(state.projectGrants)
+      }),
+      HUNSU_BRIDGE_START_ATTEMPT_ID: context.attemptId
+    },
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  await new Promise<void>((resolveSpawn, rejectSpawn) => {
+    child.once("spawn", resolveSpawn);
+    child.once("error", rejectSpawn);
+  });
+  child.unref();
+}
+
+function persistManagedBridgeIdentity(identity: ManagedBridgeIdentity): void {
+  const state = readAppState();
   writeAppState({
     ...state,
-    supervisorPid: process.pid,
-    supervisorProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
-    processNonce: commandIdentity.nonce,
-    commandIdentity,
-    cwd,
-    webUrl: getFlag(parsed, "web-url"),
-    startedAt: new Date().toISOString()
+    bridgeApiUrl: identity.bridgeApiUrl,
+    instanceId: identity.instanceId,
+    pid: identity.daemonPid,
+    supervisorPid: identity.supervisorPid ?? state.supervisorPid,
+    startedAt: identity.startedAt ?? state.startedAt
   });
-  supervisor.start();
-  writeStructuredLog({ event: "bridge.supervisor.started", status: supervisor.status() });
-  console.log("Hunsu Bridge supervisor started.");
-  console.log(JSON.stringify(supervisor.status(), null, 2));
-  try {
-    await waitForShutdown(async () => {
-      await supervisor.stop();
-    });
-  } finally {
-    clearSupervisorProcessState();
+}
+
+function managedBridgeError(error: ManagedBridgeOperationError): BridgeAppCommandError {
+  return new BridgeAppCommandError(error.code, error.message);
+}
+
+function uiFailureFromError(error: unknown): Extract<UiCommandResult, { ok: false }> {
+  const code = error instanceof BridgeAppCommandError ? error.code : "COMMAND_FAILED";
+  const message = redactDiagnosticText(error instanceof Error ? error.message : String(error));
+  return {
+    ok: false,
+    code,
+    message,
+    recovery: error instanceof BridgeAppCommandError ? error.recovery : undefined
+  };
+}
+
+function printUiCommandResult<T>(parsed: ParsedArgs, result: Extract<UiCommandResult<T>, { ok: true }>): void {
+  const safeResult = sanitizeDiagnostics(result) as typeof result;
+  assertDiagnosticsSafe(safeResult);
+  writeStructuredLog({ event: "ui.operation.completed", action: parsed.command, code: safeResult.code, message: safeResult.message });
+  if (hasFlag(parsed, "json")) {
+    console.log(JSON.stringify(safeResult));
+    return;
   }
+  console.log(safeResult.message);
+}
+
+async function ensureRunningCommand(parsed: ParsedArgs): Promise<void> {
+  const runtime = managedBridgeRuntime();
+  const result = await runtime.ensureManagedBridgeRunning({
+    cwd: resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd()),
+    webUrl: getFlag(parsed, "web-url")
+  });
+  if (!result.ok) {
+    throw managedBridgeError(result.error);
+  }
+  persistManagedBridgeIdentity(result.value);
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: result.value.transition === "reused"
+      ? "Hunsu Bridge is already connected."
+      : "Hunsu Bridge started and is connected.",
+    value: result.value
+  });
 }
 
 async function daemonCommand(parsed: ParsedArgs): Promise<void> {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
   const remote = hasFlag(parsed, "remote");
   const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
-    cwd,
-    webUrl: getFlag(parsed, "web-url"),
-    noOpen: hasFlag(parsed, "no-open"),
-    mode: remote ? "remote-ready" : "local"
-  });
+  let handle: BridgeRuntimeHandle;
+  try {
+    handle = await supervisor.start({
+      cwd,
+      webUrl: getFlag(parsed, "web-url"),
+      noOpen: hasFlag(parsed, "no-open"),
+      mode: remote ? "remote-ready" : "local",
+      deferPairing: true
+    });
+  } catch (error) {
+    if (!isAddressInUseError(error)) {
+      throw error;
+    }
+    const existing = await managedBridgeRuntime().discoverManagedBridge();
+    if (existing.state === "running-managed") {
+      writeStructuredLog({ event: "bridge.ensure-running.reused", instanceId: existing.instanceId, bridgeApiUrl: existing.bridgeApiUrl });
+      return;
+    }
+    if (existing.state === "running-unmanaged") {
+      throw new BridgeAppCommandError("BRIDGE_ALREADY_RUNNING_UNMANAGED", "A Hunsu Bridge is already running but is not managed by this Bridge App.");
+    }
+    throw new BridgeAppCommandError("BRIDGE_PORT_IN_USE", "The configured Hunsu Bridge port is already in use by another service.");
+  }
   let relayClient: Awaited<ReturnType<typeof startRelayIfConfigured>> | undefined;
   if (remote) {
     const remoteContext = remoteAccessRuntimeContext();
@@ -789,7 +916,10 @@ async function statusCommand(): Promise<void> {
   console.log("Provider:");
   console.log(`  ${snapshot.providers.current.label}: ${providerStatusSummary(snapshot.providers.current)}`);
   console.log(`  Git: ${snapshot.prerequisites.tools.git.installed ? "Ready" : "Missing"}`);
-  console.log(`  Node: ${snapshot.prerequisites.tools.node.installed ? "Ready" : "Missing"}`);
+  console.log(`  Embedded runtime: Node ${snapshot.prerequisites.tools.embeddedRuntime.version} (bundled)`);
+  console.log(`  System Node: ${snapshot.prerequisites.tools.systemNode.installed ? snapshot.prerequisites.tools.systemNode.version ?? "Installed" : "Not installed (optional)"}`);
+  console.log(`  Package manager: ${snapshot.prerequisites.tools.packageManager.installed ? snapshot.prerequisites.tools.packageManager.version ?? "Installed" : "Not installed (optional)"}`);
+  console.log(`  Versions: App ${snapshot.versions.bridgeApp}; runtime ${snapshot.versions.bridgeRuntime}; protocol ${snapshot.versions.protocol}`);
   console.log("");
   const activeRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle === "active");
   const inactiveRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle !== "active");
@@ -918,33 +1048,53 @@ async function prerequisitesCommand(parsed: ParsedArgs): Promise<void> {
 }
 
 async function codexCommand(parsed: ParsedArgs): Promise<void> {
-  await runCodexCommand(parsed, {
-    hasFlag,
-    getFlag,
-    resolvePath: path => resolve(path),
-    getCodexStatus: getCodexRuntimeStatus,
-    codexProbeEnv,
-    reconcileCodexLoginFromStatus: codex => reconcileCodexLoginFromStatus(codex, codexCliActionContext()),
-    runCodexInstallCli,
-    providerStatusSummary,
-    runCodexApiKeyLoginCli: () => runCodexApiKeyLoginCliAction(codexCliActionContext()),
-    runCodexDeviceLoginCli: options => runCodexDeviceLoginCliAction(options, codexCliActionContext()),
-    runCodexChatGptLoginCli: () => runCodexChatGptLoginCliAction(codexCliActionContext()),
-    runCodexCli: args => runCodexCliAction(args, codexCliActionContext()),
-    readState: readAppState,
-    writeState: writeAppState,
-    parseInstallChannel: parseCodexInstallChannel,
-    parseAuthenticationPreference: parseCodexAuthenticationPreference,
-    printCodexStatus
-  });
+  try {
+    await runCodexCommand(parsed, {
+      hasFlag,
+      getFlag,
+      resolvePath: path => resolve(path),
+      getCodexStatus: getCodexRuntimeStatus,
+      codexProbeEnv,
+      reconcileCodexLoginFromStatus: codex => reconcileCodexLoginFromStatus(codex, codexCliActionContext()),
+      runCodexInstallCli,
+      providerStatusSummary,
+      runCodexApiKeyLoginCli: () => runCodexApiKeyLoginCliAction(codexCliActionContext()),
+      runCodexDeviceLoginCli: options => runCodexDeviceLoginCliAction(options, codexCliActionContext()),
+      runCodexChatGptLoginCli: () => runCodexChatGptLoginCliAction(codexCliActionContext()),
+      runCodexCli: args => runCodexCliAction(args, codexCliActionContext()),
+      readState: readAppState,
+      writeState: writeAppState,
+      parseInstallChannel: parseCodexInstallChannel,
+      parseAuthenticationPreference: parseCodexAuthenticationPreference,
+      printCodexStatus
+    });
+  } catch (error) {
+    if (parsed.rest[0] === "recheck") {
+      throw new BridgeAppCommandError(
+        "PROVIDER_RECHECK_FAILED",
+        redactDiagnosticText(error instanceof Error ? error.message : "Codex recheck failed.")
+      );
+    }
+    throw error;
+  }
 }
 
 async function providerCommand(parsed: ParsedArgs): Promise<void> {
-  await runProviderCommand(parsed, {
-    hasFlag,
-    getFlag,
-    providerRegistry: createBridgeDesktopRuntimeProviderRegistry
-  });
+  try {
+    await runProviderCommand(parsed, {
+      hasFlag,
+      getFlag,
+      providerRegistry: createBridgeDesktopRuntimeProviderRegistry
+    });
+  } catch (error) {
+    if (parsed.rest[0] === "config" && parsed.rest[1]?.startsWith("validate")) {
+      throw new BridgeAppCommandError(
+        "PROVIDER_CONFIG_INVALID",
+        redactDiagnosticText(error instanceof Error ? error.message : "Provider configuration is invalid.")
+      );
+    }
+    throw error;
+  }
 }
 
 async function modelAliasCommand(parsed: ParsedArgs): Promise<void> {
@@ -1334,6 +1484,10 @@ function formatQuitBehavior(value: BridgeQuitBehavior): string {
 }
 
 async function superviseCommand(parsed: ParsedArgs): Promise<void> {
+  if (!getFlag(parsed, "attempt-id")) {
+    await ensureRunningCommand(parsed);
+    return;
+  }
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
   const state = readAppState();
   const supervisor = createBridgeAppSidecarSupervisorFromProcess({
@@ -1357,8 +1511,7 @@ async function superviseCommand(parsed: ParsedArgs): Promise<void> {
     startedAt: new Date().toISOString()
   });
   supervisor.start();
-  console.log("Hunsu Bridge sidecar supervisor started.");
-  console.log(JSON.stringify(supervisor.status(), null, 2));
+  writeStructuredLog({ event: "bridge.supervisor.started", status: supervisor.status() });
   try {
     await waitForShutdown(async () => {
       await supervisor.stop();
@@ -1595,13 +1748,15 @@ function isHunsuBridgeHealthBody(body: unknown): body is { ok: true; service: "h
 
 async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
   let state = readAppState();
+  const discovery = await managedBridgeRuntime().discoverManagedBridge();
+  if (discovery.state === "running-managed") {
+    persistManagedBridgeIdentity(discovery);
+    state = readAppState();
+  }
   const health = await readBridgeHealth(state);
-  state = reconcileBridgeProcessState(state, health);
   const account = state.account?.status === "signed-in" ? `Signed in as ${state.account.email ?? state.account.userId}` : "Signed out";
-  const localBridge = localBridgeStatusFromProcessState(state, health, {
-    processIsAlive,
-    startingGraceMs: BRIDGE_STARTING_GRACE_MS
-  });
+  const localBridgeControl = localBridgeControlForDiscovery(discovery);
+  const localBridge = localBridgeSnapshotState(localBridgeControl);
   const codex = await getCodexRuntimeStatus({ env: codexProbeEnv() });
   state = reconcileCodexLoginFromStatus(codex, codexCliActionContext());
   const runtimeProviders = await runtimeProvidersSnapshot();
@@ -1610,13 +1765,18 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
     scopeValues: PROJECT_GRANT_SCOPE_VALUES,
     normalizeGrantPath
   });
-  return createBridgeAppSnapshot({
+  const packageManager = packageManagerStatus();
+  const version = bridgeVersionInfo();
+  const snapshot = createBridgeAppSnapshot({
     state,
     localBridge,
+    localBridgeControl,
     accountLabel: account,
     remoteAccessLabel: formatBridgeRemoteAccess(state.remoteAccess),
     bridgeApiUrl: health.ok ? health.bridgeApiUrl : state.bridgeApiUrl,
-    healthError: health.ok ? undefined : health.error,
+    healthError: localBridgeControl.state === "error"
+      ? localBridgeControl.startReason ?? localBridgeControl.stopReason ?? (health.ok ? undefined : health.error)
+      : undefined,
     runtimeProviders,
     providerConfig,
     managedRoadmaps,
@@ -1626,13 +1786,105 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
     codex,
     tools: {
       git: toolStatus("git", ["--version"]),
-      node: currentNodeRuntimeStatus(),
-      packageManager: packageManagerStatus()
+      embeddedRuntime: {
+        kind: "node-sea",
+        installed: true,
+        version: process.version,
+        bundled: true
+      },
+      systemNode: {
+        ...toolStatus("node", ["--version"]),
+        optional: true
+      },
+      packageManager: {
+        ...packageManager,
+        name: packageManager.installed ? packageManagerName(packageManager.binaryPath) : undefined,
+        optional: true,
+        requiredFor: ["Installing Codex through npm"]
+      }
     },
     codexSettings: snapshotCodexSettings(state),
     diagnostics: await buildDiagnostics(diagnosticsCommandContext()),
-    logLines: readLogTail(appLogPath(), 80)
+    logLines: readLogTail(appLogPath(), 80),
+    versions: {
+      bridgeApp: HUNSU_BRIDGE_APP_VERSION,
+      bridgeRuntime: version.bridgeVersion,
+      protocol: version.protocolVersion,
+      embeddedNode: process.version,
+      codexCli: codex.cli.version
+    }
   });
+  const safeSnapshot = sanitizeDiagnostics(snapshot) as BridgeAppSnapshot;
+  assertDiagnosticsSafe(safeSnapshot);
+  return safeSnapshot;
+}
+
+function localBridgeControlForDiscovery(discovery: ManagedBridgeDiscovery): LocalBridgeControl {
+  switch (discovery.state) {
+    case "running-managed":
+      return {
+        state: "connected",
+        ownership: "managed",
+        canStart: false,
+        canStop: true,
+        startReason: "Bridge is already connected.",
+        instanceId: discovery.instanceId,
+        daemonPid: discovery.daemonPid,
+        supervisorPid: discovery.supervisorPid
+      };
+    case "running-unmanaged":
+      return {
+        state: "connected",
+        ownership: "unmanaged",
+        canStart: false,
+        canStop: false,
+        startReason: "A Bridge is already connected outside this app.",
+        stopReason: "This Bridge process is not managed by this app.",
+        instanceId: discovery.instanceId
+      };
+    case "starting":
+      return {
+        state: "starting",
+        ownership: "managed",
+        canStart: false,
+        canStop: false,
+        startReason: discovery.reason ?? "Bridge startup is in progress.",
+        stopReason: "Bridge startup is in progress."
+      };
+    case "port-conflict":
+      return {
+        state: "error",
+        ownership: "unknown",
+        canStart: false,
+        canStop: false,
+        startReason: discovery.reason,
+        stopReason: "Bridge ownership could not be verified."
+      };
+    case "stale":
+    case "not-running":
+      return {
+        state: "not-running",
+        ownership: "unknown",
+        canStart: true,
+        canStop: false,
+        stopReason: "Bridge is not running."
+      };
+  }
+}
+
+function localBridgeSnapshotState(control: LocalBridgeControl): BridgeAppSnapshot["status"]["localBridge"] {
+  if (control.state === "connected") return "connected";
+  if (control.state === "starting" || control.state === "stopping") return "starting";
+  if (control.state === "error") return "error";
+  return "not-running";
+}
+
+function packageManagerName(binaryPath: string | undefined): "pnpm" | "npm" | "yarn" | undefined {
+  const name = binaryPath?.trim().toLowerCase();
+  if (name === "pnpm" || name === "npm" || name === "yarn") {
+    return name;
+  }
+  return undefined;
 }
 
 async function providerConfigSnapshot(): Promise<BridgeAppSnapshot["providerConfig"]> {
@@ -1814,31 +2066,6 @@ function configuredBridgeApiUrl(): string | undefined {
   }
 }
 
-function reconcileBridgeProcessState(
-  state: BridgeAppState,
-  health: Awaited<ReturnType<typeof readBridgeHealth>>
-): BridgeAppState {
-  const pids = uniqueNumberList([state.supervisorPid, state.pid]);
-  if (pids.length === 0) {
-    return state;
-  }
-  const anyAlive = pids.some(pid => processIsAlive(pid));
-  const staleUrl = health.ok && state.bridgeApiUrl ? normalizeUrl(health.bridgeApiUrl) !== normalizeUrl(state.bridgeApiUrl) : false;
-  if (!anyAlive || staleUrl) {
-    const next = clearBridgeProcessRuntimeState(state);
-    writeAppState(next);
-    writeStructuredLog({
-      event: "bridge.state.stale-cleared",
-      reason: !anyAlive ? "process-dead" : "bridge-url-changed",
-      pids,
-      previousBridgeApiUrl: state.bridgeApiUrl,
-      healthBridgeApiUrl: health.ok ? health.bridgeApiUrl : undefined
-    });
-    return next;
-  }
-  return state;
-}
-
 async function stopBridgeThroughControlEndpoint(state: BridgeAppState): Promise<{ ok: true } | { ok: false; error: string }> {
   if (!state.bridgeApiUrl || !state.controlToken) {
     return { ok: false, error: "No Bridge control endpoint is known." };
@@ -1925,12 +2152,10 @@ function uniqueStringList(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function normalizeUrl(value: string): string {
-  try {
-    return new URL(value).toString();
-  } catch (_error) {
-    return value;
-  }
+function isAddressInUseError(error: unknown): boolean {
+  return error instanceof Error
+    && ("code" in error && (error as NodeJS.ErrnoException).code === "EADDRINUSE"
+      || /EADDRINUSE|address already in use/iu.test(error.message));
 }
 
 function rememberRunningBridge(handle: BridgeRuntimeHandle, cwd: string, webUrl: string | undefined): void {
@@ -1962,9 +2187,9 @@ function clearManagedProcessState(): void {
       pid: undefined,
       bridgeProcess: undefined,
       bridgeApiUrl: undefined,
+      instanceId: undefined,
       processNonce: undefined,
       commandIdentity: undefined,
-      authToken: undefined,
       controlToken: undefined,
       pairing: undefined,
       startedAt: undefined
@@ -2319,7 +2544,7 @@ function writeStructuredLog(value: Record<string, unknown>): void {
     mkdirSync(dirname(path), { recursive: true });
     appendFileSync(path, `${JSON.stringify(safeValue)}\n`, "utf8");
   } catch (_error) {
-    // Logging must not make an otherwise safe command fail on a read-only or concurrently cleaned host.
+    // Logging must not make an otherwise safe command fail on a read-only host.
   }
 }
 
@@ -2530,7 +2755,7 @@ function safeStudioNext(next: string): string {
 }
 
 async function openStudioManagedUrl(url: string): Promise<void> {
-  openStudioInBrowser(url);
+  await openStudioInBrowser(url);
 }
 
 function uniqueScopeList(scopes: BridgeCommandScope[]): BridgeCommandScope[] {
