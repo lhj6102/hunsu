@@ -615,7 +615,7 @@ function persistManagedBridgeIdentity(identity: ManagedBridgeIdentity): void {
 }
 
 function managedBridgeError(error: ManagedBridgeOperationError): BridgeAppCommandError {
-  return new BridgeAppCommandError(error.code, error.message);
+  return new BridgeAppCommandError(error.code, error.message, error.recovery);
 }
 
 function uiFailureFromError(error: unknown): Extract<UiCommandResult, { ok: false }> {

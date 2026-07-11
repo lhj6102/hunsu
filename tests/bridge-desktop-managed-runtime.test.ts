@@ -107,6 +107,16 @@ test("managed Bridge discovery distinguishes managed, unmanaged, and unrelated l
     service.kind = "unrelated";
     const conflict = await runtime.discoverManagedBridge();
     assert.equal(conflict.state, "port-conflict");
+    const refusedConflict = await runtime.ensureManagedBridgeRunning();
+    assert.equal(refusedConflict.ok, false);
+    if (!refusedConflict.ok) {
+      assert.equal(refusedConflict.error.code, "BRIDGE_PORT_IN_USE");
+      assert.deepEqual(refusedConflict.error.recovery, {
+        label: "Stop the other process using Bridge port 19687, then select Start Bridge again.",
+        action: "retry-start-bridge"
+      });
+      assert.doesNotMatch(JSON.stringify(refusedConflict.error), /synthetic-control-token/u);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

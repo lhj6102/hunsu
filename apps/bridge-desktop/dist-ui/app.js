@@ -72,7 +72,7 @@ const sensitiveQueryPattern = /([?&](?:hunsuBridgeToken|hunsuRelayToken|token|ac
 const redactedValues = new Set(["", "[redacted]", "%5bredacted%5d", "redacted", "***"]);
 const uiErrorMessages = {
   BRIDGE_ALREADY_RUNNING_UNMANAGED: "Bridge is already running outside this app.",
-  BRIDGE_PORT_IN_USE: "The local Bridge port is in use by another process.",
+  BRIDGE_PORT_IN_USE: "The configured Bridge port is in use by another process.",
   BRIDGE_START_COORDINATION_TIMEOUT: "Bridge startup coordination timed out.",
   BRIDGE_START_TIMEOUT: "Bridge did not become connected in time.",
   BRIDGE_CONTROL_UNAVAILABLE: "Bridge ownership could not be verified.",
@@ -718,7 +718,9 @@ function runtimeProviderRow(provider) {
   title.textContent = provider.label;
   const meta = document.createElement("div");
   meta.className = "project-meta";
-  meta.textContent = `${provider.group} · ${provider.status}`;
+  meta.textContent = provider.group.trim().toLocaleLowerCase() === provider.status.trim().toLocaleLowerCase()
+    ? provider.group
+    : `${provider.group} · ${provider.status}`;
   body.append(title, meta);
   row.append(body);
   return row;
@@ -1142,7 +1144,7 @@ function formatDeviceLoginState(state) {
 }
 
 function renderToolCards(tools) {
-  gitCard.replaceChildren(toolRow("Git", tools?.git));
+  gitCard.replaceChildren(toolRow("Git", tools?.git, "Install Git and make sure it is available on PATH."));
   nodeCard.replaceChildren(
     embeddedRuntimeRow(tools?.embeddedRuntime),
     optionalSystemNodeRow(tools?.systemNode),
@@ -1192,7 +1194,7 @@ function labeledToolRow(titleText, text) {
   return row;
 }
 
-function toolRow(titleText, tool) {
+function toolRow(titleText, tool, missingHelp) {
   const row = document.createElement("div");
   row.className = "project-row";
   const body = document.createElement("div");
@@ -1201,12 +1203,9 @@ function toolRow(titleText, tool) {
   title.textContent = titleText;
   const meta = document.createElement("div");
   meta.className = "project-meta";
-  meta.textContent = [
-    tool?.installed ? "Installed" : "Missing",
-    tool?.version,
-    tool?.binaryPath,
-    tool?.error
-  ].filter(Boolean).join(" · ");
+  meta.textContent = tool?.installed
+    ? ["Installed", tool.version, tool.binaryPath].filter(Boolean).join(" · ")
+    : ["Missing", missingHelp].filter(Boolean).join(" · ");
   body.append(title, meta);
   row.append(body);
   return row;

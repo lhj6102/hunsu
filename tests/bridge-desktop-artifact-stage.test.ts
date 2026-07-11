@@ -195,6 +195,11 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
         sidecarConsoleWindows: 0,
         liveLegacyPairingRevoked: true,
         workspaceRoadmapIdMatched: true,
+        portConflictFeedback: {
+          code: "BRIDGE_PORT_IN_USE",
+          configuredPort: 43127,
+          retryInstruction: "Stop the other process using Bridge port 43127, then select Start Bridge again."
+        },
         screenshotFile: "windows-installed-app-e2e-screenshot.png"
       },
       releaseGate: {

@@ -323,6 +323,15 @@ function validateInstalledAppEvidence(path, screenshotPath) {
     || evidence?.observations?.screenshotFile !== installedAppScreenshotName) {
     throw new Error(`Installed Bridge App E2E evidence is missing required native observations: ${path}`);
   }
+  const portConflictFeedback = evidence?.observations?.portConflictFeedback;
+  if (portConflictFeedback?.code !== "BRIDGE_PORT_IN_USE"
+    || !Number.isInteger(portConflictFeedback?.configuredPort)
+    || portConflictFeedback.configuredPort < 1
+    || portConflictFeedback.configuredPort > 65_535
+    || portConflictFeedback.retryInstruction
+      !== `Stop the other process using Bridge port ${portConflictFeedback.configuredPort}, then select Start Bridge again.`) {
+    throw new Error(`Installed Bridge App E2E evidence is missing actionable configured-port feedback: ${path}`);
+  }
   if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken|hunsuRelayToken|authorization|access_token|refresh_token/iu.test(text)) {
     throw new Error(`Installed Bridge App E2E evidence contains a URL or credential parameter: ${path}`);
   }

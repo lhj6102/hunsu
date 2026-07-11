@@ -96,6 +96,46 @@ test("Bridge desktop UI renders lifecycle ownership controls and runtime semanti
   }
 });
 
+test("Bridge desktop UI keeps missing Git and planned provider copy concise", () => {
+  const ui = loadUi();
+  const snapshot = snapshotFixture();
+  ui.renderSnapshot({
+    ...snapshot,
+    prerequisites: {
+      ...snapshot.prerequisites,
+      tools: {
+        ...snapshot.prerequisites.tools,
+        git: {
+          installed: false,
+          binaryPath: "git",
+          error: '\\"git\\" \\"--version\\" is not recognized as an internal or external command.'
+        }
+      }
+    },
+    providers: {
+      ...snapshot.providers,
+      providers: [
+        snapshot.providers.current,
+        {
+          providerId: "claude_code",
+          label: "Claude Code",
+          ready: false,
+          recommendedAction: "configure",
+          safeMessage: "Coming later"
+        }
+      ]
+    }
+  });
+
+  const gitCopy = text(ui.element("#git-card"));
+  assert.match(gitCopy, /Missing[\s\S]*Install Git and make sure it is available on PATH\./);
+  assert.doesNotMatch(gitCopy, /--version|not recognized|[\\"]/u);
+
+  const providerCopy = text(ui.element("#runtime-provider-list"));
+  assert.equal(providerCopy.match(/Coming later/gu)?.length, 1);
+  assert.doesNotMatch(providerCopy, /Coming later\s*·\s*Coming later/u);
+});
+
 test("runUiAction retains visible success and safe failure feedback", async () => {
   const ui = loadUi();
   const button = ui.element("#validate-codex-config");
@@ -325,10 +365,17 @@ test("Recheck behavior reports timestamped success and safe failure", async () =
 
 test("failed Pair, Open, Start, and Stop feedback is safe and survives snapshot refresh", async () => {
   let snapshot = providerConfigSnapshotFixture();
-  const failures: Record<string, { code: string; message: string }> = {
+  const failures: Record<string, { code: string; message: string; recovery?: { label: string; action: string } }> = {
     pair: { code: "BROWSER_OPEN_FAILED", message: "Pair failed https://example.test/?hunsuBridgeToken=synthetic-action-secret" },
     "open-roadmap": { code: "ROADMAP_NOT_FOUND", message: "Open failed https://example.test/?token=synthetic-action-secret" },
-    "ensure-running": { code: "BRIDGE_PORT_IN_USE", message: "Start failed access_token=synthetic-action-secret" },
+    "ensure-running": {
+      code: "BRIDGE_PORT_IN_USE",
+      message: "Start failed access_token=synthetic-action-secret",
+      recovery: {
+        label: "Stop the other process using Bridge port 43127, then select Start Bridge again.",
+        action: "retry-start-bridge"
+      }
+    },
     stop: { code: "BRIDGE_NOT_OWNED", message: "Stop failed Authorization: Bearer synthetic-action-secret" }
   };
   const ui = loadUi({
@@ -357,7 +404,7 @@ test("failed Pair, Open, Start, and Stop feedback is safe and survives snapshot 
     {
       label: "Start",
       target: "#start-bridge",
-      expected: /Bridge could not be started.*port is in use/is,
+      expected: /Bridge could not be started.*configured Bridge port is in use.*Bridge port 43127.*select Start Bridge again/is,
       snapshot: () => providerConfigSnapshotFixture({ bridgeState: "not-running" })
     },
     {

@@ -66,6 +66,10 @@ export type ManagedBridgeOperationError = {
   code: ManagedBridgeErrorCode;
   message: string;
   canForceStop?: false;
+  recovery?: {
+    label: string;
+    action: string;
+  };
 };
 
 export type ManagedBridgeResult<T> =
@@ -749,9 +753,26 @@ function ensureFailureForDiscovery(
     return fail("BRIDGE_ALREADY_RUNNING_UNMANAGED", "A Hunsu Bridge is already running but is not managed by this Bridge App.");
   }
   if (discovery.state === "port-conflict") {
-    return fail("BRIDGE_PORT_IN_USE", "The configured Hunsu Bridge port is already in use by another service.");
+    return fail(
+      "BRIDGE_PORT_IN_USE",
+      "The configured Hunsu Bridge port is already in use by another service.",
+      undefined,
+      portConflictRecovery(discovery.bridgeApiUrl)
+    );
   }
   return undefined;
+}
+
+function portConflictRecovery(bridgeApiUrl: string): { label: string; action: string } {
+  const endpoint = new URL(bridgeApiUrl);
+  const configuredPort = endpoint.port
+    || (endpoint.protocol === "http:" ? "80" : endpoint.protocol === "https:" ? "443" : "");
+  return {
+    label: configuredPort
+      ? `Stop the other process using Bridge port ${configuredPort}, then select Start Bridge again.`
+      : "Stop the other process using the configured Bridge port, then select Start Bridge again.",
+    action: "retry-start-bridge"
+  };
 }
 
 function success<T>(value: T): ManagedBridgeResult<T> {
@@ -761,9 +782,10 @@ function success<T>(value: T): ManagedBridgeResult<T> {
 function fail(
   code: ManagedBridgeErrorCode,
   message: string,
-  canForceStop?: false
+  canForceStop?: false,
+  recovery?: ManagedBridgeOperationError["recovery"]
 ): { ok: false; error: ManagedBridgeOperationError } {
-  return { ok: false, error: { code, message, canForceStop } };
+  return { ok: false, error: { code, message, canForceStop, recovery } };
 }
 
 function safelyReadState(readState: () => BridgeAppState): ManagedBridgeResult<BridgeAppState> {

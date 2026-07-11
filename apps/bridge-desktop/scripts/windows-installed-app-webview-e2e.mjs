@@ -63,7 +63,7 @@ try {
   await page.locator("#refresh").click();
   await waitForTerminalFeedback(page, "#action-status", "Bridge status refreshed", 60_000);
   await waitForLifecycle(page, { localLabel: "Not Running", startDisabled: false, stopDisabled: true });
-  await verifyPortConflictFeedback(page, options.bridgePort);
+  const portConflictFeedback = await verifyPortConflictFeedback(page, options.bridgePort);
   await openAdvancedPanel(page, "advanced");
   mkdirSync(dirname(options.screenshotPath), { recursive: true });
   await page.screenshot({ path: options.screenshotPath, fullPage: true });
@@ -98,7 +98,7 @@ try {
     ],
     observations: {
       lifecycleTransitions: ["connected-managed", "not-running", "connected-managed", "not-running"],
-      portConflictFeedback: "The local Bridge port is in use by another process.",
+      portConflictFeedback,
       workspaceRoadmapIdMatched: true,
       browserHandoffs: { web: 1, workspace: 1 },
       diagnosticsSha256: diagnosticsObservation.diagnosticsSha256,
@@ -365,6 +365,8 @@ function assertSafeDiagnosticsText(text, legacySecret, runtimeTokens) {
 }
 
 async function verifyPortConflictFeedback(page, bridgePort) {
+  const summary = "The configured Bridge port is in use by another process.";
+  const retryInstruction = `Stop the other process using Bridge port ${bridgePort}, then select Start Bridge again.`;
   const server = createServer(socket => socket.destroy());
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -374,11 +376,20 @@ async function verifyPortConflictFeedback(page, bridgePort) {
     await openLifecycleControls(page);
     await armTransitionTrace(page, "#action-status");
     await page.locator("#start-bridge").click();
-    await page.waitForFunction(() => {
+    await page.waitForFunction(({ expectedSummary, expectedRetryInstruction }) => {
       const status = document.querySelector("#action-status");
       return status?.dataset.state === "error"
-        && status.textContent?.includes("The local Bridge port is in use by another process.");
-    }, undefined, { timeout: 60_000 });
+        && status.textContent?.includes(expectedSummary)
+        && status.textContent?.includes(expectedRetryInstruction);
+    }, {
+      expectedSummary: summary,
+      expectedRetryInstruction: retryInstruction
+    }, { timeout: 60_000 });
+    const visibleFeedback = await page.locator("#action-status").textContent();
+    assert(visibleFeedback?.includes(`Bridge port ${bridgePort}`),
+      "Port-conflict feedback did not identify the configured Bridge port.");
+    assert(visibleFeedback?.includes("select Start Bridge again"),
+      "Port-conflict feedback did not tell the user how to retry.");
     assert(!(await page.locator("#start-bridge").isDisabled()), "Start did not recover after actionable port-conflict feedback.");
     assert(await page.locator("#stop-bridge").isDisabled(), "Stop became available for an unrelated port owner.");
     const trace = await readTransitionTrace(page);
@@ -386,6 +397,11 @@ async function verifyPortConflictFeedback(page, bridgePort) {
       "Port-conflict Start did not expose pending feedback.");
     await delay(3_000);
     assert(server.listening, "The Bridge disturbed the unrelated port-conflict listener.");
+    return {
+      code: "BRIDGE_PORT_IN_USE",
+      configuredPort: bridgePort,
+      retryInstruction
+    };
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
