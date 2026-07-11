@@ -1,6 +1,6 @@
-import { type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { type IncomingMessage, type ServerResponse } from "node:http";
 import { execFile, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
@@ -107,7 +107,7 @@ import {
 } from "./runtimes/codex.ts";
 import { sanitizeDiagnostics } from "./diagnostics/redaction.ts";
 import { createRuntimeProviderRegistry } from "./runtime-providers/registry.ts";
-import { createBridgeAppRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
+import { createBridgeRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
 import {
   codexProviderEnv,
   codexRuntimeStatusForResponse,
@@ -137,10 +137,11 @@ import {
   createBridgeStatusForRequest,
   currentRuntimeProviderStatus
 } from "./server/bridgeStatus.ts";
-import { bridgeCodexSettingsFromBridgeAppState } from "./server/bridgeAppState.ts";
+import { bridgeCodexSettingsFromState } from "./server/bridgeState.ts";
 import { createStudioHttpServer, studioRequestUrl } from "./server/createStudioServer.ts";
 import { handleRemoteBridgeRoute, handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
 import { baseCorsHeaders, createResponseSecurityHeaderStore } from "./server/security.ts";
+import type { HeadlessControlRouteHandler } from "./server/controlRoutes.ts";
 import { handleExecuteRoute, handleRoadmapExecuteRoute } from "./executes/executeRoutes.ts";
 import {
   executeStartHasExplicitBackendSelection,
@@ -169,6 +170,9 @@ export {
   detectCodexBinary,
   getCodexRuntimeStatus
 } from "./runtimes/codex.ts";
+export { createBridgeControlClient } from "./client/controlClient.ts";
+export type { BridgeControlClient, BridgeHealth } from "./client/controlClient.ts";
+export type { BridgeCliResult } from "./client/cliResult.ts";
 export {
   assertDiagnosticsSafe,
   redactDiagnosticText,
@@ -735,6 +739,9 @@ export type StudioServerSecurityOptions = {
   allowedOrigins?: string[];
   allowNoOrigin?: boolean;
   requirePairing?: boolean;
+  pairingValidator?: (credential?: string) =>
+    | { valid: true }
+    | { valid: false; reason: "missing" | "invalid" | "expired" | "revoked" };
 };
 
 export type BridgeControlStatusResponse = {
@@ -743,7 +750,6 @@ export type BridgeControlStatusResponse = {
   protocolVersion: string;
   bridgeVersion: string;
   daemonPid: number;
-  supervisorPid?: number;
   startedAt: string;
   state: "running";
 };
@@ -751,7 +757,6 @@ export type BridgeControlStatusResponse = {
 export type StudioServerControlStatusOptions = {
   instanceId?: string;
   daemonPid?: number;
-  supervisorPid?: number;
   startedAt?: string;
 };
 
@@ -763,6 +768,7 @@ type StudioServerSecurity = {
   allowedOrigins: string[];
   allowNoOrigin: boolean;
   requirePairing: boolean;
+  pairingValidator?: StudioServerSecurityOptions["pairingValidator"];
 };
 
 type StudioRequestSecurity = {
@@ -809,6 +815,11 @@ export type StudioServerOptions = {
   providerInventory?: ExecuteProviderInventorySource;
   security?: StudioServerSecurityOptions;
   controlStatus?: StudioServerControlStatusOptions;
+  controlRouteHandler?: HeadlessControlRouteHandler;
+  headlessRemote?: {
+    enable: () => Promise<{ deviceId?: string; connection?: string }>;
+    disable: () => Promise<{ deviceId?: string; connection?: string }>;
+  };
 };
 
 export type StudioCommandResult = {
@@ -953,8 +964,6 @@ export type ProjectInspection =
 
 export type ProjectInspectionRequest = RoadmapOpenRequest;
 
-export type BridgeRuntimeStatus = "starting" | "running" | "stopping" | "stopped" | "error";
-
 export type BridgePairingSession = {
   token: string;
   issuedAt: string;
@@ -962,68 +971,13 @@ export type BridgePairingSession = {
   revokedAt?: string;
 };
 
-type BridgeRuntimeHandleBase = {
-  bridgeApiUrl: string;
-  allowedOrigin: string;
-  controlToken: string;
-  status: BridgeRuntimeStatus;
-  startedAt?: string;
-  error?: string;
-};
-
-export type BridgeRuntimeHandle = BridgeRuntimeHandleBase & (
-  | {
-      pairingState: "unpaired";
-      studioUrl?: never;
-      authToken?: never;
-      pairing?: never;
-    }
-  | {
-      pairingState: "paired";
-      studioUrl: string;
-      authToken: string;
-      pairing: BridgePairingSession;
-    }
-);
-
-export type BridgeMode = "local" | "remote-ready";
 export type StudioPairingTokenQueryParam = "hunsuBridgeToken";
-
-export type StartBridgeInput = {
-  cwd?: string;
-  webUrl?: string;
-  noOpen?: boolean;
-  allowedOrigins?: string[];
-  mode?: BridgeMode;
-  authToken?: string;
-  controlToken?: string;
-  pairingTtlMs?: number;
-  runtimeConfig?: BridgeRuntimeConfig;
-  tokenQueryParam?: StudioPairingTokenQueryParam;
-  deferPairing?: boolean;
-};
 
 export type CreatePairingUrlInput = {
   webUrl?: string;
   authToken?: string;
   roadmapId?: string;
   tokenQueryParam?: StudioPairingTokenQueryParam;
-};
-
-export type OpenStudioInput = CreatePairingUrlInput & {
-  url?: string;
-};
-
-export type BridgeSupervisor = {
-  start(input?: StartBridgeInput): Promise<BridgeRuntimeHandle>;
-  stop(): Promise<void>;
-  waitForTerminal(): Promise<void>;
-  restart(input?: StartBridgeInput): Promise<BridgeRuntimeHandle>;
-  status(): Promise<BridgeRuntimeHandle | undefined>;
-  createPairingUrl(input?: CreatePairingUrlInput): Promise<string>;
-  openStudio(input?: OpenStudioInput): Promise<void>;
-  rotatePairing(input?: CreatePairingUrlInput): Promise<BridgeRuntimeHandle>;
-  revokePairing(): Promise<BridgeRuntimeHandle | undefined>;
 };
 
 export type BrowseRootId = string & { readonly __brand: "BrowseRootId" };
@@ -1502,71 +1456,6 @@ export function bridgePairingSessionState(session: BridgePairingSession, now = n
   return "active";
 }
 
-export type StudioBridgeStartOptions = {
-  cwd?: string;
-  webUrl?: string;
-  noOpen?: boolean;
-  dryRun?: boolean;
-  json?: boolean;
-  env?: Record<string, string | undefined>;
-};
-
-export type StudioBridgeStartInfo = {
-  bridgeApiUrl: string;
-  studioUrl: string;
-  allowedOrigin: string;
-};
-
-export async function startStudioBridge(options: StudioBridgeStartOptions = {}): Promise<StudioBridgeStartInfo> {
-  const cwd = options.cwd ?? process.cwd();
-  const env = options.env ?? currentProcessEnv();
-  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig(env, { cwd }));
-  const bridgeApiUrl = endpointUrl(runtimeConfig.bridgeApi);
-  const authToken = createBridgeApiAuthToken();
-  const webUrl = resolveStudioBridgeWebUrl(options.webUrl, env);
-  const studioUrl = createStudioPairingUrl({ webUrl, authToken });
-  const allowedOrigin = new URL(webUrl).origin;
-  const startInfo = {
-    bridgeApiUrl,
-    studioUrl,
-    allowedOrigin
-  };
-
-  if (options.dryRun) {
-    printStudioBridgeStartInfo(startInfo, options);
-    return startInfo;
-  }
-
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
-    cwd,
-    webUrl,
-    noOpen: true,
-    authToken,
-    runtimeConfig,
-    allowedOrigins: [allowedOrigin]
-  });
-  const runningStartInfo = {
-    bridgeApiUrl: handle.bridgeApiUrl,
-    studioUrl: handle.studioUrl ?? studioUrl,
-    allowedOrigin: handle.allowedOrigin
-  };
-  printStudioBridgeStartInfo(runningStartInfo, options);
-  if (!options.noOpen) {
-    await supervisor.openStudio({ url: runningStartInfo.studioUrl });
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const shutdown = () => {
-      supervisor.stop().then(resolve, reject);
-    };
-    process.once("SIGINT", shutdown);
-    process.once("SIGTERM", shutdown);
-  });
-
-  return startInfo;
-}
-
 export function resolveStudioBridgeWebUrl(webUrl: string | undefined, env: Record<string, string | undefined>): string {
   const raw = webUrl ?? unwrapConfigResult(resolveStudioLauncherConfig(env)).webUrl;
   try {
@@ -1590,33 +1479,7 @@ export function createStudioPairingUrl(input: CreatePairingUrlInput & { authToke
   return url.toString();
 }
 
-function studioBridgePairingUrl(webUrl: string, authToken: string): string {
-  return createStudioPairingUrl({ webUrl, authToken });
-}
-
-function printStudioBridgeStartInfo(info: StudioBridgeStartInfo, options: Pick<StudioBridgeStartOptions, "json">): void {
-  if (options.json) {
-    console.log(JSON.stringify({
-      bridgeApiUrl: info.bridgeApiUrl,
-      allowedOrigin: info.allowedOrigin,
-      pairing: "ready"
-    }, null, 2));
-    return;
-  }
-  console.log(`Hunsu Bridge: ${info.bridgeApiUrl}`);
-  console.log("Hunsu Studio pairing: Ready");
-  console.log(`Allowed Studio origin: ${info.allowedOrigin}`);
-}
-
 function openStudioBridgeBrowser(url: string): Promise<void> {
-  const testCapturePath = currentProcessEnv().HUNSU_BRIDGE_TEST_MODE === "1"
-    ? currentProcessEnv().HUNSU_BRIDGE_TEST_BROWSER_CAPTURE_PATH?.trim()
-    : undefined;
-  if (testCapturePath) {
-    mkdirSync(dirname(testCapturePath), { recursive: true });
-    appendFileSync(testCapturePath, `${url}\n`, { encoding: "utf8", mode: 0o600 });
-    return Promise.resolve();
-  }
   const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
   return new Promise<void>((resolveOpen, rejectOpen) => {
@@ -1631,217 +1494,6 @@ function openStudioBridgeBrowser(url: string): Promise<void> {
 
 export function openStudioInBrowser(url: string): Promise<void> {
   return openStudioBridgeBrowser(url);
-}
-
-export function createBridgeSupervisor(): BridgeSupervisor {
-  let server: Server | undefined;
-  let handle: BridgeRuntimeHandle | undefined;
-  let runtimeConfig: BridgeRuntimeConfig | undefined;
-  let repositoryPath: string | undefined;
-  let webUrl: string | undefined;
-  let allowedOrigins: string[] = [];
-  let pairingSession: BridgePairingSession | undefined;
-  let controlToken: string | undefined;
-  let stopping = false;
-  let resolveTerminal: (() => void) | undefined;
-  let terminal = Promise.resolve();
-
-  const supervisor: BridgeSupervisor = {
-    async start(input: StartBridgeInput = {}) {
-      if (handle?.status === "running" || handle?.status === "starting") {
-        return handle;
-      }
-
-      repositoryPath = input.cwd ?? repositoryPath ?? process.cwd();
-      runtimeConfig = input.runtimeConfig ?? unwrapConfigResult(resolveBridgeRuntimeConfig(process.env, { cwd: repositoryPath }));
-      webUrl = resolveStudioBridgeWebUrl(input.webUrl ?? webUrl, runtimeConfig.processEnv);
-      const allowedOrigin = new URL(webUrl).origin;
-      allowedOrigins = uniqueStrings([allowedOrigin, ...(input.allowedOrigins ?? allowedOrigins)]);
-      pairingSession = input.deferPairing
-        ? undefined
-        : createBridgePairingSession({ token: input.authToken, ttlMs: input.pairingTtlMs });
-      controlToken = input.controlToken ?? controlToken ?? createBridgeControlToken();
-      const initialBridgeApiUrl = endpointUrl(runtimeConfig.bridgeApi);
-      const tokenQueryParam = input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM;
-      const handleBase: BridgeRuntimeHandleBase = {
-        bridgeApiUrl: initialBridgeApiUrl,
-        allowedOrigin,
-        controlToken,
-        status: "starting"
-      };
-      handle = pairingSession ? {
-        ...handleBase,
-        pairingState: "paired",
-        studioUrl: createStudioPairingUrl({ webUrl, authToken: pairingSession.token, tokenQueryParam }),
-        authToken: pairingSession.token,
-        pairing: pairingSession
-      } : {
-        ...handleBase,
-        pairingState: "unpaired"
-      };
-      stopping = false;
-      terminal = new Promise<void>(resolve => {
-        resolveTerminal = resolve;
-      });
-
-      server = createStudioServer({
-        cwd: repositoryPath,
-        runtimeConfig,
-        security: {
-          pairingSession,
-          controlToken,
-          allowedOrigins,
-          requirePairing: true
-        }
-      });
-
-      await new Promise<void>((resolve, reject) => {
-        const activeServer = server;
-        if (!activeServer || !runtimeConfig) {
-          reject(new Error("Bridge server could not be created."));
-          return;
-        }
-        const onError = (error: Error) => {
-          handle = {
-            ...handle!,
-            status: "error",
-            error: error.message
-          };
-          resolveTerminal?.();
-          resolveTerminal = undefined;
-          reject(error);
-        };
-        activeServer.once("error", onError);
-        activeServer.once("close", () => {
-          if (server === activeServer) {
-            server = undefined;
-          }
-          if (handle && !stopping && handle.status !== "error") {
-            handle = { ...handle, status: "stopped" };
-          }
-          stopping = false;
-          resolveTerminal?.();
-          resolveTerminal = undefined;
-        });
-        activeServer.listen(runtimeConfig.bridgeApi.port, runtimeConfig.bridgeApi.host, () => {
-          activeServer.off("error", onError);
-          const bridgeApiUrl = bridgeApiUrlForServer(activeServer, runtimeConfig!);
-          const startedAt = new Date().toISOString();
-          handle = {
-            ...handle!,
-            bridgeApiUrl,
-            controlToken: controlToken!,
-            status: "running",
-            startedAt
-          };
-          if (!input.noOpen && handle.pairingState === "paired") {
-            void openStudioBridgeBrowser(handle.studioUrl).catch(() => undefined);
-          }
-          resolve();
-        });
-      });
-
-      return handle;
-    },
-    async stop() {
-      if (!server) {
-        if (handle) {
-          handle = { ...handle, status: "stopped" };
-        }
-        resolveTerminal?.();
-        resolveTerminal = undefined;
-        return;
-      }
-      stopping = true;
-      if (handle) {
-        handle = { ...handle, status: "stopping" };
-      }
-      const closing = server;
-      server = undefined;
-      await new Promise<void>((resolve, reject) => {
-        closing.close(error => {
-          if (error) {
-            if (handle) {
-              handle = { ...handle, status: "error", error: error.message };
-            }
-            reject(error);
-            return;
-          }
-          if (handle) {
-            handle = { ...handle, status: "stopped" };
-          }
-          stopping = false;
-          resolve();
-        });
-      });
-    },
-    async waitForTerminal() {
-      await terminal;
-    },
-    async restart(input: StartBridgeInput = {}) {
-      await supervisor.stop();
-      return supervisor.start({
-        cwd: repositoryPath,
-        webUrl,
-        allowedOrigins,
-        ...input
-      });
-    },
-    async status() {
-      return handle;
-    },
-    async createPairingUrl(input: CreatePairingUrlInput = {}) {
-      if (handle && pairingSession && bridgePairingSessionState(pairingSession) !== "active") {
-        await supervisor.rotatePairing(input);
-      }
-      const authToken = input.authToken ?? handle?.authToken;
-      if (!authToken) {
-        throw new Error("Bridge is not running and no pairing token was provided.");
-      }
-      return createStudioPairingUrl({
-        webUrl: input.webUrl ?? webUrl,
-        authToken,
-        roadmapId: input.roadmapId,
-        tokenQueryParam: input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM
-      });
-    },
-    async openStudio(input: OpenStudioInput = {}) {
-      await openStudioBridgeBrowser(input.url ?? await supervisor.createPairingUrl(input));
-    },
-    async rotatePairing(input: CreatePairingUrlInput = {}) {
-      return supervisor.restart({
-        cwd: repositoryPath,
-        webUrl: input.webUrl ?? webUrl,
-        allowedOrigins,
-        noOpen: true,
-        authToken: input.authToken ?? createBridgeApiAuthToken(),
-        controlToken,
-        tokenQueryParam: input.tokenQueryParam ?? BRIDGE_API_TOKEN_QUERY_PARAM
-      });
-    },
-    async revokePairing() {
-      if (!pairingSession || !handle || handle.pairingState !== "paired") {
-        return handle;
-      }
-      revokeBridgePairingSession(pairingSession);
-      handle = {
-        ...handle,
-        pairing: pairingSession
-      };
-      return handle;
-    }
-  };
-
-  return supervisor;
-}
-
-function bridgeApiUrlForServer(server: Server, runtimeConfig: BridgeRuntimeConfig): string {
-  const address = server.address();
-  if (typeof address === "object" && address) {
-    const host = isWildcardHost(runtimeConfig.bridgeApi.host) ? "127.0.0.1" : runtimeConfig.bridgeApi.host;
-    return `http://${host}:${address.port}`;
-  }
-  return endpointUrl(runtimeConfig.bridgeApi);
 }
 
 function bridgeApiUrlForRequest(request: IncomingMessage, runtimeConfig: BridgeRuntimeConfig): string {
@@ -1868,7 +1520,8 @@ function createStudioServerSecurity(options: StudioServerSecurityOptions | undef
       ...(options?.allowedOrigins ?? [])
     ].map(normalizeOrigin).filter((origin): origin is string => origin !== undefined)),
     allowNoOrigin: options?.allowNoOrigin ?? true,
-    requirePairing: options?.requirePairing ?? Boolean(pairingSession || options?.authToken)
+    requirePairing: options?.requirePairing ?? Boolean(pairingSession || options?.authToken || options?.pairingValidator),
+    pairingValidator: options?.pairingValidator
   };
 }
 
@@ -1953,13 +1606,6 @@ type BridgeTokenValidation =
 
 function validateBridgeApiToken(request: IncomingMessage, url: URL, security: StudioServerSecurity): BridgeTokenValidation {
   const expected = security.authToken;
-  if (!expected) {
-    return {
-      valid: false,
-      code: "pairing_token_missing",
-      error: "Pair Hunsu Web from the Bridge App before using the local Bridge API."
-    };
-  }
   const authorization = requestHeader(request, "authorization");
   const bearerToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const headerToken = requestHeader(request, BRIDGE_API_TOKEN_HEADER);
@@ -1972,11 +1618,24 @@ function validateBridgeApiToken(request: IncomingMessage, url: URL, security: St
       error: "Missing Hunsu Bridge pairing token."
     };
   }
-  if (!safeTokenEquals(candidate, expected)) {
+  const externalValidation = security.pairingValidator?.(candidate);
+  if (externalValidation?.valid) {
+    return { valid: true };
+  }
+  if (!expected || !safeTokenEquals(candidate, expected)) {
+    const reason = externalValidation?.valid === false ? externalValidation.reason : "invalid";
     return {
       valid: false,
-      code: "pairing_token_invalid",
-      error: "Invalid Hunsu Bridge pairing token."
+      code: reason === "expired"
+        ? "pairing_token_expired"
+        : reason === "revoked"
+          ? "pairing_token_revoked"
+          : "pairing_token_invalid",
+      error: reason === "expired"
+        ? "Hunsu Bridge pairing token expired. Pair again with `hunsu-bridge pair`."
+        : reason === "revoked"
+          ? "Hunsu Bridge pairing token was revoked. Pair again with `hunsu-bridge pair`."
+          : "Invalid Hunsu Bridge pairing token."
     };
   }
   if (security.pairingSession) {
@@ -1985,14 +1644,14 @@ function validateBridgeApiToken(request: IncomingMessage, url: URL, security: St
       return {
         valid: false,
         code: "pairing_token_expired",
-        error: "Hunsu Bridge pairing token expired. Pair Studio again from the Bridge App."
+        error: "Hunsu Bridge pairing token expired. Pair again with `hunsu-bridge pair`."
       };
     }
     if (state === "revoked") {
       return {
         valid: false,
         code: "pairing_token_revoked",
-        error: "Hunsu Bridge pairing token was revoked. Pair Studio again from the Bridge App."
+        error: "Hunsu Bridge pairing token was revoked. Pair again with `hunsu-bridge pair`."
       };
     }
   }
@@ -2608,16 +2267,16 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     ...runtimeConfig.codexAppServer,
     environment: { ...runtimeConfig.codexAppServer.environment }
   };
-  let codexProviderSettings = bridgeCodexSettingsFromBridgeAppState(baseRuntimeProcessEnv);
+  let codexProviderSettings = bridgeCodexSettingsFromState(baseRuntimeProcessEnv);
   applyCodexProviderSettings(runtimeConfig, baseRuntimeProcessEnv, baseCodexAppServer, codexProviderSettings);
   const roadmapRegistryPath = options.roadmapRegistryPath ?? runtimeConfig.roadmapRegistryPath;
   let runner = options.runner ?? createConfiguredRunner(runtimeConfig);
   const ownsRunner = options.runner === undefined;
   const actionRunner = options.actionRunner;
   const security = createStudioServerSecurity(options.security, runtimeConfig);
-  const controlStatus = createBridgeControlStatus(options.controlStatus, runtimeConfig);
+  const controlStatus = createBridgeControlStatus(options.controlStatus);
   const providerRegistry = createRuntimeProviderRegistry({
-    providerStateStore: createBridgeAppRuntimeProviderStore(runtimeConfig.processEnv),
+    providerStateStore: createBridgeRuntimeProviderStore(runtimeConfig.processEnv),
     codex: {
       env: () => runtimeConfig.processEnv,
       loginState: state,
@@ -2650,6 +2309,9 @@ export function createStudioServer(options: StudioServerOptions = {}) {
     try {
       const url = studioRequestUrl(request);
       const pathname = url.pathname;
+      if (options.controlRouteHandler && await options.controlRouteHandler(request, response, url)) {
+        return;
+      }
       const authenticatedControlRequest = validateBridgeControlToken(request, security).allowed;
       const requestSecurity = evaluateStudioRequestSecurity(request, url, security, {
         skipAuth: request.method === "OPTIONS" || isBridgeControlRoute(pathname) || authenticatedControlRequest
@@ -2665,7 +2327,12 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       }
 
       if (request.method === "GET" && isHealthRoute(pathname)) {
-        sendJson(response, 200, { ok: true, service: "hunsu-bridge", version: bridgeVersionInfo() });
+        sendJson(response, 200, {
+          ok: true,
+          service: "hunsu-bridge",
+          version: bridgeVersionInfo().bridgeVersion,
+          protocolVersion: "local-bridge-v1"
+        });
         return;
       }
 
@@ -2824,6 +2491,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         deactivateWorkspaceAccess: () => deactivateRemoteWorkspaceAccess(listManagedRoadmapRegistry({ roadmapRegistryPath }), {
           setWorkspaceRemoteAccess: (remoteAccessRequest, remoteAccess) => setRoadmapRemoteAccess(remoteAccessRequest, remoteAccess, { roadmapRegistryPath })
         }),
+        headlessRemote: options.headlessRemote,
         connectRemote: body => connectRemoteBridgeForRequest(body as RemoteBridgeConnectRequest, request, runtimeConfig, {
           relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH
         }),
@@ -3055,23 +2723,20 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       const message = error instanceof Error ? error.message : String(error);
       sendJson(response, 400, { error: message });
     }
-  });
+  }, { runtimeConfig });
   return server;
 }
 
 function createBridgeControlStatus(
-  options: StudioServerControlStatusOptions | undefined,
-  runtimeConfig: BridgeRuntimeConfig
+  options: StudioServerControlStatusOptions | undefined
 ): BridgeControlStatusResponse {
   const version = bridgeVersionInfo();
-  const configuredSupervisorPid = positiveProcessId(runtimeConfig.processEnv.HUNSU_BRIDGE_SUPERVISOR_PID);
   return {
     ok: true,
     instanceId: options?.instanceId?.trim() || `bridge_instance_${randomBytes(18).toString("base64url")}`,
     protocolVersion: version.protocolVersion,
     bridgeVersion: version.bridgeVersion,
     daemonPid: positiveProcessId(options?.daemonPid) ?? process.pid,
-    supervisorPid: positiveProcessId(options?.supervisorPid) ?? configuredSupervisorPid,
     startedAt: options?.startedAt ?? new Date().toISOString(),
     state: "running"
   };
@@ -6434,7 +6099,8 @@ function upsertRoadmapRegistryEntry(
 ): RoadmapRegistryEntry {
   const store = readRoadmapRegistry(options);
   const now = new Date().toISOString();
-  const roadmapId = createRoadmapId(repository.root);
+  const roadmapId = store.roadmaps.find(candidate => normalizeRepositoryPath(candidate.repositoryPath) === normalizeRepositoryPath(repository.root))?.roadmapId
+    ?? createRoadmapId(repository.root);
   const entry: RoadmapRegistryEntry = {
     roadmapId,
     displayName: displayName?.trim() || store.roadmaps.find(candidate => candidate.roadmapId === roadmapId)?.displayName || basename(repository.root),
@@ -6467,8 +6133,38 @@ function readRoadmapRegistry(options: { roadmapRegistryPath?: string } = {}): Ro
     return { version: 1, roadmaps: [] };
   }
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RoadmapRegistryStore>;
-    const roadmaps = Array.isArray(parsed.roadmaps) ? parsed.roadmaps.filter(isRoadmapRegistryEntry) : [];
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RoadmapRegistryStore> & {
+      schema?: string;
+      workspaces?: Array<{
+        workspaceId?: unknown;
+        displayName?: unknown;
+        repositoryPath?: unknown;
+        lifecycle?: unknown;
+        remoteAccess?: unknown;
+        createdAt?: unknown;
+        updatedAt?: unknown;
+      }>;
+    };
+    const roadmaps = parsed.schema === "hunsu.bridge.workspaces.v1" && Array.isArray(parsed.workspaces)
+      ? parsed.workspaces.flatMap(workspace => {
+          if (typeof workspace.workspaceId !== "string"
+            || typeof workspace.displayName !== "string"
+            || typeof workspace.repositoryPath !== "string"
+            || typeof workspace.updatedAt !== "string") return [];
+          return [{
+            roadmapId: workspace.workspaceId,
+            displayName: workspace.displayName,
+            repositoryPath: workspace.repositoryPath,
+            lifecycle: workspace.lifecycle === "inactive" ? "inactive" as const : "active" as const,
+            localAccess: { enabled: workspace.lifecycle !== "inactive" },
+            remoteAccess: isHeadlessWorkspaceRemoteAccess(workspace.remoteAccess)
+              ? { enabled: workspace.remoteAccess.enabled, scopes: workspace.remoteAccess.scopes.filter(isPersistedBridgeCommandScope) }
+              : { enabled: false, scopes: [] },
+            lastOpenedAt: workspace.updatedAt,
+            health: "unknown" as const
+          }];
+        })
+      : Array.isArray(parsed.roadmaps) ? parsed.roadmaps.filter(isRoadmapRegistryEntry) : [];
     return { version: 1, roadmaps };
   } catch (_error) {
     return { version: 1, roadmaps: [] };
@@ -6478,7 +6174,59 @@ function readRoadmapRegistry(options: { roadmapRegistryPath?: string } = {}): Ro
 function writeRoadmapRegistry(store: RoadmapRegistryStore, options: { roadmapRegistryPath?: string } = {}): void {
   const path = roadmapRegistryPath(options);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+  const existing = readHeadlessWorkspaceTimestamps(path);
+  const now = new Date().toISOString();
+  const document = {
+    schema: "hunsu.bridge.workspaces.v1",
+    workspaces: store.roadmaps.map(roadmap => ({
+      workspaceId: roadmap.roadmapId,
+      displayName: roadmap.displayName,
+      repositoryPath: roadmap.repositoryPath,
+      lifecycle: roadmap.lifecycle === "inactive" ? "inactive" : "active",
+      remoteAccess: {
+        enabled: roadmap.remoteAccess?.enabled === true,
+        scopes: roadmap.remoteAccess?.scopes ?? []
+      },
+      createdAt: existing.get(roadmap.roadmapId)?.createdAt ?? roadmap.lastOpenedAt ?? now,
+      updatedAt: roadmap.lastOpenedAt ?? now
+    }))
+  };
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  renameSync(temporary, path);
+}
+
+function isHeadlessWorkspaceRemoteAccess(value: unknown): value is { enabled: boolean; scopes: string[] } {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as { enabled?: unknown; scopes?: unknown };
+  return typeof candidate.enabled === "boolean"
+    && Array.isArray(candidate.scopes)
+    && candidate.scopes.every(scope => typeof scope === "string");
+}
+
+function isPersistedBridgeCommandScope(value: string): value is BridgeCommandScope {
+  return value === "execute.start"
+    || value === "artifactAction.run"
+    || value === "env.read"
+    || value === "hostAlias.expose"
+    || value === "remoteRelay.access";
+}
+
+function readHeadlessWorkspaceTimestamps(path: string): Map<string, { createdAt: string }> {
+  if (!existsSync(path)) return new Map();
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { schema?: unknown; workspaces?: unknown };
+    if (parsed.schema !== "hunsu.bridge.workspaces.v1" || !Array.isArray(parsed.workspaces)) return new Map();
+    return new Map(parsed.workspaces.flatMap(item => {
+      if (typeof item !== "object" || item === null) return [];
+      const value = item as { workspaceId?: unknown; createdAt?: unknown };
+      return typeof value.workspaceId === "string" && typeof value.createdAt === "string"
+        ? [[value.workspaceId, { createdAt: value.createdAt }] as const]
+        : [];
+    }));
+  } catch (_error) {
+    return new Map();
+  }
 }
 
 function roadmapRegistryPath(options: { roadmapRegistryPath?: string } = {}): string {
@@ -11198,11 +10946,4 @@ async function readOptionalJsonBody<T>(request: IncomingMessage): Promise<Partia
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-if (!(globalThis as { __HUNSU_BRIDGE_BUNDLED_SIDECAR?: boolean }).__HUNSU_BRIDGE_BUNDLED_SIDECAR && process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
-  startStudioBridge({ cwd: APP_WORKSPACE_ROOT, noOpen: true }).catch(error => {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
-  });
 }

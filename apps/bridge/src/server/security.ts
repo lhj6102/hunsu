@@ -2,9 +2,11 @@ import type { ServerResponse } from "node:http";
 
 export function baseCorsHeaders(): Record<string, string> {
   return {
-    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-methods": "GET,HEAD,POST,PUT,DELETE,OPTIONS",
     "access-control-allow-headers": "authorization,content-type,x-hunsu-bridge-token,x-hunsu-bridge-control-token",
-    "vary": "origin"
+    "access-control-allow-private-network": "true",
+    "access-control-max-age": "600",
+    "vary": "origin, access-control-request-method, access-control-request-headers, access-control-request-private-network"
   };
 }
 
