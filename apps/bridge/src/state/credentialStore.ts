@@ -32,10 +32,15 @@ export type CredentialWriteInput = {
   relay?: StoredRelayCredential | null;
 };
 
+export type ControlTokenRotation = {
+  onCommitted?: (credentials: BridgeCredentials) => void;
+};
+
 export type CredentialStore = {
   read(): Promise<BridgeCredentials | undefined>;
   ensure(): Promise<BridgeCredentials>;
   write(input: CredentialWriteInput): Promise<BridgeCredentials>;
+  rotateControlToken(input?: ControlTokenRotation): Promise<BridgeCredentials>;
 };
 
 export function createCredentialStore(
@@ -80,8 +85,10 @@ export function createCredentialStore(
         account: input.account === undefined ? current?.account ?? null : decodeAccount(paths.credentialsFile, input.account),
         relay: input.relay === undefined ? current?.relay ?? null : decodeRelay(paths.credentialsFile, input.relay)
       };
-      await writeJsonStateAtomic(paths.credentialsFile, credentials, { mode: 0o600 });
-      if (platform === "win32") await windowsAclHardener(paths.credentialsFile);
+      await writeJsonStateAtomic(paths.credentialsFile, credentials, {
+        mode: 0o600,
+        ...(platform === "win32" ? { prepareTemporaryFile: windowsAclHardener } : {})
+      });
       return credentials;
     });
   };
@@ -97,7 +104,31 @@ export function createCredentialStore(
       }
       return write({});
     },
-    write
+    write,
+    rotateControlToken(input = {}) {
+      return serialize(async () => {
+        const current = await readCurrent();
+        let controlToken = createControlToken(secureRandomBytes);
+        for (let attempt = 0; controlToken === current?.controlToken && attempt < 8; attempt += 1) {
+          controlToken = createControlToken(secureRandomBytes);
+        }
+        if (controlToken === current?.controlToken) {
+          throw invalidState(paths.credentialsFile, "a distinct control credential could not be generated");
+        }
+        const credentials: BridgeCredentials = {
+          schema: BRIDGE_CREDENTIALS_SCHEMA,
+          controlToken,
+          account: current?.account ?? null,
+          relay: current?.relay ?? null
+        };
+        await writeJsonStateAtomic(paths.credentialsFile, credentials, {
+          mode: 0o600,
+          ...(platform === "win32" ? { prepareTemporaryFile: windowsAclHardener } : {}),
+          onCommitted: () => input.onCommitted?.(credentials)
+        });
+        return credentials;
+      });
+    }
   };
 }
 

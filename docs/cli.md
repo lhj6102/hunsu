@@ -58,6 +58,8 @@ hunsu-bridge workspace inspect|remove|open <workspace-id> [--json]
 hunsu-bridge workspace grant <workspace-id> [--scopes <csv>] [--json]
 hunsu-bridge workspace revoke <workspace-id> [--json]
 
+hunsu-bridge credential rotate [--json]
+
 hunsu-bridge pair [--workspace <workspace-id>] [--json]
 hunsu-bridge open [--workspace <workspace-id>] [--json]
 
@@ -65,7 +67,7 @@ hunsu-bridge login|logout [--json]
 hunsu-bridge remote enable|disable|status [--json]
 ~~~
 
-status, doctor, provider, workspace, pair, open, login, logout, remote, and
+status, doctor, provider, workspace, credential, pair, open, login, logout, remote, and
 logs never start a daemon. Offline client commands return:
 
 ~~~json
@@ -86,3 +88,6 @@ protected filesystem locations.
 
 pair JSON always omits the sensitive URL. open passes it only to the local
 browser launcher; logs and diagnostics never receive it.
+credential rotate authenticates through the running daemon, immediately
+revokes the old control credential, and emits only safe rotation metadata.
+It does not invalidate the separate active browser pairing credential.

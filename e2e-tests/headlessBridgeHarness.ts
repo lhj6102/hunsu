@@ -1,8 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export type HeadlessBrowserMode = "proxy" | "direct";
@@ -56,6 +56,7 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
   let stopped = false;
   let controlToken = "";
   let pairingToken = "";
+  const browserCapture = await createBrowserCaptureFixture(root);
 
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
@@ -76,6 +77,8 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
     HUNSU_RELAY_API_URL: relay.url,
     HUNSU_RELAY_PUBLIC_API_URL: relay.url,
     HUNSU_RELAY_WS_URL: `ws://127.0.0.1:${relay.port}/v1/device/connect`,
+    HUNSU_E2E_BROWSER_CAPTURE_PATH: browserCapture.urlFile,
+    PATH: [browserCapture.binDirectory, process.env.PATH].filter(Boolean).join(delimiter),
     NODE_OPTIONS: [
       process.env.NODE_OPTIONS,
       "--conditions=development",
@@ -129,26 +132,26 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
     captureChildOutput(vite, childOutput);
     await waitForHttp(`http://127.0.0.1:${webPort}`, vite, childOutput);
 
-    const pairing = await fetch(new URL("/api/bridge/pairing/rotate", bridgeUrl), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-hunsu-bridge-control-token": controlToken
-      },
-      body: JSON.stringify({ webUrl: `${webUrl}/studio` })
-    });
-    if (!pairing.ok) throw new Error("Bridge browser harness could not create a legacy Web pairing.");
-    const pairingBody = await pairing.json() as { authToken?: unknown; studioUrl?: unknown };
-    if (typeof pairingBody.authToken !== "string" || typeof pairingBody.studioUrl !== "string") {
-      throw new Error("Bridge browser harness received an invalid pairing response.");
+    const pairingCommand = await runBridgeCli(["open", "--home", hunsuHome, "--json"], environment);
+    if (pairingCommand.exitCode !== 0) {
+      throw new Error(`hunsu-bridge open failed with exit code ${pairingCommand.exitCode}.`);
     }
-    pairingToken = pairingBody.authToken;
+    const pairingResult = parseStrictCliResult(pairingCommand.stdout);
+    if (pairingResult.ok !== true || pairingResult.code !== "OK") {
+      throw new Error("hunsu-bridge open did not return the successful CLI pairing contract.");
+    }
+    if (/pairingUrl|credential|hunsuBridgeToken|hunsu_bridge_pair_/iu.test(pairingCommand.stdout)) {
+      throw new Error("hunsu-bridge open exposed browser pairing credential material in CLI output.");
+    }
+    const pairingUrl = await waitForCapturedBrowserUrl(browserCapture.urlFile);
+    pairingToken = new URL(pairingUrl).searchParams.get("hunsuBridgeToken") ?? "";
+    if (!pairingToken) throw new Error("hunsu-bridge open did not launch a browser pairing URL.");
 
     return {
       mode,
       bridgeUrl,
       webUrl,
-      pairingUrl: pairingBody.studioUrl,
+      pairingUrl,
       workspacePath,
       workspaceName,
       async assertNoCredentialLeaks() {
@@ -178,6 +181,81 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
     await stop();
     throw error;
   }
+}
+
+async function createBrowserCaptureFixture(root: string): Promise<{ binDirectory: string; urlFile: string }> {
+  const binDirectory = join(root, "browser-bin");
+  const urlFile = join(root, "browser-url.txt");
+  const captureModule = join(binDirectory, "capture-browser.mjs");
+  await mkdir(binDirectory, { recursive: true });
+  const captureSource = [
+    "import { writeFileSync } from \"node:fs\";",
+    "const outputPath = process.env.HUNSU_E2E_BROWSER_CAPTURE_PATH;",
+    "const browserUrl = process.argv.at(-1);",
+    "if (!outputPath || !browserUrl) process.exit(2);",
+    "writeFileSync(outputPath, `${browserUrl}\\n`, \"utf8\");",
+    ""
+  ].join("\n");
+  await writeFile(captureModule, captureSource, "utf8");
+  const executableSource = `#!/usr/bin/env node\n${captureSource}`;
+  const posixOpeners = [join(binDirectory, "xdg-open"), join(binDirectory, "open")];
+  await Promise.all(posixOpeners.map(async path => {
+    await writeFile(path, executableSource, "utf8");
+    await chmod(path, 0o755);
+  }));
+  await writeFile(join(binDirectory, "cmd.cmd"), "@node \"%~dp0capture-browser.mjs\" %*\r\n", "utf8");
+  return { binDirectory, urlFile };
+}
+
+async function runBridgeCli(
+  args: string[],
+  environment: NodeJS.ProcessEnv
+): Promise<{ exitCode: number | null; stdout: string }> {
+  const child = spawn(process.execPath, [
+    "--experimental-transform-types",
+    "--conditions=development",
+    bridgeCliPath,
+    ...args
+  ], {
+    ...childOptions(environment),
+    detached: false
+  });
+  let stdout = "";
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", chunk => { stdout += String(chunk); });
+  await new Promise<void>((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("exit", () => resolveExit());
+  });
+  return { exitCode: child.exitCode, stdout };
+}
+
+function parseStrictCliResult(stdout: string): { schema?: unknown; ok?: unknown; code?: unknown } {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout.trim());
+  } catch (_error) {
+    throw new Error("hunsu-bridge open did not emit exactly one JSON result.");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || (value as { schema?: unknown }).schema !== "hunsu.bridge.cli-result.v1") {
+    throw new Error("hunsu-bridge open emitted an invalid CLI result schema.");
+  }
+  return value as { schema?: unknown; ok?: unknown; code?: unknown };
+}
+
+async function waitForCapturedBrowserUrl(path: string, timeoutMs = 5_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const value = (await readFile(path, "utf8")).trim();
+      if (value) return value;
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
+    }
+    await delay(25);
+  }
+  throw new Error("hunsu-bridge open did not invoke the browser command before the test timeout.");
 }
 
 async function allocatePorts(): Promise<{ bridgePort: number; webPort: number }> {

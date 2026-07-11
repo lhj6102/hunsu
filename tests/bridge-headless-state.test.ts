@@ -71,8 +71,9 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
     });
     assert.equal((await configStore.read()).port, 43127);
 
+    let credentialFill = 7;
     const credentialStore = createCredentialStore(paths, {
-      randomBytes: size => new Uint8Array(size).fill(7)
+      randomBytes: size => new Uint8Array(size).fill(credentialFill++)
     });
     const first = await credentialStore.ensure();
     const second = await credentialStore.ensure();
@@ -87,6 +88,10 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       }
     });
     assert.equal(withAccount.controlToken, first.controlToken);
+    const rotated = await credentialStore.rotateControlToken();
+    assert.notEqual(rotated.controlToken, first.controlToken);
+    assert.deepEqual(rotated.account, withAccount.account);
+    assert.equal(rotated.relay, null);
     assert.equal((await stat(paths.credentialsFile)).mode & 0o777, 0o600);
     await assert.rejects(() => credentialStore.write({
       account: {
@@ -125,6 +130,59 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       []
     );
   } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("control-token rotation hardens the temporary file before commit and never exposes split disk and daemon authority", async () => {
+  const home = await mkdtemp(join(tmpdir(), "hunsu-headless-credential-rotation-"));
+  const paths = resolveHunsuPaths({ home });
+  let randomFill = 1;
+  let failHardening = false;
+  let enteredHardening!: (path: string) => void;
+  let releaseHardening!: () => void;
+  const hardeningEntered = new Promise<string>(resolve => { enteredHardening = resolve; });
+  const hardeningRelease = new Promise<void>(resolve => { releaseHardening = resolve; });
+  const store = createCredentialStore(paths, {
+    platform: "win32",
+    randomBytes: size => new Uint8Array(size).fill(randomFill++),
+    windowsAclHardener: async path => {
+      if (!failHardening) return;
+      enteredHardening(path);
+      await hardeningRelease;
+      throw new Error("injected ACL failure");
+    }
+  });
+  try {
+    const initial = await store.ensure();
+    let activeControlToken = initial.controlToken;
+    failHardening = true;
+    const rotation = store.rotateControlToken({
+      onCommitted: credentials => { activeControlToken = credentials.controlToken; }
+    });
+    const preparedPath = await hardeningEntered;
+    assert.notEqual(preparedPath, paths.credentialsFile);
+    assert.match(preparedPath, /\.credentials\.json\..+\.tmp$/u);
+    const duringFailure = JSON.parse(await readFile(paths.credentialsFile, "utf8")) as { controlToken: string };
+    assert.equal(duringFailure.controlToken, initial.controlToken);
+    assert.equal(activeControlToken, initial.controlToken);
+
+    releaseHardening();
+    await assert.rejects(rotation, /Unable to persist Bridge state file/u);
+    const afterFailure = JSON.parse(await readFile(paths.credentialsFile, "utf8")) as { controlToken: string };
+    assert.equal(afterFailure.controlToken, initial.controlToken);
+    assert.equal(activeControlToken, initial.controlToken);
+
+    failHardening = false;
+    const rotated = await store.rotateControlToken({
+      onCommitted: credentials => { activeControlToken = credentials.controlToken; }
+    });
+    const afterSuccess = JSON.parse(await readFile(paths.credentialsFile, "utf8")) as { controlToken: string };
+    assert.equal(afterSuccess.controlToken, rotated.controlToken);
+    assert.equal(activeControlToken, rotated.controlToken);
+    assert.notEqual(activeControlToken, initial.controlToken);
+  } finally {
+    releaseHardening();
     await rm(home, { recursive: true, force: true });
   }
 });

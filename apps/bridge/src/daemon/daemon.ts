@@ -22,6 +22,7 @@ import {
   type BridgeCredentials,
   type BridgeRuntimeIdentity,
   type BridgeServiceManagerKind,
+  type CredentialStore,
   type HunsuPathInput,
   type HunsuPaths
 } from "../state/index.ts";
@@ -48,6 +49,21 @@ export type RunningBridgeDaemon = {
   close(): Promise<void>;
   waitUntilClosed(): Promise<void>;
 };
+
+export async function rotateDaemonControlCredential(input: {
+  credentialStore: Pick<CredentialStore, "read" | "rotateControlToken">;
+  activate: (controlToken: string) => void;
+}): Promise<void> {
+  try {
+    await input.credentialStore.rotateControlToken({
+      onCommitted: credentials => input.activate(credentials.controlToken)
+    });
+  } catch (error) {
+    const authoritative = await input.credentialStore.read().catch(() => undefined);
+    if (authoritative) input.activate(authoritative.controlToken);
+    throw error;
+  }
+}
 
 export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Promise<RunningBridgeDaemon> {
   const environment = { ...process.env, ...(options.env ?? {}) };
@@ -94,6 +110,7 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
     await startupLock.release().catch(() => undefined);
     throw error;
   }
+  let controlToken = credentials.controlToken;
   const structuredLog = createStructuredLog({ paths });
   const workspaceService = createWorkspaceService({ store: createWorkspaceStore(paths) });
   const providerService = createHeadlessProviderService({
@@ -106,7 +123,7 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
   const remoteCommandRouter = createRemoteCommandRouter({
     workspaceService,
     endpoint: () => identity?.endpoint,
-    controlToken: credentials.controlToken,
+    controlToken: () => controlToken,
     fetchImpl: options.fetchImpl
   });
   const remoteService = createRemoteService({
@@ -170,7 +187,18 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
     const webUrl = options.webUrl ?? processEnv.HUNSU_WEB_URL ?? "https://hunsu.app/studio";
     const allowedOrigin = new URL(webUrl).origin;
     const controlRouteHandler = createHeadlessControlRouteHandler({
-      controlToken: credentials.controlToken,
+      controlToken: () => controlToken,
+      rotateControlToken: async () => {
+        await rotateDaemonControlCredential({
+          credentialStore,
+          activate: nextControlToken => { controlToken = nextControlToken; }
+        });
+        await structuredLog.append({
+          level: "info",
+          event: "control.credential_rotated",
+          message: "Hunsu Bridge control credential was rotated."
+        }).catch(() => undefined);
+      },
       runtimeIdentity: () => {
         if (!identity) throw new BridgeError("BRIDGE_CONTROL_UNAVAILABLE", "Hunsu Bridge is still starting.");
         return identity;
@@ -190,12 +218,13 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
       roadmapRegistryPath: paths.workspacesFile,
       runtimeConfig,
       security: {
-        controlToken: credentials.controlToken,
+        controlToken: () => controlToken,
         allowedOrigins: [allowedOrigin],
         requirePairing: true,
-        pairingValidator: credential => pairingService.validate(credential)
+        pairingService
       },
       controlRouteHandler,
+      providerService,
       headlessRemote: {
         enable: () => remoteService.enable(),
         disable: () => remoteService.disable()

@@ -20,7 +20,8 @@ import { BRIDGE_REMOTE_WORKSPACE_SCOPES, type BridgeRemoteWorkspaceScope } from 
 import type { WorkspaceService } from "../workspaces/workspaceService.ts";
 
 export type HeadlessControlContext = {
-  controlToken: string;
+  controlToken: () => string;
+  rotateControlToken: () => Promise<void>;
   runtimeIdentity: () => BridgeRuntimeIdentity;
   providerService: HeadlessProviderService;
   workspaceService: WorkspaceService;
@@ -42,7 +43,7 @@ export type HeadlessControlRouteHandler = (
 export function createHeadlessControlRouteHandler(context: HeadlessControlContext): HeadlessControlRouteHandler {
   return async (request, response, url) => {
     if (!url.pathname.startsWith("/v1/control")) return false;
-    if (!validControlToken(request, context.controlToken)) {
+    if (!validControlToken(request, context.controlToken())) {
       sendResult(response, 401, cliFailure(
         "BRIDGE_CONTROL_UNAUTHORIZED",
         "Hunsu Bridge rejected the local control credential."
@@ -54,6 +55,15 @@ export function createHeadlessControlRouteHandler(context: HeadlessControlContex
       const pathname = url.pathname;
       if (request.method === "GET" && pathname === "/v1/control/status") {
         sendResult(response, 200, cliSuccess("Hunsu Bridge is running.", context.runtimeIdentity()));
+        return true;
+      }
+      if (request.method === "POST" && pathname === "/v1/control/credential/rotate") {
+        await context.rotateControlToken();
+        sendResult(response, 200, cliSuccess(
+          "Hunsu Bridge control credential was rotated.",
+          { rotated: true, pairingPreserved: true },
+          "CONTROL_CREDENTIAL_ROTATED"
+        ));
         return true;
       }
       if (request.method === "GET" && pathname === "/v1/control/provider") {

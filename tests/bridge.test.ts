@@ -1103,7 +1103,7 @@ test("Bridge Execute preflight honors selected remote backend with x-hunsu-bridg
       inventoryLookups += 1;
       throw new Error("Connection preflight must run before provider inventory lookup.");
     },
-    security: { pairingSession: pairing, allowedOrigins: ["https://studio.example.test"] }
+    security: { authToken: pairing.token, allowedOrigins: ["https://studio.example.test"] }
   });
 
   try {
@@ -3942,7 +3942,9 @@ test("Bridge pairing sessions expire and can be revoked without exposing protect
     persist: false,
     runner: new FakeRunner(),
     security: {
-      pairingSession: expiredPairing,
+      pairingValidator: credential => credential === expiredPairing.token
+        ? { valid: false, reason: "expired" }
+        : { valid: false, reason: credential ? "invalid" : "missing" },
       allowedOrigins: ["https://studio.example.test"]
     }
   });
@@ -3962,7 +3964,9 @@ test("Bridge pairing sessions expire and can be revoked without exposing protect
     persist: false,
     runner: new FakeRunner(),
     security: {
-      pairingSession: revokedPairing,
+      pairingValidator: credential => credential === revokedPairing.token
+        ? { valid: false, reason: "revoked" }
+        : { valid: false, reason: credential ? "invalid" : "missing" },
       allowedOrigins: ["https://studio.example.test"]
     }
   });
@@ -3975,6 +3979,50 @@ test("Bridge pairing sessions expire and can be revoked without exposing protect
   });
   assert.equal(revoked.status, 401);
   assert.equal(revoked.body.code, "pairing_token_revoked");
+});
+
+test("Bridge seeds an explicit browser token into the unified pairing authority", async () => {
+  const controlToken = "control-token";
+  const initialBrowserToken = "browser-token";
+  const origin = "https://studio.example.test";
+  const server = createStudioServer({
+    cwd: "/repo",
+    persist: false,
+    runner: new FakeRunner(),
+    security: {
+      controlToken,
+      authToken: initialBrowserToken,
+      allowedOrigins: [origin]
+    }
+  });
+  const protectedRequest = (credential: string) => requestStudioServerJson(
+    server,
+    "GET",
+    "/api/roadmaps/recent",
+    undefined,
+    { headers: { origin, authorization: `Bearer ${credential}` } }
+  );
+
+  assert.equal((await protectedRequest(initialBrowserToken)).status, 200);
+
+  const rotated = await requestStudioServerJson(server, "POST", "/api/bridge/pairing/rotate", {
+    webUrl: `${origin}/studio`
+  }, {
+    headers: { origin, "x-hunsu-bridge-control-token": controlToken }
+  });
+  assert.equal(rotated.status, 202);
+  assert.match(rotated.body.authToken, /^hunsu_bridge_pair_/u);
+  assert.equal((await protectedRequest(initialBrowserToken)).status, 401);
+  assert.equal((await protectedRequest(rotated.body.authToken)).status, 200);
+
+  const pairingRevoked = await requestStudioServerJson(server, "POST", "/api/bridge/pairing/revoke", undefined, {
+    headers: { origin, "x-hunsu-bridge-control-token": controlToken }
+  });
+  assert.equal(pairingRevoked.status, 202);
+  assert.equal(pairingRevoked.body.revoked, true);
+  const rejectedRotatedToken = await protectedRequest(rotated.body.authToken);
+  assert.equal(rejectedRotatedToken.status, 401);
+  assert.equal(rejectedRotatedToken.body.code, "pairing_token_revoked");
 });
 
 test("Bridge shutdown control endpoint requires control token", async () => {

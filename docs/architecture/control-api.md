@@ -30,6 +30,7 @@ identity, or credentials.
 
 ~~~text
 GET    /v1/control/status
+POST   /v1/control/credential/rotate
 
 GET    /v1/control/provider
 PUT    /v1/control/provider
@@ -57,6 +58,25 @@ POST   /v1/control/shutdown
 Unknown, missing, or invalid credentials fail with
 BRIDGE_CONTROL_UNAUTHORIZED. An offline endpoint fails at the client boundary
 with BRIDGE_NOT_RUNNING or BRIDGE_CONTROL_UNAVAILABLE.
+
+`hunsu-bridge credential rotate` authenticates with the current control
+credential, atomically replaces it in `credentials.json`, and immediately
+revokes the previous credential. The response exposes only stable safe metadata;
+it never returns either credential. Existing browser pairing remains valid
+because pairing credentials have a separate lifecycle.
+
+~~~json
+{
+  "schema": "hunsu.bridge.cli-result.v1",
+  "ok": true,
+  "code": "CONTROL_CREDENTIAL_ROTATED",
+  "message": "Hunsu Bridge control credential was rotated.",
+  "value": {
+    "rotated": true,
+    "pairingPreserved": true
+  }
+}
+~~~
 
 Browser-facing /api routes use a separate, short-lived pairing credential.
 CLI commands do not call those compatibility routes, and domain services do

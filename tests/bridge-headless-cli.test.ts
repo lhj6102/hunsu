@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { runBridgeCli } from "../apps/bridge/src/cli.ts";
 import { bridgeNotRunningResult } from "../apps/bridge/src/client/cliResult.ts";
+import { startBridgeDaemon, type RunningBridgeDaemon } from "../apps/bridge/src/daemon/daemon.ts";
 
 test("every offline client command family returns the exact stable BRIDGE_NOT_RUNNING result without creating state", async () => {
   const root = await mkdtemp(join(tmpdir(), "hunsu-headless-cli-"));
@@ -24,6 +25,7 @@ test("every offline client command family returns the exact stable BRIDGE_NOT_RU
     ["workspace", "open", "ws_missing"],
     ["workspace", "grant", "ws_missing"],
     ["workspace", "revoke", "ws_missing"],
+    ["credential", "rotate"],
     ["pair"],
     ["pair", "revoke"],
     ["open"],
@@ -57,6 +59,37 @@ test("every offline client command family returns the exact stable BRIDGE_NOT_RU
     }
     assert.equal(await exists(home), false);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("credential rotate emits the stable safe JSON result and leaves the daemon authenticated", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-cli-rotation-"));
+  const home = join(root, "state");
+  let daemon: RunningBridgeDaemon | undefined;
+  try {
+    daemon = await startBridgeDaemon({
+      home,
+      port: 0,
+      cwd: root,
+      development: true,
+      openBrowser: async () => undefined
+    });
+    const rotated = await invoke(["credential", "rotate", "--home", home, "--json"]);
+    assert.equal(rotated.code, 0);
+    assert.deepEqual(rotated.stderr, []);
+    assert.deepEqual(rotated.stdout, [JSON.stringify({
+      schema: "hunsu.bridge.cli-result.v1",
+      ok: true,
+      code: "CONTROL_CREDENTIAL_ROTATED",
+      message: "Hunsu Bridge control credential was rotated.",
+      value: { rotated: true, pairingPreserved: true }
+    })]);
+    const status = await invoke(["status", "--home", home, "--json"]);
+    assert.equal(status.code, 0);
+    assert.equal(JSON.parse(status.stdout[0]!).ok, true);
+  } finally {
+    await daemon?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

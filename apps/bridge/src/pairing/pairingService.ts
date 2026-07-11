@@ -64,6 +64,11 @@ export function createPairingService(input: {
   ttlMs?: number;
   now?: () => number;
   randomBytes?: (size: number) => Uint8Array;
+  initialPairing?: {
+    credential: string;
+    browserUrl: string;
+    workspaceId?: string;
+  };
 }): PairingService {
   if (!input.controlToken.trim()) {
     throw new Error("Control token is required before pairing can be enabled.");
@@ -75,6 +80,27 @@ export function createPairingService(input: {
   const now = input.now ?? Date.now;
   const randomBytes = input.randomBytes ?? nodeRandomBytes;
   let current: PairingSession | undefined;
+  if (input.initialPairing) {
+    const credential = input.initialPairing.credential.trim();
+    if (!credential || secretEquals(input.controlToken, credential)) {
+      throw new Error("Initial pairing credential must be non-empty and distinct from the control token.");
+    }
+    const url = pairingBrowserUrl(input.initialPairing.browserUrl);
+    if (!url) throw new Error("Initial pairing browser URL is invalid.");
+    const pairingId = `pair_${Buffer.from(randomBytes(12)).toString("base64url")}`;
+    url.searchParams.set("hunsuBridgeToken", credential);
+    if (input.initialPairing.workspaceId) url.searchParams.set("workspace", input.initialPairing.workspaceId);
+    current = {
+      pairingId,
+      credential,
+      pairingUrl: url.toString(),
+      workspaceId: input.initialPairing.workspaceId ?? null,
+      expiresAtMs: now() + ttlMs,
+      browserOpened: false,
+      consumed: false,
+      revoked: false
+    };
+  }
 
   const safeMetadata = (session: PairingSession): PairingSafeMetadata => ({
     pairingId: session.pairingId,
@@ -109,11 +135,8 @@ export function createPairingService(input: {
 
   return {
     rotate(rotationInput) {
-      let url: URL;
-      try {
-        url = new URL(rotationInput.browserUrl);
-        if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("unsupported protocol");
-      } catch (_error) {
+      const url = pairingBrowserUrl(rotationInput.browserUrl);
+      if (!url) {
         return err({ code: "PAIRING_ROTATION_FAILED", message: "Browser URL is invalid." });
       }
       const credential = `hunsu_bridge_pair_${Buffer.from(randomBytes(32)).toString("base64url")}`;
@@ -172,6 +195,15 @@ export function createPairingService(input: {
       return valid.ok ? ok(current.pairingUrl) : valid;
     }
   };
+}
+
+function pairingBrowserUrl(value: string): URL | undefined {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url : undefined;
+  } catch (_error) {
+    return undefined;
+  }
 }
 
 function secretEquals(expected: string, candidate: string): boolean {

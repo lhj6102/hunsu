@@ -142,6 +142,12 @@ import { createStudioHttpServer, studioRequestUrl } from "./server/createStudioS
 import { handleRemoteBridgeRoute, handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
 import { baseCorsHeaders, createResponseSecurityHeaderStore } from "./server/security.ts";
 import type { HeadlessControlRouteHandler } from "./server/controlRoutes.ts";
+import { createPairingService, type PairingService } from "./pairing/pairingService.ts";
+import {
+  codexSettingsForBridgeProvider,
+  createHeadlessRuntimeProviderRegistry,
+  type HeadlessProviderService
+} from "./provider/providerRegistry.ts";
 import { handleExecuteRoute, handleRoadmapExecuteRoute } from "./executes/executeRoutes.ts";
 import {
   executeStartHasExplicitBackendSelection,
@@ -733,9 +739,9 @@ export type StudioServerState = {
 
 export type StudioServerSecurityOptions = {
   authToken?: string;
-  controlToken?: string;
-  pairingSession?: BridgePairingSession;
+  controlToken?: string | (() => string);
   pairingTokenTtlMs?: number;
+  pairingService?: PairingService;
   allowedOrigins?: string[];
   allowNoOrigin?: boolean;
   requirePairing?: boolean;
@@ -762,9 +768,8 @@ export type StudioServerControlStatusOptions = {
 
 type StudioServerSecurity = {
   authToken?: string;
-  controlToken?: string;
-  pairingSession?: BridgePairingSession;
-  pairingTokenTtlMs: number;
+  controlToken?: string | (() => string);
+  pairingService?: PairingService;
   allowedOrigins: string[];
   allowNoOrigin: boolean;
   requirePairing: boolean;
@@ -816,6 +821,7 @@ export type StudioServerOptions = {
   security?: StudioServerSecurityOptions;
   controlStatus?: StudioServerControlStatusOptions;
   controlRouteHandler?: HeadlessControlRouteHandler;
+  providerService?: HeadlessProviderService;
   headlessRemote?: {
     enable: () => Promise<{ deviceId?: string; connection?: string }>;
     disable: () => Promise<{ deviceId?: string; connection?: string }>;
@@ -1506,21 +1512,39 @@ function bridgeApiUrlForRequest(request: IncomingMessage, runtimeConfig: BridgeR
 }
 
 function createStudioServerSecurity(options: StudioServerSecurityOptions | undefined, runtimeConfig: BridgeRuntimeConfig): StudioServerSecurity {
-  const pairingSession = options?.pairingSession ?? (options?.authToken
-    ? createBridgePairingSession({ token: options.authToken, ttlMs: options.pairingTokenTtlMs })
+  const controlToken = typeof options?.controlToken === "function"
+    ? nonEmptyString(options.controlToken())
+    : nonEmptyString(options?.controlToken);
+  const authToken = nonEmptyString(options?.authToken);
+  const pairingTokenTtlMs = Math.max(1, options?.pairingTokenTtlMs ?? DEFAULT_PAIRING_TOKEN_TTL_MS);
+  const pairingService = options?.pairingService ?? (controlToken
+    ? createPairingService({
+        controlToken,
+        ttlMs: pairingTokenTtlMs,
+        ...(authToken ? {
+          initialPairing: {
+            credential: authToken,
+            browserUrl: resolveStudioBridgeWebUrl(undefined, runtimeConfig.processEnv)
+          }
+        } : {})
+      })
     : undefined);
+  if (options?.pairingService && authToken && !options.pairingService.validate(authToken).valid) {
+    throw new Error("The supplied pairing service must own the explicit browser auth token.");
+  }
   return {
-    authToken: pairingSession?.token ?? nonEmptyString(options?.authToken),
-    controlToken: nonEmptyString(options?.controlToken),
-    pairingSession,
-    pairingTokenTtlMs: Math.max(1, options?.pairingTokenTtlMs ?? DEFAULT_PAIRING_TOKEN_TTL_MS),
+    authToken: pairingService ? undefined : authToken,
+    controlToken: typeof options?.controlToken === "function"
+      ? options.controlToken
+      : nonEmptyString(options?.controlToken),
+    pairingService,
     allowedOrigins: uniqueStrings([
       ...DEFAULT_BRIDGE_STUDIO_ORIGINS,
       ...bridgeStudioOriginsFromEnv(runtimeConfig.processEnv),
       ...(options?.allowedOrigins ?? [])
     ].map(normalizeOrigin).filter((origin): origin is string => origin !== undefined)),
     allowNoOrigin: options?.allowNoOrigin ?? true,
-    requirePairing: options?.requirePairing ?? Boolean(pairingSession || options?.authToken || options?.pairingValidator),
+    requirePairing: options?.requirePairing ?? Boolean(options?.authToken || pairingService || options?.pairingValidator),
     pairingValidator: options?.pairingValidator
   };
 }
@@ -1577,7 +1601,9 @@ function corsHeadersForOrigin(origin: string | undefined, security: StudioServer
 }
 
 function validateBridgeControlToken(request: IncomingMessage, security: StudioServerSecurity): StudioRequestSecurity {
-  const expected = security.controlToken;
+  const expected = typeof security.controlToken === "function"
+    ? nonEmptyString(security.controlToken())
+    : security.controlToken;
   if (!expected) {
     return {
       allowed: false,
@@ -1618,11 +1644,12 @@ function validateBridgeApiToken(request: IncomingMessage, url: URL, security: St
       error: "Missing Hunsu Bridge pairing token."
     };
   }
-  const externalValidation = security.pairingValidator?.(candidate);
+  const externalValidation = security.pairingService?.validate(candidate)
+    ?? security.pairingValidator?.(candidate);
   if (externalValidation?.valid) {
     return { valid: true };
   }
-  if (!expected || !safeTokenEquals(candidate, expected)) {
+  if (externalValidation?.valid === false || !expected || !safeTokenEquals(candidate, expected)) {
     const reason = externalValidation?.valid === false ? externalValidation.reason : "invalid";
     return {
       valid: false,
@@ -1637,23 +1664,6 @@ function validateBridgeApiToken(request: IncomingMessage, url: URL, security: St
           ? "Hunsu Bridge pairing token was revoked. Pair again with `hunsu-bridge pair`."
           : "Invalid Hunsu Bridge pairing token."
     };
-  }
-  if (security.pairingSession) {
-    const state = bridgePairingSessionState(security.pairingSession);
-    if (state === "expired") {
-      return {
-        valid: false,
-        code: "pairing_token_expired",
-        error: "Hunsu Bridge pairing token expired. Pair again with `hunsu-bridge pair`."
-      };
-    }
-    if (state === "revoked") {
-      return {
-        valid: false,
-        code: "pairing_token_revoked",
-        error: "Hunsu Bridge pairing token was revoked. Pair again with `hunsu-bridge pair`."
-      };
-    }
   }
   return { valid: true };
 }
@@ -2275,7 +2285,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
   const actionRunner = options.actionRunner;
   const security = createStudioServerSecurity(options.security, runtimeConfig);
   const controlStatus = createBridgeControlStatus(options.controlStatus);
-  const providerRegistry = createRuntimeProviderRegistry({
+  const fallbackProviderRegistry = createRuntimeProviderRegistry({
     providerStateStore: createBridgeRuntimeProviderStore(runtimeConfig.processEnv),
     codex: {
       env: () => runtimeConfig.processEnv,
@@ -2287,6 +2297,20 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           runner = createConfiguredRunner(runtimeConfig);
         }
       }
+    }
+  });
+  const providerRegistry = options.providerService
+    ? createHeadlessRuntimeProviderRegistry({
+        service: options.providerService,
+        fallback: fallbackProviderRegistry,
+        env: () => runtimeConfig.processEnv
+      })
+    : fallbackProviderRegistry;
+  const stopProviderConfigurationListener = options.providerService?.onConfigurationChange(configuration => {
+    codexProviderSettings = codexSettingsForBridgeProvider(configuration);
+    applyCodexProviderSettings(runtimeConfig, baseRuntimeProcessEnv, baseCodexAppServer, codexProviderSettings);
+    if (ownsRunner) {
+      runner = createConfiguredRunner(runtimeConfig);
     }
   });
   const providerInventoryForRequest = async (
@@ -2367,31 +2391,53 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           return;
         }
         if (pathname === "/api/bridge/pairing/revoke") {
-          if (security.pairingSession) {
-            revokeBridgePairingSession(security.pairingSession);
+          const pairingService = security.pairingService;
+          if (!pairingService) {
+            sendJson(response, 404, {
+              error: "Bridge pairing is not enabled.",
+              code: "pairing_unavailable"
+            });
+            return;
           }
+          const revoked = pairingService.revoke();
           sendJson(response, 202, {
-            pairing: security.pairingSession,
-            revoked: true
+            pairing: pairingService.getSafeMetadata(),
+            revoked
           });
           return;
         }
         const body = await readJson<Partial<CreatePairingUrlInput>>(request);
-        security.pairingSession = createBridgePairingSession({ ttlMs: security.pairingTokenTtlMs });
-        security.authToken = security.pairingSession.token;
+        const pairingService = security.pairingService;
+        if (!pairingService) {
+          sendJson(response, 404, {
+            error: "Bridge pairing is not enabled.",
+            code: "pairing_unavailable"
+          });
+          return;
+        }
         const requestWebUrl = typeof body.webUrl === "string" && body.webUrl.trim() ? body.webUrl : undefined;
         const requestRoadmapId = typeof body.roadmapId === "string" && body.roadmapId.trim() ? body.roadmapId : undefined;
-        const requestTokenQueryParam = body.tokenQueryParam === BRIDGE_API_TOKEN_QUERY_PARAM ? body.tokenQueryParam : BRIDGE_API_TOKEN_QUERY_PARAM;
+        const browserUrl = new URL(resolveStudioBridgeWebUrl(requestWebUrl, runtimeConfig.processEnv));
+        if (requestRoadmapId) {
+          const studioPath = browserUrl.pathname.replace(/\/$/u, "");
+          browserUrl.pathname = `${studioPath.endsWith("/studio") ? studioPath : "/studio"}/roadmaps/${encodeURIComponent(requestRoadmapId)}`;
+        }
+        const rotated = pairingService.rotate({
+          browserUrl: browserUrl.toString(),
+          ...(requestRoadmapId ? { workspaceId: requestRoadmapId } : {})
+        });
+        if (!rotated.ok) {
+          sendJson(response, 400, {
+            error: rotated.error.message,
+            code: rotated.error.code
+          });
+          return;
+        }
         sendJson(response, 202, {
           bridgeApiUrl: bridgeApiUrlForRequest(request, runtimeConfig),
-          studioUrl: createStudioPairingUrl({
-            webUrl: requestWebUrl,
-            authToken: security.pairingSession.token,
-            roadmapId: requestRoadmapId,
-            tokenQueryParam: requestTokenQueryParam
-          }),
-          authToken: security.pairingSession.token,
-          pairing: security.pairingSession
+          studioUrl: rotated.value.internal.pairingUrl,
+          authToken: rotated.value.internal.credential,
+          pairing: rotated.value.safe
         });
         return;
       }
@@ -2724,6 +2770,9 @@ export function createStudioServer(options: StudioServerOptions = {}) {
       sendJson(response, 400, { error: message });
     }
   }, { runtimeConfig });
+  if (stopProviderConfigurationListener) {
+    server.once("close", stopProviderConfigurationListener);
+  }
   return server;
 }
 

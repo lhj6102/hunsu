@@ -19,7 +19,7 @@ type LocalRequest = {
 export function createRemoteCommandRouter(input: {
   workspaceService: WorkspaceService;
   endpoint: () => string | undefined;
-  controlToken: string;
+  controlToken: () => string;
   fetchImpl?: typeof fetch;
 }): (command: RemoteBridgeCommandRequest) => Promise<RemoteBridgeCommandResult> {
   const fetchImpl = input.fetchImpl ?? fetch;
@@ -34,7 +34,7 @@ export function createRemoteCommandRouter(input: {
       const response = await fetchImpl(new URL(local.path, endpoint), {
         method: local.method,
         headers: {
-          [BRIDGE_CONTROL_TOKEN_HEADER]: input.controlToken,
+          [BRIDGE_CONTROL_TOKEN_HEADER]: input.controlToken(),
           ...(local.body === undefined ? {} : { "content-type": "application/json" })
         },
         ...(local.body === undefined ? {} : { body: JSON.stringify(local.body) }),

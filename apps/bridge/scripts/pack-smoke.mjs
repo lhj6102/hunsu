@@ -199,6 +199,29 @@ export async function runBridgePackSmoke(options = {}) {
     assert.equal(statusResult.value?.endpoint, endpoint.toString().replace(/\/$/u, ""));
     assert.equal(statusResult.value?.version, manifest.version);
 
+    const credentialRotationRun = await run(command("npx"), [
+      "--no-install",
+      "hunsu-bridge",
+      "credential",
+      "rotate",
+      "--home",
+      hunsuHome,
+      "--json"
+    ], { cwd: installDirectory, env: npmEnvironment, timeout: 30_000 });
+    const credentialRotationResult = parseStrictCliJson(credentialRotationRun, [controlToken]);
+    assertCliSuccess(credentialRotationResult, "CONTROL_CREDENTIAL_ROTATED");
+    assert.deepEqual(credentialRotationResult.value, { rotated: true, pairingPreserved: true });
+    const rotatedCredentials = JSON.parse(await readFile(join(hunsuHome, "credentials.json"), "utf8"));
+    const rotatedControlToken = String(rotatedCredentials.controlToken);
+    assert.match(rotatedControlToken, /^hunsu_control_[A-Za-z0-9_-]+$/u);
+    assert.notEqual(rotatedControlToken, controlToken);
+    auditCapturedOutput(credentialRotationRun, [controlToken, rotatedControlToken]);
+
+    const rejectedOldControl = await fetch(new URL("/v1/control/status", endpoint), {
+      headers: { "X-Hunsu-Bridge-Control-Token": controlToken }
+    });
+    assert.equal(rejectedOldControl.status, 401);
+
     const stopRun = await run(process.execPath, [
       "--input-type=module",
       "--eval",
@@ -208,10 +231,10 @@ export async function runBridgePackSmoke(options = {}) {
       env: { ...npmEnvironment, HUNSU_HOME: hunsuHome },
       timeout: 30_000
     });
-    const stopResult = parseStrictCliJson(stopRun, [controlToken]);
+    const stopResult = parseStrictCliJson(stopRun, [controlToken, rotatedControlToken]);
     assertCliSuccess(stopResult);
     await waitForExit(daemon, 10_000);
-    auditCapturedOutput(readiness, [controlToken]);
+    auditCapturedOutput(readiness, [controlToken, rotatedControlToken]);
     readiness.stop();
     assert.equal(daemon.exitCode, 0, "the foreground daemon must exit cleanly after authenticated shutdown");
     daemon = undefined;
@@ -308,10 +331,10 @@ function assertNodeEngineSupported(version) {
   assert.ok(major > 22 || (major === 22 && minor >= 18), `package smoke requires Node >=22.18, received ${version}`);
 }
 
-function assertCliSuccess(result) {
+function assertCliSuccess(result, expectedCode = "OK") {
   assert.equal(result.schema, "hunsu.bridge.cli-result.v1");
   assert.equal(result.ok, true, result.message ?? "Bridge CLI command failed");
-  assert.equal(result.code, "OK");
+  assert.equal(result.code, expectedCode);
 }
 
 function parseStrictCliJson(output, secrets = []) {

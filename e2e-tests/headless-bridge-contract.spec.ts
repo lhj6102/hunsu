@@ -10,7 +10,7 @@ const EXPECTED_HEALTH = {
 
 test.describe.serial("headless Bridge browser contract", () => {
   for (const mode of ["proxy", "direct"] as const satisfies readonly HeadlessBrowserMode[]) {
-    test(`${mode} mode pairs, authenticates, streams, and opens a disposable Workspace`, async ({ page, request }) => {
+    test(`${mode} mode pairs through the CLI, authenticates, streams, and opens a disposable Workspace`, async ({ page, request }) => {
       const harness = await startHeadlessBrowserHarness(mode);
       try {
         await page.goto(harness.pairingUrl, { waitUntil: "domcontentloaded" });

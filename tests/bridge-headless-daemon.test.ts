@@ -6,7 +6,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { createBridgeControlClient } from "../apps/bridge/src/client/controlClient.ts";
 import { BridgeError } from "../apps/bridge/src/client/cliResult.ts";
-import { startBridgeDaemon, type RunningBridgeDaemon } from "../apps/bridge/src/daemon/daemon.ts";
+import {
+  rotateDaemonControlCredential,
+  startBridgeDaemon,
+  type RunningBridgeDaemon
+} from "../apps/bridge/src/daemon/daemon.ts";
 import { acquireDaemonStartupLock } from "../apps/bridge/src/daemon/singleton.ts";
 import { createStructuredLog, STRUCTURED_LOG_SCHEMA } from "../apps/bridge/src/diagnostics/structuredLog.ts";
 import { createPairingService } from "../apps/bridge/src/pairing/pairingService.ts";
@@ -75,6 +79,174 @@ test("control client verifies exact loopback health before sending its credentia
     assert.ok(credentials.controlToken);
   } finally {
     await closeServer(foreign);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an ambiguous post-commit rotation failure resyncs the daemon token from authoritative credentials", async () => {
+  let activeControlToken = "hunsu_control_old";
+  await assert.rejects(
+    () => rotateDaemonControlCredential({
+      credentialStore: {
+        async rotateControlToken() {
+          throw new Error("injected post-commit failure");
+        },
+        async read() {
+          return {
+            schema: "hunsu.bridge.credentials.v1",
+            controlToken: "hunsu_control_authoritative",
+            account: null,
+            relay: null
+          };
+        }
+      },
+      activate: controlToken => { activeControlToken = controlToken; }
+    }),
+    /injected post-commit failure/u
+  );
+  assert.equal(activeControlToken, "hunsu_control_authoritative");
+});
+
+test("authenticated control credential rotation revokes the old token without invalidating browser pairing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-control-rotation-"));
+  let pairingUrl = "";
+  let daemon: RunningBridgeDaemon | undefined;
+  try {
+    daemon = await startBridgeDaemon({
+      home: join(root, "state"),
+      port: 0,
+      cwd: root,
+      webUrl: "http://localhost:5173/studio",
+      development: true,
+      openBrowser: async url => { pairingUrl = url; }
+    });
+    const credentialStore = createCredentialStore(daemon.paths);
+    const before = await credentialStore.read();
+    assert.ok(before?.controlToken);
+    const client = createBridgeControlClient({ paths: daemon.paths });
+    const paired = await client.request("/v1/control/pair", {
+      method: "POST",
+      body: { openBrowser: true }
+    });
+    assert.equal(paired.ok, true);
+    const pairingCredential = new URL(pairingUrl).searchParams.get("hunsuBridgeToken");
+    assert.ok(pairingCredential);
+
+    const rotated = await client.request("/v1/control/credential/rotate", { method: "POST" });
+    assert.deepEqual(rotated, {
+      schema: "hunsu.bridge.cli-result.v1",
+      ok: true,
+      code: "CONTROL_CREDENTIAL_ROTATED",
+      message: "Hunsu Bridge control credential was rotated.",
+      value: { rotated: true, pairingPreserved: true }
+    });
+    const after = await credentialStore.read();
+    assert.ok(after?.controlToken);
+    assert.notEqual(after.controlToken, before.controlToken);
+    assert.equal(JSON.stringify(rotated).includes(before.controlToken), false);
+    assert.equal(JSON.stringify(rotated).includes(after.controlToken), false);
+
+    const rejectedOldToken = await fetch(`${daemon.identity.endpoint}/v1/control/status`, {
+      headers: { "X-Hunsu-Bridge-Control-Token": before.controlToken }
+    });
+    assert.equal(rejectedOldToken.status, 401);
+    assert.deepEqual(await rejectedOldToken.json(), {
+      schema: "hunsu.bridge.cli-result.v1",
+      ok: false,
+      code: "BRIDGE_CONTROL_UNAUTHORIZED",
+      message: "Hunsu Bridge rejected the local control credential."
+    });
+    assert.equal((await client.request("/v1/control/status")).ok, true);
+
+    const rejectedOldCompatibilityToken = await fetch(`${daemon.identity.endpoint}/api/prerequisites`, {
+      headers: { "X-Hunsu-Bridge-Control-Token": before.controlToken }
+    });
+    assert.equal(rejectedOldCompatibilityToken.status, 401);
+    const acceptedNewCompatibilityToken = await fetch(`${daemon.identity.endpoint}/api/prerequisites`, {
+      headers: { "X-Hunsu-Bridge-Control-Token": after.controlToken }
+    });
+    assert.equal(acceptedNewCompatibilityToken.status, 200);
+
+    const stillPaired = await fetch(`${daemon.identity.endpoint}/api/prerequisites`, {
+      headers: { authorization: `Bearer ${pairingCredential}` }
+    });
+    assert.equal(stillPaired.status, 200);
+  } finally {
+    await daemon?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy browser pairing and CLI control pairing share one rotation and revocation authority", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-pairing-authority-"));
+  let openedPairingUrl = "";
+  let daemon: RunningBridgeDaemon | undefined;
+  try {
+    daemon = await startBridgeDaemon({
+      home: join(root, "state"),
+      port: 0,
+      cwd: root,
+      webUrl: "http://localhost:5173/studio",
+      development: true,
+      openBrowser: async url => { openedPairingUrl = url; }
+    });
+    const credentials = await createCredentialStore(daemon.paths).read();
+    assert.ok(credentials?.controlToken);
+    const controlHeaders = {
+      "content-type": "application/json",
+      "x-hunsu-bridge-control-token": credentials.controlToken
+    };
+    const authorize = (credential: string) => fetch(`${daemon!.identity.endpoint}/api/prerequisites`, {
+      headers: { authorization: `Bearer ${credential}` }
+    });
+
+    const legacyRotation = await fetch(`${daemon.identity.endpoint}/api/bridge/pairing/rotate`, {
+      method: "POST",
+      headers: controlHeaders,
+      body: JSON.stringify({ webUrl: "http://localhost:5173/studio" })
+    });
+    assert.equal(legacyRotation.status, 202);
+    const legacyPairing = await legacyRotation.json() as {
+      authToken?: string;
+      studioUrl?: string;
+      pairing?: { pairingId?: string };
+    };
+    assert.ok(legacyPairing.authToken);
+    assert.equal(new URL(legacyPairing.studioUrl ?? "").searchParams.get("hunsuBridgeToken"), legacyPairing.authToken);
+    assert.match(legacyPairing.pairing?.pairingId ?? "", /^pair_/u);
+    assert.equal((await authorize(legacyPairing.authToken)).status, 200);
+
+    const client = createBridgeControlClient({ paths: daemon.paths });
+    const cliRotation = await client.request("/v1/control/pair", {
+      method: "POST",
+      body: { openBrowser: true }
+    });
+    assert.equal(cliRotation.ok, true);
+    const cliCredential = new URL(openedPairingUrl).searchParams.get("hunsuBridgeToken");
+    assert.ok(cliCredential);
+    assert.equal((await authorize(legacyPairing.authToken)).status, 401);
+    assert.equal((await authorize(cliCredential)).status, 200);
+
+    assert.equal((await client.request("/v1/control/pair/revoke", { method: "POST" })).ok, true);
+    assert.equal((await authorize(cliCredential)).status, 401);
+
+    const secondLegacyRotation = await fetch(`${daemon.identity.endpoint}/api/bridge/pairing/rotate`, {
+      method: "POST",
+      headers: controlHeaders,
+      body: JSON.stringify({ webUrl: "http://localhost:5173/studio" })
+    });
+    const secondLegacyPairing = await secondLegacyRotation.json() as { authToken?: string };
+    assert.ok(secondLegacyPairing.authToken);
+    assert.equal((await authorize(secondLegacyPairing.authToken)).status, 200);
+    const legacyRevoke = await fetch(`${daemon.identity.endpoint}/api/bridge/pairing/revoke`, {
+      method: "POST",
+      headers: controlHeaders
+    });
+    assert.equal(legacyRevoke.status, 202);
+    assert.equal((await legacyRevoke.json() as { revoked?: boolean }).revoked, true);
+    assert.equal((await authorize(secondLegacyPairing.authToken)).status, 401);
+  } finally {
+    await daemon?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

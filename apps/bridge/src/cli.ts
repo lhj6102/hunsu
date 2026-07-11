@@ -132,6 +132,11 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
     if (command === "workspace") {
       return printResult(await runWorkspaceCommand(parsed, client), json, io);
     }
+    if (command === "credential") {
+      const action = parsed.positionals[1];
+      if (action !== "rotate") throw new BridgeError("BRIDGE_STATE_INVALID", `Unknown credential command: ${action ?? ""}`);
+      return printResult(await client.request("/v1/control/credential/rotate", { method: "POST" }), json, io);
+    }
     if (command === "pair" || command === "open") {
       if (command === "pair" && parsed.positionals[1] === "revoke") {
         return printResult(await client.request("/v1/control/pair/revoke", { method: "POST" }), json, io);
@@ -396,6 +401,7 @@ Client commands (never start a daemon):
   provider list|status|set codex|check codex|reset codex
   workspace add <path>|list|inspect <id>|remove <id>|open <id>
   workspace grant <id> [--scopes <csv>] | revoke <id>
+  credential rotate                   Rotate and revoke the local control credential.
   pair [--workspace <id>] | pair revoke | open [--workspace <id>]
   login | logout | remote enable|disable|status
 

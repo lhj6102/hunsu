@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -36,7 +36,11 @@ export async function readJsonState(file: string): Promise<unknown | undefined> 
 export async function writeJsonStateAtomic(
   file: string,
   value: unknown,
-  options: { mode?: number } = {}
+  options: {
+    mode?: number;
+    prepareTemporaryFile?: (temporaryFile: string) => Promise<void>;
+    onCommitted?: () => void;
+  } = {}
 ): Promise<void> {
   const directory = dirname(file);
   const mode = options.mode ?? 0o600;
@@ -55,8 +59,9 @@ export async function writeJsonStateAtomic(
     await handle.chmod(mode);
     await handle.close();
     handle = undefined;
+    await options.prepareTemporaryFile?.(temporaryFile);
     await rename(temporaryFile, file);
-    await chmod(file, mode);
+    options.onCommitted?.();
   } catch (error) {
     throw new BridgeStateError(file, `Unable to persist Bridge state file: ${basename(file)}.`, { cause: error });
   } finally {
