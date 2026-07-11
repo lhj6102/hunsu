@@ -1,6 +1,6 @@
-import { CheckCircle2, Clipboard, Download, ExternalLink, Link2, LogIn, LogOut, RefreshCw, ShieldAlert, Wifi, WifiOff } from "lucide-react";
+import { CheckCircle2, Clipboard, ExternalLink, Link2, LogIn, LogOut, RefreshCw, ShieldAlert, Wifi, WifiOff } from "lucide-react";
 import { useEffect, useState } from "react";
-import { currentStudioNext } from "@/app/routes";
+import { currentStudioNext, pushStudioPath, setupPath } from "@/app/routes";
 import { fetchRemoteBridgeDevices, postRemoteBridgeConnect } from "@/shared/api/bridgeClient";
 import { hasDirectRelaySession, hasRemoteBridgeSession } from "@/shared/api/bridgeApiBase";
 import type { BridgeConnectionState } from "@/shared/api/bridgeConnection";
@@ -104,25 +104,21 @@ export function ConnectionCenter({ open, onOpenChange, connection, currentRoadma
         />
 
         <div className="flex flex-wrap gap-2">
-          <Button type="button" onClick={() => openBridgeLink("hunsu://open")}>
+          <Button type="button" onClick={() => pushStudioPath(setupPath(currentStudioNext(window.location)))}>
             <ExternalLink className="size-4" />
-            Open Hunsu Bridge App
+            Bridge setup
           </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://provider")}>
+          <Button type="button" variant="outline" onClick={() => pushStudioPath(setupPath(currentStudioNext(window.location)))}>
             <ExternalLink className="size-4" />
             Provider Setup
           </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://workspaces")}>
+          <Button type="button" variant="outline" onClick={() => pushStudioPath("/studio")}>
             <ExternalLink className="size-4" />
             Workspaces
           </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://connection")}>
-            <ExternalLink className="size-4" />
+          <Button type="button" variant="outline" onClick={onRefresh}>
+            <RefreshCw className="size-4" />
             Connections
-          </Button>
-          <Button type="button" variant="outline" onClick={() => openBridgeLink("https://hunsu.app/download/bridge")}>
-            <Download className="size-4" />
-            Download Hunsu Bridge App
           </Button>
           <Button type="button" variant="outline" onClick={onRefresh}>
             <RefreshCw className="size-4" />
@@ -160,21 +156,21 @@ export function ConnectionCenter({ open, onOpenChange, connection, currentRoadma
               ["Warnings", status?.warnings.length ? status.warnings.join(", ") : "None"]
             ]} />
             <div className="flex flex-wrap gap-2">
-              <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://sign-in")}>
+              <Button type="button" variant="outline" title="hunsu-bridge login" onClick={() => copyCliCommand("hunsu-bridge login")}>
                 <LogIn className="size-4" />
-                Sign in
+                Copy login command
               </Button>
-              <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://sign-out")}>
+              <Button type="button" variant="outline" title="hunsu-bridge logout" onClick={() => copyCliCommand("hunsu-bridge logout")}>
                 <LogOut className="size-4" />
-                Sign out
+                Copy logout command
               </Button>
-              <Button type="button" variant="outline" onClick={() => openBridgeLink("hunsu://remote-disable")}>
+              <Button type="button" variant="outline" title="hunsu-bridge remote disable" onClick={() => copyCliCommand("hunsu-bridge remote disable")}>
                 <ShieldAlert className="size-4" />
-                Disable Remote Access
+                Copy Remote disable
               </Button>
-              <Button type="button" variant="outline" onClick={() => openBridgeLink(pairAgainLink())}>
+              <Button type="button" variant="outline" title="hunsu-bridge open" onClick={() => copyCliCommand("hunsu-bridge open")}>
                 <Link2 className="size-4" />
-                Pair again
+                Copy pairing command
               </Button>
               <Button type="button" variant="outline" onClick={copyDiagnostics}>
                 <Clipboard className="size-4" />
@@ -317,7 +313,7 @@ function problemMessage(connection: BridgeConnectionState): string {
   if (status?.warnings.includes("origin_not_allowed")) return "Bridge is running, but this Studio origin is not allowed.";
   if (compatibilityMessage) return compatibilityMessage;
   if (status?.warnings.includes("version_mismatch")) return "Bridge version is too old for this Studio session.";
-  if (status?.auth === "invalid") return "Bridge rejected this browser pairing token. Pair Studio again from the Bridge App.";
+  if (status?.auth === "invalid") return "Bridge rejected this browser pairing token. Run hunsu-bridge open to pair again.";
   if (status?.projectAccess === "denied") return "Bridge is connected, but the selected Workspace does not allow this access.";
   if (status?.projectAccess === "needs_grant") return "Bridge is connected, but this Workspace still needs access.";
   if (status?.transport === "relay" && status.health !== "connected") return "Remote Bridge is offline or Relay is unavailable.";
@@ -337,8 +333,6 @@ function connectionCompatibilityLabel(status: StudioConnectionStatus): string | 
       return "Studio update needed";
     case "feature_unavailable":
       return "Feature unavailable on this Bridge version";
-    case "bridge_app_update_needed":
-      return "Remote Relay requires newer Bridge App";
   }
 }
 
@@ -353,8 +347,6 @@ function connectionCompatibilityMessage(status: StudioConnectionStatus): string 
       return "Studio needs an update before it can use this Bridge.";
     case "feature_unavailable":
       return "This Bridge version does not support a feature Studio needs.";
-    case "bridge_app_update_needed":
-      return "Remote Relay requires a newer Hunsu Bridge App on that device.";
   }
 }
 
@@ -365,17 +357,16 @@ function connectionModeLabel(connection: BridgeConnectionState): string {
   return "Not connected";
 }
 
-function openBridgeLink(url: string): void {
-  window.location.href = url;
-}
-
-function pairAgainLink(): string {
-  return `hunsu://pair?next=${encodeURIComponent(currentStudioNext(window.location))}`;
+function copyCliCommand(command: string): void {
+  void navigator.clipboard?.writeText(command);
 }
 
 function advancedCliCommand(): string {
-  const targetUrl = new URL(currentStudioNext(window.location), window.location.origin).toString();
-  return `npx @hunsu/bridge@latest --web-url "${targetUrl}"`;
+  return [
+    "npx @hunsu/bridge@next setup",
+    "hunsu-bridge status",
+    "hunsu-bridge open"
+  ].join("\n");
 }
 
 function buildDiagnostics(connection: BridgeConnectionState): unknown {
