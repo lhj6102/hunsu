@@ -421,6 +421,21 @@ try {
   Assert-True ($null -ne $conflictListenerPid) "Dummy listener did not claim the Bridge port."
   $conflict = Invoke-BridgeJson ensure-running --json
   Assert-True ((-not $conflict.ok) -and $conflict.code -eq "BRIDGE_PORT_IN_USE") "Non-Hunsu listener did not return BRIDGE_PORT_IN_USE."
+  $sidecarStartsBefore = if (Test-Path -LiteralPath $logPath) {
+    @(Select-String -LiteralPath $logPath -Pattern '"event":"sidecar.starting"').Count
+  } else { 0 }
+  $terminalFailuresBefore = if (Test-Path -LiteralPath $logPath) {
+    @(Select-String -LiteralPath $logPath -Pattern '"event":"sidecar.terminal-failure"').Count
+  } else { 0 }
+  $null = & $SidecarPath supervise --cwd $root --attempt-id bridge_attempt_windows_port_conflict --restart-limit 3 2>&1
+  Assert-True ($LASTEXITCODE -eq 0) "The direct managed supervisor did not terminate cleanly after its daemon bind failure."
+  $sidecarStartsAfter = @(Select-String -LiteralPath $logPath -Pattern '"event":"sidecar.starting"').Count
+  $terminalFailuresAfter = @(Select-String -LiteralPath $logPath -Pattern '"event":"sidecar.terminal-failure"').Count
+  Assert-True (($sidecarStartsAfter - $sidecarStartsBefore) -eq 1) "The direct managed supervisor restarted its terminal port-conflict daemon."
+  Assert-True (($terminalFailuresAfter - $terminalFailuresBefore) -eq 1) "The direct managed supervisor did not record exactly one terminal failure."
+  Assert-True (Select-String -LiteralPath $logPath -Pattern 'BRIDGE_PORT_IN_USE' -Quiet) "The real daemon did not emit the stable port-conflict code."
+  Assert-True (Select-String -LiteralPath $logPath -Pattern '"exitCode":78' -Quiet) "The real daemon did not use the typed terminal exit code."
+  Assert-True (Select-String -LiteralPath $logPath -Pattern 'typed-terminal-exit' -Quiet) "The supervisor did not classify the daemon's typed terminal exit."
   for ($sample = 0; $sample -lt 12; $sample += 1) {
     $conflictTopology = Get-RelevantSidecarTopology
     Assert-True (@($conflictTopology.Supervisors).Count -eq 0) "Port conflict left or restarted a Bridge supervisor."
@@ -434,6 +449,9 @@ try {
     actionableCode = "BRIDGE_PORT_IN_USE"
     unrelatedListenerPreserved = $true
     supervisorSamples = 12
+    directSupervisorStarts = $sidecarStartsAfter - $sidecarStartsBefore
+    terminalDaemonExitCode = 78
+    typedTerminalFailure = $true
     lingeringSupervisors = 0
     lingeringDaemons = 0
     unrelatedListenerPid = $conflictListenerPid

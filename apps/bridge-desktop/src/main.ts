@@ -71,10 +71,15 @@ import {
   type ManagedBridgeDiscovery,
   type ManagedBridgeIdentity,
   type ManagedBridgeOperationError,
+  type ManagedBridgeRuntimeOptions,
   type ManagedBridgeStartContext,
   type ManagedBridgeStopResult
 } from "./processes/managedBridgeRuntime.ts";
 import { stopVerifiedWindowsManagedBridge } from "./processes/windowsManagedBridgeTermination.ts";
+import {
+  BRIDGE_SIDECAR_TERMINAL_EXIT_CODE,
+  isTerminalSidecarFailureCode
+} from "./sidecar-supervisor.ts";
 import {
   canonicalBridgeUiIntentTab,
   bridgeAppStatePath as appStatePath,
@@ -178,6 +183,7 @@ class BridgeAppCommandError extends Error {
 
 type BridgeAppMainOptions = {
   diagnosticsSecurityMigration?: DiagnosticsSecurityMigrationOptions;
+  managedBridgeRuntime?: Pick<ManagedBridgeRuntimeOptions, "probeTimeoutMs" | "stopTimeoutMs">;
 };
 
 async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions = {}): Promise<number> {
@@ -219,7 +225,7 @@ async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions 
         await statusCommand();
         return 0;
       case "stop":
-        await stopCommand(parsed);
+        await stopCommand(parsed, options.managedBridgeRuntime);
         return 0;
       case "diagnostics":
         await runDiagnosticsCommand(diagnosticsCommandContext());
@@ -300,15 +306,18 @@ async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions 
     }
   } catch (error) {
     const result = uiFailureFromError(error);
+    const terminalDaemonFailure = parsed.command === "daemon" && isTerminalSidecarFailureCode(result.code);
     writeStructuredLog({ event: "command.failed", command: parsed.command, code: result.code, error: result.message });
     writeStructuredLog({ event: "ui.operation.failed", action: parsed.command, code: result.code, message: result.message });
     if (hasFlag(parsed, "json")) {
       assertDiagnosticsSafe(result);
       console.log(JSON.stringify(result));
     } else {
-      console.error(result.message);
+      console.error(terminalDaemonFailure ? `${result.code}: ${result.message}` : result.message);
     }
-    return 1;
+    return terminalDaemonFailure
+      ? BRIDGE_SIDECAR_TERMINAL_EXIT_CODE
+      : 1;
   }
 }
 
@@ -557,14 +566,17 @@ function sanitizeExistingLogFile(path: string): void {
   }
 }
 
-function managedBridgeRuntime() {
+function managedBridgeRuntime(
+  options: Pick<ManagedBridgeRuntimeOptions, "probeTimeoutMs" | "stopTimeoutMs"> = {}
+) {
   return createManagedBridgeRuntime({
     readState: readAppState,
     writeState: writeAppState,
     startSupervisor: startDetachedManagedSupervisor,
     openUrl: openStudioManagedUrl,
     processIsAlive,
-    writeStructuredLog
+    writeStructuredLog,
+    ...options
   });
 }
 
@@ -882,8 +894,11 @@ function codexStatusLabel(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus
   return "Not Ready";
 }
 
-async function stopCommand(parsed: ParsedArgs): Promise<void> {
-  const runtime = managedBridgeRuntime();
+async function stopCommand(
+  parsed: ParsedArgs,
+  runtimeOptions?: Pick<ManagedBridgeRuntimeOptions, "probeTimeoutMs" | "stopTimeoutMs">
+): Promise<void> {
+  const runtime = managedBridgeRuntime(runtimeOptions);
   const discovery = await runtime.discoverManagedBridge();
   let result = await runtime.stopManagedBridge();
   if (!result.ok && result.error.code === "BRIDGE_CONTROL_UNAVAILABLE" && discovery.state === "running-managed") {

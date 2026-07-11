@@ -103,7 +103,6 @@ test("first fixed launch revokes legacy pairing and rewrites persisted/logged to
     rmSync(root, { recursive: true, force: true });
   }
 });
-
 test("rejected legacy pairing revocation stays pending and a successful retry completes it", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-security-rejected-"));
   const statePath = join(root, "bridge-app.json");
@@ -297,7 +296,7 @@ test("reachable nonresponsive health endpoint cannot stall a finite CLI command"
   console.log = () => undefined;
   try {
     const startedAt = Date.now();
-    const exitCode = await main(["help"], {
+    const exitCode = await main(["diagnostics-redaction-blocked", "--json"], {
       diagnosticsSecurityMigration: {
         configuredBridgeApiUrl: null,
         fetchTimeoutMs: 50

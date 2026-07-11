@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -11,7 +11,10 @@ import {
   createManagedBridgeRuntime,
   type ManagedBridgeFetch
 } from "../apps/bridge-desktop/src/processes/managedBridgeRuntime.ts";
-import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
+import {
+  BRIDGE_SIDECAR_TERMINAL_EXIT_CODE,
+  BridgeSidecarSupervisor
+} from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
 import { main } from "../apps/bridge-desktop/src/main.ts";
 import {
   defaultBridgeAppState,
@@ -163,6 +166,63 @@ test("concurrent and repeated ensure-running calls start exactly one managed dae
     const repeated = await runtime.ensureManagedBridgeRunning();
     assert.equal(repeated.ok, true);
     assert.equal(starts, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("startup coordination preserves a fresh live lock and recovers an aged lock after PID reuse", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-start-lock-"));
+  const lockPath = join(root, "bridge-start.lock");
+  const fixedNow = new Date("2026-07-11T00:01:00.000Z");
+  let state = defaultBridgeAppState();
+  const service = fakeBridgeService(() => state);
+  service.online = false;
+  let starts = 0;
+  writeFileSync(lockPath, `${JSON.stringify({
+    pid: 4242,
+    startedAt: fixedNow.toISOString(),
+    instanceAttemptId: "bridge_attempt_active"
+  })}\n`, "utf8");
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath,
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    processIsAlive: pid => pid === 4242,
+    now: () => fixedNow,
+    coordinationTimeoutMs: 50,
+    startTimeoutMs: 50,
+    pollIntervalMs: 1,
+    startSupervisor: async () => {
+      starts += 1;
+      state = {
+        ...state,
+        bridgeApiUrl: BRIDGE_URL,
+        controlToken: CONTROL_TOKEN,
+        pid: 4321,
+        startedAt: fixedNow.toISOString()
+      };
+      service.online = true;
+    }
+  });
+
+  try {
+    const active = await runtime.discoverManagedBridge();
+    assert.equal(active.state, "starting");
+    assert.equal(starts, 0);
+    assert.equal(existsSync(lockPath), true);
+
+    writeFileSync(lockPath, `${JSON.stringify({
+      pid: 4242,
+      startedAt: new Date(fixedNow.getTime() - 60_000).toISOString(),
+      instanceAttemptId: "bridge_attempt_reused_pid"
+    })}\n`, "utf8");
+    const recovered = await runtime.ensureManagedBridgeRunning();
+    assert.equal(recovered.ok, true);
+    assert.equal(starts, 1);
+    assert.equal(existsSync(lockPath), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -500,7 +560,12 @@ test("the real app snapshot exposes stopping during an in-flight authenticated S
   console.error = (...values: unknown[]) => { output.push(values.map(String).join(" ")); };
 
   try {
-    const stopping = main(["stop", "--json"]);
+    const stopping = main(["stop", "--json"], {
+      managedBridgeRuntime: {
+        probeTimeoutMs: 8_000,
+        stopTimeoutMs: 20_000
+      }
+    });
     await shutdownRequested;
     const persistedDuringStop = JSON.parse(readFileSync(statePath, "utf8")) as BridgeAppState;
     assert.equal(persistedDuringStop.managedBridgeTransition?.state, "stopping");
@@ -575,29 +640,110 @@ test("sidecar supervisor treats a clean daemon exit as terminal without restart"
   }
 });
 
-test("deterministic EADDRINUSE exits are terminal and never enter a restart loop", async () => {
-  const root = mkdtempSync(join(tmpdir(), "hunsu-sidecar-port-terminal-"));
-  const logPath = join(root, "sidecar.log");
-  const supervisor = new BridgeSidecarSupervisor({
-    command: process.execPath,
-    args: ["-e", "process.stderr.write('EADDRINUSE BRIDGE_PORT_IN_USE\\n'); process.exit(1)"],
-    logPath,
-    restartLimit: 3,
-    restartDelayMs: 10
+test("a real post-discovery daemon bind race is terminal and never enters a restart loop", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-sidecar-bind-race-"));
+  const statePath = join(root, "bridge-app.json");
+  const appLogPath = join(root, "bridge-app.log");
+  const sidecarLogPath = join(root, "sidecar.log");
+  const port = await unusedLocalPort();
+  const bridgeApiUrl = `http://127.0.0.1:${port}`;
+  let conflictServer: ReturnType<typeof createServer> | undefined;
+  let supervisor: BridgeSidecarSupervisor | undefined;
+  writeBridgeAppState({
+    ...defaultBridgeAppState(),
+    diagnosticsSecurityVersion: 1
+  }, statePath);
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: bridgeApiUrl,
+    statePath,
+    lockPath: join(root, "bridge-start.lock"),
+    pollIntervalMs: 5,
+    startTimeoutMs: 2_000,
+    startSupervisor: async () => {
+      // This callback is reached only after both pre-lock and post-lock
+      // discovery proved the endpoint offline. Occupy it now, immediately
+      // before the real daemon attempts to listen, to reproduce the bind race.
+      conflictServer = createServer((request, response) => {
+        response.setHeader("content-type", "application/json");
+        response.setHeader("connection", "close");
+        response.writeHead(request.url === "/health" ? 200 : 404).end(JSON.stringify(
+          request.url === "/health"
+            ? { ok: true, service: "another-service" }
+            : { error: "not_found" }
+        ));
+      });
+      await listenOnLocalPort(conflictServer, port);
+      supervisor = new BridgeSidecarSupervisor({
+        command: process.execPath,
+        args: [
+          "--conditions=development",
+          join(process.cwd(), "apps/bridge-desktop/src/main.ts"),
+          "daemon",
+          "--cwd",
+          root,
+          "--no-open"
+        ],
+        cwd: root,
+        env: {
+          ...process.env,
+          HUNSU_BRIDGE_APP_STATE_PATH: statePath,
+          HUNSU_BRIDGE_APP_LOG_PATH: appLogPath,
+          HUNSU_BRIDGE_HOST: "127.0.0.1",
+          HUNSU_BRIDGE_PORT: String(port),
+          HUNSU_BRIDGE_SUPERVISOR_PID: String(process.pid)
+        },
+        logPath: sidecarLogPath,
+        restartLimit: 3,
+        restartDelayMs: 20
+      });
+      supervisor.start();
+    }
   });
   try {
-    supervisor.start();
+    assert.equal((await runtime.discoverManagedBridge()).state, "not-running");
+    const started = await runtime.ensureManagedBridgeRunning({ cwd: root });
+    assert.equal(started.ok, false);
+    if (!started.ok) {
+      assert.equal(started.error.code, "BRIDGE_PORT_IN_USE");
+    }
+    assert.ok(supervisor);
     const terminal = await supervisor.waitForTerminal();
-    await delay(40);
+    await delay(80);
     assert.equal(terminal.status, "crashed");
     assert.equal(terminal.restartCount, 0);
+    if (terminal.status === "crashed") {
+      assert.equal(terminal.exitCode, BRIDGE_SIDECAR_TERMINAL_EXIT_CODE);
+    }
     assert.equal(supervisor.status().restartCount, 0);
-    assert.match(readFileSync(logPath, "utf8"), /sidecar\.terminal-failure/);
+    const sidecarLog = readFileSync(sidecarLogPath, "utf8");
+    assert.match(sidecarLog, /BRIDGE_PORT_IN_USE/u);
+    assert.match(sidecarLog, /sidecar\.terminal-failure/u);
+    assert.match(sidecarLog, /typed-terminal-exit/u);
   } finally {
-    await supervisor.stop();
+    await supervisor?.stop();
+    if (conflictServer?.listening) {
+      await new Promise<void>(resolve => conflictServer?.close(() => resolve()));
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function unusedLocalPort(): Promise<number> {
+  const server = createServer();
+  await listenOnLocalPort(server, 0);
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const port = address.port;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return port;
+}
+
+async function listenOnLocalPort(server: ReturnType<typeof createServer>, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+}
 
 function fakeBridgeService(readState: () => BridgeAppState): {
   fetch: ManagedBridgeFetch;

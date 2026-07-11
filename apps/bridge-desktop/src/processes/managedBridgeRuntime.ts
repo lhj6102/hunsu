@@ -201,6 +201,9 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
   const startTimeoutMs = options.startTimeoutMs ?? 12_000;
   const stopTimeoutMs = options.stopTimeoutMs ?? 8_000;
   const pollIntervalMs = options.pollIntervalMs ?? 100;
+  const startupLockStaleAfterMs = coordinationTimeoutMs
+    + startTimeoutMs
+    + Math.max(5_000, pollIntervalMs * 2);
   const configuredEndpoint = resolveBridgeApiServerConfig(env);
   const canonicalBridgeApiUrl = normalizeBridgeApiUrl(
     options.canonicalBridgeApiUrl
@@ -286,7 +289,12 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
       return discovery;
     }
 
-    const activeLock = readActiveStartupLock(lockPath, processIsAlive);
+    const activeLock = readActiveStartupLock(
+      lockPath,
+      processIsAlive,
+      now,
+      startupLockStaleAfterMs
+    );
     if (activeLock && activeLock.instanceAttemptId !== ignoreLockAttemptId) {
       return { state: "starting", reason: "Another Bridge startup attempt is in progress." };
     }
@@ -443,7 +451,7 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
       pid: currentPid,
       startedAt: now().toISOString(),
       instanceAttemptId: attemptId
-    }, processIsAlive);
+    }, processIsAlive, now, startupLockStaleAfterMs);
     if (!lock.acquired) {
       if (lock.reason === "active") {
         const coordinated = await waitForCoordination();
@@ -925,7 +933,9 @@ function defaultTcpEndpointProbe(bridgeApiUrl: string, timeoutMs: number): Promi
 function acquireStartupLock(
   path: string,
   metadata: StartupLockMetadata,
-  processIsAlive: (pid: number) => boolean
+  processIsAlive: (pid: number) => boolean,
+  now: () => Date,
+  staleAfterMs: number
 ): StartupLockAcquisition {
   mkdirSync(dirname(path), { recursive: true });
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -947,7 +957,7 @@ function acquireStartupLock(
         return { acquired: false, reason: "unavailable" };
       }
       const existing = readStartupLock(path);
-      if (existing && processIsAlive(existing.pid)) {
+      if (existing && isActiveStartupLock(existing, processIsAlive, now, staleAfterMs)) {
         return { acquired: false, reason: "active" };
       }
       try {
@@ -962,7 +972,9 @@ function acquireStartupLock(
 
 function readActiveStartupLock(
   path: string,
-  processIsAlive: (pid: number) => boolean
+  processIsAlive: (pid: number) => boolean,
+  now: () => Date,
+  staleAfterMs: number
 ): StartupLockMetadata | undefined {
   const metadata = readStartupLock(path);
   if (!metadata) {
@@ -973,7 +985,7 @@ function readActiveStartupLock(
     }
     return undefined;
   }
-  if (processIsAlive(metadata.pid)) {
+  if (isActiveStartupLock(metadata, processIsAlive, now, staleAfterMs)) {
     return metadata;
   }
   try {
@@ -984,12 +996,30 @@ function readActiveStartupLock(
   return undefined;
 }
 
+function isActiveStartupLock(
+  metadata: StartupLockMetadata,
+  processIsAlive: (pid: number) => boolean,
+  now: () => Date,
+  staleAfterMs: number
+): boolean {
+  if (!processIsAlive(metadata.pid)) {
+    return false;
+  }
+  const startedAt = Date.parse(metadata.startedAt);
+  const ageMs = now().getTime() - startedAt;
+  return Number.isFinite(startedAt)
+    && Number.isFinite(ageMs)
+    && ageMs >= -staleAfterMs
+    && ageMs <= staleAfterMs;
+}
+
 function readStartupLock(path: string): StartupLockMetadata | undefined {
   try {
     const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
     if (!isRecord(value)
       || !isPositiveProcessId(value.pid)
       || typeof value.startedAt !== "string"
+      || !Number.isFinite(Date.parse(value.startedAt))
       || typeof value.instanceAttemptId !== "string"
       || !value.instanceAttemptId) {
       return undefined;

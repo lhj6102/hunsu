@@ -20,6 +20,20 @@ export type SidecarSupervisorOptions = {
   restartDelayMs?: number;
 };
 
+/**
+ * A daemon uses this process exit code when startup cannot succeed without
+ * external intervention.  The supervisor must not restart these failures.
+ * 78 is EX_CONFIG on platforms that define sysexits.h and is also preserved by
+ * Windows process exit status handling.
+ */
+export const BRIDGE_SIDECAR_TERMINAL_EXIT_CODE = 78;
+
+const TERMINAL_SIDECAR_FAILURE_CODES = new Set([
+  "BRIDGE_ALREADY_RUNNING_UNMANAGED",
+  "BRIDGE_PORT_IN_USE",
+  "BRIDGE_START_COORDINATION_TIMEOUT"
+]);
+
 export class BridgeSidecarSupervisor {
   private readonly options: SidecarSupervisorOptions;
   private child: ChildProcess | undefined;
@@ -114,8 +128,13 @@ export class BridgeSidecarSupervisor {
         return;
       }
       this.statusValue = { status: "crashed", restartCount: this.restartCount, exitCode, signal };
-      if (this.deterministicFailure) {
-        this.writeLog({ event: "sidecar.terminal-failure", exitCode, signal, reason: "singleton-or-port" });
+      if (exitCode === BRIDGE_SIDECAR_TERMINAL_EXIT_CODE || this.deterministicFailure) {
+        this.writeLog({
+          event: "sidecar.terminal-failure",
+          exitCode,
+          signal,
+          reason: exitCode === BRIDGE_SIDECAR_TERMINAL_EXIT_CODE ? "typed-terminal-exit" : "singleton-or-port"
+        });
         this.finishTerminal();
         return;
       }
@@ -152,4 +171,8 @@ export class BridgeSidecarSupervisor {
 
 export function isTerminalSidecarFailure(text: string): boolean {
   return /EADDRINUSE|BRIDGE_ALREADY_RUNNING_UNMANAGED|BRIDGE_PORT_IN_USE|BRIDGE_START_COORDINATION_TIMEOUT/iu.test(text);
+}
+
+export function isTerminalSidecarFailureCode(code: string): boolean {
+  return TERMINAL_SIDECAR_FAILURE_CODES.has(code);
 }

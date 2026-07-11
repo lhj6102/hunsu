@@ -94,6 +94,11 @@ test("redaction scenario uses fresh Diagnostics plus a real Windows clipboard ro
 test("port-conflict scenario samples beyond the restart delay and leaves no Bridge process", () => {
   const conflictScenario = between(script, "# Scenario E", "Write-SafeEvidence");
   assert.match(conflictScenario, /BRIDGE_PORT_IN_USE/);
+  assert.match(conflictScenario, /supervise --cwd \$root --attempt-id bridge_attempt_windows_port_conflict --restart-limit 3/);
+  assert.match(conflictScenario, /sidecarStartsAfter - \$sidecarStartsBefore\) -eq 1/);
+  assert.match(conflictScenario, /sidecar\.terminal-failure/);
+  assert.match(conflictScenario, /'"exitCode":78'/);
+  assert.match(conflictScenario, /typed-terminal-exit/);
   assert.match(conflictScenario, /for \(\$sample = 0; \$sample -lt 12; \$sample \+= 1\)/);
   assert.match(conflictScenario, /Supervisors\)\.Count -eq 0/);
   assert.match(conflictScenario, /Daemons\)\.Count -eq 0/);
