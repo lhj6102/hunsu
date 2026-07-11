@@ -8,4 +8,6 @@ export type BridgePackSmokeResult = {
   durationMs: number;
 };
 
-export function runBridgePackSmoke(): Promise<BridgePackSmokeResult>;
+export function runBridgePackSmoke(options?: {
+  outputDirectory?: string;
+}): Promise<BridgePackSmokeResult>;

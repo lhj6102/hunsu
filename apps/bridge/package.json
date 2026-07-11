@@ -16,7 +16,7 @@
   "exports": {
     ".": {
       "development": "./src/package-api.ts",
-      "types": "./dist/index.d.ts",
+      "types": "./src/package-api.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     }
