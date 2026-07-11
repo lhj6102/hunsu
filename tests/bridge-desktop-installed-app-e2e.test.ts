@@ -78,6 +78,8 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
   assert.match(driver, /version labels passed/u);
   assert.match(driver, /pageErrors\.length === 0/u);
   assert.match(driver, /consoleErrors\.length === 0/u);
+  assert.match(driver, /safeConsoleErrorSummary/u);
+  assert.match(driver, /redactConsoleError/u);
   assert.match(driver, /verifyPortConflictFeedback/u);
   assert.match(driver, /The local Bridge port is in use by another process\./u);
   assert.match(driver, /capturedUrl\.pathname === `\/studio\/roadmaps\/\$\{encodeURIComponent\(roadmapId\)\}`/u);

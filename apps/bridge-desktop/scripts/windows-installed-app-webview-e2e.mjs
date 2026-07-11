@@ -13,7 +13,9 @@ try {
   const page = await waitForBridgePage(browser);
   page.on("pageerror", error => pageErrors.push(String(error?.message ?? error)));
   page.on("console", message => {
-    if (message.type() === "error") consoleErrors.push(message.text());
+    if (message.type() === "error") {
+      consoleErrors.push({ text: message.text(), location: message.location() });
+    }
   });
   await page.locator("#start-bridge").waitFor({ state: "attached", timeout: 30_000 });
 
@@ -67,7 +69,9 @@ try {
   await page.screenshot({ path: options.screenshotPath, fullPage: true });
 
   assert(pageErrors.length === 0, `The installed WebView raised ${pageErrors.length} unhandled page error(s).`);
-  assert(consoleErrors.length === 0, `The installed WebView logged ${consoleErrors.length} console error(s).`);
+  const consoleErrorSummary = safeConsoleErrorSummary(consoleErrors, [options.legacySecret, pairingToken, workspaceToken]);
+  assert(consoleErrors.length === 0,
+    `The installed WebView logged ${consoleErrors.length} console error(s): ${JSON.stringify(consoleErrorSummary)}`);
   const evidence = {
     schemaVersion: 1,
     result: "passed",
@@ -444,6 +448,38 @@ function assert(condition, message) {
 
 function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function safeConsoleErrorSummary(errors, secrets) {
+  return errors.slice(0, 50).map(error => ({
+    text: redactConsoleError(error.text, secrets).slice(0, 500),
+    source: redactConsoleUrl(error.location?.url ?? "", secrets),
+    line: Number(error.location?.lineNumber ?? 0),
+    column: Number(error.location?.columnNumber ?? 0)
+  }));
+}
+
+function redactConsoleError(value, secrets) {
+  let safe = String(value ?? "");
+  for (const secret of secrets.filter(Boolean)) {
+    safe = safe.split(secret).join("[redacted]");
+  }
+  return safe
+    .replace(/([?&](?:hunsuBridgeToken|hunsuRelayToken|token|access_token|refresh_token|authorization|code|state)=)[^&#\s"']*/giu, "$1[redacted]")
+    .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s"']+/giu, "$1[redacted]")
+    .replace(/(["']?(?:authToken|controlToken|hunsuBridgeToken|hunsuRelayToken|access_token|refresh_token)["']?\s*[:=]\s*["']?)[^\s,"'}&]+/giu, "$1[redacted]")
+    .replace(/\b(?:bridge_test|control_test|qa_legacy)_[A-Za-z0-9_-]+\b/gu, "[redacted]")
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/gu, "[redacted]");
+}
+
+function redactConsoleUrl(value, secrets) {
+  const safe = redactConsoleError(value, secrets);
+  try {
+    const url = new URL(safe);
+    return `${url.protocol}//${url.host}${url.pathname}`.slice(0, 500);
+  } catch (_error) {
+    return safe.slice(0, 500);
+  }
 }
 
 function delay(milliseconds) {
