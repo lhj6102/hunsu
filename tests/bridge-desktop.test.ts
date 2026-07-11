@@ -3463,6 +3463,7 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
   const registryPath = join(root, "roadmaps.json");
   const credentialPath = join(root, "credentials.json");
   const relayRegistryPath = join(root, "relay.json");
+  const browserCapturePath = join(root, "browser-capture.log");
   const bridgePort = await getUnusedPort();
   const childEnv = {
     ...process.env,
@@ -3471,7 +3472,9 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     HUNSU_ROADMAP_REGISTRY_PATH: registryPath,
     HUNSU_BRIDGE_CREDENTIAL_PATH: credentialPath,
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
-    HUNSU_BRIDGE_PORT: String(bridgePort)
+    HUNSU_BRIDGE_PORT: String(bridgePort),
+    HUNSU_BRIDGE_TEST_MODE: "1",
+    HUNSU_BRIDGE_TEST_BROWSER_CAPTURE_PATH: browserCapturePath
   };
   const child = spawn(process.execPath, [
     "--conditions=development",
@@ -3504,7 +3507,9 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     "HUNSU_ROADMAP_REGISTRY_PATH",
     "HUNSU_BRIDGE_CREDENTIAL_PATH",
     "HUNSU_RELAY_REGISTRY_PATH",
-    "HUNSU_BRIDGE_PORT"
+    "HUNSU_BRIDGE_PORT",
+    "HUNSU_BRIDGE_TEST_MODE",
+    "HUNSU_BRIDGE_TEST_BROWSER_CAPTURE_PATH"
   ];
   const previousEnv = snapshotEnv(envKeys);
   let managedSupervisorPid: number | undefined;
@@ -3531,6 +3536,38 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     assert.equal(initialState.authToken, undefined);
     assert.equal(initialState.pairing, undefined);
     assert.match(initialState.controlToken ?? "", /^hunsu_bridge_control_/);
+
+    const pairLogs: string[] = [];
+    const previousPairLog = console.log;
+    console.log = (...values: unknown[]) => {
+      pairLogs.push(values.map(String).join(" "));
+    };
+    try {
+      assert.equal(await main([
+        "pair",
+        "--web-url",
+        "http://127.0.0.1:19688/studio"
+      ]), 0);
+    } finally {
+      console.log = previousPairLog;
+    }
+    assert.equal(pairLogs.some(line => line.includes("Hunsu Web opened with a fresh pairing.")), true);
+    const pairedState = JSON.parse(readFileSync(statePath, "utf8")) as {
+      authToken?: string;
+      pairing?: unknown;
+      controlToken?: string;
+    };
+    assert.equal(pairedState.authToken, undefined);
+    assert.equal(pairedState.pairing, undefined);
+    assert.equal(pairedState.controlToken, initialState.controlToken);
+    const capturedUrl = readFileSync(browserCapturePath, "utf8").trim().split(/\r?\n/).at(-1) ?? "";
+    const pairedToken = new URL(capturedUrl).searchParams.get("hunsuBridgeToken") ?? "";
+    assert.match(pairedToken, /^hunsu_bridge_/);
+    const newTokenResponse = await fetch(`http://127.0.0.1:${bridgePort}/api/roadmaps/recent`, {
+      headers: { "x-hunsu-bridge-token": pairedToken }
+    });
+    assert.equal(newTokenResponse.status, 200);
+    assert.doesNotMatch(readFileSync(logPath, "utf8"), new RegExp(pairedToken));
 
     const logs: string[] = [];
     const previousLog = console.log;

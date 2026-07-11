@@ -199,6 +199,44 @@ test("stale state is reconciled before startup and unmanaged listeners are never
   }
 });
 
+test("Pair and Open Roadmap reuse one daemon, rotate once per action, and return only safe results", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-open-"));
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL,
+    controlToken: CONTROL_TOKEN,
+    pid: 4321
+  };
+  const service = fakeBridgeService(() => state);
+  const opened: string[] = [];
+  let starts = 0;
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath: join(root, "bridge-start.lock"),
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    startSupervisor: async () => { starts += 1; },
+    openUrl: async url => { opened.push(url); }
+  });
+
+  try {
+    const paired = await runtime.createManagedPairing({ webUrl: "https://hunsu.app/studio" });
+    const openedRoadmap = await runtime.openManagedRoadmap("roadmap_123", { webUrl: "https://hunsu.app/studio" });
+    assert.equal(paired.ok, true);
+    assert.equal(openedRoadmap.ok, true);
+    assert.equal(starts, 0);
+    assert.equal(service.rotations, 2);
+    assert.equal(opened.length, 2);
+    assert.match(opened[1], /roadmap_123/);
+    assert.match(opened[1], /hunsuBridgeToken=synthetic-pairing-/);
+    assert.doesNotMatch(JSON.stringify([paired, openedRoadmap]), /synthetic-pairing|hunsuBridgeToken|studioUrl|authToken/);
+    assert.equal("token" in (state.pairing ?? {}), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function fakeBridgeService(readState: () => BridgeAppState): {
   fetch: ManagedBridgeFetch;
   online: boolean;

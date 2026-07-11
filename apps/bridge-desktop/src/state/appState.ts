@@ -147,8 +147,6 @@ export type BridgeAppState = {
   bridgeApiUrl?: string;
   processNonce?: string;
   commandIdentity?: BridgeProcessCommandIdentity;
-  /** Transient runtime credential; writeBridgeAppState always removes it. */
-  authToken?: string;
   controlToken?: string;
   pairing?: BridgePairingMetadata;
   diagnosticsSecurityVersion?: number;

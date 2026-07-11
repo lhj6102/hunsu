@@ -133,7 +133,6 @@ import {
   sanitizeDiagnostics,
   setRoadmapLifecycle,
   setRoadmapRemoteAccess,
-  type BridgePairingSession,
   type DirectProviderModelSelection,
   type RuntimeProviderStatus,
   type BridgeRuntimeHandle,
@@ -568,6 +567,7 @@ function managedBridgeRuntime() {
     readState: readAppState,
     writeState: writeAppState,
     startSupervisor: startDetachedManagedSupervisor,
+    openUrl: openStudioManagedUrl,
     processIsAlive,
     writeStructuredLog
   });
@@ -712,112 +712,22 @@ async function pairCommand(parsed: ParsedArgs): Promise<void> {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
   const next = safeStudioNext(getFlag(parsed, "next") ?? "/studio");
   const webUrl = studioWebUrlForNext(getFlag(parsed, "web-url"), next);
-  const running = await rotateRunningBridgePairing({ webUrl });
-  if (running.ok) {
-    if (hasFlag(parsed, "no-open")) {
-      console.log("A fresh pairing was created without displaying its bearer URL.");
-    } else {
-      await openStudioManagedUrl(running.pairingUrl);
-    }
-    console.log("Hunsu Bridge pairing refreshed on the running managed Bridge.");
-    return;
-  }
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
+  const result = await managedBridgeRuntime().createManagedPairing({
     cwd,
     webUrl,
-    noOpen: true,
-    mode: "local"
+    openBrowser: !hasFlag(parsed, "no-open")
   });
-  rememberRunningBridge(handle, cwd, webUrl);
-  const pairingUrl = await supervisor.createPairingUrl({ webUrl });
-  if (hasFlag(parsed, "no-open")) {
-    console.log("A fresh pairing was created without displaying its bearer URL.");
-  } else {
-    await supervisor.openStudio({ url: pairingUrl });
+  if (!result.ok) {
+    throw managedBridgeError(result.error);
   }
-  console.log("Hunsu Bridge pairing opened.");
-  await waitForShutdown(supervisor.stop);
-  clearManagedProcessState();
-}
-
-async function rotateRunningBridgePairing(input: {
-  webUrl: string;
-  roadmapId?: string;
-}): Promise<
-  | { ok: true; pairingUrl: string; handle: BridgeRuntimeHandle }
-  | { ok: false; error: string }
-> {
-  const state = readAppState();
-  if (!state.bridgeApiUrl || !state.controlToken) {
-    return { ok: false, error: "No running managed Bridge control endpoint is known." };
-  }
-  try {
-    const response = await fetch(new URL("/api/bridge/pairing/rotate", state.bridgeApiUrl), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-hunsu-bridge-control-token": state.controlToken
-      },
-      body: JSON.stringify({
-        webUrl: input.webUrl,
-        roadmapId: input.roadmapId
-      })
-    });
-    const body = await response.json().catch(() => undefined) as Partial<BridgeRuntimeHandle> & { studioUrl?: string; error?: string } | undefined;
-    if (!response.ok || !body?.authToken || !body.pairing || !body.studioUrl) {
-      return { ok: false, error: body?.error ?? `Bridge pairing refresh failed with HTTP ${response.status}.` };
-    }
-    const handle: BridgeRuntimeHandle = {
-      bridgeApiUrl: body.bridgeApiUrl ?? state.bridgeApiUrl,
-      studioUrl: body.studioUrl,
-      allowedOrigin: new URL(input.webUrl).origin,
-      pairingState: "paired",
-      authToken: body.authToken,
-      controlToken: state.controlToken,
-      pairing: body.pairing,
-      status: "running",
-      startedAt: state.startedAt
-    };
-    writeAppState({
-      ...state,
-      bridgeApiUrl: handle.bridgeApiUrl,
-      authToken: handle.authToken,
-      pairing: handle.pairing
-    });
-    writeStructuredLog({ event: "bridge.pairing.rotated", bridgeApiUrl: handle.bridgeApiUrl, issuedAt: handle.pairing.issuedAt });
-    return { ok: true, pairingUrl: body.studioUrl, handle };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : "Unable to reach running managed Bridge." };
-  }
-}
-
-async function revokeRunningBridgePairing(): Promise<boolean> {
-  const state = readAppState();
-  if (!state.bridgeApiUrl || !state.controlToken) {
-    return false;
-  }
-  try {
-    const response = await fetch(new URL("/api/bridge/pairing/revoke", state.bridgeApiUrl), {
-      method: "POST",
-      headers: {
-        "x-hunsu-bridge-control-token": state.controlToken
-      }
-    });
-    if (!response.ok) {
-      return false;
-    }
-    const body = await response.json().catch(() => undefined) as { pairing?: BridgePairingSession } | undefined;
-    writeAppState({
-      ...state,
-      authToken: undefined,
-      pairing: body?.pairing ?? state.pairing
-    });
-    writeStructuredLog({ event: "bridge.pairing.revoked", bridgeApiUrl: state.bridgeApiUrl });
-    return true;
-  } catch (_error) {
-    return false;
-  }
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: result.value.browserOpened
+      ? "Hunsu Web opened with a fresh pairing."
+      : "A fresh pairing was created without opening a browser.",
+    value: result.value
+  });
 }
 
 async function openProjectCommand(parsed: ParsedArgs, forcedAction: "open" | "port" | "create"): Promise<void> {
@@ -834,18 +744,27 @@ async function openProjectCommand(parsed: ParsedArgs, forcedAction: "open" | "po
       ? applyStudioPort({ path, title: basename(project.path), goal: `Port ${basename(project.path)} into Hunsu.` }, state)
       : openStudioRoadmap({ path: project.path }, state);
 
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
+  const opened = await managedBridgeRuntime().openManagedRoadmap(result.roadmap.roadmapId, {
     cwd: result.repository.root,
     webUrl: getFlag(parsed, "web-url"),
-    noOpen: true
+    openBrowser: !hasFlag(parsed, "no-open")
   });
-  rememberRunningBridge(handle, result.repository.root, getFlag(parsed, "web-url"));
-  await supervisor.openStudio({ roadmapId: result.roadmap.roadmapId });
-  printProjectAction(project, result.roadmap.roadmapId);
-  printAppStatus(handle);
-  await waitForShutdown(supervisor.stop);
-  clearManagedProcessState();
+  if (!opened.ok) {
+    throw managedBridgeError(opened.error);
+  }
+  if (!hasFlag(parsed, "json")) {
+    printProjectAction(project, result.roadmap.roadmapId);
+  }
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: "Workspace opened in Hunsu Web.",
+    value: {
+      ...opened.value,
+      action: "open-project" as const,
+      roadmapId: result.roadmap.roadmapId
+    }
+  });
 }
 
 async function resolveChosenProjectPath(parsed: ParsedArgs): Promise<string> {
@@ -865,18 +784,26 @@ async function openRoadmapCommand(parsed: ParsedArgs): Promise<void> {
   if (!roadmapId?.trim()) {
     throw new Error("Roadmap ID is required.");
   }
-  const repositoryPath = resolveRoadmapRepositoryPath(roadmapId.trim(), roadmapRegistryOptions());
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
+  let repositoryPath: string;
+  try {
+    repositoryPath = resolveRoadmapRepositoryPath(roadmapId.trim(), roadmapRegistryOptions());
+  } catch (_error) {
+    throw new BridgeAppCommandError("ROADMAP_NOT_FOUND", "That Workspace could not be found in the managed Roadmap registry.");
+  }
+  const opened = await managedBridgeRuntime().openManagedRoadmap(roadmapId.trim(), {
     cwd: repositoryPath,
     webUrl: getFlag(parsed, "web-url"),
-    noOpen: true
+    openBrowser: !hasFlag(parsed, "no-open")
   });
-  rememberRunningBridge(handle, repositoryPath, getFlag(parsed, "web-url"));
-  await supervisor.openStudio({ roadmapId: roadmapId.trim() });
-  printAppStatus(handle);
-  await waitForShutdown(supervisor.stop);
-  clearManagedProcessState();
+  if (!opened.ok) {
+    throw managedBridgeError(opened.error);
+  }
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: "Workspace opened in Hunsu Web.",
+    value: opened.value
+  });
 }
 
 function inspectCommand(parsed: ParsedArgs): void {
@@ -1347,6 +1274,27 @@ function authCommandContext() {
     disableAllManagedRoadmapRemoteAccess,
     projectGrantsWithoutRemoteRelay
   };
+}
+
+async function revokeRunningBridgePairing(): Promise<boolean> {
+  const state = readAppState();
+  if (!state.bridgeApiUrl || !state.controlToken) {
+    return false;
+  }
+  try {
+    const response = await fetch(new URL("/api/bridge/pairing/revoke", state.bridgeApiUrl), {
+      method: "POST",
+      headers: { "x-hunsu-bridge-control-token": state.controlToken }
+    });
+    if (!response.ok) {
+      return false;
+    }
+    writeAppState({ ...state, pairing: undefined });
+    writeStructuredLog({ event: "bridge.pairing.revoked", bridgeApiUrl: state.bridgeApiUrl });
+    return true;
+  } catch (_error) {
+    return false;
+  }
 }
 
 async function remoteCommand(parsed: ParsedArgs): Promise<void> {
@@ -2098,7 +2046,6 @@ function clearBridgeProcessRuntimeState(state: BridgeAppState): BridgeAppState {
     bridgeApiUrl: undefined,
     processNonce: undefined,
     commandIdentity: undefined,
-    authToken: undefined,
     controlToken: undefined,
     pairing: undefined,
     startedAt: undefined

@@ -54,7 +54,11 @@ export type ManagedBridgeErrorCode =
   | "BRIDGE_PORT_IN_USE"
   | "BRIDGE_START_COORDINATION_TIMEOUT"
   | "BRIDGE_START_TIMEOUT"
-  | "BRIDGE_CONTROL_UNAVAILABLE";
+  | "BRIDGE_CONTROL_UNAVAILABLE"
+  | "PAIRING_ROTATION_FAILED"
+  | "BROWSER_OPEN_FAILED"
+  | "ROADMAP_NOT_FOUND";
+
 export type ManagedBridgeOperationError = {
   code: ManagedBridgeErrorCode;
   message: string;
@@ -70,9 +74,22 @@ export type ManagedBridgeEnsureResult = ManagedBridgeResult<ManagedBridgeIdentit
   transition: "reused" | "started";
 }>;
 
+export type ManagedBridgeBrowserResult = ManagedBridgeResult<{
+  action: "pair" | "open-roadmap";
+  bridgeApiUrl: string;
+  instanceId: string;
+  roadmapId?: string;
+  browserOpened: boolean;
+}>;
+
 export type ManagedBridgeEnsureInput = {
   cwd?: string;
   webUrl?: string;
+};
+
+export type ManagedBridgePairingInput = ManagedBridgeEnsureInput & {
+  roadmapId?: string;
+  openBrowser?: boolean;
 };
 
 export type ManagedBridgeStartContext = ManagedBridgeEnsureInput & {
@@ -93,6 +110,7 @@ export type ManagedBridgeRuntimeOptions = {
   readState?: () => BridgeAppState;
   writeState?: (state: BridgeAppState) => void;
   startSupervisor?: (context: ManagedBridgeStartContext) => Promise<void>;
+  openUrl?: (url: string) => Promise<void>;
   fetch?: ManagedBridgeFetch;
   probeTcpEndpoint?: (bridgeApiUrl: string) => Promise<boolean>;
   processIsAlive?: (pid: number) => boolean;
@@ -110,7 +128,10 @@ export type ManagedBridgeRuntimeOptions = {
 export type ManagedBridgeRuntime = {
   discoverManagedBridge(): Promise<ManagedBridgeDiscovery>;
   ensureManagedBridgeRunning(input?: ManagedBridgeEnsureInput): Promise<ManagedBridgeEnsureResult>;
+  createManagedPairing(input?: ManagedBridgePairingInput): Promise<ManagedBridgeBrowserResult>;
+  openManagedRoadmap(roadmapId: string, input?: Omit<ManagedBridgePairingInput, "roadmapId">): Promise<ManagedBridgeBrowserResult>;
 };
+
 type EndpointProbe =
   | { kind: "offline"; bridgeApiUrl: string }
   | { kind: "conflict"; bridgeApiUrl: string }
@@ -432,11 +453,110 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
     }
   }
 
+  async function pairingOperation(
+    action: "pair" | "open-roadmap",
+    input: ManagedBridgePairingInput
+  ): Promise<ManagedBridgeBrowserResult> {
+    const ensured = await ensureManagedBridgeRunning({ cwd: input.cwd, webUrl: input.webUrl });
+    if (!ensured.ok) {
+      logOpenRoadmapFailure(action, input.roadmapId, ensured.error);
+      return ensured;
+    }
+    const stateRead = safelyReadState(readState);
+    const controlToken = stateRead.ok ? stateRead.value.controlToken : undefined;
+    if (!controlToken) {
+      const result = fail("BRIDGE_CONTROL_UNAVAILABLE", "The managed Bridge control credential is unavailable.");
+      logOpenRoadmapFailure(action, input.roadmapId, result.error);
+      return result;
+    }
+    const response = await safeFetch(new URL("/api/bridge/pairing/rotate", ensured.value.bridgeApiUrl).toString(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [CONTROL_TOKEN_HEADER]: controlToken
+      },
+      body: JSON.stringify({
+        webUrl: input.webUrl,
+        roadmapId: input.roadmapId
+      })
+    });
+    const body = response ? await safeJson(response) : undefined;
+    const studioUrl = response?.ok && isRecord(body) && typeof body.studioUrl === "string"
+      ? safeBrowserUrl(body.studioUrl)
+      : undefined;
+    if (!studioUrl) {
+      const result = fail("PAIRING_ROTATION_FAILED", "The managed Bridge could not create a fresh browser pairing.");
+      logOpenRoadmapFailure(action, input.roadmapId, result.error);
+      return result;
+    }
+    options.writeStructuredLog?.({
+      event: "bridge.pairing.rotated",
+      bridgeApiUrl: ensured.value.bridgeApiUrl,
+      instanceId: ensured.value.instanceId,
+      roadmapId: input.roadmapId
+    });
+    const openBrowser = input.openBrowser ?? true;
+    if (openBrowser) {
+      if (!options.openUrl) {
+        const result = fail("BROWSER_OPEN_FAILED", "No browser opener is configured for this Bridge operation.");
+        logOpenRoadmapFailure(action, input.roadmapId, result.error);
+        return result;
+      }
+      try {
+        await options.openUrl(studioUrl);
+      } catch (_error) {
+        const result = fail("BROWSER_OPEN_FAILED", "The paired Hunsu Web page could not be opened.");
+        logOpenRoadmapFailure(action, input.roadmapId, result.error);
+        return result;
+      }
+    }
+    const value: Extract<ManagedBridgeBrowserResult, { ok: true }>["value"] = {
+      action,
+      bridgeApiUrl: ensured.value.bridgeApiUrl,
+      instanceId: ensured.value.instanceId,
+      roadmapId: input.roadmapId,
+      browserOpened: openBrowser
+    };
+    options.writeStructuredLog?.({
+      event: action === "open-roadmap" ? "bridge.open-roadmap.completed" : "ui.operation.completed",
+      action,
+      instanceId: ensured.value.instanceId,
+      roadmapId: input.roadmapId
+    });
+    return success(value);
+  }
+
+  function logOpenRoadmapFailure(
+    action: "pair" | "open-roadmap",
+    roadmapId: string | undefined,
+    error: ManagedBridgeOperationError
+  ): void {
+    if (action !== "open-roadmap") {
+      return;
+    }
+    options.writeStructuredLog?.({
+      event: "bridge.open-roadmap.failed",
+      roadmapId,
+      code: error.code
+    });
+  }
+
   return {
     discoverManagedBridge: () => discoverInternal(),
-    ensureManagedBridgeRunning
+    ensureManagedBridgeRunning,
+    createManagedPairing: (input = {}) => pairingOperation("pair", input),
+    openManagedRoadmap: (roadmapId, input = {}) => {
+      const normalizedRoadmapId = roadmapId.trim();
+      if (!normalizedRoadmapId) {
+        const result = fail("ROADMAP_NOT_FOUND", "A Roadmap ID is required.");
+        logOpenRoadmapFailure("open-roadmap", undefined, result.error);
+        return Promise.resolve(result);
+      }
+      return pairingOperation("open-roadmap", { ...input, roadmapId: normalizedRoadmapId });
+    }
   };
 }
+
 export function discoverManagedBridge(options: ManagedBridgeRuntimeOptions = {}): Promise<ManagedBridgeDiscovery> {
   return createManagedBridgeRuntime(options).discoverManagedBridge();
 }
@@ -447,6 +567,22 @@ export function ensureManagedBridgeRunning(
 ): Promise<ManagedBridgeEnsureResult> {
   return createManagedBridgeRuntime(options).ensureManagedBridgeRunning(input);
 }
+
+export function createManagedPairing(
+  options: ManagedBridgeRuntimeOptions,
+  input: ManagedBridgePairingInput = {}
+): Promise<ManagedBridgeBrowserResult> {
+  return createManagedBridgeRuntime(options).createManagedPairing(input);
+}
+
+export function openManagedRoadmap(
+  roadmapId: string,
+  options: ManagedBridgeRuntimeOptions,
+  input: Omit<ManagedBridgePairingInput, "roadmapId"> = {}
+): Promise<ManagedBridgeBrowserResult> {
+  return createManagedBridgeRuntime(options).openManagedRoadmap(roadmapId, input);
+}
+
 export function clearManagedBridgeRuntimeState(state: BridgeAppState): BridgeAppState {
   return {
     ...state,
@@ -575,6 +711,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 async function safeJson(response: Response): Promise<unknown> {
   try {
     return await response.json();
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function safeBrowserUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : undefined;
   } catch (_error) {
     return undefined;
   }
