@@ -42,12 +42,11 @@ Required visible states include:
 - Bridge update needed
 - Bridge error
 
-Connection Center explains missing app install, Bridge not running, missing
+Connection Center explains missing Bridge setup, Bridge not running, missing
 pairing token, wrong allowed origin, old Bridge version, missing Workspace
 access, Remote Bridge offline, Relay unavailable, and Web/Bridge account
-mismatch. The primary recovery actions open Hunsu Bridge App sections for
-Provider, Workspaces, and Connections. Download and advanced CLI paths remain
-available as secondary actions.
+mismatch. Recovery actions show stable hunsu-bridge commands or in-Web flows
+for Provider, Workspaces, pairing, and Remote status.
 
 When a paired local Bridge exposes Relay registry data, Connection Center also
 lists available Remote Bridges with online/offline state so the same panel can
@@ -63,13 +62,14 @@ Launcher responsibilities:
 
 - active Roadmap list from the local Bridge Roadmap Registry
 - open active Roadmaps
-- send Add Roadmap to Bridge App through `hunsu://add-roadmap`
+- add or open a registered Workspace through Bridge APIs
 - show an empty state when no active Roadmaps are exposed by Bridge
 - keep manual path entry as an Advanced fallback
 
 The launcher can display many active Roadmaps. It does not show inactive
 Roadmaps by default and does not show the MOVE graph. Add, activate,
-deactivate, repair, and remove are Bridge App responsibilities.
+deactivate, repair, and remove are daemon-owned operations exposed through
+Bridge APIs and CLI commands.
 
 ## Roadmap View Shell
 

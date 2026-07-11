@@ -86,7 +86,7 @@ Failures return `{ ok: false, backendId, error, message, actions }`, where
 `REASONING_UNSUPPORTED`, or `SERVICE_TIER_UNSUPPORTED`, plus actions.
 
 Codex owns its catalog at the runtime-provider adapter boundary. Local status
-and Bridge App Remote publication serialize that same catalog. Remote Relay
+and daemon Remote publication serialize that same catalog. Remote Relay
 transport maps `remote:<deviceId>` to that device's local backend for the
 request and restores the remote backend id on the response.
 
@@ -111,5 +111,6 @@ hunsu-bridge model-alias validate PrimaryModel
 hunsu-bridge model-alias override PrimaryModel --backend remote:device_123 --model gpt-5.5 --reasoning medium --service-tier fast
 ```
 
-The CLI stores aliases in Bridge App state. Web stores its current user aliases in
-browser local storage and sends them with Execute and HUNSU Draft start requests.
+The daemon stores aliases in its configured state after an authenticated
+control request. Web stores its current user aliases in browser local storage
+and sends them with Execute and HUNSU Draft start requests.

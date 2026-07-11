@@ -560,7 +560,7 @@ Access modes:
 Team conversations expose read-only inspection to the user. Hunsu Draft agent
 conversations can allow conversation and transaction while active.
 
-## Bridge App Models
+## Bridge Runtime Models
 
 These models are local Studio state, not Roadmap history.
 

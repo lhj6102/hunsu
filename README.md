@@ -30,102 +30,44 @@ Hunsu exists for that human layer.
 
 Prerequisites:
 
+- Node.js 22.18 or newer
 - Git
 - Codex CLI installed and authenticated when you want to run agent Executes
 
-Recommended local-first path:
+Install or update the exact prerelease runtime:
 
-```text
-Install Hunsu Bridge App
-Open the app
-Add and activate a Roadmap
-Hunsu Bridge starts locally
-Studio opens in the browser
+```sh
+npx @hunsu/bridge@next setup
+npx @hunsu/bridge@next status
+npx @hunsu/bridge@next open
 ```
-
-The Bridge App starts Hunsu Bridge on `127.0.0.1`, creates a temporary pairing
-session, opens Studio, and keeps local repository access on your machine. Login
-is optional for local use; signing in enables Remote Bridge access through
-authenticated Relay commands. Remote Registry and connection-status responses
-redact local filesystem paths until the matching Project Grant exists.
 
 Codex is an external prerequisite runtime. Hunsu does not bundle Codex, read
 Codex credential files, store OpenAI API keys, or transmit Codex tokens. Bridge
-App checks Codex readiness, can open Codex login flows, and can show the
-official install command, but Execute remains disabled until the local Codex CLI,
-Codex app-server, and Codex authentication are ready.
+checks Codex readiness through its provider adapter. Execute remains disabled
+until the local Codex binary, app-server, and authentication are ready.
 
-Advanced developer fallback:
-
-```sh
-npx @hunsu/bridge@latest
-```
-
-Headless Linux/devbox path:
-
-```sh
-hunsu-bridge login
-hunsu-bridge prerequisites status
-hunsu-bridge codex status
-hunsu-bridge codex login --device
-hunsu-bridge roadmaps add /path/to/project
-hunsu-bridge roadmaps activate <roadmapId>
-hunsu-bridge remote status
-hunsu-bridge projects grant /path/to/project
-hunsu-bridge projects list
-hunsu-bridge start --remote
-```
+The operating system user service manager owns the production daemon. Client
+commands connect to that daemon and never create a temporary fallback process.
+Login is optional for local use; signing in enables outbound Remote Relay
+access. Remote responses redact local paths unless an explicit Workspace grant
+allows them.
 
 For repository development:
 
 ```sh
 corepack enable
 pnpm install
-pnpm --filter @hunsu/bridge-desktop bridge-app status
-pnpm --filter @hunsu/bridge-desktop bridge-app inspect /path/to/project
-pnpm --filter @hunsu/bridge-desktop bridge-app service install
-pnpm --filter @hunsu/bridge bridge --dry-run
-pnpm hunsu studio --dry-run
-pnpm hunsu studio --no-open
+pnpm dev:stack
 ```
 
-The `npx @hunsu/bridge@latest` flow remains supported for development,
-automation, and recovery. It is not the primary onboarding path for ordinary
-users. Hunsu Bridge must not be exposed directly to a public network; Remote
-Bridge access goes through authenticated Relay commands, not a public HTTP
-proxy.
+The local stack uses an isolated temporary HUNSU_HOME, random ports, a
+hunsu.localhost Web origin, deterministic provider and Relay fixtures, and a
+same-origin development proxy. See
+[Local Development](docs/local-development.md).
 
-Studio recovery links use the Bridge App protocol surface:
-
-```text
-hunsu://open
-hunsu://provider
-hunsu://provider/codex
-hunsu://pair?next=/studio
-hunsu://add-workspace
-hunsu://workspaces
-hunsu://connection
-hunsu://connection/remote
-hunsu://diagnostics
-hunsu://open-workspace?workspaceId=<id>
-hunsu://activate-roadmap?roadmapId=<id>
-hunsu://open-project?path=/path/to/project
-hunsu://open-roadmap?roadmapId=<id>
-hunsu://sign-in
-hunsu://remote-disable
-```
-
-Older aliases remain accepted: `hunsu://codex`,
-`hunsu://prerequisites`, `hunsu://prerequisites/codex`,
-`hunsu://roadmaps`, and `hunsu://add-roadmap`.
-
-`hunsu://open` is the safe default open/focus intent and opens Bridge App on
-Provider setup. Older `roadmaps`, `add-roadmap`, and `prerequisites` aliases
-remain supported for compatibility.
-
-The desktop bundle includes macOS and Windows installer metadata for the
-`hunsu://` protocol. Linux GUI installs can register the user-level handler with
-`hunsu-bridge protocol install`.
+Hunsu Bridge must not be exposed directly to a public network. Remote access
+uses authenticated outbound Relay commands rather than a public HTTP proxy.
 
 ## Open Source Model
 
@@ -196,7 +138,7 @@ Hunsu Web
 
 Hunsu Bridge
   - owns Git access
-  - is normally managed by Hunsu Bridge App
+  - runs as one daemon owned by the OS user service manager
   - owns Roadmap Registry path resolution
   - owns Codex runner integration
   - owns Agent Conversation storage
@@ -216,7 +158,7 @@ Hunsu CLI and core
   - immutable Team Snapshot reconstruction
   - Preview manifest parsing and command contract
   - stable command contract for Studio, Inspector, Director, and recovery tools
-  - advanced `npx @hunsu/bridge@latest` launcher fallback
+  - advanced `npx @hunsu/bridge@next` launcher fallback during the prerelease
 ```
 
 Hunsu Web is the human-facing orchestration surface. Hunsu Bridge is the
@@ -310,8 +252,9 @@ MOVE-scoped checks from depending on hardcoded ports.
   API deploy and local Worker development.
 - `HUNSU_AGENT_PREVIEW_PORT` reserves the default Preview debug fallback port:
   `19673`.
-- `HUNSU_ROADMAP_REGISTRY_PATH`, `HUNSU_ROUTE_WORKTREE_ROOT`, and
-  `HUNSU_ACTION_WORKTREE_ROOT` control Bridge runtime paths.
+- `HUNSU_HOME` overrides the Bridge state root. Provider, Workspace,
+  credential, runtime identity, logs, and stable runtime versions live beneath
+  that one root.
 - `HUNSU_CODEX_BINARY_PATH`, `HUNSU_CODEX_APP_SERVER_COMMAND`,
   `HUNSU_CODEX_APP_SERVER_ARGS`, and
   `HUNSU_CODEX_*` thread option variables are resolved by `@hunsu/config`
@@ -319,16 +262,17 @@ MOVE-scoped checks from depending on hardcoded ports.
 
 Troubleshooting:
 
-- Codex CLI not found: open Bridge App Prerequisites, install Codex, or set a
-  custom Codex path.
-- Codex login required or expired: run `hunsu-bridge codex login` or use the
-  Bridge App Codex card.
-- Codex app-server unavailable: run `hunsu-bridge codex recheck` and verify
+- Bridge not running: run `hunsu-bridge service start`.
+- Codex CLI not found: install Codex or run
+  `hunsu-bridge provider set codex --binary <path>`.
+- Codex login required or expired: run `hunsu-bridge provider check codex` and
+  complete the provider's supported login flow.
+- Codex app-server unavailable: run `hunsu-bridge provider check codex` and verify
   `codex app-server --stdio` works in your shell.
 - Codex rate limited: wait for Codex access to recover; Hunsu shows only safe
   rate-limit summaries when Codex provides them.
-- Roadmap inactive or missing: activate, repair, or remove it from Bridge App
-  Roadmaps. Studio shows Active Roadmaps only.
+- Workspace missing: inspect or remove it with `hunsu-bridge workspace`
+  commands. Hunsu Web shows only registered, healthy Workspaces.
 - Project Grant missing: grant the project path before Remote Access Execute or
   Artifact Action commands.
 
@@ -340,6 +284,21 @@ Troubleshooting:
   and retired vocabulary.
 - [Architecture](docs/architecture.md): system boundaries across Hunsu Web,
   Hunsu Bridge, Hub API, CLI, core, runner, Git, and event storage.
+- [Headless Bridge](docs/architecture/headless-bridge.md): daemon ownership,
+  process boundaries, state, and compatibility adapter.
+- [Control API](docs/architecture/control-api.md): authenticated local CLI
+  control routes and health contract.
+- [Bridge CLI](docs/cli.md): stable JSON results and command behavior.
+- [Service Management](docs/service-management.md): user-service adapters,
+  exact runtime paths, setup, and lifecycle.
+- [Local Development](docs/local-development.md): isolated stack, random ports,
+  deterministic fixtures, and browser modes.
+- [Web Pairing](docs/web-pairing.md): browser credential separation and
+  compatibility behavior.
+- [Remote Bridge](docs/remote-bridge.md): outbound Relay, login, grants, and
+  path redaction.
+- [Bridge Releases](docs/releasing-bridge.md): protected OIDC publication,
+  provenance, exact tags, and stable-promotion gates.
 - [Workspace Structure](docs/workspace-structure.md): pnpm workspace, Turbo
   tasks, package roles, dependencies, and test layout.
 - [Executable Runtime State](docs/executable-runtime-state.md): Git commit as
@@ -376,7 +335,9 @@ it in code comments or migration notes outside the published docs.
 ## Development Checks
 
 ```bash
+pnpm run check:no-desktop-prototype
 pnpm run check
 pnpm run build
-pnpm exec turbo run typecheck
+pnpm run test:e2e:stack
+pnpm run test:package:bridge
 ```
