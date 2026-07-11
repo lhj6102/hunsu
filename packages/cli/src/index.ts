@@ -30,7 +30,8 @@ import {
   updateMainToMove,
   writeCommands
 } from "@hunsu/core";
-import { startStudioBridge } from "@hunsu/bridge";
+import { createBridgeControlClient } from "@hunsu/bridge";
+import { currentProcessEnv } from "@hunsu/config";
 import type { ArtifactActionRunInput, ArtifactActionRunPlan, ArtifactActionRunRecord, Board, HunsuEvent, HunsuPortPlan, MoveEvent, MoveEventStatus, RunTimeline } from "@hunsu/core";
 import { validateHarness } from "@hunsu/protocol";
 import type { BoardProjection, Command, DomainEvent, HarnessSnapshot, NodeRecord, Destination, DestinationSeedInput } from "@hunsu/protocol";
@@ -125,13 +126,20 @@ function initCommand(): void {
 }
 
 async function studioCommand(parsed: ParsedArgs): Promise<void> {
-  await startStudioBridge({
-    cwd: getFlag(parsed, "cwd") ?? process.cwd(),
-    webUrl: getFlag(parsed, "web-url"),
-    noOpen: hasFlag(parsed, "no-open"),
-    dryRun: hasFlag(parsed, "dry-run"),
-    json: hasFlag(parsed, "json")
+  const result = await createBridgeControlClient({ env: currentProcessEnv() }).request("/v1/control/pair", {
+    method: "POST",
+    body: {
+      openBrowser: !hasFlag(parsed, "no-open"),
+      ...(getFlag(parsed, "web-url") ? { webUrl: getFlag(parsed, "web-url") } : {})
+    }
   });
+  if (hasFlag(parsed, "json")) {
+    console.log(JSON.stringify(result));
+    if (!result.ok) throw new Error(result.message);
+    return;
+  }
+  if (!result.ok) throw new Error(`${result.code}: ${result.message}`);
+  console.log(result.message);
 }
 
 function boardCommand(parsed: ParsedArgs): void {
