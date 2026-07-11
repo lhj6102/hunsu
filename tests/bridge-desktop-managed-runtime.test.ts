@@ -256,6 +256,7 @@ test("managed Stop is authenticated and idempotent while unmanaged Stop is refus
     readState: () => state,
     writeState: next => { state = next; },
     fetch: service.fetch,
+    processIsAlive: () => false,
     pollIntervalMs: 1,
     stopTimeoutMs: 200
   });
