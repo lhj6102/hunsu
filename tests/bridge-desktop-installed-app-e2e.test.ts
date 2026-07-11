@@ -92,6 +92,8 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
 
 test("Windows x64 workflow gates upload on installed WebView evidence and checksum-stages it", () => {
   assert.match(artifactWorkflow, /Run installed Windows Bridge App WebView E2E/u);
+  assert.match(artifactWorkflow, /Run Windows managed Bridge lifecycle E2E[\s\S]{0,120}timeout-minutes: 10/u);
+  assert.match(artifactWorkflow, /Run installed Windows Bridge App WebView E2E[\s\S]{0,120}timeout-minutes: 10/u);
   assert.match(artifactWorkflow, /windows-installed-app-e2e\.ps1/u);
   assert.match(artifactWorkflow, /-InstallerPath \$installer\.FullName/u);
   assert.match(artifactWorkflow, /-EvidencePath \$env:INSTALLED_APP_EVIDENCE_PATH/u);

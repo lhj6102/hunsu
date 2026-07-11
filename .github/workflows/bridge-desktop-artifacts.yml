@@ -218,6 +218,7 @@ jobs:
 
       - name: Run Windows managed Bridge lifecycle E2E
         if: matrix.platform == 'windows'
+        timeout-minutes: 10
         shell: pwsh
         env:
           MANAGED_BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/windows-managed-bridge-e2e-evidence.json
@@ -228,6 +229,7 @@ jobs:
 
       - name: Run installed Windows Bridge App WebView E2E
         if: matrix.platform == 'windows'
+        timeout-minutes: 10
         shell: pwsh
         env:
           INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
