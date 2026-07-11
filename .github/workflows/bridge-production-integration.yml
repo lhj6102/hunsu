@@ -1,0 +1,98 @@
+name: Bridge Production Integration Attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: Exact stable release candidate tag
+        required: true
+        type: string
+      evidence_url:
+        description: HTTPS URL to the retained, redacted production test record
+        required: true
+        type: string
+      hunsu_app_pairing:
+        description: Real hunsu.app pairing passed
+        required: true
+        default: false
+        type: boolean
+      hunsu_login:
+        description: Real headless Hunsu login passed
+        required: true
+        default: false
+        type: boolean
+      relay_round_trip:
+        description: Real Relay command round trip passed
+        required: true
+        default: false
+        type: boolean
+      codex_provider:
+        description: Real Codex provider check passed
+        required: true
+        default: false
+        type: boolean
+      granted_workspace:
+        description: One explicitly granted Workspace passed and ungranted access failed
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    name: Attest real production integration
+    runs-on: ubuntu-latest
+    environment: bridge-production-promotion
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.version_tag }}
+          fetch-depth: 0
+      - name: Bind the reviewed evidence to this exact tag and commit
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+          EVIDENCE_URL: ${{ inputs.evidence_url }}
+          HUNSU_APP_PAIRING: ${{ inputs.hunsu_app_pairing }}
+          HUNSU_LOGIN: ${{ inputs.hunsu_login }}
+          RELAY_ROUND_TRIP: ${{ inputs.relay_round_trip }}
+          CODEX_PROVIDER: ${{ inputs.codex_provider }}
+          GRANTED_WORKSPACE: ${{ inputs.granted_workspace }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
+            echo "Dispatch this attestation from the exact reviewed tag." >&2
+            exit 1
+          fi
+          safe_evidence_url=$(node --input-type=module -e '
+            const raw = process.env.EVIDENCE_URL ?? "";
+            let url;
+            try {
+              url = new URL(raw);
+            } catch {
+              process.stderr.write("Production evidence URL is invalid.\n");
+              process.exit(1);
+            }
+            const unsafe = url.protocol !== "https:"
+              || Boolean(url.username || url.password || url.search || url.hash)
+              || /[\u0000-\u001f\u007f]/u.test(raw)
+              || /hunsu_(?:control|bridge_pair)_[A-Za-z0-9_-]+|access[_-]?token|x-amz-signature/iu.test(raw);
+            if (unsafe) {
+              process.stderr.write("Production evidence URL must be public, credential-free HTTPS without query or fragment data.\n");
+              process.exit(1);
+            }
+            process.stdout.write(url.toString());
+          ')
+          for result in "$HUNSU_APP_PAIRING" "$HUNSU_LOGIN" "$RELAY_ROUND_TRIP" "$CODEX_PROVIDER" "$GRANTED_WORKSPACE"; do
+            if [[ "$result" != "true" ]]; then
+              echo "Every production integration result must be explicitly attested." >&2
+              exit 1
+            fi
+          done
+          {
+            echo "### Production integration attestation"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Tag: $VERSION_TAG"
+            echo "- Evidence: $safe_evidence_url"
+          } >> "$GITHUB_STEP_SUMMARY"
