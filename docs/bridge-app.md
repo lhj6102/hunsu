@@ -130,23 +130,32 @@ pnpm --filter @hunsu/bridge-desktop desktop:build
 pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes
 ```
 
-`build` compiles the headless command package, bundles the sidecar entrypoint,
-creates a Node SEA blob, downloads the pinned Node runtime archive for the
-selected Tauri target, verifies it against Node's `SHASUMS256.txt`, injects the
-SEA blob with `postject`, and writes that target's native ELF/Mach-O/PE sidecar
-plus `dist/sidecar-manifest.json`. The target defaults to the build host and can
-be selected with `HUNSU_BRIDGE_SIDECAR_TARGET` or `--target`. Desktop packaging
-uses Tauri `externalBin` for the active sidecar and keeps resources limited to
-the sidecar manifest; see [Windows Packaging](windows-packaging.md). The
-packaged sidecar is a native executable and does not require `node` on the
-installed user's `PATH`.
+`build` compiles the headless command package and runs the build-time sidecar
+pipeline in this order: bundle the sidecar entrypoint, create the Node SEA blob,
+inject that blob with `postject`, sign and verify the injected executable on
+macOS, validate the native ELF/Mach-O/PE artifact, and prepare the selected
+target plus `dist/sidecar-manifest.json`. Before injection, the build downloads
+the pinned Node runtime archive for the selected Tauri target and verifies it
+against Node's `SHASUMS256.txt`. The target defaults to the build host and can be
+selected with `HUNSU_BRIDGE_SIDECAR_TARGET` or `--target`. Desktop packaging uses
+Tauri `externalBin` for the active sidecar and keeps resources limited to the
+sidecar manifest; see [Windows Packaging](windows-packaging.md). The packaged
+sidecar is a native executable and does not require `node` on the installed
+user's `PATH`.
 
 SEA generation verifies that its Node executable reports exactly the pinned
 embedded runtime version before creating the blob. Local builds can set
 `HUNSU_BRIDGE_SEA_NODE_PATH` to an exact-version Node executable; mismatches
 fail before bundling or injection. After `postject` modifies a macOS sidecar,
 the build ad-hoc signs it and verifies the new signature before native
-validation and the `status` smoke test.
+validation and target preparation. Build-time sidecar preparation does not
+execute the prepared sidecar.
+
+The desktop artifact workflow performs the runtime `status` smoke only after
+the desktop bundle has been built, with a strict 60-second timeout. For Windows
+x64, the workflow next runs the managed Bridge lifecycle automation and then
+the installed Tauri WebView2 automation. Those automated gates produce QA
+evidence; passing them is not human approval to publish a dogfood release.
 
 `desktop:prepare` builds the UI and command package, removes stale prepared
 sidecars, and builds only the current host target plus its manifest. Therefore
@@ -170,9 +179,14 @@ and workspace state do not stay at launch-time values. Diagnostics routes to
 `hunsu://diagnostics`; `hunsu://prerequisites` remains a Provider compatibility
 alias.
 
-Quit is explicit. The native menu confirms before exiting and honors the
-persisted background preference for keeping or stopping the supervised Local
-Bridge. The preference is exposed in Bridge App Settings and through
+Quit is explicit. The native menu shows preference-neutral confirmation before
+reading Bridge state, so snapshot, provider, and diagnostics work cannot delay
+the dialog. Cancel performs no preference lookup or lifecycle action. After
+confirmation, the shell reads only `settings quit-behavior get` with a one-second
+bound and safely falls back to keep-background. Stop-background uses bounded
+`stop --json` verification; failure keeps the desktop app open with an
+actionable message instead of silently ignoring the preference. The preference
+is exposed in Bridge App Settings and through
 `hunsu-bridge settings quit-behavior`.
 
 Studio remains the main product UI for Roadmaps, Execute, Hunsu Drafts,
@@ -510,10 +524,13 @@ The native/browser QA contract is recorded in
 `tests/bridge-qa-matrix.test.ts`. The matrix covers macOS, Windows, Linux GUI,
 Linux no-GUI, and Chrome/Safari/Edge/Firefox browser checks with concrete
 in-repo evidence files and command checklists. Real native-host executions are
-recorded separately in the matrix's `nativeHostResults` section. As of
-2026-07-10, this Linux no-GUI workspace has not run macOS, Windows, Linux GUI,
-packaged installer, tray/menu-bar, or native daemon QA; those remain external
-host blockers rather than contract-only pass claims.
+recorded separately in the matrix's `nativeHostResults` section. On 2026-07-11,
+Windows x64 run `29140643663` validated the NSIS-installed app on a
+GitHub-hosted Windows runner, including managed lifecycle scenarios A-F and
+real WebView2/clipboard automation. The attestation is recorded in
+`docs/qa/windows-x64-installed-app-29140643663.md`. Human installed-app visual
+QA remains required before a dogfood release, and macOS and Linux GUI execution
+still require their external native hosts.
 
 ## Compatibility
 

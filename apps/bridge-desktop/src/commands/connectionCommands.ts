@@ -271,7 +271,7 @@ export async function enableRemoteAccessIfSignedIn(context: RemoteAccessRuntimeC
 }
 
 export function startRelayIfConfigured(
-  handle: Pick<BridgeRuntimeHandle, "bridgeApiUrl" | "authToken">,
+  handle: Pick<BridgeRuntimeHandle, "bridgeApiUrl" | "controlToken">,
   context: RemoteAccessRuntimeContext
 ): Promise<RelayOutboundClient | undefined> {
   const state = context.readState();
@@ -297,7 +297,7 @@ export function startRelayIfConfigured(
       }),
       projectGrants: () => context.activeManagedProjectGrants(context.readState().projectGrants),
       bridgeApiUrl: handle.bridgeApiUrl,
-      bridgeAuthToken: handle.authToken
+      bridgeControlToken: handle.controlToken
     });
     relayClient.start();
     context.writeStructuredLog({ event: "relay.started", relayUrl, deviceId: state.device.id });
@@ -311,13 +311,13 @@ export async function attachRemoteAccessCommand(context: RemoteAccessRuntimeCont
     context.writeState({ ...state, remoteAccess: "unavailable" });
     throw new Error("Remote Access is unavailable until this device is signed in.");
   }
-  if (!state.bridgeApiUrl || !state.authToken) {
+  if (!state.bridgeApiUrl || !state.controlToken) {
     context.writeState({ ...state, remoteAccess: "registered-offline" });
     throw new Error("No running managed Bridge is available for Relay attachment.");
   }
   const relayClient = await startRelayIfConfigured({
     bridgeApiUrl: state.bridgeApiUrl,
-    authToken: state.authToken
+    controlToken: state.controlToken
   }, context);
   if (!relayClient) {
     writeRemoteAccessState("registered-offline", context);
@@ -349,7 +349,7 @@ export function startRemoteAccessProcessIfPossible(
   }
   const cwd = context.resolvePath(context.getFlag(parsed, "cwd") ?? state.cwd ?? process.cwd());
   const webUrl = context.getFlag(parsed, "web-url");
-  const args = state.bridgeApiUrl && state.authToken
+  const args = state.bridgeApiUrl && state.controlToken
     ? ["remote", "attach"]
     : [
         "daemon",

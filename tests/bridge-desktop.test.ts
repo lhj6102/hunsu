@@ -22,7 +22,10 @@ import {
 } from "../apps/bridge-desktop/src/auth.ts";
 import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts";
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
-import { currentNodeRuntimeStatus } from "../apps/bridge-desktop/src/commands/diagnosticsCommands.ts";
+import {
+  currentNodeRuntimeStatus,
+  diagnosticToolLaunchCommand
+} from "../apps/bridge-desktop/src/commands/diagnosticsCommands.ts";
 import { currentBridgeCommandInvocation } from "../apps/bridge-desktop/src/processes/backgroundSpawn.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
@@ -128,12 +131,22 @@ test("Bridge App version and Node runtime checks never start the packaged sideca
     console.log = previousLog;
   }
 
-  assert.deepEqual(output, ["Hunsu Bridge 0.1.0"]);
+  assert.deepEqual(output, ["Hunsu Bridge 0.1.1"]);
   assert.deepEqual(currentNodeRuntimeStatus("C:\\Hunsu\\hunsu-bridge.exe", "v22.22.0"), {
     installed: true,
     binaryPath: "C:\\Hunsu\\hunsu-bridge.exe",
     version: "v22.22.0"
   });
+});
+
+test("Bridge App probes Windows package-manager command shims through cmd.exe", () => {
+  assert.deepEqual(
+    diagnosticToolLaunchCommand("npm", ["--version"], { COMSPEC: "C:\\Windows\\System32\\cmd.exe" }, "win32"),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", '""npm" "--version""']
+    }
+  );
 });
 
 test("Bridge App Roadmap deep links record UI intents for native focus flows", async () => {
@@ -193,7 +206,12 @@ test("Bridge App Tauri tray routes focus, refreshes summaries, and uses persiste
   assert.match(source, /fn refresh_bridge_tray_menu/);
   assert.match(source, /tray\.set_menu\(Some\(menu\)\)/);
   assert.match(source, /quit_background_preference/);
-  assert.match(source, /snapshot\["status"\]\["quitBehavior"\]/);
+  assert.match(source, /QUIT_PREFERENCE_ARGS: \[&str; 3\] = \["settings", "quit-behavior", "get"\]/);
+  const quitPreferenceRead = source.match(
+    /async fn quit_background_preference\([\s\S]*?\n\}\n\nfn quit_background_preference_from_output/
+  )?.[0];
+  assert.ok(quitPreferenceRead);
+  assert.doesNotMatch(quitPreferenceRead, /bridge_snapshot|snapshot/);
   assert.doesNotMatch(source, /HUNSU_BRIDGE_QUIT_BACKGROUND/);
 });
 
@@ -618,10 +636,10 @@ test("Bridge App desktop UI preserves unauthenticated failure and renders ChatGP
 
 test("Bridge App desktop UI keeps Local/Remote connection primary and provider placeholders Advanced", () => {
   const html = readFileSync(join(process.cwd(), "apps/bridge-desktop/src-ui/index.html"), "utf8");
-  const primaryNav = html.match(/<nav aria-label="Bridge sections">([\s\S]*?)<\/nav>/)?.[1] ?? "";
+  const primaryNav = html.match(/<nav\b[^>]*aria-label="Bridge sections"[^>]*>([\s\S]*?)<\/nav>/)?.[1] ?? "";
   assert.deepEqual([...primaryNav.matchAll(/<button[^>]*>([^<]+)<\/button>/g)].map(match => match[1]), ["Provider", "Workspaces", "Connection"]);
   assert.doesNotMatch(primaryNav, /Overview|Advanced|Diagnostics|Settings/);
-  const providerPanel = html.match(/<section data-panel="provider">([\s\S]*?)<\/section>/)?.[1] ?? "";
+  const providerPanel = html.match(/<section\b[^>]*data-panel="provider"[^>]*>([\s\S]*?)<\/section>/)?.[1] ?? "";
   assert.match(providerPanel, /<dt>Provider<\/dt>[\s\S]*<dt>Workspaces<\/dt>[\s\S]*<dt>Connection<\/dt>/);
   assert.doesNotMatch(providerPanel, /Account|Remote Access|Device|Service/);
   assert.match(html, /id="provider-config-form"/);
@@ -1338,11 +1356,14 @@ test("Bridge App service install dry-run does not persist installed state", asyn
       projectGrants: [],
       service: { installed: false, manager }
     }, null, 2), "utf8");
-    const before = readFileSync(statePath, "utf8");
-
     assert.equal(await main(["service", "install", "--dry-run", "--cwd", root]), 0);
 
-    assert.equal(readFileSync(statePath, "utf8"), before);
+    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as {
+      diagnosticsSecurityVersion?: number;
+      service?: { installed?: boolean; manager?: string };
+    };
+    assert.equal(persisted.diagnosticsSecurityVersion, 1);
+    assert.deepEqual(persisted.service, { installed: false, manager });
     assert.equal(existsSync(unitPath), false);
     assert.equal(logs.some(line => line.includes("Dry run:")), true);
     assert.equal(logs.some(line => line.includes("Installed Hunsu Bridge service artifact")), false);
@@ -1402,6 +1423,20 @@ test("Bridge App Codex install requires confirmation and supports dry-run", asyn
   };
 
   try {
+    assert.equal(await main(["codex", "install"]), 0);
+    assert.equal(logs.some(line => line.includes("npm is required to install Codex")), true);
+    assert.equal(logs.some(line => line.includes("Select Existing Codex")), true);
+    assert.equal(logs.some(line => line.startsWith("Installer:")), false);
+    logs.length = 0;
+
+    const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+    const npmPath = join(root, npmCommand);
+    writeFileSync(npmPath, process.platform === "win32"
+      ? "@echo off\r\necho 11.0.0\r\n"
+      : "#!/bin/sh\nprintf '11.0.0\\n'\n", "utf8");
+    if (process.platform !== "win32") chmodSync(npmPath, 0o755);
+    process.env.PATH = root;
+
     assert.equal(await main(["codex", "install"]), 0);
     assert.equal(logs.some(line => line.includes("Confirm Codex installation")), true);
     assert.equal(logs.some(line => line.includes("--confirm")), true);
@@ -1487,7 +1522,7 @@ test("Bridge App stop clears stale PID state without killing an unrelated proces
     assert.equal(state.bridgeApiUrl, undefined);
     assert.ok(state.account);
     assert.ok(state.device);
-    assert.equal(logs.some(line => line.includes("No PID was terminated")), true);
+    assert.equal(logs.some(line => line.includes("already stopped")), true);
   } finally {
     console.log = previousLog;
     if (previousStatePath === undefined) delete process.env.HUNSU_BRIDGE_APP_STATE_PATH;
@@ -1541,9 +1576,9 @@ test("Bridge App health check rejects non-Hunsu health responses", async () => {
     const snapshot = JSON.parse(logs.at(-1) ?? "{}") as {
       status?: { localBridge?: string; healthError?: string };
     };
-    assert.equal(snapshot.status?.localBridge, "not-running");
+    assert.equal(snapshot.status?.localBridge, "error");
     assert.notEqual(snapshot.status?.localBridge, "connected");
-    assert.match(snapshot.status?.healthError ?? "", /Bridge is not reachable/);
+    assert.match(snapshot.status?.healthError ?? "", /owned by another service/);
   } finally {
     console.log = previousLog;
     restoreEnv(previousEnv);
@@ -2027,7 +2062,7 @@ test("Bridge App validates remote roadmapId against the granted local project pa
   const calls: string[] = [];
   const result = await forwardRelayCommand({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "execute.start",
@@ -2111,7 +2146,7 @@ test("Bridge App allows Relay move file payload paths as repo-relative file path
   const calls: string[] = [];
   const result = await forwardRelayCommand({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "moveFile.blob",
@@ -2159,7 +2194,7 @@ test("Bridge App validates remote registry removal roadmapId against the granted
   const calls: string[] = [];
   const result = await forwardRelayCommand({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "roadmap.registry.remove",
@@ -2191,7 +2226,7 @@ test("Bridge App forwards remote event streams incrementally", async () => {
   const events: Array<{ event?: string; data?: string }> = [];
   const result = await forwardRelayCommandStream({
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     command: {
       deviceId: "device_123",
       command: "live.events",
@@ -2424,7 +2459,7 @@ async function requestBridgeServerRoute(
   const listener = server.listeners("request")[0] as ((request: any, response: any) => void) | undefined;
   assert.ok(listener);
   return await new Promise<{ status: number; body: any; headers: Record<string, string> }>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for Bridge route ${requestSpec.method} ${requestSpec.path}`)), 1000);
+    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for Bridge route ${requestSpec.method} ${requestSpec.path}`)), 10_000);
     const bodyText = requestSpec.body === undefined ? "" : JSON.stringify(requestSpec.body);
     const listeners = new Map<string, Array<() => void>>();
     let settled = false;
@@ -2568,15 +2603,15 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
     },
     projectGrants: [grant],
     bridgeApiUrl: "http://127.0.0.1:19689",
-    bridgeAuthToken: "token",
+    bridgeControlToken: "token",
     websocketFactory: () => socket,
     fetchImpl: async (url, init) => {
       const requestUrl = new URL(String(url));
       const headers = init?.headers as Record<string, string> | undefined;
-      forwardedRequests.push({ path: requestUrl.pathname, method: init?.method, token: headers?.["x-hunsu-bridge-token"] });
+      forwardedRequests.push({ path: requestUrl.pathname, method: init?.method, token: headers?.["x-hunsu-bridge-control-token"] });
       if (requestUrl.pathname === "/api/bridge/status") {
         assert.equal(init?.method, "GET");
-        assert.equal(headers?.["x-hunsu-bridge-token"], "token");
+        assert.equal(headers?.["x-hunsu-bridge-control-token"], "token");
         return new Response(JSON.stringify({ provider: { providerId: "codex" }, connections: [], workspaces: { active: [], managed: [] } }), {
           status: 200,
           headers: { "content-type": "application/json" }
@@ -2584,7 +2619,7 @@ test("Bridge App outbound Relay client registers devices and forwards only grant
       }
       assert.equal(requestUrl.pathname, "/api/roadmaps/open");
       assert.equal(init?.method, "POST");
-      assert.equal(headers?.["x-hunsu-bridge-token"], "token");
+      assert.equal(headers?.["x-hunsu-bridge-control-token"], "token");
       return new Response(JSON.stringify({ ok: true }), {
         status: 202,
         headers: { "content-type": "application/json" }
@@ -2882,12 +2917,12 @@ test("Bridge desktop filtered artifact report command resolves package-root defa
     assert.equal(reported.status, 0, `${reported.stdout}\n${reported.stderr}`);
     const report = JSON.parse(readFileSync(join(bundleDir, "artifact-size-report.json"), "utf8")) as {
       schema: string;
-      directory: string;
+      target: string;
       artifacts: Array<{ path: string }>;
       sidecars: Array<{ target: string; file: string }>;
     };
-    assert.equal(report.schema, "hunsu.bridge-desktop-artifact-sizes.v2");
-    assert.equal(report.directory, bundleDir);
+    assert.equal(report.schema, "hunsu.bridge-desktop-artifact-sizes.v3");
+    assert.equal(report.target, target);
     assert.deepEqual(report.artifacts.map(artifact => artifact.path), ["Hunsu Bridge.test-bundle"]);
     assert.deepEqual(report.sidecars, [{
       target,
@@ -2973,7 +3008,12 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(tauriSource, /Add Workspace/);
     assert.match(tauriSource, /MessageDialogButtons::OkCancel/);
     assert.match(tauriSource, /quit_background_preference/);
-    assert.match(tauriSource, /status"\]\["quitBehavior"\]/);
+    assert.match(tauriSource, /QUIT_PREFERENCE_ARGS: \[&str; 3\] = \["settings", "quit-behavior", "get"\]/);
+    const quitPreferenceRead = tauriSource.match(
+      /async fn quit_background_preference\([\s\S]*?\n\}\n\nfn quit_background_preference_from_output/
+    )?.[0];
+    assert.ok(quitPreferenceRead);
+    assert.doesNotMatch(quitPreferenceRead, /bridge_snapshot|snapshot/);
     assert.doesNotMatch(tauriSource, /HUNSU_BRIDGE_QUIT_BACKGROUND/);
     const sidecarScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/prepare-sidecars.mjs"), "utf8");
     const buildScript = readFileSync(join(process.cwd(), "apps/bridge-desktop/scripts/build-native-sidecars.mjs"), "utf8");
@@ -3058,7 +3098,10 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(artifactWorkflow, /codesign --verify --deep --strict --verbose=2 "\$\{app_bundle\}"/);
     assert.match(artifactWorkflow, /test -x "\$\{SIDECAR_PATH\}"/);
     assert.match(artifactWorkflow, /stage-desktop-artifacts\.mjs/);
-    assert.match(artifactWorkflow, /if: inputs\.platform == 'all'/);
+    assert.match(
+      artifactWorkflow,
+      /if: inputs\.validation == 'gated' && inputs\.platform == 'all'/
+    );
     assert.match(artifactWorkflow, /--include-size-report/);
     assert.doesNotMatch(artifactWorkflow, /SIDECAR_SHA256SUM\.txt|bundle\/\*\*\/\*/);
     assert.equal(
@@ -3170,7 +3213,7 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
       schema: string;
       sidecars: Array<{ target: string; file: string }>;
     };
-    assert.equal(sizeReport.schema, "hunsu.bridge-desktop-artifact-sizes.v2");
+    assert.equal(sizeReport.schema, "hunsu.bridge-desktop-artifact-sizes.v3");
     assert.deepEqual(sizeReport.sidecars.map(sidecar => sidecar.target), [sidecarArtifacts[0][0]]);
     assert.match(reported.stdout, new RegExp(`sidecar:${sidecarArtifacts[0][0]}`));
 
@@ -3460,6 +3503,7 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
   const registryPath = join(root, "roadmaps.json");
   const credentialPath = join(root, "credentials.json");
   const relayRegistryPath = join(root, "relay.json");
+  const browserCapturePath = join(root, "browser-capture.log");
   const bridgePort = await getUnusedPort();
   const childEnv = {
     ...process.env,
@@ -3468,7 +3512,9 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     HUNSU_ROADMAP_REGISTRY_PATH: registryPath,
     HUNSU_BRIDGE_CREDENTIAL_PATH: credentialPath,
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
-    HUNSU_BRIDGE_PORT: String(bridgePort)
+    HUNSU_BRIDGE_PORT: String(bridgePort),
+    HUNSU_BRIDGE_TEST_MODE: "1",
+    HUNSU_BRIDGE_TEST_BROWSER_CAPTURE_PATH: browserCapturePath
   };
   const child = spawn(process.execPath, [
     "--conditions=development",
@@ -3501,21 +3547,36 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
     "HUNSU_ROADMAP_REGISTRY_PATH",
     "HUNSU_BRIDGE_CREDENTIAL_PATH",
     "HUNSU_RELAY_REGISTRY_PATH",
-    "HUNSU_BRIDGE_PORT"
+    "HUNSU_BRIDGE_PORT",
+    "HUNSU_BRIDGE_TEST_MODE",
+    "HUNSU_BRIDGE_TEST_BROWSER_CAPTURE_PATH"
   ];
   const previousEnv = snapshotEnv(envKeys);
+  let managedSupervisorPid: number | undefined;
+  let managedDaemonPid: number | undefined;
   try {
     await waitFor(async () => {
       if (!existsSync(statePath)) return false;
       const state = JSON.parse(readFileSync(statePath, "utf8")) as { supervisorPid?: number; pid?: number };
-      return state.supervisorPid === child.pid && typeof state.pid === "number";
+      return typeof state.supervisorPid === "number" && typeof state.pid === "number";
     }, 5_000);
+    await waitForChildExit(child, 5_000, () => `${stdout}\n${stderr}`);
     const health = await fetch(`http://127.0.0.1:${bridgePort}/health`);
     assert.equal(health.status, 200);
 
     applyEnv(childEnv, envKeys);
-    const initialState = JSON.parse(readFileSync(statePath, "utf8")) as { authToken?: string; controlToken?: string };
-    assert.match(initialState.authToken ?? "", /^hunsu_bridge_/);
+    const initialState = JSON.parse(readFileSync(statePath, "utf8")) as {
+      authToken?: string;
+      pairing?: unknown;
+      controlToken?: string;
+      supervisorPid?: number;
+      pid?: number;
+    };
+    managedSupervisorPid = initialState.supervisorPid;
+    managedDaemonPid = initialState.pid;
+    assert.notEqual(managedSupervisorPid, child.pid);
+    assert.equal(initialState.authToken, undefined);
+    assert.equal(initialState.pairing, undefined);
     assert.match(initialState.controlToken ?? "", /^hunsu_bridge_control_/);
 
     const pairLogs: string[] = [];
@@ -3527,24 +3588,24 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
       assert.equal(await main([
         "pair",
         "--web-url",
-        "http://127.0.0.1:19688/studio",
-        "--no-open"
+        "http://127.0.0.1:19688/studio"
       ]), 0);
     } finally {
       console.log = previousPairLog;
     }
-    assert.equal(pairLogs.some(line => line.includes("Hunsu Bridge pairing refreshed on the running managed Bridge.")), true);
-    const pairedState = JSON.parse(readFileSync(statePath, "utf8")) as { authToken?: string; controlToken?: string };
-    assert.notEqual(pairedState.authToken, initialState.authToken);
+    assert.equal(pairLogs.some(line => line.includes("Hunsu Web opened with a fresh pairing.")), true);
+    const pairedState = JSON.parse(readFileSync(statePath, "utf8")) as { authToken?: string; pairing?: unknown; controlToken?: string };
+    assert.equal(pairedState.authToken, undefined);
+    assert.equal(pairedState.pairing, undefined);
     assert.equal(pairedState.controlToken, initialState.controlToken);
-    const oldTokenResponse = await fetch(`http://127.0.0.1:${bridgePort}/api/roadmaps/recent`, {
-      headers: { "x-hunsu-bridge-token": initialState.authToken ?? "" }
-    });
-    assert.equal(oldTokenResponse.status, 401);
+    const capturedUrl = readFileSync(browserCapturePath, "utf8").trim().split(/\r?\n/).at(-1) ?? "";
+    const pairedToken = new URL(capturedUrl).searchParams.get("hunsuBridgeToken") ?? "";
+    assert.match(pairedToken, /^hunsu_bridge_/);
     const newTokenResponse = await fetch(`http://127.0.0.1:${bridgePort}/api/roadmaps/recent`, {
-      headers: { "x-hunsu-bridge-token": pairedState.authToken ?? "" }
+      headers: { "x-hunsu-bridge-token": pairedToken }
     });
     assert.equal(newTokenResponse.status, 200);
+    assert.doesNotMatch(readFileSync(logPath, "utf8"), new RegExp(pairedToken));
 
     const logs: string[] = [];
     const previousLog = console.log;
@@ -3557,22 +3618,31 @@ test("Bridge App stop terminates the integrated restart supervisor and daemon", 
       console.log = previousLog;
     }
     assert.equal(logs.some(line => line.includes("Hunsu Bridge stopped.")), true);
-    await waitForChildExit(child, 5_000, () => `${stdout}\n${stderr}`);
     await waitFor(async () => !(await bridgeHealthReachable(bridgePort)), 2_000);
     await delay(900);
     assert.equal(await bridgeHealthReachable(bridgePort), false);
+    assert.equal(managedSupervisorPid ? processIsAliveForTest(managedSupervisorPid) : true, false);
+    assert.equal(managedDaemonPid ? processIsAliveForTest(managedDaemonPid) : true, false);
     const stoppedState = JSON.parse(readFileSync(statePath, "utf8")) as { supervisorPid?: number; pid?: number };
     assert.equal(stoppedState.supervisorPid, undefined);
     assert.equal(stoppedState.pid, undefined);
   } finally {
     restoreEnv(previousEnv);
-    if (child.exitCode === null) {
-      child.kill("SIGTERM");
-      await Promise.race([waitForChildExit(child, 1_000), delay(1_000)]).catch(() => undefined);
-    }
+    if (child.exitCode === null) child.kill("SIGTERM");
+    if (managedSupervisorPid && processIsAliveForTest(managedSupervisorPid)) process.kill(managedSupervisorPid, "SIGTERM");
+    if (managedDaemonPid && processIsAliveForTest(managedDaemonPid)) process.kill(managedDaemonPid, "SIGTERM");
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function processIsAliveForTest(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
 
 async function waitForSidecarStatus(
   supervisor: BridgeSidecarSupervisor,

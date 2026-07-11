@@ -70,7 +70,8 @@ export function isPublicBridgeRoute(pathname: string): boolean {
 }
 
 export function isBridgeControlRoute(pathname: string): boolean {
-  return pathname === "/api/bridge/pairing/rotate"
+  return pathname === "/api/bridge/control/status"
+    || pathname === "/api/bridge/pairing/rotate"
     || pathname === "/api/bridge/pairing/revoke"
     || pathname === "/api/bridge/control/shutdown";
 }

@@ -80,6 +80,11 @@ export type RuntimeProviderConfigField = {
   label?: string;
 };
 
+export type RuntimeProviderConfigValidationError = {
+  field: string;
+  message: string;
+};
+
 export type RuntimeProviderDiagnostics = {
   effectiveEnv?: Record<string, string | null>;
   codexHome?: unknown;
@@ -179,7 +184,7 @@ export type RuntimeProviderInstallResult = {
   providerId: string;
   confirmed: boolean;
   started: boolean;
-  status: "confirmation_required" | "already_installed" | "dry_run" | "completed" | "failed";
+  status: "confirmation_required" | "prerequisite_missing" | "already_installed" | "dry_run" | "completed" | "failed";
   message: string;
   plan?: RuntimeProviderInstallPlan;
   command?: string;
@@ -228,6 +233,7 @@ export type RuntimeProviderAdapter = {
     valid: boolean;
     provider: RuntimeProviderStatus;
     diagnostics?: RuntimeProviderDiagnostics;
+    errors?: RuntimeProviderConfigValidationError[];
   }>;
   status(input?: {
     force?: boolean;

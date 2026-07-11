@@ -1,10 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir, hostname, platform } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { currentProcessEnv } from "@hunsu/config";
 import type {
-  BridgePairingSession,
   RoadmapRegistryEntry,
   RuntimeProviderConfigField,
   RuntimeProviderMetadata,
@@ -25,7 +24,7 @@ export type BridgeProcessCommandIdentity = {
 
 export type BridgeProcessStartMetadata = {
   platform: NodeJS.Platform;
-  source: "proc-stat" | "ps-lstart";
+  source: "proc-stat" | "ps-lstart" | "windows-cim-creation-date";
   value: string;
 };
 
@@ -34,6 +33,8 @@ export type BridgeProcessRuntimeMetadata = {
   processNonce?: string;
   commandIdentity: BridgeProcessCommandIdentity;
   startMetadata?: BridgeProcessStartMetadata;
+  parentPid?: number;
+  executablePath?: string;
   recordedAt: string;
 };
 
@@ -108,6 +109,46 @@ export type BridgeToolStatus = {
   error?: string;
 };
 
+export type BridgeEmbeddedRuntimeStatus = {
+  kind: "node-sea";
+  installed: true;
+  version: string;
+  bundled: true;
+};
+
+export type BridgePackageManagerStatus = BridgeToolStatus & {
+  name?: "pnpm" | "npm" | "yarn";
+  optional: true;
+  requiredFor?: string[];
+};
+
+export type BridgePairingMetadata = {
+  issuedAt: string;
+  expiresAt: string;
+  revokedAt?: string;
+};
+
+export type LocalBridgeControl = {
+  state: "not-running" | "starting" | "connected" | "stopping" | "error";
+  ownership: "managed" | "unmanaged" | "unknown";
+  canStart: boolean;
+  canStop: boolean;
+  startReason?: string;
+  stopReason?: string;
+  instanceId?: string;
+  daemonPid?: number;
+  supervisorPid?: number;
+};
+
+export type ManagedBridgeTransition = {
+  state: "stopping";
+  instanceId: string;
+  bridgeApiUrl: string;
+  daemonPid: number;
+  supervisorPid?: number;
+  requestedAt: string;
+};
+
 export type BridgeAppState = {
   schema: "hunsu.bridge-app-state.v1";
   supervisorPid?: number;
@@ -117,9 +158,11 @@ export type BridgeAppState = {
   bridgeApiUrl?: string;
   processNonce?: string;
   commandIdentity?: BridgeProcessCommandIdentity;
-  authToken?: string;
   controlToken?: string;
-  pairing?: BridgePairingSession;
+  pairing?: BridgePairingMetadata;
+  diagnosticsSecurityVersion?: number;
+  managedBridgeTransition?: ManagedBridgeTransition;
+  instanceId?: string;
   cwd?: string;
   webUrl?: string;
   startedAt?: string;
@@ -172,6 +215,7 @@ export type BridgeAppSnapshot = {
     startedAt?: string;
     healthError?: string;
   };
+  localBridgeControl: LocalBridgeControl;
   providers: {
     currentProviderId: string;
     current: RuntimeProviderStatus;
@@ -206,9 +250,17 @@ export type BridgeAppSnapshot = {
     codex: unknown;
     tools: {
       git: BridgeToolStatus;
-      node: BridgeToolStatus;
-      packageManager: BridgeToolStatus;
+      embeddedRuntime: BridgeEmbeddedRuntimeStatus;
+      systemNode: BridgeToolStatus & { optional: true };
+      packageManager: BridgePackageManagerStatus;
     };
+  };
+  versions: {
+    bridgeApp: string;
+    bridgeRuntime: string;
+    protocol: string;
+    embeddedNode: string;
+    codexCli?: string;
   };
   codexSettings: BridgeCodexSettings & {
     environment: {
@@ -231,6 +283,7 @@ export type BridgeAppSnapshot = {
 export function defaultBridgeAppState(): BridgeAppState {
   return {
     schema: "hunsu.bridge-app-state.v1",
+    diagnosticsSecurityVersion: 0,
     account: { status: "signed-out" },
     codex: defaultBridgeCodexSettings(),
     runtimeProviders: defaultBridgeRuntimeProviderState(),
@@ -253,7 +306,7 @@ export function readBridgeAppState(path = bridgeAppStatePath()): BridgeAppState 
     return defaultBridgeAppState();
   }
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<BridgeAppState>;
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as ParsedBridgeAppState;
     return normalizeBridgeAppState(parsed);
   } catch (_error) {
     return defaultBridgeAppState();
@@ -261,8 +314,24 @@ export function readBridgeAppState(path = bridgeAppStatePath()): BridgeAppState 
 }
 
 export function writeBridgeAppState(state: BridgeAppState, path = bridgeAppStatePath()): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true });
+  const { authToken: _legacyAuthToken, ...stateWithoutLegacyAuth } = state as BridgeAppState & { authToken?: unknown };
+  const safeState: BridgeAppState = {
+    ...stateWithoutLegacyAuth,
+    pairing: safePairingMetadata(state.pairing),
+    managedBridgeTransition: safeManagedBridgeTransition(state.managedBridgeTransition)
+  };
+  const temporaryPath = join(
+    directory,
+    `.${basename(path)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
+  );
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(safeState, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPath, path);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
 }
 
 export function recordBridgeUiIntent(
@@ -289,6 +358,7 @@ export function recordBridgeUiIntent(
 export function createBridgeAppSnapshot(input: {
   state: BridgeAppState;
   localBridge: BridgeAppSnapshot["status"]["localBridge"];
+  localBridgeControl: LocalBridgeControl;
   accountLabel: string;
   remoteAccessLabel: BridgeAppSnapshot["status"]["remoteAccess"];
   bridgeApiUrl?: string;
@@ -304,6 +374,7 @@ export function createBridgeAppSnapshot(input: {
   codexSettings: BridgeAppSnapshot["codexSettings"];
   diagnostics: unknown;
   logLines: string[];
+  versions: BridgeAppSnapshot["versions"];
 }): BridgeAppSnapshot {
   return {
     schema: "hunsu.bridge-app-snapshot.v1",
@@ -320,6 +391,7 @@ export function createBridgeAppSnapshot(input: {
       startedAt: input.state.startedAt,
       healthError: input.healthError
     },
+    localBridgeControl: input.localBridgeControl,
     providers: input.runtimeProviders,
     providerConfig: input.providerConfig,
     workspaces: {
@@ -346,6 +418,7 @@ export function createBridgeAppSnapshot(input: {
       codex: input.codex,
       tools: input.tools
     },
+    versions: input.versions,
     codexSettings: input.codexSettings,
     codexLogin: input.state.codexLogin,
     runtimeProviders: input.runtimeProviders,
@@ -355,7 +428,14 @@ export function createBridgeAppSnapshot(input: {
   };
 }
 
-export function normalizeBridgeAppState(parsed: Partial<BridgeAppState>): BridgeAppState {
+type ParsedBridgeAppState = Omit<Partial<BridgeAppState>, "pairing" | "managedBridgeTransition"> & {
+  authToken?: unknown;
+  pairing?: unknown;
+  managedBridgeTransition?: unknown;
+};
+
+export function normalizeBridgeAppState(parsed: ParsedBridgeAppState): BridgeAppState {
+  const { authToken: _legacyAuthToken, ...parsedWithoutLegacyAuth } = parsed;
   const runtimeProviders = normalizeBridgeRuntimeProviderState(parsed.runtimeProviders);
   const legacyCodex = parsed.codex as (BridgeCodexSettings & { environment?: unknown }) | undefined;
   const legacyBinaryPath = typeof legacyCodex?.binaryPath === "string" && legacyCodex.binaryPath.trim()
@@ -380,7 +460,7 @@ export function normalizeBridgeAppState(parsed: Partial<BridgeAppState>): Bridge
   }).runtimeProviders;
   return {
     ...defaultBridgeAppState(),
-    ...parsed,
+    ...parsedWithoutLegacyAuth,
     account: parsed.account ?? { status: "signed-out" },
     codex: stripLegacyCodexSettings(parsed.codex ?? defaultBridgeCodexSettings()),
     runtimeProviders: migratedRuntimeProviders,
@@ -390,7 +470,56 @@ export function normalizeBridgeAppState(parsed: Partial<BridgeAppState>): Bridge
     modelAliases: Array.isArray(parsed.modelAliases) ? parsed.modelAliases : [],
     modelAliasOverrides: Array.isArray(parsed.modelAliasOverrides) ? parsed.modelAliasOverrides : [],
     service: parsed.service ?? defaultBridgeServiceState(),
-    quitBehavior: parseBridgeQuitBehavior(parsed.quitBehavior)
+    quitBehavior: parseBridgeQuitBehavior(parsed.quitBehavior),
+    pairing: safePairingMetadata(parsed.pairing),
+    diagnosticsSecurityVersion: Number.isInteger(parsed.diagnosticsSecurityVersion) && (parsed.diagnosticsSecurityVersion ?? 0) >= 0
+      ? parsed.diagnosticsSecurityVersion
+      : 0,
+    managedBridgeTransition: safeManagedBridgeTransition(parsed.managedBridgeTransition)
+  };
+}
+
+function safePairingMetadata(value: unknown): BridgePairingMetadata | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.issuedAt !== "string" || typeof record.expiresAt !== "string") {
+    return undefined;
+  }
+  return {
+    issuedAt: record.issuedAt,
+    expiresAt: record.expiresAt,
+    revokedAt: typeof record.revokedAt === "string" ? record.revokedAt : undefined
+  };
+}
+
+function safeManagedBridgeTransition(value: unknown): ManagedBridgeTransition | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.state !== "stopping"
+    || typeof record.instanceId !== "string"
+    || !record.instanceId.trim()
+    || typeof record.bridgeApiUrl !== "string"
+    || !record.bridgeApiUrl.trim()
+    || !Number.isInteger(record.daemonPid)
+    || (record.daemonPid as number) < 1
+    || (record.supervisorPid !== undefined && (!Number.isInteger(record.supervisorPid) || (record.supervisorPid as number) < 1))
+    || typeof record.requestedAt !== "string"
+    || !Number.isFinite(Date.parse(record.requestedAt))
+  ) {
+    return undefined;
+  }
+  return {
+    state: "stopping",
+    instanceId: record.instanceId,
+    bridgeApiUrl: record.bridgeApiUrl,
+    daemonPid: record.daemonPid as number,
+    supervisorPid: record.supervisorPid as number | undefined,
+    requestedAt: record.requestedAt
   };
 }
 

@@ -22,6 +22,14 @@ export type BridgeCommandInvocation = {
   args: string[];
 };
 
+export type WindowsProcessIdentity = {
+  processId: number;
+  parentProcessId: number;
+  executablePath?: string;
+  commandLine?: string;
+  creationDate: string;
+};
+
 export function bridgeNodeExecArgs(): string[] {
   return process.execArgv.filter(arg => !arg.startsWith("--inspect"));
 }
@@ -79,6 +87,7 @@ export function bridgeProcessCommandIdentityForSpawn(kind: BridgeProcessCommandI
 }
 
 export function bridgeProcessRuntimeMetadata(pid: number, commandIdentity: BridgeProcessCommandIdentity): BridgeProcessRuntimeMetadata {
+  const windowsIdentity = process.platform === "win32" ? inspectWindowsProcess(pid) : undefined;
   const verifiableNonce = processNonceCanBeVerified() && processEnvironmentValue(pid, BRIDGE_PROCESS_NONCE_ENV) === commandIdentity.nonce
     ? commandIdentity.nonce
     : undefined;
@@ -87,6 +96,8 @@ export function bridgeProcessRuntimeMetadata(pid: number, commandIdentity: Bridg
     processNonce: verifiableNonce,
     commandIdentity,
     startMetadata: processStartMetadata(pid),
+    parentPid: windowsIdentity?.parentProcessId,
+    executablePath: windowsIdentity?.executablePath,
     recordedAt: new Date().toISOString()
   };
 }
@@ -116,11 +127,14 @@ export function createBridgeAppSidecarSupervisor(input: {
     command: invocation.command,
     args: invocation.args,
     cwd: input.cwd,
-    env: bridgeProcessEnvWithNonce({
-      state: input.state,
-      nonce: daemonNonce,
-      activeProjectGrants: input.activeProjectGrants
-    }),
+    env: {
+      ...bridgeProcessEnvWithNonce({
+        state: input.state,
+        nonce: daemonNonce,
+        activeProjectGrants: input.activeProjectGrants
+      }),
+      HUNSU_BRIDGE_SUPERVISOR_PID: String(process.pid)
+    },
     logPath: input.appLogPath,
     restartLimit: input.restartLimit,
     restartDelayMs: 750
@@ -209,6 +223,14 @@ export function processEnvironmentValue(pid: number, key: string): string | unde
 }
 
 export function processStartMetadata(pid: number): BridgeProcessStartMetadata | undefined {
+  if (process.platform === "win32") {
+    const identity = inspectWindowsProcess(pid);
+    return identity ? {
+      platform: process.platform,
+      source: "windows-cim-creation-date",
+      value: identity.creationDate
+    } : undefined;
+  }
   if (process.platform === "linux") {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -242,6 +264,9 @@ export function sameProcessStartMetadata(left: BridgeProcessStartMetadata, right
 }
 
 export function processCommandLine(pid: number): string | undefined {
+  if (process.platform === "win32") {
+    return inspectWindowsProcess(pid)?.commandLine;
+  }
   if (process.platform === "linux") {
     try {
       const commandLine = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
@@ -260,6 +285,65 @@ export function processCommandLine(pid: number): string | undefined {
   } catch (_error) {
     return undefined;
   }
+}
+
+export function inspectWindowsProcess(
+  pid: number,
+  runPowerShell: (script: string) => string = runWindowsPowerShell
+): WindowsProcessIdentity | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return undefined;
+  }
+  const script = [
+    `$process = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\"`,
+    "if ($null -eq $process) { exit 3 }",
+    "$process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Compress"
+  ].join("; ");
+  try {
+    return windowsProcessIdentityFromJson(runPowerShell(script));
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+export function windowsProcessIdentityFromJson(value: string): WindowsProcessIdentity | undefined {
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const processId = Number(parsed.ProcessId);
+    const parentProcessId = Number(parsed.ParentProcessId);
+    const creationDate = typeof parsed.CreationDate === "string" ? parsed.CreationDate.trim() : "";
+    if (!Number.isInteger(processId) || processId <= 0 || !Number.isInteger(parentProcessId) || parentProcessId < 0 || !creationDate) {
+      return undefined;
+    }
+    return {
+      processId,
+      parentProcessId,
+      executablePath: nonEmptyProcessString(parsed.ExecutablePath),
+      commandLine: nonEmptyProcessString(parsed.CommandLine),
+      creationDate
+    };
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function runWindowsPowerShell(script: string): string {
+  return execFileSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    script
+  ], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    windowsHide: true
+  }).trim();
+}
+
+function nonEmptyProcessString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 export function commandLineLooksLikeBridgeApp(commandLine: string, expectedKinds: BridgeProcessCommandIdentity["kind"][]): boolean {
@@ -284,9 +368,12 @@ export function handleToRuntimeState(state: BridgeAppState, handle: BridgeRuntim
     bridgeApiUrl: handle.bridgeApiUrl,
     processNonce: commandIdentity.nonce,
     commandIdentity,
-    authToken: handle.authToken,
     controlToken: handle.controlToken,
-    pairing: handle.pairing,
+    pairing: handle.pairing ? {
+      issuedAt: handle.pairing.issuedAt,
+      expiresAt: handle.pairing.expiresAt,
+      revokedAt: handle.pairing.revokedAt
+    } : undefined,
     cwd,
     webUrl,
     startedAt: handle.startedAt,

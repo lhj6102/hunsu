@@ -1,12 +1,45 @@
 {
   "schema": "hunsu.bridge-platform-qa.v1",
-  "updatedAt": "2026-07-10",
+  "updatedAt": "2026-07-11",
   "nativeHostResults": {
-    "status": "not-run-in-this-workspace",
-    "recordedAt": "2026-07-10",
-    "workspace": "Linux no-GUI development workspace",
-    "realRuns": [],
-    "externalBlocker": "macOS, Windows, Linux GUI, packaged installer, tray/menu-bar, and real native host daemon QA require external hosts. Product behavior contracts are covered in source tests; real native-host execution evidence is appended here only after those external runs complete."
+    "status": "windows-x64-installed-app-gate-passed",
+    "recordedAt": "2026-07-11",
+    "workspace": "Linux no-GUI development workspace plus GitHub-hosted Windows x64 runner",
+    "realRuns": [
+      {
+        "target": "Windows x64",
+        "workflow": "Bridge Desktop Artifacts",
+        "runId": 29143013811,
+        "commit": "29bbb2d903500612b3cc6d7a5853acc267eec89c",
+        "status": "passed",
+        "artifact": "hunsu-bridge-windows-x64",
+        "artifactId": 8245874656,
+        "artifactSizeBytes": 25064955,
+        "artifactDigest": "sha256:0d3142388ab68a98c1e661bb3ca52dac8c60d2558ac2cc7cb2b9537aa7f44ca0",
+        "evidenceUrl": "https://github.com/lhj6102/hunsu/actions/runs/29143013811",
+        "evidenceFiles": [
+          "windows-managed-bridge-e2e-evidence.json",
+          "windows-installed-app-e2e-evidence.json",
+          "windows-installed-app-e2e-screenshot.png",
+          "docs/qa/windows-x64-installed-app-29143013811.md",
+          "docs/qa/windows-x64-installed-app-29143013811-visual-review.json"
+        ],
+        "checks": [
+          "Windows Tauri and NSIS bundle build",
+          "Windows GUI subsystem verification",
+          "packaged sidecar smoke test",
+          "managed Bridge lifecycle scenarios A-F",
+          "real post-discovery bind race exits once with typed terminal code 78",
+          "silent NSIS install and Tauri WebView2 automation",
+          "actionable configured-port conflict feedback",
+          "unambiguous Advanced navigation and Remote Access presentation",
+          "durable independent screenshot review bound to run, commit, artifact, and screenshot digest",
+          "safe lifecycle and installed-app evidence checksum staging",
+          "candidate artifact upload"
+        ]
+      }
+    ],
+    "externalBlocker": "Human installed-app visual QA remains a release prerequisite, and macOS and Linux GUI native-host execution still require their external hosts. The automated installed-app gate deliberately keeps releaseEligible false, so no dogfood release has been published."
   },
   "targets": [
     {
@@ -32,23 +65,37 @@
     },
     {
       "target": "Windows",
-      "status": "validated-by-contract",
-      "nativeHostExecuted": false,
+      "status": "windows-x64-installed-app-gate-passed",
+      "nativeHostExecuted": true,
       "evidence": [
         "apps/bridge-desktop/src-tauri/Cargo.toml",
         "apps/bridge-desktop/src-tauri/tauri.conf.json",
         "apps/bridge-desktop/src-tauri/src/main.rs",
         "apps/bridge-desktop/scripts/build-native-sidecars.mjs",
-        "apps/bridge-desktop/scripts/prepare-sidecars.mjs",
-        "tests/bridge-desktop.test.ts"
+        "apps/bridge-desktop/scripts/windows-managed-bridge-e2e.ps1",
+        "apps/bridge-desktop/scripts/windows-installed-app-e2e.ps1",
+        "apps/bridge-desktop/scripts/windows-installed-app-webview-e2e.mjs",
+        ".github/workflows/bridge-desktop-artifacts.yml",
+        "tests/bridge-desktop-windows-e2e-script.test.ts",
+        "tests/bridge-desktop-installed-app-e2e.test.ts",
+        "docs/qa/windows-x64-installed-app-29143013811.md",
+        "docs/qa/windows-x64-installed-app-29143013811-visual-review.json"
       ],
       "checks": [
         "active NSIS installer registers hunsu:// through Tauri desktop deep-link configuration",
-        "native sidecar .exe artifacts are generated for x86_64-pc-windows-msvc and aarch64-pc-windows-msvc",
-        "DPAPI-backed credential adapter command boundary is covered with mocks",
-        "tray summary refresh and quit preference behavior are source-contract tested",
-        "open project and launch Studio use the same Bridge App command surface",
-        "uninstall and reinstall preserve no committed user data"
+        "Windows x64 native sidecar and NSIS installer build on a real Windows host",
+        "Windows release executable uses the GUI subsystem",
+        "managed lifecycle reuses one daemon and one supervisor",
+        "Pair and browser handoff use fresh token-safe command results",
+        "authenticated Stop releases the port without supervisor restart",
+        "post-discovery EADDRINUSE exits with terminal code 78 and never restarts",
+        "unmanaged Hunsu and non-Hunsu port owners are not replaced or killed",
+        "P0 diagnostics and log redaction run with synthetic pairing tokens",
+        "installed NSIS candidate reuses the managed daemon and passes real WebView2 lifecycle, Workspace Open, provider-feedback, diagnostics-copy, and version-label checks",
+        "installed app reports the configured port and points users to Connection and Start Bridge without disturbing an unrelated listener",
+        "installed app visibly selects the active Advanced tab and avoids duplicate Remote Access and Git controls",
+        "independent visual verdict is stored with reviewer, timestamp, provenance, rubric, and screenshot hash",
+        "both safe evidence files are included in the candidate checksum manifest"
       ]
     },
     {

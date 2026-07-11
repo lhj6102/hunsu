@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { isSea } from "node:sea";
@@ -32,7 +33,6 @@ import {
 import { runAuthCallbackCommand, runLoginCommand, runLogoutCommand } from "./commands/authCommands.ts";
 import {
   buildDiagnostics,
-  currentNodeRuntimeStatus,
   packageManagerStatus,
   runDiagnosticsCommand,
   toolStatus
@@ -48,7 +48,6 @@ import {
 } from "./commands/workspaceCommands.ts";
 import {
   enableRemoteAccessIfSignedIn,
-  localBridgeStatusFromProcessState,
   publishProjectGrantsToRelay,
   runRemoteCommand,
   startRelayIfConfigured,
@@ -56,20 +55,31 @@ import {
   writeRemoteAccessState
 } from "./commands/connectionCommands.ts";
 import {
-  BRIDGE_PROCESS_NONCE_ENV,
   bridgeNodeExecArgs,
+  bridgeProcessCommandIdentityForSpawn,
+  bridgeProcessEnvWithNonce,
   bridgeProcessRuntimeMetadata,
-  commandLineLooksLikeBridgeApp,
   createBridgeAppSidecarSupervisor as createBridgeAppSidecarSupervisorFromProcess,
   currentBridgeCommandInvocation,
   currentBridgeProcessCommandIdentity,
   handleToRuntimeState,
-  processCommandLine,
-  processEnvironmentValue,
-  processIsAlive,
-  processStartMetadata,
-  sameProcessStartMetadata
+  processIsAlive
 } from "./processes/backgroundSpawn.ts";
+import {
+  clearManagedBridgeRuntimeState,
+  createManagedBridgeRuntime,
+  type ManagedBridgeDiscovery,
+  type ManagedBridgeIdentity,
+  type ManagedBridgeOperationError,
+  type ManagedBridgeRuntimeOptions,
+  type ManagedBridgeStartContext,
+  type ManagedBridgeStopResult
+} from "./processes/managedBridgeRuntime.ts";
+import { stopVerifiedWindowsManagedBridge } from "./processes/windowsManagedBridgeTermination.ts";
+import {
+  BRIDGE_SIDECAR_TERMINAL_EXIT_CODE,
+  isTerminalSidecarFailureCode
+} from "./sidecar-supervisor.ts";
 import {
   canonicalBridgeUiIntentTab,
   bridgeAppStatePath as appStatePath,
@@ -84,11 +94,10 @@ import {
   writeBridgeAppState as writeAppState,
   type BridgeAppSnapshot,
   type BridgeAppState,
-  type BridgeProcessCommandIdentity,
   type BridgeQuitBehavior,
-  type BridgeProcessRuntimeMetadata,
   type BridgeRoadmapAccessSnapshot,
   type BridgeServiceState,
+  type LocalBridgeControl,
   type BridgeUiIntent,
   bridgeCodexProviderSettings
 } from "./state/appState.ts";
@@ -99,6 +108,8 @@ import {
 } from "./relay.ts";
 import {
   applyStudioPort,
+  assertDiagnosticsSafe,
+  bridgeVersionInfo,
   createBridgeSupervisor,
   createRuntimeProviderRegistry,
   createStudioRoadmap,
@@ -116,12 +127,12 @@ import {
   openStudioInBrowser,
   openStudioRoadmap,
   removeRoadmapRegistryEntry,
+  redactDiagnosticText,
   resolveRoadmapRepositoryPath,
   resolveStudioBridgeWebUrl,
   sanitizeDiagnostics,
   setRoadmapLifecycle,
   setRoadmapRemoteAccess,
-  type BridgePairingSession,
   type DirectProviderModelSelection,
   type RuntimeProviderStatus,
   type BridgeRuntimeHandle,
@@ -145,19 +156,48 @@ const DEFAULT_LAUNCHD_USER_PLIST_PATH = join(homedir(), "Library", "LaunchAgents
 const WINDOWS_USER_TASK_NAME = "Hunsu Bridge";
 const PROJECT_GRANT_SCOPE_VALUES = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"] as const satisfies readonly BridgeCommandScope[];
 const DEFAULT_PROJECT_GRANT_SCOPES: BridgeCommandScope[] = ["execute.start", "artifactAction.run", "env.read", "hostAlias.expose"];
-const HUNSU_BRIDGE_APP_VERSION = "0.1.0";
-const BRIDGE_STARTING_GRACE_MS = 15_000;
+const HUNSU_BRIDGE_APP_VERSION = "0.1.1";
+const DIAGNOSTICS_SECURITY_VERSION = 1;
+const DIAGNOSTICS_SECURITY_MIGRATION_FETCH_TIMEOUT_MS = 1_500;
 
-async function main(argv = process.argv.slice(2)): Promise<number> {
+type UiCommandResult<T = unknown> =
+  | { ok: true; code: "OK" | string; message: string; value?: T }
+  | {
+      ok: false;
+      code: string;
+      message: string;
+      recovery?: { label: string; action: string };
+    };
+
+class BridgeAppCommandError extends Error {
+  readonly code: string;
+  readonly recovery?: { label: string; action: string };
+
+  constructor(code: string, message: string, recovery?: { label: string; action: string }) {
+    super(message);
+    this.name = "BridgeAppCommandError";
+    this.code = code;
+    this.recovery = recovery;
+  }
+}
+
+type BridgeAppMainOptions = {
+  diagnosticsSecurityMigration?: DiagnosticsSecurityMigrationOptions;
+  managedBridgeRuntime?: Pick<ManagedBridgeRuntimeOptions, "probeTimeoutMs" | "stopTimeoutMs">;
+};
+
+async function main(argv = process.argv.slice(2), options: BridgeAppMainOptions = {}): Promise<number> {
   const parsed = parseArgs(normalizeBridgeAppArgv(argv));
   try {
     if (parsed.flags.has("version")) {
       console.log(`Hunsu Bridge ${HUNSU_BRIDGE_APP_VERSION}`);
       return 0;
     }
+    await applyDiagnosticsSecurityMigration(options.diagnosticsSecurityMigration);
     switch (parsed.command) {
       case "start":
-        await supervisedStartCommand(parsed);
+      case "ensure-running":
+        await ensureRunningCommand(parsed);
         return 0;
       case "pair":
         await pairCommand(parsed);
@@ -185,10 +225,18 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
         await statusCommand();
         return 0;
       case "stop":
-        await stopCommand();
+        await stopCommand(parsed, options.managedBridgeRuntime);
         return 0;
       case "diagnostics":
         await runDiagnosticsCommand(diagnosticsCommandContext());
+        return 0;
+      case "diagnostics-redaction-blocked":
+        writeStructuredLog({ event: "diagnostics.redaction.blocked-copy" });
+        printUiCommandResult(parsed, {
+          ok: true,
+          code: "OK",
+          message: "Sensitive diagnostics copy was blocked."
+        });
         return 0;
       case "snapshot":
         await snapshotCommand();
@@ -257,59 +305,400 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
         return 1;
     }
   } catch (error) {
-    writeStructuredLog({ event: "command.failed", command: parsed.command, error: error instanceof Error ? error.message : String(error) });
-    console.error(error instanceof Error ? error.message : String(error));
-    return 1;
+    const result = uiFailureFromError(error);
+    const terminalDaemonFailure = parsed.command === "daemon" && isTerminalSidecarFailureCode(result.code);
+    writeStructuredLog({ event: "command.failed", command: parsed.command, code: result.code, error: result.message });
+    writeStructuredLog({ event: "ui.operation.failed", action: parsed.command, code: result.code, message: result.message });
+    if (hasFlag(parsed, "json")) {
+      assertDiagnosticsSafe(result);
+      console.log(JSON.stringify(result));
+    } else {
+      console.error(terminalDaemonFailure ? `${result.code}: ${result.message}` : result.message);
+    }
+    return terminalDaemonFailure
+      ? BRIDGE_SIDECAR_TERMINAL_EXIT_CODE
+      : 1;
   }
 }
 
-async function supervisedStartCommand(parsed: ParsedArgs): Promise<void> {
-  const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
+type DiagnosticsSecurityMigrationOptions = {
+  fetch?: typeof globalThis.fetch;
+  fetchTimeoutMs?: number;
+  probeTcpEndpoint?: (bridgeApiUrl: string) => Promise<boolean>;
+  processIsAlive?: (pid: number) => boolean;
+  configuredBridgeApiUrl?: string | null;
+};
+
+type DiagnosticsSecurityMigrationResponse = {
+  response: Response;
+  body: unknown;
+};
+
+async function applyDiagnosticsSecurityMigration(options: DiagnosticsSecurityMigrationOptions = {}): Promise<void> {
   const state = readAppState();
-  const supervisor = createBridgeAppSidecarSupervisorFromProcess({
-    cwd,
-    webUrl: getFlag(parsed, "web-url"),
-    remote: hasFlag(parsed, "remote"),
-    noOpen: hasFlag(parsed, "no-open"),
-    restartLimit: Number(getFlag(parsed, "restart-limit") ?? 3),
-    appLogPath: appLogPath(),
-    state,
-    activeProjectGrants: activeManagedProjectGrants(state.projectGrants)
+  if ((state.diagnosticsSecurityVersion ?? 0) >= DIAGNOSTICS_SECURITY_VERSION) {
+    return;
+  }
+  sanitizeExistingLogFile(appLogPath());
+  try {
+    writeAppState({
+      ...state,
+      pairing: undefined
+    });
+  } catch (_error) {
+    return;
+  }
+  const revocation = await revokeLegacyPairingOrProveNoReachableSession(state, options);
+  if (!revocation.complete) {
+    writeStructuredLog({
+      event: "diagnostics.security-migration.pending",
+      version: DIAGNOSTICS_SECURITY_VERSION,
+      reason: revocation.reason
+    });
+    return;
+  }
+  try {
+    writeAppState({
+      ...readAppState(),
+      pairing: undefined,
+      diagnosticsSecurityVersion: DIAGNOSTICS_SECURITY_VERSION
+    });
+  } catch (_error) {
+    return;
+  }
+  writeStructuredLog({
+    event: "diagnostics.security-migration.completed",
+    version: DIAGNOSTICS_SECURITY_VERSION,
+    pairingRevoked: revocation.pairingRevoked
   });
-  const commandIdentity = currentBridgeProcessCommandIdentity("start");
+}
+
+async function revokeLegacyPairingOrProveNoReachableSession(
+  state: BridgeAppState,
+  options: DiagnosticsSecurityMigrationOptions
+): Promise<
+  | { complete: true; pairingRevoked: boolean }
+  | { complete: false; reason: "revocation-rejected" | "reachable-session-unowned" | "managed-process-reachability-uncertain" }
+> {
+  const fetchBridge = options.fetch ?? ((input, init) => fetch(input, init));
+  const fetchTimeoutMs = options.fetchTimeoutMs ?? DIAGNOSTICS_SECURITY_MIGRATION_FETCH_TIMEOUT_MS;
+  const probeTcpEndpoint = options.probeTcpEndpoint ?? probeBridgeTcpEndpoint;
+  const isAlive = options.processIsAlive ?? processIsAlive;
+  const configuredUrl = options.configuredBridgeApiUrl === null
+    ? undefined
+    : options.configuredBridgeApiUrl ?? configuredBridgeApiUrl();
+  const bridgeApiUrls = uniqueStringList([state.bridgeApiUrl, configuredUrl].filter((value): value is string => Boolean(value?.trim())));
+  const hasLiveManagedProcess = uniqueNumberList([state.supervisorPid, state.pid]).some(pid => isAlive(pid));
+  let pairingRevoked = false;
+  let revocationRejected = false;
+  let reachableSessionUnowned = false;
+  let reachabilityUncertain = hasLiveManagedProcess && bridgeApiUrls.length === 0;
+
+  for (const bridgeApiUrl of bridgeApiUrls) {
+    if (state.controlToken) {
+      let result: DiagnosticsSecurityMigrationResponse;
+      try {
+        result = await fetchDiagnosticsSecurityMigrationJson(
+          fetchBridge,
+          new URL("/api/bridge/pairing/revoke", bridgeApiUrl).toString(),
+          {
+            method: "POST",
+            headers: { "x-hunsu-bridge-control-token": state.controlToken }
+          },
+          fetchTimeoutMs
+        );
+      } catch (_error) {
+        reachabilityUncertain ||= await migrationEndpointReachabilityIsUncertain(
+          bridgeApiUrl,
+          state.bridgeApiUrl,
+          hasLiveManagedProcess,
+          probeTcpEndpoint
+        );
+        continue;
+      }
+      if (!result.response.ok) {
+        revocationRejected = true;
+        continue;
+      }
+      const body = result.body as { revoked?: unknown } | undefined;
+      if (body?.revoked !== true) {
+        revocationRejected = true;
+        continue;
+      }
+      pairingRevoked = true;
+      continue;
+    }
+
+    try {
+      const result = await fetchDiagnosticsSecurityMigrationJson(
+        fetchBridge,
+        new URL("/health", bridgeApiUrl).toString(),
+        { method: "GET" },
+        fetchTimeoutMs
+      );
+      if (result.response.ok && isHunsuBridgeHealthBody(result.body)) {
+        reachableSessionUnowned = true;
+      } else if (!result.response.ok || result.body === undefined) {
+        reachabilityUncertain = true;
+      }
+    } catch (_error) {
+      reachabilityUncertain ||= await migrationEndpointReachabilityIsUncertain(
+        bridgeApiUrl,
+        state.bridgeApiUrl,
+        hasLiveManagedProcess,
+        probeTcpEndpoint
+      );
+    }
+  }
+
+  if (revocationRejected) {
+    return { complete: false, reason: "revocation-rejected" };
+  }
+  if (reachableSessionUnowned) {
+    return { complete: false, reason: "reachable-session-unowned" };
+  }
+  if (reachabilityUncertain) {
+    return { complete: false, reason: "managed-process-reachability-uncertain" };
+  }
+  return { complete: true, pairingRevoked };
+}
+
+async function fetchDiagnosticsSecurityMigrationJson(
+  fetchBridge: typeof globalThis.fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<DiagnosticsSecurityMigrationResponse> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`Diagnostics security migration request timed out after ${timeoutMs} ms.`);
+      error.name = "AbortError";
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+  const request = (async () => {
+    const response = await fetchBridge(url, { ...init, signal: controller.signal });
+    return {
+      response,
+      body: response.ok ? await response.json() : undefined
+    };
+  })();
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function migrationEndpointReachabilityIsUncertain(
+  bridgeApiUrl: string,
+  persistedBridgeApiUrl: string | undefined,
+  hasLiveManagedProcess: boolean,
+  probeTcpEndpoint: (bridgeApiUrl: string) => Promise<boolean>
+): Promise<boolean> {
+  try {
+    if (await probeTcpEndpoint(bridgeApiUrl)) {
+      return true;
+    }
+  } catch (_error) {
+    return true;
+  }
+  return hasLiveManagedProcess
+    && normalizeBridgeOrigin(bridgeApiUrl) === normalizeBridgeOrigin(persistedBridgeApiUrl);
+}
+
+function normalizeBridgeOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    return new URL(value).origin;
+  } catch (_error) {
+    return undefined;
+  }
+}
+
+function probeBridgeTcpEndpoint(bridgeApiUrl: string): Promise<boolean> {
+  let url: URL;
+  try {
+    url = new URL(bridgeApiUrl);
+  } catch (_error) {
+    return Promise.resolve(false);
+  }
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    return Promise.resolve(false);
+  }
+  return new Promise(resolveProbe => {
+    const host = url.hostname.startsWith("[") && url.hostname.endsWith("]")
+      ? url.hostname.slice(1, -1)
+      : url.hostname;
+    const socket = createConnection({ host, port });
+    let settled = false;
+    const settle = (reachable: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolveProbe(reachable);
+    };
+    socket.setTimeout(500, () => settle(false));
+    socket.once("connect", () => settle(true));
+    socket.once("error", () => settle(false));
+  });
+}
+
+function sanitizeExistingLogFile(path: string): void {
+  if (!existsSync(path)) {
+    return;
+  }
+  try {
+    const safeText = readFileSync(path, "utf8")
+      .split(/\r?\n/)
+      .map(line => redactDiagnosticText(line))
+      .join("\n");
+    assertDiagnosticsSafe(safeText);
+    writeFileSync(path, safeText, { encoding: "utf8", mode: 0o600 });
+  } catch (_error) {
+    // Safe reads still redact each historical line if this best-effort rewrite fails.
+  }
+}
+
+function managedBridgeRuntime(
+  options: Pick<ManagedBridgeRuntimeOptions, "probeTimeoutMs" | "stopTimeoutMs"> = {}
+) {
+  return createManagedBridgeRuntime({
+    readState: readAppState,
+    writeState: writeAppState,
+    startSupervisor: startDetachedManagedSupervisor,
+    openUrl: openStudioManagedUrl,
+    processIsAlive,
+    writeStructuredLog,
+    ...options
+  });
+}
+
+async function startDetachedManagedSupervisor(context: ManagedBridgeStartContext): Promise<void> {
+  const cwd = resolve(context.cwd ?? readAppState().cwd ?? process.cwd());
+  const commandArgs = [
+    "supervise",
+    "--cwd",
+    cwd,
+    "--attempt-id",
+    context.attemptId,
+    ...(context.webUrl ? ["--web-url", context.webUrl] : [])
+  ];
+  const invocation = currentBridgeCommandInvocation({ commandArgs });
+  const commandIdentity = bridgeProcessCommandIdentityForSpawn("supervise", [invocation.command, ...invocation.args]);
+  const state = readAppState();
+  const child = spawn(invocation.command, invocation.args, {
+    cwd,
+    env: {
+      ...bridgeProcessEnvWithNonce({
+        state,
+        nonce: commandIdentity.nonce,
+        activeProjectGrants: activeManagedProjectGrants(state.projectGrants)
+      }),
+      HUNSU_BRIDGE_START_ATTEMPT_ID: context.attemptId
+    },
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  await new Promise<void>((resolveSpawn, rejectSpawn) => {
+    child.once("spawn", resolveSpawn);
+    child.once("error", rejectSpawn);
+  });
+  child.unref();
+}
+
+function persistManagedBridgeIdentity(identity: ManagedBridgeIdentity): void {
+  const state = readAppState();
   writeAppState({
     ...state,
-    supervisorPid: process.pid,
-    supervisorProcess: bridgeProcessRuntimeMetadata(process.pid, commandIdentity),
-    processNonce: commandIdentity.nonce,
-    commandIdentity,
-    cwd,
-    webUrl: getFlag(parsed, "web-url"),
-    startedAt: new Date().toISOString()
+    bridgeApiUrl: identity.bridgeApiUrl,
+    instanceId: identity.instanceId,
+    pid: identity.daemonPid,
+    supervisorPid: identity.supervisorPid ?? state.supervisorPid,
+    startedAt: identity.startedAt ?? state.startedAt
   });
-  supervisor.start();
-  writeStructuredLog({ event: "bridge.supervisor.started", status: supervisor.status() });
-  console.log("Hunsu Bridge supervisor started.");
-  console.log(JSON.stringify(supervisor.status(), null, 2));
-  try {
-    await waitForShutdown(async () => {
-      await supervisor.stop();
-    });
-  } finally {
-    clearSupervisorProcessState();
+}
+
+function managedBridgeError(error: ManagedBridgeOperationError): BridgeAppCommandError {
+  return new BridgeAppCommandError(error.code, error.message, error.recovery);
+}
+
+function uiFailureFromError(error: unknown): Extract<UiCommandResult, { ok: false }> {
+  const code = error instanceof BridgeAppCommandError ? error.code : "COMMAND_FAILED";
+  const message = redactDiagnosticText(error instanceof Error ? error.message : String(error));
+  return {
+    ok: false,
+    code,
+    message,
+    recovery: error instanceof BridgeAppCommandError ? error.recovery : undefined
+  };
+}
+
+function printUiCommandResult<T>(parsed: ParsedArgs, result: Extract<UiCommandResult<T>, { ok: true }>): void {
+  const safeResult = sanitizeDiagnostics(result) as typeof result;
+  assertDiagnosticsSafe(safeResult);
+  writeStructuredLog({ event: "ui.operation.completed", action: parsed.command, code: safeResult.code, message: safeResult.message });
+  if (hasFlag(parsed, "json")) {
+    console.log(JSON.stringify(safeResult));
+    return;
   }
+  console.log(safeResult.message);
+}
+
+async function ensureRunningCommand(parsed: ParsedArgs): Promise<void> {
+  const runtime = managedBridgeRuntime();
+  const result = await runtime.ensureManagedBridgeRunning({
+    cwd: resolve(getFlag(parsed, "cwd") ?? readAppState().cwd ?? process.cwd()),
+    webUrl: getFlag(parsed, "web-url")
+  });
+  if (!result.ok) {
+    throw managedBridgeError(result.error);
+  }
+  persistManagedBridgeIdentity(result.value);
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: result.value.transition === "reused"
+      ? "Hunsu Bridge is already connected."
+      : "Hunsu Bridge started and is connected.",
+    value: result.value
+  });
 }
 
 async function daemonCommand(parsed: ParsedArgs): Promise<void> {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
   const remote = hasFlag(parsed, "remote");
   const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
-    cwd,
-    webUrl: getFlag(parsed, "web-url"),
-    noOpen: hasFlag(parsed, "no-open"),
-    mode: remote ? "remote-ready" : "local"
-  });
+  let handle: BridgeRuntimeHandle;
+  try {
+    handle = await supervisor.start({
+      cwd,
+      webUrl: getFlag(parsed, "web-url"),
+      noOpen: hasFlag(parsed, "no-open"),
+      mode: remote ? "remote-ready" : "local",
+      deferPairing: true
+    });
+  } catch (error) {
+    if (!isAddressInUseError(error)) {
+      throw error;
+    }
+    const existing = await managedBridgeRuntime().discoverManagedBridge();
+    if (existing.state === "running-managed") {
+      writeStructuredLog({ event: "bridge.ensure-running.reused", instanceId: existing.instanceId, bridgeApiUrl: existing.bridgeApiUrl });
+      return;
+    }
+    if (existing.state === "running-unmanaged") {
+      throw new BridgeAppCommandError("BRIDGE_ALREADY_RUNNING_UNMANAGED", "A Hunsu Bridge is already running but is not managed by this Bridge App.");
+    }
+    throw new BridgeAppCommandError("BRIDGE_PORT_IN_USE", "The configured Hunsu Bridge port is already in use by another service.");
+  }
   let relayClient: Awaited<ReturnType<typeof startRelayIfConfigured>> | undefined;
   if (remote) {
     const remoteContext = remoteAccessRuntimeContext();
@@ -319,10 +708,11 @@ async function daemonCommand(parsed: ParsedArgs): Promise<void> {
   }
   rememberRunningBridge(handle, cwd, getFlag(parsed, "web-url"));
   printAppStatus(handle);
-  await waitForShutdown(async () => {
+  await waitForBridgeSupervisorTerminal(supervisor, async () => {
     relayClient?.stop();
     await supervisor.stop();
   });
+  relayClient?.stop();
   clearManagedProcessState();
 }
 
@@ -330,111 +720,22 @@ async function pairCommand(parsed: ParsedArgs): Promise<void> {
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
   const next = safeStudioNext(getFlag(parsed, "next") ?? "/studio");
   const webUrl = studioWebUrlForNext(getFlag(parsed, "web-url"), next);
-  const running = await rotateRunningBridgePairing({ webUrl });
-  if (running.ok) {
-    if (hasFlag(parsed, "no-open")) {
-      console.log(running.pairingUrl);
-    } else {
-      await openStudioManagedUrl(running.pairingUrl);
-    }
-    console.log("Hunsu Bridge pairing refreshed on the running managed Bridge.");
-    return;
-  }
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
+  const result = await managedBridgeRuntime().createManagedPairing({
     cwd,
     webUrl,
-    noOpen: true,
-    mode: "local"
+    openBrowser: !hasFlag(parsed, "no-open")
   });
-  rememberRunningBridge(handle, cwd, webUrl);
-  const pairingUrl = await supervisor.createPairingUrl({ webUrl });
-  if (hasFlag(parsed, "no-open")) {
-    console.log(pairingUrl);
-  } else {
-    await supervisor.openStudio({ url: pairingUrl });
+  if (!result.ok) {
+    throw managedBridgeError(result.error);
   }
-  printAppStatus({ ...handle, studioUrl: pairingUrl });
-  await waitForShutdown(supervisor.stop);
-  clearManagedProcessState();
-}
-
-async function rotateRunningBridgePairing(input: {
-  webUrl: string;
-  roadmapId?: string;
-}): Promise<
-  | { ok: true; pairingUrl: string; handle: BridgeRuntimeHandle }
-  | { ok: false; error: string }
-> {
-  const state = readAppState();
-  if (!state.bridgeApiUrl || !state.controlToken) {
-    return { ok: false, error: "No running managed Bridge control endpoint is known." };
-  }
-  try {
-    const response = await fetch(new URL("/api/bridge/pairing/rotate", state.bridgeApiUrl), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-hunsu-bridge-control-token": state.controlToken
-      },
-      body: JSON.stringify({
-        webUrl: input.webUrl,
-        roadmapId: input.roadmapId
-      })
-    });
-    const body = await response.json().catch(() => undefined) as Partial<BridgeRuntimeHandle> & { studioUrl?: string; error?: string } | undefined;
-    if (!response.ok || !body?.authToken || !body.pairing || !body.studioUrl) {
-      return { ok: false, error: body?.error ?? `Bridge pairing refresh failed with HTTP ${response.status}.` };
-    }
-    const handle: BridgeRuntimeHandle = {
-      bridgeApiUrl: body.bridgeApiUrl ?? state.bridgeApiUrl,
-      studioUrl: body.studioUrl,
-      allowedOrigin: new URL(input.webUrl).origin,
-      authToken: body.authToken,
-      controlToken: state.controlToken,
-      pairing: body.pairing,
-      status: "running",
-      startedAt: state.startedAt
-    };
-    writeAppState({
-      ...state,
-      bridgeApiUrl: handle.bridgeApiUrl,
-      authToken: handle.authToken,
-      pairing: handle.pairing
-    });
-    writeStructuredLog({ event: "bridge.pairing.rotated", bridgeApiUrl: handle.bridgeApiUrl, issuedAt: handle.pairing.issuedAt });
-    return { ok: true, pairingUrl: body.studioUrl, handle };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : "Unable to reach running managed Bridge." };
-  }
-}
-
-async function revokeRunningBridgePairing(): Promise<boolean> {
-  const state = readAppState();
-  if (!state.bridgeApiUrl || !state.controlToken) {
-    return false;
-  }
-  try {
-    const response = await fetch(new URL("/api/bridge/pairing/revoke", state.bridgeApiUrl), {
-      method: "POST",
-      headers: {
-        "x-hunsu-bridge-control-token": state.controlToken
-      }
-    });
-    if (!response.ok) {
-      return false;
-    }
-    const body = await response.json().catch(() => undefined) as { pairing?: BridgePairingSession } | undefined;
-    writeAppState({
-      ...state,
-      authToken: undefined,
-      pairing: body?.pairing ?? state.pairing
-    });
-    writeStructuredLog({ event: "bridge.pairing.revoked", bridgeApiUrl: state.bridgeApiUrl });
-    return true;
-  } catch (_error) {
-    return false;
-  }
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: result.value.browserOpened
+      ? "Hunsu Web opened with a fresh pairing."
+      : "A fresh pairing was created without opening a browser.",
+    value: result.value
+  });
 }
 
 async function openProjectCommand(parsed: ParsedArgs, forcedAction: "open" | "port" | "create"): Promise<void> {
@@ -445,24 +746,34 @@ async function openProjectCommand(parsed: ParsedArgs, forcedAction: "open" | "po
   }
 
   const state = createStudioState();
+  const registryOptions = roadmapRegistryOptions();
   const result = forcedAction === "create" || project.kind === "new-project"
-    ? createStudioRoadmap({ path, title: basename(path) }, state)
+    ? createStudioRoadmap({ path, title: basename(path) }, state, { persist: true, ...registryOptions })
     : forcedAction === "port" || project.kind === "git-project"
-      ? applyStudioPort({ path, title: basename(project.path), goal: `Port ${basename(project.path)} into Hunsu.` }, state)
-      : openStudioRoadmap({ path: project.path }, state);
+      ? applyStudioPort({ path, title: basename(project.path), goal: `Port ${basename(project.path)} into Hunsu.` }, state, registryOptions)
+      : openStudioRoadmap({ path: project.path }, state, { persist: true, ...registryOptions });
 
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
+  const opened = await managedBridgeRuntime().openManagedRoadmap(result.roadmap.roadmapId, {
     cwd: result.repository.root,
     webUrl: getFlag(parsed, "web-url"),
-    noOpen: true
+    openBrowser: !hasFlag(parsed, "no-open")
   });
-  rememberRunningBridge(handle, result.repository.root, getFlag(parsed, "web-url"));
-  await supervisor.openStudio({ roadmapId: result.roadmap.roadmapId });
-  printProjectAction(project, result.roadmap.roadmapId);
-  printAppStatus(handle);
-  await waitForShutdown(supervisor.stop);
-  clearManagedProcessState();
+  if (!opened.ok) {
+    throw managedBridgeError(opened.error);
+  }
+  if (!hasFlag(parsed, "json")) {
+    printProjectAction(project, result.roadmap.roadmapId);
+  }
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: "Workspace opened in Hunsu Web.",
+    value: {
+      ...opened.value,
+      action: "open-project" as const,
+      roadmapId: result.roadmap.roadmapId
+    }
+  });
 }
 
 async function resolveChosenProjectPath(parsed: ParsedArgs): Promise<string> {
@@ -482,18 +793,26 @@ async function openRoadmapCommand(parsed: ParsedArgs): Promise<void> {
   if (!roadmapId?.trim()) {
     throw new Error("Roadmap ID is required.");
   }
-  const repositoryPath = resolveRoadmapRepositoryPath(roadmapId.trim(), roadmapRegistryOptions());
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
+  let repositoryPath: string;
+  try {
+    repositoryPath = resolveRoadmapRepositoryPath(roadmapId.trim(), roadmapRegistryOptions());
+  } catch (_error) {
+    throw new BridgeAppCommandError("ROADMAP_NOT_FOUND", "That Workspace could not be found in the managed Roadmap registry.");
+  }
+  const opened = await managedBridgeRuntime().openManagedRoadmap(roadmapId.trim(), {
     cwd: repositoryPath,
     webUrl: getFlag(parsed, "web-url"),
-    noOpen: true
+    openBrowser: !hasFlag(parsed, "no-open")
   });
-  rememberRunningBridge(handle, repositoryPath, getFlag(parsed, "web-url"));
-  await supervisor.openStudio({ roadmapId: roadmapId.trim() });
-  printAppStatus(handle);
-  await waitForShutdown(supervisor.stop);
-  clearManagedProcessState();
+  if (!opened.ok) {
+    throw managedBridgeError(opened.error);
+  }
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: "Workspace opened in Hunsu Web.",
+    value: opened.value
+  });
 }
 
 function inspectCommand(parsed: ParsedArgs): void {
@@ -533,7 +852,10 @@ async function statusCommand(): Promise<void> {
   console.log("Provider:");
   console.log(`  ${snapshot.providers.current.label}: ${providerStatusSummary(snapshot.providers.current)}`);
   console.log(`  Git: ${snapshot.prerequisites.tools.git.installed ? "Ready" : "Missing"}`);
-  console.log(`  Node: ${snapshot.prerequisites.tools.node.installed ? "Ready" : "Missing"}`);
+  console.log(`  Embedded runtime: Node ${snapshot.prerequisites.tools.embeddedRuntime.version} (bundled)`);
+  console.log(`  System Node: ${snapshot.prerequisites.tools.systemNode.installed ? snapshot.prerequisites.tools.systemNode.version ?? "Installed" : "Not installed (optional)"}`);
+  console.log(`  Package manager: ${snapshot.prerequisites.tools.packageManager.installed ? snapshot.prerequisites.tools.packageManager.version ?? "Installed" : "Not installed (optional)"}`);
+  console.log(`  Versions: App ${snapshot.versions.bridgeApp}; runtime ${snapshot.versions.bridgeRuntime}; protocol ${snapshot.versions.protocol}`);
   console.log("");
   const activeRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle === "active");
   const inactiveRoadmaps = snapshot.managedRoadmaps.filter(roadmap => roadmap.lifecycle !== "active");
@@ -572,60 +894,27 @@ function codexStatusLabel(codex: Awaited<ReturnType<typeof getCodexRuntimeStatus
   return "Not Ready";
 }
 
-async function stopCommand(): Promise<void> {
-  const state = readAppState();
-  const controlStop = await stopBridgeThroughControlEndpoint(state);
-  if (controlStop.ok) {
-    for (const targetPid of uniqueNumberList([state.supervisorPid, state.pid])) {
-      const verification = verifyManagedBridgePid(targetPid, state);
-      if (verification.ok) {
-        try {
-          process.kill(targetPid, "SIGTERM");
-        } catch (error) {
-          writeStructuredLog({
-            event: "bridge.stop.post-control-signal-failed",
-            pid: targetPid,
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
-      }
-    }
-    writeAppState(clearBridgeProcessRuntimeState(readAppState()));
-    console.log("Hunsu Bridge stopped.");
-    return;
+async function stopCommand(
+  parsed: ParsedArgs,
+  runtimeOptions?: Pick<ManagedBridgeRuntimeOptions, "probeTimeoutMs" | "stopTimeoutMs">
+): Promise<void> {
+  const runtime = managedBridgeRuntime(runtimeOptions);
+  const discovery = await runtime.discoverManagedBridge();
+  let result = await runtime.stopManagedBridge();
+  if (!result.ok && result.error.code === "BRIDGE_CONTROL_UNAVAILABLE" && discovery.state === "running-managed") {
+    result = await stopManagedBridgeWithVerifiedWindowsFallback(discovery);
   }
-  const targetPids = uniqueNumberList([state.supervisorPid, state.pid]);
-  if (targetPids.length === 0) {
-    console.log("Hunsu Bridge is not managed by this Bridge App process.");
-    return;
+  if (!result.ok) {
+    throw managedBridgeError(result.error);
   }
-  let stopped = false;
-  let stopError: unknown;
-  let verifiedAny = false;
-  for (const targetPid of targetPids) {
-    const verification = verifyManagedBridgePid(targetPid, state);
-    if (!verification.ok) {
-      writeStructuredLog({ event: "bridge.stop.pid-verification-failed", pid: targetPid, reason: verification.reason });
-      continue;
-    }
-    verifiedAny = true;
-    try {
-      process.kill(targetPid, "SIGTERM");
-      stopped = true;
-      break;
-    } catch (error) {
-      stopError = error;
-    }
-  }
-  writeAppState(clearBridgeProcessRuntimeState(state));
-  if (!verifiedAny) {
-    console.log("Removed stale Hunsu Bridge process state. No PID was terminated.");
-    return;
-  }
-  if (!stopped) {
-    throw new Error(stopError instanceof Error ? stopError.message : "Unable to stop Hunsu Bridge.");
-  }
-  console.log("Hunsu Bridge stopped.");
+  printUiCommandResult(parsed, {
+    ok: true,
+    code: "OK",
+    message: result.value.previousState === "not-running"
+      ? "Hunsu Bridge is already stopped."
+      : "Hunsu Bridge stopped.",
+    value: result.value
+  });
 }
 
 function diagnosticsCommandContext() {
@@ -662,33 +951,53 @@ async function prerequisitesCommand(parsed: ParsedArgs): Promise<void> {
 }
 
 async function codexCommand(parsed: ParsedArgs): Promise<void> {
-  await runCodexCommand(parsed, {
-    hasFlag,
-    getFlag,
-    resolvePath: path => resolve(path),
-    getCodexStatus: getCodexRuntimeStatus,
-    codexProbeEnv,
-    reconcileCodexLoginFromStatus: codex => reconcileCodexLoginFromStatus(codex, codexCliActionContext()),
-    runCodexInstallCli,
-    providerStatusSummary,
-    runCodexApiKeyLoginCli: () => runCodexApiKeyLoginCliAction(codexCliActionContext()),
-    runCodexDeviceLoginCli: options => runCodexDeviceLoginCliAction(options, codexCliActionContext()),
-    runCodexChatGptLoginCli: () => runCodexChatGptLoginCliAction(codexCliActionContext()),
-    runCodexCli: args => runCodexCliAction(args, codexCliActionContext()),
-    readState: readAppState,
-    writeState: writeAppState,
-    parseInstallChannel: parseCodexInstallChannel,
-    parseAuthenticationPreference: parseCodexAuthenticationPreference,
-    printCodexStatus
-  });
+  try {
+    await runCodexCommand(parsed, {
+      hasFlag,
+      getFlag,
+      resolvePath: path => resolve(path),
+      getCodexStatus: getCodexRuntimeStatus,
+      codexProbeEnv,
+      reconcileCodexLoginFromStatus: codex => reconcileCodexLoginFromStatus(codex, codexCliActionContext()),
+      runCodexInstallCli,
+      providerStatusSummary,
+      runCodexApiKeyLoginCli: () => runCodexApiKeyLoginCliAction(codexCliActionContext()),
+      runCodexDeviceLoginCli: options => runCodexDeviceLoginCliAction(options, codexCliActionContext()),
+      runCodexChatGptLoginCli: () => runCodexChatGptLoginCliAction(codexCliActionContext()),
+      runCodexCli: args => runCodexCliAction(args, codexCliActionContext()),
+      readState: readAppState,
+      writeState: writeAppState,
+      parseInstallChannel: parseCodexInstallChannel,
+      parseAuthenticationPreference: parseCodexAuthenticationPreference,
+      printCodexStatus
+    });
+  } catch (error) {
+    if (parsed.rest[0] === "recheck") {
+      throw new BridgeAppCommandError(
+        "PROVIDER_RECHECK_FAILED",
+        redactDiagnosticText(error instanceof Error ? error.message : "Codex recheck failed.")
+      );
+    }
+    throw error;
+  }
 }
 
 async function providerCommand(parsed: ParsedArgs): Promise<void> {
-  await runProviderCommand(parsed, {
-    hasFlag,
-    getFlag,
-    providerRegistry: createBridgeDesktopRuntimeProviderRegistry
-  });
+  try {
+    await runProviderCommand(parsed, {
+      hasFlag,
+      getFlag,
+      providerRegistry: createBridgeDesktopRuntimeProviderRegistry
+    });
+  } catch (error) {
+    if (parsed.rest[0] === "config" && parsed.rest[1]?.startsWith("validate")) {
+      throw new BridgeAppCommandError(
+        "PROVIDER_CONFIG_INVALID",
+        redactDiagnosticText(error instanceof Error ? error.message : "Provider configuration is invalid.")
+      );
+    }
+    throw error;
+  }
 }
 
 async function modelAliasCommand(parsed: ParsedArgs): Promise<void> {
@@ -943,6 +1252,27 @@ function authCommandContext() {
   };
 }
 
+async function revokeRunningBridgePairing(): Promise<boolean> {
+  const state = readAppState();
+  if (!state.bridgeApiUrl || !state.controlToken) {
+    return false;
+  }
+  try {
+    const response = await fetch(new URL("/api/bridge/pairing/revoke", state.bridgeApiUrl), {
+      method: "POST",
+      headers: { "x-hunsu-bridge-control-token": state.controlToken }
+    });
+    if (!response.ok) {
+      return false;
+    }
+    writeAppState({ ...state, pairing: undefined });
+    writeStructuredLog({ event: "bridge.pairing.revoked", bridgeApiUrl: state.bridgeApiUrl });
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
 async function remoteCommand(parsed: ParsedArgs): Promise<void> {
   await runRemoteCommand(parsed, {
     ...remoteAccessRuntimeContext(),
@@ -1078,6 +1408,10 @@ function formatQuitBehavior(value: BridgeQuitBehavior): string {
 }
 
 async function superviseCommand(parsed: ParsedArgs): Promise<void> {
+  if (!getFlag(parsed, "attempt-id")) {
+    await ensureRunningCommand(parsed);
+    return;
+  }
   const cwd = resolve(getFlag(parsed, "cwd") ?? process.cwd());
   const state = readAppState();
   const supervisor = createBridgeAppSidecarSupervisorFromProcess({
@@ -1101,12 +1435,9 @@ async function superviseCommand(parsed: ParsedArgs): Promise<void> {
     startedAt: new Date().toISOString()
   });
   supervisor.start();
-  console.log("Hunsu Bridge sidecar supervisor started.");
-  console.log(JSON.stringify(supervisor.status(), null, 2));
+  writeStructuredLog({ event: "bridge.supervisor.started", status: supervisor.status() });
   try {
-    await waitForShutdown(async () => {
-      await supervisor.stop();
-    });
+    await waitForSidecarSupervisorTerminal(supervisor);
   } finally {
     clearSupervisorProcessState();
   }
@@ -1234,7 +1565,7 @@ function printAppStatus(handle: BridgeRuntimeHandle): void {
   console.log(`  Remote Access: ${formatBridgeRemoteAccess(state.remoteAccess)}`);
   console.log("");
   console.log("Actions:");
-  console.log(`  Open in Studio: ${handle.studioUrl ?? "Unavailable"}`);
+  console.log(`  Hunsu Web pairing: ${handle.pairingState === "paired" ? "Ready" : "Not created"}`);
   console.log(`  Local API: ${handle.bridgeApiUrl}`);
 }
 
@@ -1339,13 +1670,15 @@ function isHunsuBridgeHealthBody(body: unknown): body is { ok: true; service: "h
 
 async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
   let state = readAppState();
+  const discovery = await managedBridgeRuntime().discoverManagedBridge();
+  if (discovery.state === "running-managed") {
+    persistManagedBridgeIdentity(discovery);
+    state = readAppState();
+  }
   const health = await readBridgeHealth(state);
-  state = reconcileBridgeProcessState(state, health);
   const account = state.account?.status === "signed-in" ? `Signed in as ${state.account.email ?? state.account.userId}` : "Signed out";
-  const localBridge = localBridgeStatusFromProcessState(state, health, {
-    processIsAlive,
-    startingGraceMs: BRIDGE_STARTING_GRACE_MS
-  });
+  const localBridgeControl = localBridgeControlForDiscovery(discovery);
+  const localBridge = localBridgeSnapshotState(localBridgeControl);
   const codex = await getCodexRuntimeStatus({ env: codexProbeEnv() });
   state = reconcileCodexLoginFromStatus(codex, codexCliActionContext());
   const runtimeProviders = await runtimeProvidersSnapshot();
@@ -1354,13 +1687,18 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
     scopeValues: PROJECT_GRANT_SCOPE_VALUES,
     normalizeGrantPath
   });
-  return createBridgeAppSnapshot({
+  const packageManager = packageManagerStatus();
+  const version = bridgeVersionInfo();
+  const snapshot = createBridgeAppSnapshot({
     state,
     localBridge,
+    localBridgeControl,
     accountLabel: account,
     remoteAccessLabel: formatBridgeRemoteAccess(state.remoteAccess),
     bridgeApiUrl: health.ok ? health.bridgeApiUrl : state.bridgeApiUrl,
-    healthError: health.ok ? undefined : health.error,
+    healthError: localBridgeControl.state === "error"
+      ? localBridgeControl.startReason ?? localBridgeControl.stopReason ?? (health.ok ? undefined : health.error)
+      : undefined,
     runtimeProviders,
     providerConfig,
     managedRoadmaps,
@@ -1370,13 +1708,117 @@ async function readAppSnapshot(): Promise<BridgeAppSnapshot> {
     codex,
     tools: {
       git: toolStatus("git", ["--version"]),
-      node: currentNodeRuntimeStatus(),
-      packageManager: packageManagerStatus()
+      embeddedRuntime: {
+        kind: "node-sea",
+        installed: true,
+        version: process.version,
+        bundled: true
+      },
+      systemNode: {
+        ...toolStatus("node", ["--version"]),
+        optional: true
+      },
+      packageManager: {
+        ...packageManager,
+        name: packageManager.installed ? packageManagerName(packageManager.binaryPath) : undefined,
+        optional: true,
+        requiredFor: ["Installing Codex through npm"]
+      }
     },
     codexSettings: snapshotCodexSettings(state),
     diagnostics: await buildDiagnostics(diagnosticsCommandContext()),
-    logLines: readLogTail(appLogPath(), 80)
+    logLines: readLogTail(appLogPath(), 80),
+    versions: {
+      bridgeApp: HUNSU_BRIDGE_APP_VERSION,
+      bridgeRuntime: version.bridgeVersion,
+      protocol: version.protocolVersion,
+      embeddedNode: process.version,
+      codexCli: codex.cli.version
+    }
   });
+  const safeSnapshot = sanitizeDiagnostics(snapshot) as BridgeAppSnapshot;
+  assertDiagnosticsSafe(safeSnapshot);
+  return safeSnapshot;
+}
+
+function localBridgeControlForDiscovery(discovery: ManagedBridgeDiscovery): LocalBridgeControl {
+  switch (discovery.state) {
+    case "running-managed":
+      return {
+        state: "connected",
+        ownership: "managed",
+        canStart: false,
+        canStop: true,
+        startReason: "Bridge is already connected.",
+        instanceId: discovery.instanceId,
+        daemonPid: discovery.daemonPid,
+        supervisorPid: discovery.supervisorPid
+      };
+    case "stopping":
+      return {
+        state: "stopping",
+        ownership: "managed",
+        canStart: false,
+        canStop: false,
+        startReason: "Bridge shutdown is in progress.",
+        stopReason: "Bridge shutdown is in progress.",
+        instanceId: discovery.instanceId,
+        daemonPid: discovery.daemonPid,
+        supervisorPid: discovery.supervisorPid
+      };
+    case "running-unmanaged":
+      return {
+        state: "connected",
+        ownership: "unmanaged",
+        canStart: false,
+        canStop: false,
+        startReason: "A Bridge is already connected outside this app.",
+        stopReason: "This Bridge process is not managed by this app.",
+        instanceId: discovery.instanceId
+      };
+    case "starting":
+      return {
+        state: "starting",
+        ownership: "managed",
+        canStart: false,
+        canStop: false,
+        startReason: discovery.reason ?? "Bridge startup is in progress.",
+        stopReason: "Bridge startup is in progress."
+      };
+    case "port-conflict":
+      return {
+        state: "error",
+        ownership: "unknown",
+        canStart: false,
+        canStop: false,
+        startReason: discovery.reason,
+        stopReason: "Bridge ownership could not be verified."
+      };
+    case "stale":
+    case "not-running":
+      return {
+        state: "not-running",
+        ownership: "unknown",
+        canStart: true,
+        canStop: false,
+        stopReason: "Bridge is not running."
+      };
+  }
+}
+
+function localBridgeSnapshotState(control: LocalBridgeControl): BridgeAppSnapshot["status"]["localBridge"] {
+  if (control.state === "connected") return "connected";
+  if (control.state === "starting" || control.state === "stopping") return "starting";
+  if (control.state === "error") return "error";
+  return "not-running";
+}
+
+function packageManagerName(binaryPath: string | undefined): "pnpm" | "npm" | "yarn" | undefined {
+  const name = binaryPath?.trim().toLowerCase();
+  if (name === "pnpm" || name === "npm" || name === "yarn") {
+    return name;
+  }
+  return undefined;
 }
 
 async function providerConfigSnapshot(): Promise<BridgeAppSnapshot["providerConfig"]> {
@@ -1558,107 +2000,16 @@ function configuredBridgeApiUrl(): string | undefined {
   }
 }
 
-function reconcileBridgeProcessState(
-  state: BridgeAppState,
-  health: Awaited<ReturnType<typeof readBridgeHealth>>
-): BridgeAppState {
-  const pids = uniqueNumberList([state.supervisorPid, state.pid]);
-  if (pids.length === 0) {
-    return state;
-  }
-  const anyAlive = pids.some(pid => processIsAlive(pid));
-  const staleUrl = health.ok && state.bridgeApiUrl ? normalizeUrl(health.bridgeApiUrl) !== normalizeUrl(state.bridgeApiUrl) : false;
-  if (!anyAlive || staleUrl) {
-    const next = clearBridgeProcessRuntimeState(state);
-    writeAppState(next);
-    writeStructuredLog({
-      event: "bridge.state.stale-cleared",
-      reason: !anyAlive ? "process-dead" : "bridge-url-changed",
-      pids,
-      previousBridgeApiUrl: state.bridgeApiUrl,
-      healthBridgeApiUrl: health.ok ? health.bridgeApiUrl : undefined
-    });
-    return next;
-  }
-  return state;
-}
-
-async function stopBridgeThroughControlEndpoint(state: BridgeAppState): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (!state.bridgeApiUrl || !state.controlToken) {
-    return { ok: false, error: "No Bridge control endpoint is known." };
-  }
-  try {
-    const response = await fetch(new URL("/api/bridge/control/shutdown", state.bridgeApiUrl), {
-      method: "POST",
-      headers: {
-        "x-hunsu-bridge-control-token": state.controlToken
-      }
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => undefined) as { error?: string } | undefined;
-      return { ok: false, error: body?.error ?? `Bridge shutdown returned HTTP ${response.status}.` };
-    }
-    await new Promise(resolve => setTimeout(resolve, 150));
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : "Unable to reach Bridge control endpoint." };
-  }
-}
-
-function clearBridgeProcessRuntimeState(state: BridgeAppState): BridgeAppState {
-  return {
-    ...state,
-    supervisorPid: undefined,
-    pid: undefined,
-    supervisorProcess: undefined,
-    bridgeProcess: undefined,
-    bridgeApiUrl: undefined,
-    processNonce: undefined,
-    commandIdentity: undefined,
-    authToken: undefined,
-    controlToken: undefined,
-    pairing: undefined,
-    startedAt: undefined
-  };
-}
-
-function verifyManagedBridgePid(pid: number, state: BridgeAppState): { ok: true } | { ok: false; reason: string } {
-  if (!processIsAlive(pid)) {
-    return { ok: false, reason: "process_not_alive" };
-  }
-  const metadata = storedProcessMetadataForPid(pid, state);
-  if (!metadata?.startMetadata) {
-    return { ok: false, reason: "process_metadata_unavailable" };
-  }
-  const currentStartMetadata = processStartMetadata(pid);
-  if (!currentStartMetadata || !sameProcessStartMetadata(metadata.startMetadata, currentStartMetadata)) {
-    return { ok: false, reason: "process_start_metadata_mismatch" };
-  }
-  if (metadata.processNonce) {
-    const currentNonce = processEnvironmentValue(pid, BRIDGE_PROCESS_NONCE_ENV);
-    if (currentNonce !== metadata.processNonce) {
-      return { ok: false, reason: currentNonce ? "process_nonce_mismatch" : "process_nonce_unavailable" };
-    }
-  }
-  const commandLine = processCommandLine(pid);
-  if (!commandLine) {
-    return { ok: false, reason: "process_command_unavailable" };
-  }
-  const expectedKinds: BridgeProcessCommandIdentity["kind"][] = [metadata.commandIdentity.kind];
-  if (!commandLineLooksLikeBridgeApp(commandLine, expectedKinds)) {
-    return { ok: false, reason: "process_command_mismatch" };
-  }
-  return { ok: true };
-}
-
-function storedProcessMetadataForPid(pid: number, state: BridgeAppState): BridgeProcessRuntimeMetadata | undefined {
-  if (state.supervisorPid === pid && state.supervisorProcess?.pid === pid) {
-    return state.supervisorProcess;
-  }
-  if (state.pid === pid && state.bridgeProcess?.pid === pid) {
-    return state.bridgeProcess;
-  }
-  return undefined;
+async function stopManagedBridgeWithVerifiedWindowsFallback(
+  discovery: Extract<ManagedBridgeDiscovery, { state: "running-managed" }>
+): Promise<ManagedBridgeStopResult> {
+  const state = readAppState();
+  return stopVerifiedWindowsManagedBridge(discovery, state, {
+    platform: process.platform,
+    isBridgeOnline: async () => (await readBridgeHealth(state)).ok,
+    onStopped: () => writeAppState(clearManagedBridgeRuntimeState(readAppState())),
+    writeStructuredLog
+  });
 }
 
 function uniqueNumberList(values: Array<number | undefined>): number[] {
@@ -1669,12 +2020,10 @@ function uniqueStringList(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function normalizeUrl(value: string): string {
-  try {
-    return new URL(value).toString();
-  } catch (_error) {
-    return value;
-  }
+function isAddressInUseError(error: unknown): boolean {
+  return error instanceof Error
+    && ("code" in error && (error as NodeJS.ErrnoException).code === "EADDRINUSE"
+      || /EADDRINUSE|address already in use/iu.test(error.message));
 }
 
 function rememberRunningBridge(handle: BridgeRuntimeHandle, cwd: string, webUrl: string | undefined): void {
@@ -1706,9 +2055,9 @@ function clearManagedProcessState(): void {
       pid: undefined,
       bridgeProcess: undefined,
       bridgeApiUrl: undefined,
+      instanceId: undefined,
       processNonce: undefined,
       commandIdentity: undefined,
-      authToken: undefined,
       controlToken: undefined,
       pairing: undefined,
       startedAt: undefined
@@ -2057,8 +2406,14 @@ function roadmapRegistryOptions(): { roadmapRegistryPath?: string } {
 
 function writeStructuredLog(value: Record<string, unknown>): void {
   const path = appLogPath();
-  mkdirSync(dirname(path), { recursive: true });
-  appendFileSync(path, `${JSON.stringify({ ...value, at: new Date().toISOString() })}\n`, "utf8");
+  const safeValue = sanitizeDiagnostics({ ...value, at: new Date().toISOString() });
+  assertDiagnosticsSafe(safeValue);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(safeValue)}\n`, "utf8");
+  } catch (_error) {
+    // Logging must not make an otherwise safe command fail on a read-only host.
+  }
 }
 
 async function authDevServerCommand(parsed: ParsedArgs): Promise<void> {
@@ -2076,7 +2431,15 @@ function readLogTail(path: string, maxLines: number): string[] {
     return [];
   }
   try {
-    return readFileSync(path, "utf8").trimEnd().split("\n").slice(-maxLines);
+    return readFileSync(path, "utf8")
+      .trimEnd()
+      .split("\n")
+      .slice(-maxLines)
+      .map(line => {
+        const safeLine = redactDiagnosticText(line);
+        assertDiagnosticsSafe(safeLine);
+        return safeLine;
+      });
   } catch (_error) {
     return [];
   }
@@ -2103,6 +2466,34 @@ async function waitForShutdown(stop: () => Promise<void>): Promise<void> {
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
   });
+}
+
+async function waitForBridgeSupervisorTerminal(
+  supervisor: { waitForTerminal(): Promise<unknown>; stop(): Promise<unknown> },
+  stop: () => Promise<void> = async () => { await supervisor.stop(); }
+): Promise<void> {
+  let stopping = false;
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    void stop().catch(error => {
+      writeStructuredLog({ event: "bridge.stop.failed", error: error instanceof Error ? error.message : String(error) });
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  try {
+    await supervisor.waitForTerminal();
+  } finally {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+  }
+}
+
+async function waitForSidecarSupervisorTerminal(
+  supervisor: { waitForTerminal(): Promise<unknown>; stop(): Promise<unknown> }
+): Promise<void> {
+  await waitForBridgeSupervisorTerminal(supervisor);
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -2260,7 +2651,7 @@ function safeStudioNext(next: string): string {
 }
 
 async function openStudioManagedUrl(url: string): Promise<void> {
-  openStudioInBrowser(url);
+  await openStudioInBrowser(url);
 }
 
 function uniqueScopeList(scopes: BridgeCommandScope[]): BridgeCommandScope[] {
@@ -2317,4 +2708,10 @@ function isRelayCommandName(value: string): value is RelayCommandName {
   ].includes(value);
 }
 
-export { main, normalizeBridgeAppArgv };
+export {
+  applyDiagnosticsSecurityMigration,
+  main,
+  normalizeBridgeAppArgv,
+  readLogTail,
+  writeStructuredLog
+};
