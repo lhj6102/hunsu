@@ -29,7 +29,6 @@ import {
   completeStudioMove,
   connectRemoteBridge,
   createBridgePairingSession,
-  createBridgeSupervisor,
   createFilesystemBrowseGrant,
   createRemoteStudioConnectionStatus,
   createStudioConnectionStatus,
@@ -361,8 +360,8 @@ test("Bridge Execute preflight separates Roadmap readiness from Codex readiness"
   setRoadmapLifecycle({ roadmapId: inactive.roadmap.roadmapId }, "inactive", { roadmapRegistryPath: registryPath });
   mkdirSync(repoUnhealthyPlainGit, { recursive: true });
   run("git", ["init"], repoUnhealthyPlainGit);
-  const registry = JSON.parse(readFileSync(registryPath, "utf8")) as { roadmaps: Array<{ roadmapId: string; repositoryPath: string }> };
-  const unhealthyEntry = registry.roadmaps.find(entry => entry.roadmapId === unhealthy.roadmap.roadmapId);
+  const registry = JSON.parse(readFileSync(registryPath, "utf8")) as { workspaces: Array<{ workspaceId: string; repositoryPath: string }> };
+  const unhealthyEntry = registry.workspaces.find(entry => entry.workspaceId === unhealthy.roadmap.roadmapId);
   if (unhealthyEntry) {
     unhealthyEntry.repositoryPath = repoUnhealthyPlainGit;
   }
@@ -381,21 +380,21 @@ test("Bridge Execute preflight separates Roadmap readiness from Codex readiness"
   assert.equal(inactiveResponse.body.error, "WORKSPACE_INACTIVE");
   assert.equal(inactiveResponse.body.runtime, undefined);
   assert.deepEqual(inactiveResponse.body.actions.map((action: { type: string }) => action.type), ["open_workspaces", "activate_workspace"]);
-  assert.match(inactiveResponse.body.actions.find((action: { type: string; href?: string }) => action.type === "activate_workspace")?.href ?? "", /^hunsu:\/\/activate-workspace\?workspaceId=/);
+  assert.equal(inactiveResponse.body.actions.find((action: { type: string; href?: string }) => action.type === "activate_workspace")?.href, "/studio");
 
   const unhealthyServer = createStudioServer({ cwd: repoUnhealthyPlainGit, state, persist: true, roadmapRegistryPath: registryPath });
   const unhealthyResponse = await requestStudioServerJson(unhealthyServer, "POST", "/api/runs/start", body);
   assert.equal(unhealthyResponse.status, 409);
   assert.equal(unhealthyResponse.body.area, "workspace");
   assert.equal(unhealthyResponse.body.error, "WORKSPACE_UNHEALTHY");
-  assert.equal(unhealthyResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://workspaces"), true);
+  assert.equal(unhealthyResponse.body.actions.some((action: { href?: string }) => action.href === "/studio"), true);
 
   const missingServer = createStudioServer({ cwd: repoMissing, state, persist: true, roadmapRegistryPath: registryPath });
   const missingResponse = await requestStudioServerJson(missingServer, "POST", "/api/runs/start", body);
   assert.equal(missingResponse.status, 409);
   assert.equal(missingResponse.body.area, "workspace");
   assert.equal(missingResponse.body.error, "WORKSPACE_MISSING");
-  assert.equal(missingResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://workspaces"), true);
+  assert.equal(missingResponse.body.actions.some((action: { href?: string }) => action.href === "/studio"), true);
 
   const missingProviderRuntimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(parent, "missing-codex-path")
@@ -409,7 +408,7 @@ test("Bridge Execute preflight separates Roadmap readiness from Codex readiness"
   assert.equal(providerResponse.body.area, "provider");
   assert.equal(providerResponse.body.error, "PROVIDER_MISSING");
   assert.equal(providerResponse.body.providerId, "codex");
-  assert.equal(providerResponse.body.actions.some((action: { href?: string }) => action.href === "hunsu://provider/codex"), true);
+  assert.equal(providerResponse.body.actions.some((action: { href?: string }) => action.href === "/studio/setup?next=%2Fstudio"), true);
 });
 
 test("Bridge runtime provider facade maps Codex status and registry placeholders", async () => {
@@ -920,19 +919,12 @@ test("Bridge Codex provider env and auth-home diagnostics are explicit and secre
 
 test("Bridge status and workspace APIs expose provider, local backend, and remote workspaces", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-bridge-status-test-"));
-  const registryPath = join(root, "roadmaps.json");
+  const registryPath = join(root, "workspaces.json");
   const relayRegistryPath = join(root, "relay-devices.json");
-  const bridgeAppStatePath = join(root, "bridge-app.json");
   const state = createStudioState();
   const active = createStudioRoadmap({ path: join(root, "active-workspace"), title: "active-workspace" }, state, { persist: true, roadmapRegistryPath: registryPath });
   const inactive = createStudioRoadmap({ path: join(root, "inactive-workspace"), title: "inactive-workspace" }, state, { persist: true, roadmapRegistryPath: registryPath });
   setRoadmapLifecycle({ roadmapId: inactive.roadmap.roadmapId }, "inactive", { roadmapRegistryPath: registryPath });
-  writeFileSync(registryPath, `${JSON.stringify({
-    ...JSON.parse(readFileSync(registryPath, "utf8")),
-    roadmaps: (JSON.parse(readFileSync(registryPath, "utf8")) as { roadmaps: Array<Record<string, unknown>> }).roadmaps.map(roadmap => roadmap.roadmapId === active.roadmap.roadmapId
-      ? { ...roadmap, remoteAccess: { enabled: true, scopes: ["remoteRelay.access"] } }
-      : roadmap)
-  }, null, 2)}\n`, "utf8");
   writeFileSync(relayRegistryPath, `${JSON.stringify({
     schema: "hunsu.relay-registry.v1",
     devices: [{
@@ -947,7 +939,7 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
         workspaceId: "remote_workspace_1",
         roadmapId: "remote_workspace_1",
         displayName: "remote-workspace",
-        path: "/remote/active-workspace",
+        path: active.repository.root,
         lifecycle: "active",
         health: "ok",
         backendId: "local",
@@ -963,7 +955,7 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
   }, null, 2)}\n`, "utf8");
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(root, "missing-path"),
-    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath,
+    HUNSU_HOME: root,
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
     HUNSU_BRIDGE_DEVICE_ID: "device_local",
     HUNSU_BRIDGE_DEVICE_NAME: "Local Devbox"
@@ -983,15 +975,15 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
   assert.deepEqual(queryOnlyStatus.body.workspaces.active.map((workspace: { displayName: string }) => workspace.displayName), ["active-workspace"]);
   assert.equal(queryOnlyStatus.body.workspaces.managed.length, 2);
 
-  writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-    schema: "hunsu.bridge-app-state.v1",
-    account: { status: "signed-in", userId: "user_1", email: "user_1@example.test" },
-    projectGrants: []
+  writeFileSync(join(root, "credentials.json"), `${JSON.stringify({
+    schema: "hunsu.bridge.credentials.v1",
+    controlToken: "test-control-token",
+    account: { accountId: "user_1", accessToken: "test-account-token", refreshToken: null, expiresAt: null },
+    relay: null
   }, null, 2)}\n`, "utf8");
-  runtimeConfig.processEnv.HUNSU_BRIDGE_APP_STATE_PATH = bridgeAppStatePath;
   const status = await requestStudioServerJson(server, "GET", "/api/bridge/status");
   assert.equal(status.body.account.signedIn, true);
-  assert.equal(status.body.account.source, "bridge_app");
+  assert.equal(status.body.account.source, "daemon");
   assert.equal(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.label, "MacBook Pro");
   assert.equal(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.provider.providerId, "remote:device_1:provider");
   assert.match(status.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.provider.safeMessage ?? "", /Remote provider status is not available/);
@@ -1016,32 +1008,29 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
   assert.equal(remoteWorkspace?.path, undefined);
   assert.equal(remoteWorkspace?.pathRedacted, true);
 
-  writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-    schema: "hunsu.bridge-app-state.v1",
-    account: { status: "signed-in", userId: "user_1", email: "user_1@example.test" },
-    projectGrants: [{
-      path: "/remote/active-workspace",
-      grantedAt: "2026-07-09T00:02:00.000Z",
-      scopes: ["remoteRelay.access"]
-    }]
+  writeFileSync(join(root, "config.json"), `${JSON.stringify({
+    schema: "hunsu.bridge.config.v1",
+    host: "127.0.0.1",
+    port: 19687,
+    provider: { kind: "unconfigured" },
+    remote: { enabled: true }
   }, null, 2)}\n`, "utf8");
-  runtimeConfig.processEnv.HUNSU_BRIDGE_APP_STATE_PATH = bridgeAppStatePath;
   const persistedStatus = await requestStudioServerJson(server, "GET", "/api/bridge/status");
   const persistedRemoteWorkspace = persistedStatus.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.workspaces[0];
   assert.equal(persistedStatus.body.account.signedIn, true);
-  assert.equal(persistedStatus.body.account.email, "user_1@example.test");
-  assert.equal(persistedRemoteWorkspace?.path, "/remote/active-workspace");
-  assert.equal(persistedRemoteWorkspace?.pathRedacted, undefined);
+  assert.equal(persistedStatus.body.account.userId, "user_1");
+  assert.equal(persistedRemoteWorkspace?.path, undefined);
+  assert.equal(persistedRemoteWorkspace?.pathRedacted, true);
 
   runtimeConfig.processEnv.HUNSU_BRIDGE_ACCOUNT_USER_ID = "user_1";
   runtimeConfig.processEnv.HUNSU_BRIDGE_PROJECT_GRANTS_JSON = JSON.stringify([{
-    path: "/remote/active-workspace",
+    path: active.repository.root,
     scopes: ["remoteRelay.access"]
   }]);
   const grantedStatus = await requestStudioServerJson(server, "GET", "/api/bridge/status");
   const grantedRemoteWorkspace = grantedStatus.body.connections.find((connection: { mode: string }) => connection.mode === "remote")?.workspaces[0];
   assert.equal(grantedStatus.body.account.signedIn, true);
-  assert.equal(grantedRemoteWorkspace?.path, "/remote/active-workspace");
+  assert.equal(grantedRemoteWorkspace?.path, active.repository.root);
   assert.equal(grantedRemoteWorkspace?.pathRedacted, undefined);
 
   const activeWorkspaces = await requestStudioServerJson(server, "GET", "/api/workspaces/active");
@@ -1073,9 +1062,8 @@ test("Bridge status and workspace APIs expose provider, local backend, and remot
 
 test("Bridge Execute preflight honors selected remote backend with x-hunsu-bridge-token", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-selected-remote-preflight-test-"));
-  const registryPath = join(root, "roadmaps.json");
+  const registryPath = join(root, "workspaces.json");
   const relayRegistryPath = join(root, "relay-devices.json");
-  const bridgeAppStatePath = join(root, "bridge-app.json");
   const state = createStudioState();
   const active = createStudioRoadmap({ path: join(root, "active-workspace"), title: "active-workspace" }, state, { persist: true, roadmapRegistryPath: registryPath });
   writeFileSync(relayRegistryPath, `${JSON.stringify({
@@ -1097,7 +1085,7 @@ test("Bridge Execute preflight honors selected remote backend with x-hunsu-bridg
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(root, "missing-path"),
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
-    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+    HUNSU_HOME: root
   }, {
     cwd: active.repository.root,
     roadmapRegistryPath: registryPath
@@ -1119,10 +1107,11 @@ test("Bridge Execute preflight honors selected remote backend with x-hunsu-bridg
   });
 
   try {
-    writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-      schema: "hunsu.bridge-app-state.v1",
-      account: { status: "signed-in", userId: "user_remote", email: "remote@example.test" },
-      projectGrants: []
+    writeFileSync(join(root, "credentials.json"), `${JSON.stringify({
+      schema: "hunsu.bridge.credentials.v1",
+      controlToken: "test-control-token",
+      account: { accountId: "user_remote", accessToken: "test-account-token", refreshToken: null, expiresAt: null },
+      relay: null
     }, null, 2)}\n`, "utf8");
     const executeBody = {
       requestId: String(active.board.requests[0].id),
@@ -1239,9 +1228,8 @@ test("Bridge Execute rejects unknown explicit backend IDs before inventory or ru
 test("Bridge Execute rejects a remote-unsupported Harness Member model before invoking the runner", async () => {
   const configRoot = mkdtempSync(join(tmpdir(), "hunsu-remote-harness-model-preflight-test-"));
   const repo = createRepo();
-  const registryPath = join(configRoot, "roadmaps.json");
+  const registryPath = join(configRoot, "workspaces.json");
   const relayRegistryPath = join(configRoot, "relay-devices.json");
-  const bridgeAppStatePath = join(configRoot, "bridge-app.json");
   const state = createStudioState();
   const protocol = createDefaultHarness();
   protocol.members[0].modelSelection = {
@@ -1319,15 +1307,16 @@ test("Bridge Execute rejects a remote-unsupported Harness Member model before in
       }]
     }]
   }, null, 2)}\n`, "utf8");
-  writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-    schema: "hunsu.bridge-app-state.v1",
-    account: { status: "signed-in", userId: "user_model_test", email: "model-test@example.test" },
-    projectGrants: []
+  writeFileSync(join(configRoot, "credentials.json"), `${JSON.stringify({
+    schema: "hunsu.bridge.credentials.v1",
+    controlToken: "test-control-token",
+    account: { accountId: "user_model_test", accessToken: "test-account-token", refreshToken: null, expiresAt: null },
+    relay: null
   }, null, 2)}\n`, "utf8");
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(configRoot, "missing-path"),
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
-    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+    HUNSU_HOME: configRoot
   }, {
     cwd: repo,
     roadmapRegistryPath: registryPath
@@ -1397,9 +1386,8 @@ test("Bridge Execute rejects a remote-unsupported Harness Member model before in
 test("Bridge Execute resume revalidates remote backend inventory and models before state or runner work", async () => {
   const configRoot = mkdtempSync(join(tmpdir(), "hunsu-remote-resume-preflight-test-"));
   const repo = createRepo();
-  const registryPath = join(configRoot, "roadmaps.json");
+  const registryPath = join(configRoot, "workspaces.json");
   const relayRegistryPath = join(configRoot, "relay-devices.json");
-  const bridgeAppStatePath = join(configRoot, "bridge-app.json");
   const state = createStudioState();
   const protocol = createDefaultHarness();
   protocol.members[0].modelSelection = {
@@ -1439,10 +1427,11 @@ test("Bridge Execute resume revalidates remote backend inventory and models befo
       workspaces: []
     }]
   }, null, 2)}\n`, "utf8");
-  writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-    schema: "hunsu.bridge-app-state.v1",
-    account: { status: "signed-in", userId: "user_resume", email: "resume@example.test" },
-    projectGrants: []
+  writeFileSync(join(configRoot, "credentials.json"), `${JSON.stringify({
+    schema: "hunsu.bridge.credentials.v1",
+    controlToken: "test-control-token",
+    account: { accountId: "user_resume", accessToken: "test-account-token", refreshToken: null, expiresAt: null },
+    relay: null
   }, null, 2)}\n`, "utf8");
 
   const localInventory = providerInventoryForBridgeStatus({ provider: remoteProvider });
@@ -1474,7 +1463,7 @@ test("Bridge Execute resume revalidates remote backend inventory and models befo
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(configRoot, "missing-path"),
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
-    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+    HUNSU_HOME: configRoot
   }, {
     cwd: repo,
     roadmapRegistryPath: registryPath
@@ -1593,22 +1582,22 @@ test("Bridge Execute resume revalidates remote backend inventory and models befo
   }
 });
 
-test("Bridge remote enable uses persisted Bridge App sign-in evidence", async () => {
+test("Bridge remote enable uses persisted daemon sign-in evidence", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-remote-enable-account-evidence-test-"));
-  const registryPath = join(root, "roadmaps.json");
+  const registryPath = join(root, "workspaces.json");
   const relayRegistryPath = join(root, "relay-devices.json");
-  const bridgeAppStatePath = join(root, "bridge-app.json");
   const state = createStudioState();
   const active = createStudioRoadmap({ path: join(root, "active-workspace"), title: "active-workspace" }, state, { persist: true, roadmapRegistryPath: registryPath });
-  writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-    schema: "hunsu.bridge-app-state.v1",
-    account: { status: "signed-in", userId: "persisted_user", email: "persisted@example.test" },
-    projectGrants: []
+  writeFileSync(join(root, "credentials.json"), `${JSON.stringify({
+    schema: "hunsu.bridge.credentials.v1",
+    controlToken: "test-control-token",
+    account: { accountId: "persisted_user", accessToken: "test-account-token", refreshToken: null, expiresAt: null },
+    relay: null
   }, null, 2)}\n`, "utf8");
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(root, "missing-path"),
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
-    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath,
+    HUNSU_HOME: root,
     HUNSU_BRIDGE_DEVICE_ID: "device_persisted",
     HUNSU_BRIDGE_DEVICE_NAME: "Persisted Devbox"
   }, {
@@ -1622,12 +1611,13 @@ test("Bridge remote enable uses persisted Bridge App sign-in evidence", async ()
     assert.equal(enabled.status, 202);
     assert.equal(enabled.body.device.userId, "persisted_user");
     const status = await requestStudioServerJson(server, "GET", "/api/bridge/status");
-    assert.equal(status.body.account.source, "bridge_app");
+    assert.equal(status.body.account.source, "daemon");
 
-    writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-      schema: "hunsu.bridge-app-state.v1",
-      account: { status: "signed-out" },
-      projectGrants: []
+    writeFileSync(join(root, "credentials.json"), `${JSON.stringify({
+      schema: "hunsu.bridge.credentials.v1",
+      controlToken: "test-control-token",
+      account: null,
+      relay: null
     }, null, 2)}\n`, "utf8");
     const rejected = await requestStudioServerJson(server, "POST", "/api/connections/remote/enable?userId=loose_user");
     assert.equal(rejected.status, 401);
@@ -1639,9 +1629,8 @@ test("Bridge remote enable uses persisted Bridge App sign-in evidence", async ()
 
 test("Bridge remote enable publishes active workspaces and project grants", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-remote-publish-test-"));
-  const registryPath = join(root, "roadmaps.json");
+  const registryPath = join(root, "workspaces.json");
   const relayRegistryPath = join(root, "relay-devices.json");
-  const bridgeAppStatePath = join(root, "bridge-app.json");
   const state = createStudioState();
   const active = createStudioRoadmap({ path: join(root, "active-workspace"), title: "active-workspace" }, state, { persist: true, roadmapRegistryPath: registryPath });
   const inactive = createStudioRoadmap({ path: join(root, "inactive-workspace"), title: "inactive-workspace" }, state, { persist: true, roadmapRegistryPath: registryPath });
@@ -1649,7 +1638,7 @@ test("Bridge remote enable publishes active workspaces and project grants", asyn
   const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
     PATH: join(root, "missing-path"),
     HUNSU_RELAY_REGISTRY_PATH: relayRegistryPath,
-    HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath,
+    HUNSU_HOME: root,
     HUNSU_BRIDGE_DEVICE_ID: "device_publish",
     HUNSU_BRIDGE_DEVICE_NAME: "Publish Devbox"
   }, {
@@ -1659,10 +1648,11 @@ test("Bridge remote enable publishes active workspaces and project grants", asyn
   const server = createStudioServer({ cwd: active.repository.root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
 
   try {
-    writeFileSync(bridgeAppStatePath, `${JSON.stringify({
-      schema: "hunsu.bridge-app-state.v1",
-      account: { status: "signed-in", userId: "user_publish", email: "user_publish@example.test" },
-      projectGrants: []
+    writeFileSync(join(root, "credentials.json"), `${JSON.stringify({
+      schema: "hunsu.bridge.credentials.v1",
+      controlToken: "test-control-token",
+      account: { accountId: "user_publish", accessToken: "test-account-token", refreshToken: null, expiresAt: null },
+      relay: null
     }, null, 2)}\n`, "utf8");
     const enabled = await requestStudioServerJson(server, "POST", "/api/connections/remote/enable");
     assert.equal(enabled.status, 202);
@@ -2030,7 +2020,7 @@ test("Bridge runtime Codex ChatGPT login endpoint records pending state and auth
 test("Bridge provider facade login and configure endpoints use the Codex adapter", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-provider-facade-test-"));
   const fakeCodex = join(root, "codex");
-  const bridgeAppStatePath = join(root, "bridge-app-state.json");
+  const configPath = join(root, "config.json");
   const codexHome = join(root, "codex-home");
   const loginEnvPath = join(root, "codex-login-env.json");
   mkdirSync(codexHome, { recursive: true });
@@ -2058,7 +2048,7 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
   try {
     const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
       PATH: "",
-      HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+      HUNSU_HOME: root
     }, { cwd: root }));
     const state = createStudioState();
     const server = createStudioServer({ cwd: root, state, persist: false, runner: new FakeRunner(), runtimeConfig });
@@ -2083,12 +2073,10 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
     assert.equal(current.body.ready, true);
     assert.equal(current.body.install.binaryPath, fakeCodex);
     assert.equal(current.body.diagnostics.effectiveEnv.HUNSU_CODEX_BINARY_PATH, fakeCodex);
-    const persistedState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
-      codex?: { binaryPath?: string; codexHome?: string };
-      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string } } } };
+    const persistedState = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider?: { binaryPath?: string; home?: string };
     };
-    assert.equal(persistedState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
-    assert.equal(persistedState.codex?.binaryPath, undefined);
+    assert.equal(persistedState.provider?.binaryPath, fakeCodex);
 
     const config = await requestStudioServerJson(server, "GET", "/api/providers/current/config");
     assert.equal(config.status, 200);
@@ -2108,15 +2096,12 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
     assert.equal(saved.status, 202);
     assert.equal(saved.body.status.ready, true);
     assert.equal(saved.body.status.diagnostics.effectiveEnv.CODEX_HOME, codexHome);
-    const savedState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
-      codex?: { binaryPath?: string; codexHome?: string };
-      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string; authenticationPreference?: string } } } };
+    const savedState = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider?: { binaryPath?: string; home?: string; authenticationPreference?: string };
     };
-    assert.equal(savedState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
-    assert.equal(savedState.runtimeProviders?.providers?.codex?.settings?.codexHome, codexHome);
-    assert.equal(savedState.runtimeProviders?.providers?.codex?.settings?.authenticationPreference, "device_code");
-    assert.equal(savedState.codex?.binaryPath, undefined);
-    assert.equal(savedState.codex?.codexHome, undefined);
+    assert.equal(savedState.provider?.binaryPath, fakeCodex);
+    assert.equal(savedState.provider?.home, codexHome);
+    assert.equal(savedState.provider?.authenticationPreference, "device_code");
 
     const login = await requestStudioServerJson(server, "POST", "/api/providers/current/login", { method: "chatgpt" });
     assert.equal(login.status, 202);
@@ -2140,19 +2125,19 @@ test("Bridge provider facade login and configure endpoints use the Codex adapter
 
     const keyReset = await requestStudioServerJson(server, "DELETE", "/api/providers/current/config/codexHome");
     assert.equal(keyReset.status, 202);
-    const keyResetState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
-      runtimeProviders?: { providers?: { codex?: { settings?: { binaryPath?: string; codexHome?: string; authenticationPreference?: string } } } };
+    const keyResetState = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider?: { binaryPath?: string; home?: string; authenticationPreference?: string };
     };
-    assert.equal(keyResetState.runtimeProviders?.providers?.codex?.settings?.binaryPath, fakeCodex);
-    assert.equal(keyResetState.runtimeProviders?.providers?.codex?.settings?.codexHome, undefined);
-    assert.equal(keyResetState.runtimeProviders?.providers?.codex?.settings?.authenticationPreference, "device_code");
+    assert.equal(keyResetState.provider?.binaryPath, fakeCodex);
+    assert.equal(keyResetState.provider?.home, undefined);
+    assert.equal(keyResetState.provider?.authenticationPreference, "device_code");
 
     const deleted = await requestStudioServerJson(server, "DELETE", "/api/providers/current/config");
     assert.equal(deleted.status, 202);
-    const resetState = JSON.parse(readFileSync(bridgeAppStatePath, "utf8")) as {
-      runtimeProviders?: { providers?: { codex?: { settings?: Record<string, unknown> } } };
+    const resetState = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider?: Record<string, unknown>;
     };
-    assert.deepEqual(resetState.runtimeProviders?.providers?.codex?.settings, {});
+    assert.deepEqual(resetState.provider, { kind: "codex" });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2164,7 +2149,6 @@ test("Bridge provider config validation probes saved app-server command and pars
   const appServerCommand = join(root, "codex-app-server");
   const binaryAppServerLog = join(root, "binary-app-server.log");
   const appServerLog = join(root, "app-server.log");
-  const bridgeAppStatePath = join(root, "bridge-app-state.json");
   writeFileSync(binaryPath, [
     `#!${process.execPath}`,
     "const fs = require('node:fs');",
@@ -2196,7 +2180,7 @@ test("Bridge provider config validation probes saved app-server command and pars
   try {
     const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
       PATH: "",
-      HUNSU_BRIDGE_APP_STATE_PATH: bridgeAppStatePath
+      HUNSU_HOME: root
     }, { cwd: root }));
     const server = createStudioServer({ cwd: root, persist: false, runner: new FakeRunner(), runtimeConfig });
     const fields = [
@@ -3755,110 +3739,6 @@ test("Bridge server exposes sanitized legacy Codex provider status", async () =>
   assert.doesNotMatch(serialized, /sk-provider-secret|refresh-provider-secret|codex-token-secret|raw-limit-id|hardLimitUsd/);
 });
 
-test("Bridge supervisor starts, stops, and creates pairing URLs", async () => {
-  const repo = createRepo();
-  const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({}, { cwd: repo }));
-  const supervisor = createBridgeSupervisor();
-  const handle = await supervisor.start({
-    cwd: repo,
-    webUrl: "http://127.0.0.1:19688/studio",
-    noOpen: true,
-    runtimeConfig: {
-      ...runtimeConfig,
-      bridgeApi: {
-        ...runtimeConfig.bridgeApi,
-        port: 0
-      }
-    }
-  });
-
-  try {
-    assert.equal(handle.status, "running");
-    assert.match(handle.bridgeApiUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
-    if (handle.pairingState !== "paired") {
-      assert.fail("Default Bridge startup should create an active pairing.");
-    }
-    assert.match(handle.authToken, /^hunsu_bridge_/);
-    assert.equal(bridgePairingSessionState(handle.pairing), "active");
-    const health = await fetch(`${handle.bridgeApiUrl}/health`);
-    assert.equal(health.status, 200);
-    const healthBody = await health.json() as { ok: boolean; service: string; version: { protocolVersion: string } };
-    assert.equal(healthBody.ok, true);
-    assert.equal(healthBody.service, "hunsu-bridge");
-    assert.equal(healthBody.version.protocolVersion, bridgeVersionInfo().protocolVersion);
-
-    const pairingUrl = await supervisor.createPairingUrl({ roadmapId: "roadmap_pairing" });
-    assert.match(pairingUrl, /\/studio\/roadmaps\/roadmap_pairing/);
-    assert.match(pairingUrl, new RegExp(`hunsuBridgeToken=${handle.authToken}`));
-
-    const connectionStatus = createStudioConnectionStatus({
-      bridgeApiUrl: handle.bridgeApiUrl,
-      runtimeConfig: {
-        ...runtimeConfig,
-        bridgeApi: {
-          ...runtimeConfig.bridgeApi,
-          host: "0.0.0.0"
-        }
-      }
-    });
-    assert.equal(connectionStatus.version.protocolVersion, bridgeVersionInfo().protocolVersion);
-    assert.deepEqual(connectionStatus.warnings, ["public_bind"]);
-
-    const oldToken = handle.authToken;
-    assert.match(handle.controlToken, /^hunsu_bridge_control_/);
-    const rejectedControl = await fetch(`${handle.bridgeApiUrl}/api/bridge/pairing/rotate`, {
-      method: "POST",
-      headers: {
-        "x-hunsu-bridge-control-token": "wrong-control-token",
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({})
-    });
-    assert.equal(rejectedControl.status, 401);
-    assert.equal((await rejectedControl.json()).code, "bridge_control_token_invalid");
-
-    const controlledRevoke = await fetch(`${handle.bridgeApiUrl}/api/bridge/pairing/revoke`, {
-      method: "POST",
-      headers: { "x-hunsu-bridge-control-token": handle.controlToken }
-    });
-    assert.equal(controlledRevoke.status, 202);
-    assert.equal((await controlledRevoke.json()).revoked, true);
-    const controlledRevokedResponse = await fetch(`${handle.bridgeApiUrl}/api/roadmaps/recent`, {
-      headers: { "x-hunsu-bridge-token": oldToken }
-    });
-    assert.equal(controlledRevokedResponse.status, 401);
-    assert.equal((await controlledRevokedResponse.json()).code, "pairing_token_revoked");
-
-    const controlledRotate = await fetch(`${handle.bridgeApiUrl}/api/bridge/pairing/rotate`, {
-      method: "POST",
-      headers: {
-        "x-hunsu-bridge-control-token": handle.controlToken,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ webUrl: "http://127.0.0.1:19688/studio", roadmapId: "roadmap_pairing" })
-    });
-    assert.equal(controlledRotate.status, 202);
-    const controlledRotateBody = await controlledRotate.json() as { authToken: string; studioUrl: string };
-    assert.notEqual(controlledRotateBody.authToken, oldToken);
-    assert.match(controlledRotateBody.studioUrl, /\/studio\/roadmaps\/roadmap_pairing/);
-    const controlledAccepted = await fetch(`${handle.bridgeApiUrl}/api/roadmaps/recent`, {
-      headers: { "x-hunsu-bridge-token": controlledRotateBody.authToken }
-    });
-    assert.equal(controlledAccepted.status, 200);
-
-    const rotated = await supervisor.rotatePairing();
-    if (rotated.pairingState !== "paired") {
-      assert.fail("Pairing rotation should produce a paired runtime handle.");
-    }
-    assert.notEqual(rotated.authToken, oldToken);
-    assert.equal(bridgePairingSessionState(rotated.pairing), "active");
-  } finally {
-    await supervisor.stop();
-  }
-
-  assert.equal((await supervisor.status())?.status, "stopped");
-});
-
 test("Bridge server requires allowed browser origins and pairing tokens for protected APIs", async () => {
   const runner = new FakeRunner();
   runner.providerStatusResponse = { backend: "app-server", available: true };
@@ -3900,7 +3780,7 @@ test("Bridge server requires allowed browser origins and pairing tokens for prot
   const publicHealth = await requestStudioServerJson(server, "GET", "/health");
   assert.equal(publicHealth.status, 200);
   assert.equal(publicHealth.body.service, "hunsu-bridge");
-  assert.equal(publicHealth.body.version.protocolVersion, bridgeVersionInfo().protocolVersion);
+  assert.equal(publicHealth.body.protocolVersion, bridgeVersionInfo().protocolVersion);
 
   const preflight = await requestStudioServerJson(server, "OPTIONS", "/api/filesystem/grants", undefined, {
     headers: {
@@ -3946,7 +3826,7 @@ test("Bridge API exposes Remote Bridge devices and remote connection status", as
       registeredAt: new Date().toISOString(),
       lastSeenAt: new Date().toISOString(),
       status: "online",
-      bridgeVersion: "0.1.2",
+      bridgeVersion: bridgeVersionInfo().bridgeVersion,
       protocolVersion: "local-bridge-v1"
     }]
   }), "utf8");
@@ -4163,17 +4043,6 @@ test("Bridge version compatibility reports update and feature requirements", () 
   assert.equal(tooOldStudio.compatible, false);
   if (!tooOldStudio.compatible) assert.equal(tooOldStudio.reason, "studio_update_needed");
 
-  const oldBridgeApp = evaluateBridgeCompatibility({
-    ...current,
-    bridgeAppVersion: "0.1.0"
-  }, {
-    minBridgeVersion: current.bridgeVersion,
-    minBridgeAppVersionForRelay: "9.0.0",
-    requiredProtocolVersion: current.protocolVersion,
-    requiredFeatures: []
-  });
-  assert.equal(oldBridgeApp.compatible, false);
-  if (!oldBridgeApp.compatible) assert.equal(oldBridgeApp.reason, "bridge_app_update_needed");
 });
 
 test("Bridge server default Codex runner uses resolved app-server config", async () => {
