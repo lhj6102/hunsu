@@ -9,17 +9,19 @@
       {
         "target": "Windows x64",
         "workflow": "Bridge Desktop Artifacts",
-        "runId": 29118028406,
-        "commit": "a6ebe5f887fe4e13588e6cb538d223dc4ab5a6aa",
+        "runId": 29140643663,
+        "commit": "55426874276b2011fe1c74aa6bbad672f0f53e0f",
         "status": "passed",
         "artifact": "hunsu-bridge-windows-x64",
-        "artifactId": 8237547490,
-        "artifactSizeBytes": 24981539,
-        "artifactDigest": "sha256:3cbf784f1df6af9408d36d1fe4631bf7090a0f425e1125f125c8987190a35b2b",
-        "evidenceUrl": "https://github.com/lhj6102/hunsu/actions/runs/29118028406",
+        "artifactId": 8245078964,
+        "artifactSizeBytes": 25059696,
+        "artifactDigest": "sha256:f70f076c4fd6993f1ae0f506ea115204e6c2dc6eba1232315e5d49ddc1b371cf",
+        "evidenceUrl": "https://github.com/lhj6102/hunsu/actions/runs/29140643663",
         "evidenceFiles": [
           "windows-managed-bridge-e2e-evidence.json",
-          "windows-installed-app-e2e-evidence.json"
+          "windows-installed-app-e2e-evidence.json",
+          "windows-installed-app-e2e-screenshot.png",
+          "docs/qa/windows-x64-installed-app-29140643663.md"
         ],
         "checks": [
           "Windows Tauri and NSIS bundle build",
@@ -27,6 +29,8 @@
           "packaged sidecar smoke test",
           "managed Bridge lifecycle scenarios A-F",
           "silent NSIS install and Tauri WebView2 automation",
+          "actionable configured-port conflict feedback",
+          "unambiguous Advanced navigation and Remote Access presentation",
           "safe lifecycle and installed-app evidence checksum staging",
           "candidate artifact upload"
         ]
@@ -70,7 +74,8 @@
         "apps/bridge-desktop/scripts/windows-installed-app-webview-e2e.mjs",
         ".github/workflows/bridge-desktop-artifacts.yml",
         "tests/bridge-desktop-windows-e2e-script.test.ts",
-        "tests/bridge-desktop-installed-app-e2e.test.ts"
+        "tests/bridge-desktop-installed-app-e2e.test.ts",
+        "docs/qa/windows-x64-installed-app-29140643663.md"
       ],
       "checks": [
         "active NSIS installer registers hunsu:// through Tauri desktop deep-link configuration",
@@ -82,6 +87,8 @@
         "unmanaged Hunsu and non-Hunsu port owners are not replaced or killed",
         "P0 diagnostics and log redaction run with synthetic pairing tokens",
         "installed NSIS candidate reuses the managed daemon and passes real WebView2 lifecycle, Workspace Open, provider-feedback, diagnostics-copy, and version-label checks",
+        "installed app reports the configured port and points users to Connection and Start Bridge without disturbing an unrelated listener",
+        "installed app visibly selects the active Advanced tab and avoids duplicate Remote Access and Git controls",
         "both safe evidence files are included in the candidate checksum manifest"
       ]
     },

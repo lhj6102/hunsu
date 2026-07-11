@@ -510,10 +510,13 @@ The native/browser QA contract is recorded in
 `tests/bridge-qa-matrix.test.ts`. The matrix covers macOS, Windows, Linux GUI,
 Linux no-GUI, and Chrome/Safari/Edge/Firefox browser checks with concrete
 in-repo evidence files and command checklists. Real native-host executions are
-recorded separately in the matrix's `nativeHostResults` section. As of
-2026-07-10, this Linux no-GUI workspace has not run macOS, Windows, Linux GUI,
-packaged installer, tray/menu-bar, or native daemon QA; those remain external
-host blockers rather than contract-only pass claims.
+recorded separately in the matrix's `nativeHostResults` section. On 2026-07-11,
+Windows x64 run `29140643663` validated the NSIS-installed app on a
+GitHub-hosted Windows runner, including managed lifecycle scenarios A-F and
+real WebView2/clipboard automation. The attestation is recorded in
+`docs/qa/windows-x64-installed-app-29140643663.md`. Human installed-app visual
+QA remains required before a dogfood release, and macOS and Linux GUI execution
+still require their external native hosts.
 
 ## Compatibility
 

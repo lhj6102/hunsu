@@ -17,6 +17,10 @@ test("Bridge platform QA matrix is machine-checkable for native and browser targ
         commit?: string;
         status?: string;
         evidenceUrl?: string;
+        artifactId?: number;
+        artifactSizeBytes?: number;
+        artifactDigest?: string;
+        evidenceFiles?: string[];
       }>;
       externalBlocker?: string;
     };
@@ -34,10 +38,14 @@ test("Bridge platform QA matrix is machine-checkable for native and browser targ
   assert.equal(matrix.nativeHostResults.status, "windows-x64-installed-app-gate-passed");
   assert.equal(matrix.nativeHostResults.realRuns.length >= 1, true);
   const windowsRun = matrix.nativeHostResults.realRuns.find(run => run.target === "Windows x64");
-  assert.equal(windowsRun?.runId, 29118028406);
-  assert.match(windowsRun?.commit ?? "", /^[0-9a-f]{40}$/u);
+  assert.equal(windowsRun?.runId, 29140643663);
+  assert.equal(windowsRun?.commit, "55426874276b2011fe1c74aa6bbad672f0f53e0f");
   assert.equal(windowsRun?.status, "passed");
-  assert.match(windowsRun?.evidenceUrl ?? "", /github\.com\/lhj6102\/hunsu\/actions\/runs\/29118028406/u);
+  assert.match(windowsRun?.evidenceUrl ?? "", /github\.com\/lhj6102\/hunsu\/actions\/runs\/29140643663/u);
+  assert.equal(windowsRun?.artifactId, 8245078964);
+  assert.equal(windowsRun?.artifactSizeBytes, 25059696);
+  assert.equal(windowsRun?.artifactDigest, "sha256:f70f076c4fd6993f1ae0f506ea115204e6c2dc6eba1232315e5d49ddc1b371cf");
+  assert.ok(windowsRun?.evidenceFiles?.includes("docs/qa/windows-x64-installed-app-29140643663.md"));
   assert.match(matrix.nativeHostResults.externalBlocker ?? "", /Human installed-app visual QA/);
   assert.match(matrix.nativeHostResults.externalBlocker ?? "", /releaseEligible false/);
   assert.deepEqual(matrix.targets.map(target => target.target), [
