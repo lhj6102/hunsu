@@ -19,8 +19,10 @@ import { main } from "../apps/bridge-desktop/src/main.ts";
 import {
   defaultBridgeAppState,
   writeBridgeAppState,
-  type BridgeAppState
+  type BridgeAppState,
+  type BridgeProcessRuntimeMetadata
 } from "../apps/bridge-desktop/src/state/appState.ts";
+import { verifyWindowsManagedProcessTree } from "../apps/bridge-desktop/src/processes/windowsManagedBridgeTermination.ts";
 
 const BRIDGE_URL = "http://127.0.0.1:19687";
 const CONTROL_TOKEN = "synthetic-control-token";
@@ -168,6 +170,272 @@ test("concurrent and repeated ensure-running calls start exactly one managed dae
     assert.equal(starts, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Test A: a detached starter may return before daemon state without losing managed ownership", async () => {
+  const harness = await delayedDetachedStartupHarness();
+  try {
+    assert.equal(harness.starts, 1);
+    assert.equal(harness.result.ok, true);
+    if (!harness.result.ok) assert.fail("delayed managed Bridge startup failed");
+    assert.equal(harness.result.value.state, "running-managed");
+    assert.equal(harness.result.value.transition, "started");
+    assert.equal(harness.result.value.supervisorPid, 4000);
+    assert.equal(harness.result.value.daemonPid, 4321);
+    assert.equal(harness.result.value.instanceId, harness.serviceInstanceId);
+    assert.equal(harness.state.controlToken, CONTROL_TOKEN);
+    assert.equal(harness.state.supervisorPid, 4000);
+    assert.equal(harness.state.pid, 4321);
+    assert.deepEqual(harness.state.supervisorProcess, windowsSupervisorProcessMetadata());
+    assert.deepEqual(harness.state.bridgeProcess, windowsDaemonProcessMetadata());
+    assert.equal(existsSync(harness.lockPath), false);
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("Test B: a control token written during an in-flight health probe is used on retry", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-token-race-"));
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL,
+    pid: 4321
+  };
+  let healthCalls = 0;
+  let statusCalls = 0;
+  let releaseFirstHealth: (() => void) | undefined;
+  const firstHealthGate = new Promise<void>(resolve => { releaseFirstHealth = resolve; });
+  let signalFirstHealth: (() => void) | undefined;
+  const firstHealthStarted = new Promise<void>(resolve => { signalFirstHealth = resolve; });
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath: join(root, "bridge-start.lock"),
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: async (input, init = {}) => {
+      const url = new URL(input);
+      if (url.pathname === "/health") {
+        healthCalls += 1;
+        if (healthCalls === 1) {
+          signalFirstHealth?.();
+          await firstHealthGate;
+        }
+        return jsonResponse({
+          ok: true,
+          service: "hunsu-bridge",
+          version: { bridgeVersion: "0.1.2", protocolVersion: "local-bridge-v1" }
+        });
+      }
+      assert.equal(url.pathname, "/api/bridge/control/status");
+      statusCalls += 1;
+      assert.equal(new Headers(init.headers).get("x-hunsu-bridge-control-token"), CONTROL_TOKEN);
+      return jsonResponse({
+        ok: true,
+        instanceId: "bridge_instance_token_race",
+        protocolVersion: "local-bridge-v1",
+        bridgeVersion: "0.1.2",
+        daemonPid: 4321,
+        supervisorPid: 4000,
+        startedAt: "2026-07-11T00:00:00.000Z",
+        state: "running"
+      });
+    }
+  });
+
+  try {
+    const discovering = runtime.discoverManagedBridge();
+    await firstHealthStarted;
+    state = { ...state, controlToken: CONTROL_TOKEN };
+    releaseFirstHealth?.();
+    const discovery = await discovering;
+    assert.equal(healthCalls, 2);
+    assert.equal(statusCalls, 1);
+    assert.equal(discovery.state, "running-managed");
+    assert.notEqual(discovery.state, "running-unmanaged");
+  } finally {
+    releaseFirstHealth?.();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Test C: the owning active startup lock prevents stale-state clearing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-own-lock-"));
+  const lockPath = join(root, "bridge-start.lock");
+  const supervisorProcess = windowsSupervisorProcessMetadata();
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL,
+    supervisorPid: supervisorProcess.pid,
+    supervisorProcess
+  };
+  const expected = structuredClone(state);
+  let writes = 0;
+  writeFileSync(lockPath, `${JSON.stringify({
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    instanceAttemptId: "bridge_attempt_own_lock"
+  })}\n`, "utf8");
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath,
+    readState: () => state,
+    writeState: next => { writes += 1; state = next; },
+    fetch: async () => { throw new TypeError("offline"); },
+    probeTcpEndpoint: async () => false,
+    processIsAlive: pid => pid === process.pid
+  });
+
+  try {
+    const discovery = await runtime.discoverManagedBridge();
+    assert.equal(discovery.state, "starting");
+    assert.equal(writes, 0);
+    assert.deepEqual(state, expected);
+    assert.equal(state.supervisorPid, supervisorProcess.pid);
+    assert.deepEqual(state.supervisorProcess, supervisorProcess);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an active startup lock treats ambiguous TCP reachability as starting, not a confirmed conflict", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-tcp-starting-"));
+  const lockPath = join(root, "bridge-start.lock");
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL,
+    supervisorPid: 4000,
+    supervisorProcess: windowsSupervisorProcessMetadata()
+  };
+  const expected = structuredClone(state);
+  writeFileSync(lockPath, `${JSON.stringify({
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    instanceAttemptId: "bridge_attempt_tcp_bound"
+  })}\n`, "utf8");
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath,
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: async () => { throw new TypeError("HTTP is not ready"); },
+    probeTcpEndpoint: async () => true,
+    processIsAlive: pid => pid === process.pid
+  });
+
+  try {
+    assert.equal((await runtime.discoverManagedBridge()).state, "starting");
+    assert.deepEqual(state, expected);
+
+    const hunsuNotReadyRuntime = createManagedBridgeRuntime({
+      canonicalBridgeApiUrl: BRIDGE_URL,
+      lockPath,
+      readState: () => state,
+      writeState: next => { state = next; },
+      fetch: async () => jsonResponse({ ok: false, service: "hunsu-bridge" }, 503),
+      processIsAlive: pid => pid === process.pid
+    });
+    assert.equal((await hunsuNotReadyRuntime.discoverManagedBridge()).state, "starting");
+    assert.deepEqual(state, expected);
+
+    rmSync(lockPath, { force: true });
+    assert.equal((await runtime.discoverManagedBridge()).state, "port-conflict");
+    assert.deepEqual(state, expected);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Test D: a stable unauthenticated Hunsu daemon remains unmanaged and is never replaced", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-stable-unmanaged-"));
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL
+  };
+  const service = fakeBridgeService(() => state);
+  let starts = 0;
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath: join(root, "bridge-start.lock"),
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    startSupervisor: async () => { starts += 1; }
+  });
+
+  try {
+    assert.equal((await runtime.discoverManagedBridge()).state, "running-unmanaged");
+    const ensured = await runtime.ensureManagedBridgeRunning();
+    assert.equal(ensured.ok, false);
+    if (!ensured.ok) assert.equal(ensured.error.code, "BRIDGE_ALREADY_RUNNING_UNMANAGED");
+    assert.equal(starts, 0);
+    assert.equal(service.online, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Test E: a stable non-Hunsu listener remains a port conflict and is untouched", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-stable-conflict-"));
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL
+  };
+  const service = fakeBridgeService(() => state);
+  service.kind = "unrelated";
+  let starts = 0;
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath: join(root, "bridge-start.lock"),
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    startSupervisor: async () => { starts += 1; }
+  });
+
+  try {
+    assert.equal((await runtime.discoverManagedBridge()).state, "port-conflict");
+    const ensured = await runtime.ensureManagedBridgeRunning();
+    assert.equal(ensured.ok, false);
+    if (!ensured.ok) assert.equal(ensured.error.code, "BRIDGE_PORT_IN_USE");
+    assert.equal(starts, 0);
+    assert.equal(service.online, true);
+    assert.equal(service.shutdowns, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Test F: delayed startup preserves complete metadata for verified Windows fallback", async () => {
+  const harness = await delayedDetachedStartupHarness();
+  try {
+    assert.equal(harness.result.ok, true);
+    if (!harness.result.ok) assert.fail("delayed managed Bridge startup failed");
+    assert.deepEqual(
+      verifyWindowsManagedProcessTree(harness.result.value, harness.state, {
+        processIsAlive: pid => pid === 4000 || pid === 4321,
+        inspectProcess: pid => pid === 4000
+          ? {
+              processId: 4000,
+              parentProcessId: 3900,
+              executablePath: "C:\\Hunsu\\hunsu-bridge.exe",
+              commandLine: "C:\\Hunsu\\hunsu-bridge.exe supervise --attempt-id bridge_attempt_delayed",
+              creationDate: "20260711120000.000000+540"
+            }
+          : pid === 4321
+            ? {
+                processId: 4321,
+                parentProcessId: 4000,
+                executablePath: "C:\\Hunsu\\hunsu-bridge-sidecar.exe",
+                commandLine: "C:\\Hunsu\\hunsu-bridge-sidecar.exe daemon --no-open",
+                creationDate: "20260711120001.000000+540"
+              }
+            : undefined
+      }),
+      { ok: true, treeRootPid: 4000, targetPids: [4000, 4321] }
+    );
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
   }
 });
 
@@ -727,6 +995,117 @@ test("a real post-discovery daemon bind race is terminal and never enters a rest
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+async function delayedDetachedStartupHarness() {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-delayed-detached-"));
+  const lockPath = join(root, "bridge-start.lock");
+  let state = defaultBridgeAppState();
+  const service = fakeBridgeService(() => state);
+  service.online = false;
+  let starts = 0;
+  let waitsAfterStarter = 0;
+  let starterReturned = false;
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath,
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    probeTcpEndpoint: async () => false,
+    processIsAlive: pid => pid === process.pid || pid === 4000 || pid === 4321,
+    pollIntervalMs: 1,
+    coordinationTimeoutMs: 200,
+    startTimeoutMs: 200,
+    startSupervisor: async () => {
+      starts += 1;
+      starterReturned = true;
+    },
+    sleep: async () => {
+      assert.equal(starterReturned, true);
+      waitsAfterStarter += 1;
+      if (waitsAfterStarter === 1) {
+        state = {
+          ...state,
+          bridgeApiUrl: BRIDGE_URL,
+          supervisorPid: 4000,
+          supervisorProcess: windowsSupervisorProcessMetadata()
+        };
+        return;
+      }
+      if (waitsAfterStarter === 2) {
+        state = {
+          ...state,
+          bridgeApiUrl: BRIDGE_URL,
+          instanceId: service.instanceId,
+          controlToken: CONTROL_TOKEN,
+          supervisorPid: 4000,
+          pid: 4321,
+          supervisorProcess: windowsSupervisorProcessMetadata(),
+          bridgeProcess: windowsDaemonProcessMetadata(),
+          startedAt: "2026-07-11T00:00:00.000Z"
+        };
+        service.online = true;
+      }
+    }
+  });
+
+  try {
+    const result = await runtime.ensureManagedBridgeRunning();
+    return {
+      root,
+      lockPath,
+      result,
+      state,
+      starts,
+      serviceInstanceId: service.instanceId
+    };
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function windowsSupervisorProcessMetadata(): BridgeProcessRuntimeMetadata {
+  const executable = "C:\\Hunsu\\hunsu-bridge.exe";
+  return {
+    pid: 4000,
+    commandIdentity: {
+      kind: "supervise",
+      executable,
+      argv: [executable, "supervise", "--attempt-id", "bridge_attempt_delayed"],
+      nonce: "supervisor_nonce_delayed"
+    },
+    startMetadata: {
+      platform: "win32",
+      source: "windows-cim-creation-date",
+      value: "20260711120000.000000+540"
+    },
+    parentPid: 3900,
+    executablePath: executable,
+    recordedAt: "2026-07-11T03:00:00.000Z"
+  };
+}
+
+function windowsDaemonProcessMetadata(): BridgeProcessRuntimeMetadata {
+  const executable = "C:\\Hunsu\\hunsu-bridge-sidecar.exe";
+  return {
+    pid: 4321,
+    commandIdentity: {
+      kind: "daemon",
+      executable,
+      argv: [executable, "daemon", "--no-open"],
+      nonce: "daemon_nonce_delayed"
+    },
+    startMetadata: {
+      platform: "win32",
+      source: "windows-cim-creation-date",
+      value: "20260711120001.000000+540"
+    },
+    parentPid: 4000,
+    executablePath: executable,
+    recordedAt: "2026-07-11T03:00:01.000Z"
+  };
+}
 
 async function unusedLocalPort(): Promise<number> {
   const server = createServer();

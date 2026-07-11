@@ -15,6 +15,7 @@ import {
 } from "../state/appState.ts";
 
 const CONTROL_TOKEN_HEADER = "x-hunsu-bridge-control-token";
+const MAX_DISCOVERY_STATE_PASSES = 3;
 
 export type ManagedBridgeDiscovery =
   | ({ state: "running-managed" } & ManagedBridgeIdentity)
@@ -148,6 +149,7 @@ export type ManagedBridgeRuntime = {
 
 type EndpointProbe =
   | { kind: "offline"; bridgeApiUrl: string }
+  | { kind: "tcp-reachable"; bridgeApiUrl: string }
   | { kind: "conflict"; bridgeApiUrl: string }
   | { kind: "hunsu-unmanaged"; bridgeApiUrl: string; reason: string }
   | ({ kind: "managed" } & ManagedBridgeIdentity);
@@ -210,55 +212,181 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
       ?? (configuredEndpoint.ok ? endpointUrl(configuredEndpoint.value.bridgeApi) : undefined)
   );
 
-  async function discoverInternal(ignoreLockAttemptId?: string): Promise<ManagedBridgeDiscovery> {
-    const stateRead = safelyReadState(readState);
-    if (!stateRead.ok) {
+  async function discoverInternal(): Promise<ManagedBridgeDiscovery> {
+    for (let pass = 0; pass < MAX_DISCOVERY_STATE_PASSES; pass += 1) {
+      const beforeRead = safelyReadState(readState);
+      if (!beforeRead.ok) {
+        return { state: "stale", reason: "Bridge App state could not be read." };
+      }
+      const before = beforeRead.value;
+      const probes = await probeCandidates(before);
+      const afterRead = safelyReadState(readState);
+      if (!afterRead.ok) {
+        return { state: "stale", reason: "Bridge App state could not be read." };
+      }
+      const after = afterRead.value;
+      if (runtimeOwnershipStateChanged(before, after)) {
+        continue;
+      }
+
+      const managed = managedEndpointProbe(probes);
+      if (managed) {
+        return managedDiscovery(after, managed);
+      }
+
+      // A stable non-Hunsu listener is authoritative even while a startup lock
+      // exists. It is a real bind conflict and must never be replaced.
+      const conflict = conflictEndpointProbe(probes);
+      if (conflict) {
+        return conflictDiscovery(conflict);
+      }
+
+      // The endpoint was probed before consulting the lock. Any live startup
+      // lock, including this caller's own lock, now protects state that the
+      // supervisor or daemon may still be establishing.
+      if (activeStartupLock()) {
+        return startingDiscovery();
+      }
+
+      const hunsu = unmanagedEndpointProbe(probes);
+      if (hunsu) {
+        return unmanagedDiscovery(hunsu);
+      }
+      const tcpReachable = tcpReachableEndpointProbe(probes);
+      if (tcpReachable) {
+        return conflictDiscovery(tcpReachable);
+      }
+
+      if (hasPersistedRuntimeEvidence(after)) {
+        const cleanup = await clearRuntimeStateIfStillStale(after);
+        if (cleanup === "retry") {
+          continue;
+        }
+        return cleanup;
+      }
+      if (!canonicalBridgeApiUrl) {
+        return { state: "stale", reason: "The configured Bridge endpoint is invalid." };
+      }
+      return { state: "not-running" };
+    }
+
+    if (activeStartupLock()) {
+      return startingDiscovery();
+    }
+    return {
+      state: "stale",
+      reason: "Bridge runtime state changed while ownership was being checked."
+    };
+  }
+
+  async function clearRuntimeStateIfStillStale(
+    expected: BridgeAppState
+  ): Promise<ManagedBridgeDiscovery | "retry"> {
+    const latestRead = safelyReadState(readState);
+    if (!latestRead.ok) {
       return { state: "stale", reason: "Bridge App state could not be read." };
     }
-    const state = stateRead.value;
-    const candidates = uniqueBridgeApiUrls([state.bridgeApiUrl, canonicalBridgeApiUrl]);
-    const probes = await Promise.all(candidates.map(bridgeApiUrl => probeEndpoint(bridgeApiUrl, state.controlToken)));
-    const managed = probes.find((probe): probe is Extract<EndpointProbe, { kind: "managed" }> => probe.kind === "managed");
+    const latest = latestRead.value;
+    if (runtimeOwnershipStateChanged(expected, latest)) {
+      return "retry";
+    }
+    if (activeStartupLock()) {
+      return startingDiscovery();
+    }
+
+    // Confirm the latest endpoint snapshot is still offline. This second probe
+    // prevents stale cleanup from relying on a request that began before the
+    // supervisor or daemon finished persisting ownership.
+    const probes = await probeCandidates(latest);
+    const afterProbeRead = safelyReadState(readState);
+    if (!afterProbeRead.ok) {
+      return { state: "stale", reason: "Bridge App state could not be read." };
+    }
+    const afterProbe = afterProbeRead.value;
+    if (runtimeOwnershipStateChanged(latest, afterProbe)) {
+      return "retry";
+    }
+
+    const managed = managedEndpointProbe(probes);
     if (managed) {
-      const transition = state.managedBridgeTransition;
-      const transitionMatches = transition?.state === "stopping"
-        && transition.instanceId === managed.instanceId
-        && normalizeBridgeApiUrl(transition.bridgeApiUrl) === normalizeBridgeApiUrl(managed.bridgeApiUrl)
-        && transition.daemonPid === managed.daemonPid;
-      const transitionExpired = transitionMatches
-        && now().getTime() - Date.parse(transition.requestedAt) > stopTimeoutMs + Math.max(5_000, pollIntervalMs * 2);
-      if (transitionMatches && !transitionExpired) {
-        const discovery: ManagedBridgeDiscovery = {
-          state: "stopping",
-          bridgeApiUrl: managed.bridgeApiUrl,
-          instanceId: managed.instanceId,
-          daemonPid: managed.daemonPid,
-          supervisorPid: managed.supervisorPid,
-          startedAt: managed.startedAt,
-          bridgeVersion: managed.bridgeVersion,
-          protocolVersion: managed.protocolVersion,
-          requestedAt: transition.requestedAt
-        };
-        options.writeStructuredLog?.({
-          event: "bridge.discovery.completed",
-          state: discovery.state,
-          bridgeApiUrl: discovery.bridgeApiUrl,
-          instanceId: discovery.instanceId
-        });
-        return discovery;
-      }
-      if (transition) {
-        safelyWriteState(writeState, { ...state, managedBridgeTransition: undefined });
-      }
+      return managedDiscovery(afterProbe, managed);
+    }
+    const conflict = conflictEndpointProbe(probes);
+    if (conflict) {
+      return conflictDiscovery(conflict);
+    }
+    if (activeStartupLock()) {
+      return startingDiscovery();
+    }
+    const hunsu = unmanagedEndpointProbe(probes);
+    if (hunsu) {
+      return unmanagedDiscovery(hunsu);
+    }
+    const tcpReachable = tcpReachableEndpointProbe(probes);
+    if (tcpReachable) {
+      return conflictDiscovery(tcpReachable);
+    }
+
+    const beforeWriteRead = safelyReadState(readState);
+    if (!beforeWriteRead.ok) {
+      return { state: "stale", reason: "Bridge App state could not be read." };
+    }
+    const beforeWrite = beforeWriteRead.value;
+    if (runtimeOwnershipStateChanged(afterProbe, beforeWrite)) {
+      return "retry";
+    }
+    if (activeStartupLock()) {
+      return startingDiscovery();
+    }
+    if (hasPersistedRuntimeEvidence(beforeWrite)) {
+      safelyWriteState(writeState, clearManagedBridgeRuntimeState(beforeWrite));
+      return {
+        state: "stale",
+        reason: "Persisted Bridge runtime state no longer identifies a reachable daemon."
+      };
+    }
+    if (!canonicalBridgeApiUrl) {
+      return { state: "stale", reason: "The configured Bridge endpoint is invalid." };
+    }
+    return { state: "not-running" };
+  }
+
+  function probeCandidates(state: BridgeAppState): Promise<EndpointProbe[]> {
+    const candidates = uniqueBridgeApiUrls([state.bridgeApiUrl, canonicalBridgeApiUrl]);
+    return Promise.all(candidates.map(bridgeApiUrl => probeEndpoint(bridgeApiUrl, state.controlToken)));
+  }
+
+  function activeStartupLock(): StartupLockMetadata | undefined {
+    return readActiveStartupLock(
+      lockPath,
+      processIsAlive,
+      now,
+      startupLockStaleAfterMs
+    );
+  }
+
+  function managedDiscovery(
+    state: BridgeAppState,
+    managed: Extract<EndpointProbe, { kind: "managed" }>
+  ): ManagedBridgeDiscovery {
+    const transition = state.managedBridgeTransition;
+    const transitionMatches = transition?.state === "stopping"
+      && transition.instanceId === managed.instanceId
+      && normalizeBridgeApiUrl(transition.bridgeApiUrl) === normalizeBridgeApiUrl(managed.bridgeApiUrl)
+      && transition.daemonPid === managed.daemonPid;
+    const transitionExpired = transitionMatches
+      && now().getTime() - Date.parse(transition.requestedAt) > stopTimeoutMs + Math.max(5_000, pollIntervalMs * 2);
+    if (transitionMatches && !transitionExpired) {
       const discovery: ManagedBridgeDiscovery = {
-        state: "running-managed",
+        state: "stopping",
         bridgeApiUrl: managed.bridgeApiUrl,
         instanceId: managed.instanceId,
         daemonPid: managed.daemonPid,
         supervisorPid: managed.supervisorPid,
         startedAt: managed.startedAt,
         bridgeVersion: managed.bridgeVersion,
-        protocolVersion: managed.protocolVersion
+        protocolVersion: managed.protocolVersion,
+        requestedAt: transition.requestedAt
       };
       options.writeStructuredLog?.({
         event: "bridge.discovery.completed",
@@ -268,57 +396,86 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
       });
       return discovery;
     }
-    const hunsu = probes.find((probe): probe is Extract<EndpointProbe, { kind: "hunsu-unmanaged" }> => probe.kind === "hunsu-unmanaged");
-    if (hunsu) {
-      const discovery: ManagedBridgeDiscovery = {
-        state: "running-unmanaged",
-        bridgeApiUrl: hunsu.bridgeApiUrl,
-        reason: hunsu.reason
-      };
-      options.writeStructuredLog?.({ event: "bridge.discovery.completed", state: discovery.state, bridgeApiUrl: discovery.bridgeApiUrl });
-      return discovery;
+    if (transition) {
+      safelyWriteState(writeState, { ...state, managedBridgeTransition: undefined });
     }
-    const conflict = probes.find((probe): probe is Extract<EndpointProbe, { kind: "conflict" }> => probe.kind === "conflict");
-    if (conflict) {
-      const discovery: ManagedBridgeDiscovery = {
-        state: "port-conflict",
-        bridgeApiUrl: conflict.bridgeApiUrl,
-        reason: "The configured Bridge endpoint is owned by another service."
-      };
-      options.writeStructuredLog?.({ event: "bridge.discovery.completed", state: discovery.state, bridgeApiUrl: discovery.bridgeApiUrl });
-      return discovery;
-    }
+    const discovery: ManagedBridgeDiscovery = {
+      state: "running-managed",
+      bridgeApiUrl: managed.bridgeApiUrl,
+      instanceId: managed.instanceId,
+      daemonPid: managed.daemonPid,
+      supervisorPid: managed.supervisorPid,
+      startedAt: managed.startedAt,
+      bridgeVersion: managed.bridgeVersion,
+      protocolVersion: managed.protocolVersion
+    };
+    options.writeStructuredLog?.({
+      event: "bridge.discovery.completed",
+      state: discovery.state,
+      bridgeApiUrl: discovery.bridgeApiUrl,
+      instanceId: discovery.instanceId
+    });
+    return discovery;
+  }
 
-    const activeLock = readActiveStartupLock(
-      lockPath,
-      processIsAlive,
-      now,
-      startupLockStaleAfterMs
-    );
-    if (activeLock && activeLock.instanceAttemptId !== ignoreLockAttemptId) {
-      return { state: "starting", reason: "Another Bridge startup attempt is in progress." };
-    }
+  function conflictDiscovery(
+    conflict: Extract<EndpointProbe, { kind: "conflict" | "tcp-reachable" }>
+  ): ManagedBridgeDiscovery {
+    const discovery: ManagedBridgeDiscovery = {
+      state: "port-conflict",
+      bridgeApiUrl: conflict.bridgeApiUrl,
+      reason: "The configured Bridge endpoint is owned by another service."
+    };
+    options.writeStructuredLog?.({
+      event: "bridge.discovery.completed",
+      state: discovery.state,
+      bridgeApiUrl: discovery.bridgeApiUrl
+    });
+    return discovery;
+  }
 
-    if (hasPersistedRuntimeEvidence(state)) {
-      safelyWriteState(writeState, clearManagedBridgeRuntimeState(state));
-      return { state: "stale", reason: "Persisted Bridge runtime state no longer identifies a reachable daemon." };
-    }
-    if (!canonicalBridgeApiUrl) {
-      return { state: "stale", reason: "The configured Bridge endpoint is invalid." };
-    }
-    return { state: "not-running" };
+  function unmanagedDiscovery(
+    hunsu: Extract<EndpointProbe, { kind: "hunsu-unmanaged" }>
+  ): ManagedBridgeDiscovery {
+    const discovery: ManagedBridgeDiscovery = {
+      state: "running-unmanaged",
+      bridgeApiUrl: hunsu.bridgeApiUrl,
+      reason: hunsu.reason
+    };
+    options.writeStructuredLog?.({
+      event: "bridge.discovery.completed",
+      state: discovery.state,
+      bridgeApiUrl: discovery.bridgeApiUrl
+    });
+    return discovery;
+  }
+
+  function startingDiscovery(): ManagedBridgeDiscovery {
+    return {
+      state: "starting",
+      reason: "Bridge ownership is still being established."
+    };
   }
 
   async function probeEndpoint(bridgeApiUrl: string, controlToken: string | undefined): Promise<EndpointProbe> {
     const healthResponse = await safeFetch(new URL("/health", bridgeApiUrl).toString(), { method: "GET" });
     if (!healthResponse) {
       return await probeTcpEndpoint(bridgeApiUrl)
-        ? { kind: "conflict", bridgeApiUrl }
+        ? { kind: "tcp-reachable", bridgeApiUrl }
         : { kind: "offline", bridgeApiUrl };
     }
     const healthBody = await safeJson(healthResponse);
     if (!healthResponse.ok || !isBridgeHealthResponse(healthBody)) {
-      return { kind: "conflict", bridgeApiUrl };
+      if (isRecord(healthBody) && healthBody.service === "hunsu-bridge") {
+        return {
+          kind: "hunsu-unmanaged",
+          bridgeApiUrl,
+          reason: "The Hunsu Bridge health endpoint is not ready."
+        };
+      }
+      return isRecord(healthBody) && typeof healthBody.service === "string"
+        ? { kind: "conflict", bridgeApiUrl }
+        : { kind: "tcp-reachable", bridgeApiUrl };
     }
     if (!controlToken?.trim()) {
       return {
@@ -384,12 +541,15 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
     return undefined;
   }
 
-  async function waitForStartedRuntime(attemptId: string): Promise<ManagedBridgeDiscovery> {
+  async function waitForStartedRuntime(): Promise<ManagedBridgeDiscovery> {
     const deadline = now().getTime() + startTimeoutMs;
     let last: ManagedBridgeDiscovery = { state: "not-running" };
     while (now().getTime() <= deadline) {
-      last = await discoverInternal(attemptId);
-      if (last.state === "running-managed") {
+      last = await discoverInternal();
+      if (last.state === "running-managed"
+        || last.state === "running-unmanaged"
+        || last.state === "port-conflict"
+        || last.state === "stopping") {
         return last;
       }
       await sleep(pollIntervalMs);
@@ -467,7 +627,7 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
     }
 
     try {
-      discovery = await discoverInternal(attemptId);
+      discovery = await discoverInternal();
       if (discovery.state === "running-managed") {
         options.writeStructuredLog?.({ event: "bridge.ensure-running.reused", instanceId: discovery.instanceId, bridgeApiUrl: discovery.bridgeApiUrl });
         return managedEnsureSuccess(discovery, "reused");
@@ -487,7 +647,7 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
           webUrl: input.webUrl
         });
       } catch (_error) {
-        const raced = await discoverInternal(attemptId);
+        const raced = await discoverInternal();
         if (raced.state === "running-managed") {
           options.writeStructuredLog?.({ event: "bridge.ensure-running.reused", instanceId: raced.instanceId, bridgeApiUrl: raced.bridgeApiUrl });
           return managedEnsureSuccess(raced, "reused");
@@ -496,7 +656,7 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
         return racedFailure ?? fail("BRIDGE_START_TIMEOUT", "The managed Bridge supervisor could not be started.");
       }
 
-      const started = await waitForStartedRuntime(attemptId);
+      const started = await waitForStartedRuntime();
       if (started.state === "running-managed") {
         options.writeStructuredLog?.({ event: "bridge.ensure-running.started", instanceId: started.instanceId, bridgeApiUrl: started.bridgeApiUrl });
         return managedEnsureSuccess(started, "started");
@@ -817,10 +977,67 @@ function hasPersistedRuntimeEvidence(state: BridgeAppState): boolean {
   return Boolean(
     state.supervisorPid
       || state.pid
+      || state.supervisorProcess
+      || state.bridgeProcess
       || state.bridgeApiUrl
+      || state.instanceId
+      || state.processNonce
+      || state.commandIdentity
       || state.controlToken
       || state.pairing
+      || state.managedBridgeTransition
       || state.startedAt
+  );
+}
+
+function runtimeOwnershipStateChanged(before: BridgeAppState, after: BridgeAppState): boolean {
+  return before.bridgeApiUrl !== after.bridgeApiUrl
+    || before.instanceId !== after.instanceId
+    || before.controlToken !== after.controlToken
+    || before.supervisorPid !== after.supervisorPid
+    || before.pid !== after.pid
+    || before.startedAt !== after.startedAt
+    || before.processNonce !== after.processNonce
+    || !sameRuntimeOwnershipValue(before.commandIdentity, after.commandIdentity)
+    || !sameRuntimeOwnershipValue(before.supervisorProcess, after.supervisorProcess)
+    || !sameRuntimeOwnershipValue(before.bridgeProcess, after.bridgeProcess)
+    || !sameRuntimeOwnershipValue(before.pairing, after.pairing)
+    || !sameRuntimeOwnershipValue(before.managedBridgeTransition, after.managedBridgeTransition);
+}
+
+function sameRuntimeOwnershipValue(before: unknown, after: unknown): boolean {
+  return JSON.stringify(before) === JSON.stringify(after);
+}
+
+function managedEndpointProbe(
+  probes: EndpointProbe[]
+): Extract<EndpointProbe, { kind: "managed" }> | undefined {
+  return probes.find(
+    (probe): probe is Extract<EndpointProbe, { kind: "managed" }> => probe.kind === "managed"
+  );
+}
+
+function conflictEndpointProbe(
+  probes: EndpointProbe[]
+): Extract<EndpointProbe, { kind: "conflict" }> | undefined {
+  return probes.find(
+    (probe): probe is Extract<EndpointProbe, { kind: "conflict" }> => probe.kind === "conflict"
+  );
+}
+
+function unmanagedEndpointProbe(
+  probes: EndpointProbe[]
+): Extract<EndpointProbe, { kind: "hunsu-unmanaged" }> | undefined {
+  return probes.find(
+    (probe): probe is Extract<EndpointProbe, { kind: "hunsu-unmanaged" }> => probe.kind === "hunsu-unmanaged"
+  );
+}
+
+function tcpReachableEndpointProbe(
+  probes: EndpointProbe[]
+): Extract<EndpointProbe, { kind: "tcp-reachable" }> | undefined {
+  return probes.find(
+    (probe): probe is Extract<EndpointProbe, { kind: "tcp-reachable" }> => probe.kind === "tcp-reachable"
   );
 }
 
