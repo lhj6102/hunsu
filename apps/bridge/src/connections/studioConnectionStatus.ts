@@ -1,10 +1,10 @@
 import { existsSync } from "node:fs";
 import type { BridgeRuntimeConfig } from "@hunsu/config";
 import type { RemoteBridgeDeviceRecord } from "./remoteConnection.ts";
+import { HUNSU_BRIDGE_PROTOCOL_VERSION, HUNSU_BRIDGE_VERSION } from "../version.ts";
 
 export type BridgeVersionInfo = {
   bridgeVersion: string;
-  bridgeAppVersion?: string;
   protocolVersion: string;
   minSupportedStudioVersion?: string;
   supportedFeatures: string[];
@@ -12,14 +12,13 @@ export type BridgeVersionInfo = {
 
 export type StudioBridgeRequirement = {
   minBridgeVersion: string;
-  minBridgeAppVersionForRelay?: string;
   requiredProtocolVersion: string;
   requiredFeatures: string[];
 };
 
 export type BridgeCompatibility =
   | { compatible: true }
-  | { compatible: false; reason: "bridge_update_needed" | "studio_update_needed" | "feature_unavailable" | "bridge_app_update_needed"; message: string };
+  | { compatible: false; reason: "bridge_update_needed" | "studio_update_needed" | "feature_unavailable"; message: string };
 
 export type StudioConnectionStatus = {
   mode: "none" | "local" | "remote";
@@ -61,15 +60,13 @@ export type StudioConnectionStatus = {
   compatibility?: BridgeCompatibility;
 };
 
-const HUNSU_BRIDGE_VERSION = "0.1.2";
-const HUNSU_BRIDGE_PROTOCOL_VERSION = "local-bridge-v1";
 const HUNSU_BRIDGE_SUPPORTED_FEATURES = [
   "local-pairing",
   "project-finder",
   "roadmap-registry",
   "artifact-actions",
   "connection-status",
-  "bridge-supervisor",
+  "headless-daemon",
   "remote-ready"
 ];
 
@@ -79,10 +76,9 @@ export const DEFAULT_STUDIO_BRIDGE_REQUIREMENT: StudioBridgeRequirement = {
   requiredFeatures: ["local-pairing", "connection-status"]
 };
 
-export function bridgeVersionInfo(input: { bridgeAppVersion?: string } = {}): BridgeVersionInfo {
+export function bridgeVersionInfo(): BridgeVersionInfo {
   return {
     bridgeVersion: HUNSU_BRIDGE_VERSION,
-    bridgeAppVersion: input.bridgeAppVersion,
     protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
     supportedFeatures: [...HUNSU_BRIDGE_SUPPORTED_FEATURES]
   };
@@ -114,15 +110,6 @@ export function evaluateBridgeCompatibility(
       reason: "feature_unavailable",
       message: `Bridge feature is unavailable: ${missingFeature}.`
     };
-  }
-  if (requirement.minBridgeAppVersionForRelay) {
-    if (!version.bridgeAppVersion || compareDottedVersions(version.bridgeAppVersion, requirement.minBridgeAppVersionForRelay) < 0) {
-      return {
-        compatible: false,
-        reason: "bridge_app_update_needed",
-        message: `Remote Relay requires Bridge App ${requirement.minBridgeAppVersionForRelay} or newer.`
-      };
-    }
   }
   if (version.minSupportedStudioVersion && compareDottedVersions(studioVersion, version.minSupportedStudioVersion) < 0) {
     return {
@@ -220,7 +207,6 @@ export function createRemoteStudioConnectionStatus(input: {
   const version: BridgeVersionInfo = {
     ...bridgeVersionInfo(),
     bridgeVersion: input.device.bridgeVersion ?? "unknown",
-    bridgeAppVersion: input.device.bridgeAppVersion,
     protocolVersion: input.device.protocolVersion ?? "unknown"
   };
   const compatibility = evaluateBridgeCompatibility(version, input.requirement ?? DEFAULT_STUDIO_BRIDGE_REQUIREMENT, input.studioVersion);

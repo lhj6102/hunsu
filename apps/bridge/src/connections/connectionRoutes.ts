@@ -30,6 +30,10 @@ type ConnectionRouteContext = {
     scopes: BridgeCommandScope[];
   }) => void;
   deactivateWorkspaceAccess: () => void;
+  headlessRemote?: {
+    enable: () => Promise<{ deviceId?: string; connection?: string }>;
+    disable: () => Promise<{ deviceId?: string; connection?: string }>;
+  };
   connectRemote: (body: unknown) => Promise<unknown>;
   readJson: <T>(request: IncomingMessage) => Promise<T>;
   sendJson: (response: ServerResponse, status: number, body: unknown) => void;
@@ -96,6 +100,22 @@ async function enableRemoteConnectionRoute(
     context.sendJson(response, 401, { error: "login_required", message: "Sign in to Hunsu before enabling Remote Bridge." });
     return;
   }
+  if (context.headlessRemote) {
+    const remote = await context.headlessRemote.enable();
+    const provider = await context.currentProvider();
+    const device = {
+      ...context.remoteDevice({ account, status: remote.connection === "connected" ? "online" : "offline", provider }),
+      ...(remote.deviceId ? { deviceId: remote.deviceId } : {}),
+      remoteAccess: "enabled" as const
+    };
+    const status = await context.bridgeStatus();
+    context.sendJson(response, 202, {
+      enabled: true,
+      device,
+      connections: status.connections.filter(connection => connection.mode === "remote")
+    });
+    return;
+  }
   const provider = await context.currentProvider();
   const device = await enableRemoteBridgePublication({
     device: context.remoteDevice({ account, status: "online", provider }),
@@ -117,6 +137,21 @@ async function disableRemoteConnectionRoute(
   context: ConnectionRouteContext
 ): Promise<void> {
   const account = context.account();
+  if (context.headlessRemote) {
+    const remote = await context.headlessRemote.disable();
+    const device = {
+      ...context.remoteDevice({ account, status: "offline" }),
+      ...(remote.deviceId ? { deviceId: remote.deviceId } : {}),
+      remoteAccess: "disabled" as const
+    };
+    const status = await context.bridgeStatus();
+    context.sendJson(response, 202, {
+      enabled: false,
+      device,
+      connections: status.connections.filter(connection => connection.mode === "remote")
+    });
+    return;
+  }
   const device = await disableRemoteBridgePublication({
     device: context.remoteDevice({ account, status: "offline" }),
     relay: context.relay(),

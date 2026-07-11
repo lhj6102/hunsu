@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Check, CheckCircle2, Clipboard, Download, ExternalLink, Loader2, RefreshCw, Terminal, Wifi, WifiOff } from "lucide-react";
+import { Check, CheckCircle2, Clipboard, ExternalLink, Loader2, RefreshCw, Terminal, Wifi, WifiOff } from "lucide-react";
 import { pushStudioPath, safeStudioNext } from "@/app/routes";
 import { cn } from "@/lib/utils";
 import { bridgeApiHttpUrl } from "@/shared/api/bridgeApiBase";
@@ -9,7 +9,7 @@ import { Button } from "@/shared/ui/button";
 
 export function SetupScreen({ next = "/studio" }: { next?: string }) {
   const safeNext = safeStudioNext(next);
-  const command = useMemo(() => bridgeCommandForCurrentOrigin(safeNext), [safeNext]);
+  const command = useMemo(bridgeSetupCommands, []);
   const healthEndpoint = useMemo(() => bridgeApiHttpUrl("/health"), []);
   const connection = useBridgeConnection({ enabled: true, intervalMs: 1800 });
   const [copied, setCopied] = useState(false);
@@ -60,30 +60,30 @@ export function SetupScreen({ next = "/studio" }: { next?: string }) {
             </p>
 
             <div className="mt-8 flex flex-wrap gap-3">
-              <Button type="button" size="lg" onClick={() => openBridgeLink(pairLink(safeNext))}>
-                <ExternalLink className="size-4" />
-                Open Hunsu Bridge App
+              <Button type="button" size="lg" onClick={copyCommand}>
+                <Clipboard className="size-4" />
+                Copy setup commands
               </Button>
-              <Button type="button" variant="outline" size="lg" onClick={() => openBridgeLink("https://hunsu.app/download/bridge")}>
-                <Download className="size-4" />
-                Download Hunsu Bridge App
+              <Button type="button" variant="outline" size="lg" onClick={() => window.location.reload()}>
+                <RefreshCw className="size-4" />
+                Check again
               </Button>
             </div>
 
             <div className="mt-7 grid gap-3 sm:grid-cols-3">
-              <SetupStep number="1" title="Open" body="Launch the Bridge App on this machine." />
-              <SetupStep number="2" title="Pair" body="Bridge opens Studio with a fresh pairing session." />
-              <SetupStep number="3" title="Continue" body="Choose or create a Roadmap from Project Finder." />
+              <SetupStep number="1" title="Setup" body="Run npx @hunsu/bridge@next setup once." />
+              <SetupStep number="2" title="Pair" body="Run hunsu-bridge open for a fresh browser session." />
+              <SetupStep number="3" title="Continue" body="Choose or create a Workspace in Studio." />
             </div>
 
             <details className="mt-6 rounded-[18px] border border-[color:var(--apple-hairline)] bg-white/64 px-4 py-3">
               <summary className="flex cursor-pointer items-center gap-2 text-[13px] font-semibold text-[color:var(--apple-ink)]">
                 <Terminal className="size-4" />
-                Advanced terminal command
+                Terminal commands
               </summary>
               <div className="mt-4 overflow-hidden rounded-[14px] border border-[color:var(--apple-hairline)] bg-[color:var(--apple-ink)] text-white">
                 <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
-                  <span className="text-[13px] font-semibold">CLI fallback</span>
+                  <span className="text-[13px] font-semibold">Headless setup</span>
                   <Button type="button" size="sm" variant="secondary" className="h-8 bg-white/12 text-white hover:bg-white/18" onClick={copyCommand}>
                     {copied ? <Check className="size-4" /> : <Clipboard className="size-4" />}
                     {copied ? "Copied" : "Copy"}
@@ -118,12 +118,12 @@ export function SetupScreen({ next = "/studio" }: { next?: string }) {
 
             {bridgeRunningWithoutToken ? (
               <div className="mt-5 rounded-[14px] border border-[color:var(--apple-orange)]/28 bg-white/54 px-4 py-3 text-[12px] leading-5 text-[color:var(--apple-body)]">
-                Bridge is reachable, but this browser tab does not have the pairing token yet. Pair again from the Bridge App or use the advanced CLI fallback.
+                Bridge is reachable, but this browser tab has no pairing token. Run hunsu-bridge open, then check again.
               </div>
             ) : null}
             {bridgeNeedsFreshPairing ? (
               <div className="mt-5 rounded-[14px] border border-[color:var(--apple-orange)]/28 bg-white/54 px-4 py-3 text-[12px] leading-5 text-[color:var(--apple-body)]">
-                Bridge is reachable, but this browser tab needs a fresh pairing session. Pair again from the Bridge App.
+                Bridge is reachable, but this browser tab needs a fresh pairing session. Run hunsu-bridge open.
               </div>
             ) : null}
           </aside>
@@ -183,7 +183,7 @@ function statusBody(status: string, tokenPresent: boolean, canContinue: boolean,
   if (status === "online" && tokenPresent) return "Bridge answered locally, but Studio could not verify this browser pairing.";
   if (status === "online") return "Bridge answered locally, but Studio still needs a fresh pairing token.";
   if (status === "checking") return `Checking ${healthEndpoint} for a local Bridge session.`;
-  return "Open the Bridge App. It will start Bridge and open Studio with a temporary pairing token.";
+  return "Run the setup commands on this machine, then check the Bridge connection again.";
 }
 
 function canContinueToStudio(connection: BridgeConnectionState): boolean {
@@ -192,22 +192,10 @@ function canContinueToStudio(connection: BridgeConnectionState): boolean {
     && isUsableLocalStudioConnectionStatus(connection.connection);
 }
 
-function openBridgeLink(url: string): void {
-  window.location.href = url;
-}
-
-function pairLink(next: string): string {
-  return `hunsu://pair?next=${encodeURIComponent(next)}`;
-}
-
-function bridgeCommandForCurrentOrigin(next: string): string {
-  if (typeof window === "undefined") {
-    return "npx @hunsu/bridge@latest";
-  }
-  const origin = window.location.origin;
-  const targetUrl = new URL(next, origin).toString();
-  if (origin === "https://hunsu.app" && next === "/studio") {
-    return "npx @hunsu/bridge@latest";
-  }
-  return `npx @hunsu/bridge@latest --web-url "${targetUrl}"`;
+function bridgeSetupCommands(): string {
+  return [
+    "npx @hunsu/bridge@next setup",
+    "hunsu-bridge status",
+    "hunsu-bridge open"
+  ].join("\n");
 }

@@ -343,10 +343,10 @@ test("Relay service enforces PKCE for authorization-code token exchange", async 
   try {
     const codeVerifier = randomBytes(32).toString("base64url");
     const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
-    const redirectUri = "hunsu://pair";
+    const redirectUri = "http://127.0.0.1:43123/oauth/callback";
     const authorizeUrl = new URL("/oauth/authorize", urls.apiUrl);
     authorizeUrl.searchParams.set("response_type", "code");
-    authorizeUrl.searchParams.set("client_id", "hunsu-bridge-app");
+    authorizeUrl.searchParams.set("client_id", "hunsu-bridge-cli");
     authorizeUrl.searchParams.set("redirect_uri", redirectUri);
     authorizeUrl.searchParams.set("code_challenge", codeChallenge);
     authorizeUrl.searchParams.set("code_challenge_method", "S256");
@@ -360,7 +360,7 @@ test("Relay service enforces PKCE for authorization-code token exchange", async 
 
     const wrongVerifier = await postFormRaw(`${urls.apiUrl}/oauth/token`, {
       grant_type: "authorization_code",
-      client_id: "hunsu-bridge-app",
+      client_id: "hunsu-bridge-cli",
       code,
       code_verifier: "wrong-verifier",
       redirect_uri: redirectUri
@@ -370,7 +370,7 @@ test("Relay service enforces PKCE for authorization-code token exchange", async 
 
     const token = await postForm(`${urls.apiUrl}/oauth/token`, {
       grant_type: "authorization_code",
-      client_id: "hunsu-bridge-app",
+      client_id: "hunsu-bridge-cli",
       code,
       code_verifier: codeVerifier,
       redirect_uri: redirectUri

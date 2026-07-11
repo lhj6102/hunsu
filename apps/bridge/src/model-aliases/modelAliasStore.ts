@@ -343,20 +343,24 @@ function modelError(code: ModelAliasValidationErrorCode, message: string, detail
 }
 
 function openProviderSetupAction(providerId: string): ExecutePreflightAction {
-  return { type: "open_provider_setup", label: "Open Provider Setup", href: `hunsu://provider/${providerId}`, providerId };
+  return { type: "open_provider_setup", label: `Run hunsu-bridge provider status`, href: "/studio/setup?next=%2Fstudio", providerId };
 }
 
 function loginProviderAction(providerId: string, label: string): ExecutePreflightAction {
-  return { type: "login_provider", label: `Sign in to ${label}`, href: `hunsu://provider/${providerId}`, providerId };
+  return { type: "login_provider", label: `Check ${label} with hunsu-bridge provider check ${providerId}`, href: "/studio/setup?next=%2Fstudio", providerId };
 }
 
 function recheckProviderAction(providerId: string): ExecutePreflightAction {
-  return { type: "recheck_provider", label: "Recheck Provider", href: `hunsu://provider/${providerId}`, providerId };
+  return { type: "recheck_provider", label: `Run hunsu-bridge provider check ${providerId}`, href: "/studio/setup?next=%2Fstudio", providerId };
 }
 
 function openConnectionAction(backendId: string): ExecutePreflightAction {
   const remote = backendId.startsWith("remote:") || backendId === "remote";
-  return { type: "open_connection", label: "Open Connection", href: remote ? "hunsu://connection/remote" : "hunsu://connection" };
+  return {
+    type: "open_connection",
+    label: remote ? "Run hunsu-bridge remote status" : "Run hunsu-bridge status",
+    href: "/studio/setup?next=%2Fstudio"
+  };
 }
 
 function editModelAliasAction(): ExecutePreflightAction {

@@ -1,0 +1,214 @@
+name: Publish Bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: Exact Git tag, for example v0.2.0-next.0
+        required: true
+        type: string
+      dist_tag:
+        description: npm distribution tag
+        required: true
+        default: next
+        type: choice
+        options:
+          - next
+          - latest
+      confirm_stable:
+        description: Confirm that all stable-promotion gates passed
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  NODE_VERSION: 22.18.0
+  NPM_VERSION: 11.5.1
+  PNPM_VERSION: 10.30.2
+
+jobs:
+  verify_headless:
+    name: Verify release identity and headless gate
+    runs-on: ubuntu-latest
+    outputs:
+      verified_sha: ${{ steps.identity.outputs.verified_sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.version_tag }}
+          fetch-depth: 0
+      - name: Require the selected exact tag
+        id: identity
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+          DIST_TAG: ${{ inputs.dist_tag }}
+          CONFIRM_STABLE: ${{ inputs.confirm_stable }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
+            echo "Dispatch this workflow from the exact tag $VERSION_TAG." >&2
+            exit 1
+          fi
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const pkg = JSON.parse(readFileSync("apps/bridge/package.json", "utf8"));
+            const expected = "v" + pkg.version;
+            if (process.env.VERSION_TAG !== expected) {
+              throw new Error("Git tag " + process.env.VERSION_TAG + " does not match package version " + pkg.version);
+            }
+            const prerelease = pkg.version.includes("-");
+            if (process.env.DIST_TAG === "next" && !prerelease) {
+              throw new Error("The next dist-tag requires a prerelease package version.");
+            }
+            if (process.env.DIST_TAG === "latest" && prerelease) {
+              throw new Error("A prerelease cannot be published under latest.");
+            }
+            if (process.env.DIST_TAG === "latest" && process.env.CONFIRM_STABLE !== "true") {
+              throw new Error("Stable promotion requires explicit confirmation.");
+            }
+          '
+          verified_sha=$(git rev-parse "${VERSION_TAG}^{commit}")
+          if [[ "$verified_sha" != "$GITHUB_SHA" ]]; then
+            echo "The dispatched tag does not resolve to the checked-out commit." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$verified_sha" origin/main; then
+            echo "Bridge releases must point to a commit already merged into main." >&2
+            exit 1
+          fi
+          echo "verified_sha=$verified_sha" >> "$GITHUB_OUTPUT"
+      - name: Require successful Bridge Headless run for this commit
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          VERIFIED_SHA: ${{ steps.identity.outputs.verified_sha }}
+        with:
+          script: |
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "bridge-headless.yml",
+              head_sha: process.env.VERIFIED_SHA,
+              status: "completed",
+              per_page: 100
+            });
+            const successful = response.data.workflow_runs.find(
+              run => run.conclusion === "success"
+                && run.event === "push"
+                && run.head_branch === "main"
+            );
+            if (!successful) {
+              core.setFailed(
+                "No successful Bridge Headless main push run exists for commit " + process.env.VERIFIED_SHA
+              );
+              return;
+            }
+            core.info("Using Bridge Headless run " + successful.html_url);
+      - name: Require stable service and production attestations
+        if: inputs.dist_tag == 'latest'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          VERIFIED_SHA: ${{ steps.identity.outputs.verified_sha }}
+        with:
+          script: |
+            const required = [
+              { workflow_id: "bridge-service-smoke.yml", label: "cross-platform service smoke" },
+              { workflow_id: "bridge-production-integration.yml", label: "production integration attestation" }
+            ];
+            for (const requirement of required) {
+              const response = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: requirement.workflow_id,
+                head_sha: process.env.VERIFIED_SHA,
+                status: "completed",
+                per_page: 100
+              });
+              const successful = response.data.workflow_runs.find(run => run.conclusion === "success");
+              if (!successful) {
+                core.setFailed(`No successful ${requirement.label} run exists for ${process.env.VERIFIED_SHA}.`);
+                return;
+              }
+              core.info(`Using ${requirement.label} run ${successful.html_url}`);
+            }
+
+  package:
+    name: Re-run package smoke
+    needs: verify_headless
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.verify_headless.outputs.verified_sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check:no-desktop-prototype
+      - name: Smoke and retain the exact pnpm-normalized release tarball
+        shell: bash
+        run: |
+          mkdir -p bridge-release
+          HUNSU_BRIDGE_PACK_OUTPUT="$PWD/bridge-release" pnpm run test:package:bridge
+          sha256sum bridge-release/*.tgz > bridge-release/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bridge-release-${{ needs.verify_headless.outputs.verified_sha }}
+          path: bridge-release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish @hunsu/bridge
+    needs:
+      - verify_headless
+      - package
+    runs-on: ubuntu-latest
+    # Configure required reviewers for this environment in repository settings.
+    environment: bridge-npm-release
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.verify_headless.outputs.verified_sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bridge-release-${{ needs.verify_headless.outputs.verified_sha }}
+          path: bridge-release
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+      - name: Install the minimum trusted-publishing npm CLI
+        run: npm install --global "npm@${NPM_VERSION}"
+      - name: Reverify immutable release identity and artifact
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+          VERIFIED_SHA: ${{ needs.verify_headless.outputs.verified_sha }}
+        shell: bash
+        run: |
+          sha256sum --check bridge-release/SHA256SUMS
+          git fetch --force origin "refs/tags/${VERSION_TAG}:refs/tags/hunsu-release-candidate"
+          current_tag_sha=$(git rev-parse "refs/tags/hunsu-release-candidate^{commit}")
+          if [[ "$current_tag_sha" != "$VERIFIED_SHA" || "$GITHUB_SHA" != "$VERIFIED_SHA" ]]; then
+            echo "The release tag moved after verification." >&2
+            exit 1
+          fi
+      - name: Publish exact version with provenance
+        env:
+          DIST_TAG: ${{ inputs.dist_tag }}
+        run: npm publish bridge-release/*.tgz --tag "$DIST_TAG" --provenance

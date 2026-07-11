@@ -110,14 +110,6 @@ export type RelayClientConfig = {
   relayWsUrl?: string;
 };
 
-export type BridgeSidecarPackagingConfig = {
-  nativeSidecarDir?: string;
-  sidecarCacheDir?: string;
-  sidecarNodeVersion?: string;
-  seaNodePath?: string;
-  sidecarTarget?: string;
-};
-
 export type BridgeRuntimeConfigOptions = {
   cwd?: string;
   homeDir?: string;
@@ -151,7 +143,7 @@ export const HUNSU_PORT_SPECS: Record<HunsuPortName, PortSpec> = {
     defaultPort: 19687,
     portEnv: ["HUNSU_BRIDGE_PORT", "PORT"],
     reserved: false,
-    allowPortZero: false
+    allowPortZero: true
   },
   studioWeb: {
     name: "studioWeb",
@@ -275,16 +267,6 @@ export function resolveStudioLauncherConfig(env: Env): ConfigResult<StudioLaunch
 
 export function currentProcessEnv(): Env {
   return process.env;
-}
-
-export function resolveBridgeSidecarPackagingConfig(env: Env): ConfigResult<BridgeSidecarPackagingConfig> {
-  return ok({
-    nativeSidecarDir: firstNonEmpty(env, ["HUNSU_BRIDGE_NATIVE_SIDECAR_DIR"])?.value,
-    sidecarCacheDir: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_CACHE_DIR"])?.value,
-    sidecarNodeVersion: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_NODE_VERSION"])?.value,
-    seaNodePath: firstNonEmpty(env, ["HUNSU_BRIDGE_SEA_NODE_PATH"])?.value,
-    sidecarTarget: firstNonEmpty(env, ["HUNSU_BRIDGE_SIDECAR_TARGET"])?.value
-  });
 }
 
 function defaultBrowserHubApiUrl(env: Env): string | undefined {

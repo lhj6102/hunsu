@@ -136,7 +136,6 @@ export type RemoteBridgeDeviceRecord = RemoteBridgeDeviceSummary & {
   status: "online" | "offline";
   remoteAccess?: "enabled" | "disabled";
   bridgeVersion?: string;
-  bridgeAppVersion?: string;
   protocolVersion?: string;
 };
 
@@ -893,7 +892,7 @@ function requestHeader(request: IncomingMessage, name: string): string | undefin
   return value;
 }
 
-function isRelayCommandName(value: string): value is RelayCommandName {
+export function isRelayCommandName(value: string): value is RelayCommandName {
   return [
     "health",
     "bridge.status",
@@ -939,6 +938,33 @@ function isRelayCommandName(value: string): value is RelayCommandName {
     "agentSession.events",
     "live.events"
   ].includes(value);
+}
+
+export function scopesForRemoteBridgeCommand(command: RelayCommandName): BridgeCommandScope[] {
+  switch (command) {
+    case "execute.start":
+    case "execute.pause":
+    case "execute.resume":
+    case "execute.stop":
+    case "execute.completeMove":
+      return ["execute.start", "remoteRelay.access"];
+    case "artifactAction.list":
+    case "artifactAction.runs":
+      return ["env.read", "hostAlias.expose", "remoteRelay.access"];
+    case "artifactAction.start":
+    case "artifactAction.stop":
+      return ["artifactAction.run", "env.read", "hostAlias.expose", "remoteRelay.access"];
+    case "health":
+    case "bridge.status":
+    case "connection.status":
+    case "provider.inventory":
+    case "modelAlias.validate":
+    case "modelAlias.resolve":
+    case "roadmap.registry.list":
+      return [];
+    default:
+      return ["remoteRelay.access"];
+  }
 }
 
 function isRuntimeProviderStatus(value: unknown): value is RuntimeProviderStatus {

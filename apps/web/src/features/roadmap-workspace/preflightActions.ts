@@ -1,25 +1,24 @@
 import type { ExecutePreflightAction } from "@/shared/api/bridgeTypes";
 
+const STUDIO_SETUP_HREF = "/studio/setup?next=%2Fstudio";
+
 export function bridgeActionHref(action: ExecutePreflightAction): string {
-  if (action.href) return action.href;
+  if (action.href?.startsWith("/") && !action.href.startsWith("//")) return action.href;
   switch (action.type) {
     case "open_provider_setup":
     case "install_provider":
     case "login_provider":
     case "recheck_provider":
-      return action.providerId ? `hunsu://provider/${encodeURIComponent(action.providerId)}` : "hunsu://provider";
+      return STUDIO_SETUP_HREF;
     case "open_workspaces":
-      return "hunsu://workspaces";
+      return "/studio";
     case "activate_workspace":
-      return action.workspaceId
-        ? `hunsu://activate-workspace?workspaceId=${encodeURIComponent(action.workspaceId)}`
-        : "hunsu://workspaces";
+      return "/studio";
     case "edit_model_alias":
       return "/studio/settings/model-aliases";
     case "open_connection":
-      return "hunsu://connection";
-    case "open_bridge_app":
+      return STUDIO_SETUP_HREF;
     default:
-      return "hunsu://open";
+      return STUDIO_SETUP_HREF;
   }
 }

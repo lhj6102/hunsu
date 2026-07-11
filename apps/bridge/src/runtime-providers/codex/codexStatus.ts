@@ -290,46 +290,46 @@ async function readRateLimitsWithClient(client: CodexAppServerProbeClient): Prom
 export function codexRuntimePreflightError(status: CodexRuntimeStatus): ExecutePreflightError | undefined {
   if (!status.cli.installed) {
     return preflight("CODEX_CLI_MISSING", "Codex CLI is not installed or was not found.", [
-      { type: "install_codex", label: "Install Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+      { type: "install_codex", label: "Install Codex, then run hunsu-bridge provider check codex" },
+      { type: "open_prerequisites", label: "Run hunsu-bridge provider status" }
     ]);
   }
   if (!status.appServer.available) {
     return preflight("CODEX_APP_SERVER_UNAVAILABLE", status.appServer.error ?? "Codex app-server is unavailable.", [
-      { type: "codex_recheck", label: "Recheck Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+      { type: "codex_recheck", label: "Run hunsu-bridge provider check codex" },
+      { type: "open_prerequisites", label: "Run hunsu-bridge provider status" }
     ]);
   }
   if (status.auth.state === "not_authenticated") {
     return preflight("CODEX_LOGIN_REQUIRED", "Codex login is required before Execute can start.", [
       { type: "codex_login_chatgpt", label: "Sign in with ChatGPT" },
       { type: "codex_login_device", label: "Use Device Code" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+      { type: "open_prerequisites", label: "Run hunsu-bridge provider status" }
     ]);
   }
   if (status.auth.state === "expired") {
     return preflight("CODEX_AUTH_EXPIRED", "Codex authentication is expired. Sign in again before Execute.", [
       { type: "codex_login_chatgpt", label: "Sign in with ChatGPT" },
-      { type: "codex_recheck", label: "Recheck Codex" }
+      { type: "codex_recheck", label: "Run hunsu-bridge provider check codex" }
     ]);
   }
   if (status.auth.state === "invalid") {
     return preflight("CODEX_LOGIN_REQUIRED", "Codex authentication is invalid. Sign in again before Execute.", [
       { type: "codex_login_chatgpt", label: "Sign in with ChatGPT" },
-      { type: "codex_recheck", label: "Recheck Codex" }
+      { type: "codex_recheck", label: "Run hunsu-bridge provider check codex" }
     ]);
   }
   if (status.auth.state !== "authenticated") {
     return preflight("CODEX_RUNTIME_UNKNOWN", status.auth.error ?? "Codex runtime readiness could not be confirmed.", [
-      { type: "codex_recheck", label: "Recheck Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+      { type: "codex_recheck", label: "Run hunsu-bridge provider check codex" },
+      { type: "open_prerequisites", label: "Run hunsu-bridge provider status" }
     ]);
   }
   if (status.usage.rateLimited) {
     const reset = status.usage.rateLimitSummary?.resetAt ? ` Reset: ${status.usage.rateLimitSummary.resetAt}.` : "";
     return preflight("CODEX_RATE_LIMITED", `Codex access is temporarily unavailable because it is rate limited.${reset}`, [
-      { type: "codex_recheck", label: "Recheck Codex" },
-      { type: "open_prerequisites", label: "Open Prerequisites" }
+      { type: "codex_recheck", label: "Run hunsu-bridge provider check codex" },
+      { type: "open_prerequisites", label: "Run hunsu-bridge provider status" }
     ]);
   }
   return undefined;
@@ -356,7 +356,6 @@ export type ExecutePreflightAction = {
     | "codex_login_chatgpt"
     | "codex_login_device"
     | "codex_recheck"
-    | "open_bridge_app"
     | "open_prerequisites"
     | "open_roadmaps"
     | "activate_roadmap";
@@ -366,7 +365,7 @@ export type ExecutePreflightAction = {
 };
 
 function preflight(error: Extract<ExecutePreflightError, { area: "codex" }>["error"], message: string, actions: ExecutePreflightAction[]): ExecutePreflightError {
-  return { area: "codex", error, message, runtime: "codex", actions: [{ type: "open_bridge_app", label: "Open Bridge App", href: "hunsu://open" }, ...actions] };
+  return { area: "codex", error, message, runtime: "codex", actions };
 }
 
 export function codexAuthHomeDiagnostic(input: {

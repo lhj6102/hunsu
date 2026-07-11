@@ -602,7 +602,6 @@ export type BridgeStatusResponse = {
 
 export type ExecutePreflightAction = {
   type:
-    | "open_bridge_app"
     | "open_provider_setup"
     | "open_workspaces"
     | "open_connection"
@@ -733,7 +732,6 @@ export type ProjectInspectionResult = { project: ProjectInspection };
 
 export type BridgeVersionInfo = {
   bridgeVersion: string;
-  bridgeAppVersion?: string;
   protocolVersion: string;
   minSupportedStudioVersion?: string;
   supportedFeatures: string[];
@@ -741,7 +739,6 @@ export type BridgeVersionInfo = {
 
 export type StudioBridgeRequirement = {
   minBridgeVersion: string;
-  minBridgeAppVersionForRelay?: string;
   requiredProtocolVersion: string;
   requiredFeatures: string[];
 };
@@ -790,7 +787,7 @@ export type StudioConnectionStatusResult = StudioConnectionStatus;
 
 export type BridgeCompatibility =
   | { compatible: true }
-  | { compatible: false; reason: "bridge_update_needed" | "studio_update_needed" | "feature_unavailable" | "bridge_app_update_needed"; message: string };
+  | { compatible: false; reason: "bridge_update_needed" | "studio_update_needed" | "feature_unavailable"; message: string };
 
 export type RemoteBridgeDevice = {
   deviceId: string;
@@ -810,7 +807,6 @@ export type RemoteBridgeDevice = {
   }>;
   lastSnapshotAt?: string;
   bridgeVersion?: string;
-  bridgeAppVersion?: string;
   protocolVersion?: string;
 };
 

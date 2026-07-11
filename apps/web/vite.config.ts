@@ -5,6 +5,10 @@ import { resolveStudioWebServerConfig, unwrapConfigResult } from "@hunsu/config"
 import { defineConfig } from "vite";
 
 const hunsuWeb = unwrapConfigResult(resolveStudioWebServerConfig(process.env));
+const bridgeProxy = {
+  target: hunsuWeb.apiProxyTarget,
+  changeOrigin: false
+};
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -22,9 +26,14 @@ export default defineConfig({
     host: hunsuWeb.web.host,
     port: hunsuWeb.web.port,
     strictPort: hunsuWeb.strictPort,
+    allowedHosts: ["hunsu.localhost"],
     proxy: {
-      "/api": hunsuWeb.apiProxyTarget,
-      "/health": hunsuWeb.apiProxyTarget
+      "/api": bridgeProxy,
+      "/health": bridgeProxy,
+      "/__bridge": {
+        ...bridgeProxy,
+        rewrite: path => path.replace(/^\/__bridge(?=\/|$)/u, "") || "/"
+      }
     }
   }
 });

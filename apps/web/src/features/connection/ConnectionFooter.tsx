@@ -1,4 +1,5 @@
-import { CheckCircle2, Download, ExternalLink, WifiOff } from "lucide-react";
+import { CheckCircle2, ExternalLink, WifiOff } from "lucide-react";
+import { currentStudioNext, pushStudioPath, setupPath } from "@/app/routes";
 import type { BridgeConnectionState } from "@/shared/api/bridgeConnection";
 import type { BridgeStatusResponse } from "@/shared/api/bridgeTypes";
 import { cn } from "@/lib/utils";
@@ -75,7 +76,7 @@ export function ConnectionFooter({
           {!providerReady && activeProvider ? (
             <Button type="button" size="sm" variant="outline" className="h-8 text-[11px]" onClick={event => {
               event.stopPropagation();
-              window.location.href = `hunsu://provider/${encodeURIComponent(activeProvider.providerId)}`;
+              pushStudioPath(setupPath(currentStudioNext(window.location)));
             }}>
               <ExternalLink className="size-3.5" />
               Open Provider Setup
@@ -83,7 +84,7 @@ export function ConnectionFooter({
           ) : bridgeStatus.account.signedIn && !hasRemote ? (
             <Button type="button" size="sm" variant="outline" className="h-8 text-[11px]" onClick={event => {
               event.stopPropagation();
-              window.location.href = "hunsu://connection/remote";
+              onOpen();
             }}>
               <ExternalLink className="size-3.5" />
               Enable Remote
@@ -92,7 +93,7 @@ export function ConnectionFooter({
           <div className="flex gap-2">
             <Button type="button" size="sm" variant="outline" className="h-8 flex-1 text-[11px]" onClick={event => {
               event.stopPropagation();
-              window.location.href = "hunsu://add-workspace";
+              pushStudioPath("/studio");
             }}>
               <ExternalLink className="size-3.5" />
               Add workspace
@@ -102,16 +103,14 @@ export function ConnectionFooter({
       ) : !collapsed && !connected ? (
         <div className="mt-2 flex gap-2">
           <Button type="button" size="sm" variant="outline" className="h-8 flex-1 text-[11px]" onClick={() => {
-            window.location.href = "https://hunsu.app/download/bridge";
-          }}>
-            <Download className="size-3.5" />
-            Install Bridge
-          </Button>
-          <Button type="button" size="sm" variant="outline" className="h-8 flex-1 text-[11px]" onClick={() => {
-            window.location.href = "hunsu://open";
+            pushStudioPath(setupPath(currentStudioNext(window.location)));
           }}>
             <ExternalLink className="size-3.5" />
-            Open Bridge
+            Bridge setup
+          </Button>
+          <Button type="button" size="sm" variant="outline" className="h-8 flex-1 text-[11px]" onClick={onOpen}>
+            <ExternalLink className="size-3.5" />
+            CLI commands
           </Button>
         </div>
       ) : null}

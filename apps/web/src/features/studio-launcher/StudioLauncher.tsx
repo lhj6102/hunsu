@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ExternalLink, Folder, GitBranch, Plus, Search, Trash2 } from "lucide-react";
+import { AlertTriangle, Folder, GitBranch, Plus, Search, Trash2 } from "lucide-react";
 import { pushStudioPath, studioRoadmapPath } from "@/app/routes";
 import { cn } from "@/lib/utils";
 import { postFilesystemGrant, postRoadmapCreate, postRoadmapOpen, postRoadmapPortApply, postRoadmapRegistryRemove } from "@/shared/api/bridgeClient";
@@ -152,13 +152,9 @@ export function StudioLauncher({
             Active workspaces
           </h1>
           <div className="mt-5 flex flex-wrap gap-3">
-            <Button type="button" size="lg" onClick={() => openBridgeLink("hunsu://add-roadmap")}>
-              <ExternalLink className="size-4" />
+            <Button type="button" size="lg" onClick={() => setAdvancedOpen(true)}>
+              <Plus className="size-4" />
               Add workspace
-            </Button>
-            <Button type="button" size="lg" variant="outline" onClick={() => openBridgeLink("hunsu://workspaces")}>
-              <ExternalLink className="size-4" />
-              Open Bridge App
             </Button>
           </div>
         </div>
@@ -179,7 +175,7 @@ export function StudioLauncher({
           </section>
         ) : (
           <section className="mt-6 shrink-0 rounded-[18px] border border-[color:var(--apple-hairline)] bg-white/58 px-4 py-5 text-[13px] leading-5 text-muted-foreground">
-            No active workspaces. Add a workspace in Hunsu Bridge App to start.
+            No active workspaces. Add one here or run hunsu-bridge workspace add &lt;path&gt;.
           </section>
         )}
 
@@ -362,10 +358,6 @@ function FinderSkeleton() {
 
 function isAbsoluteLocalPath(value: string): boolean {
   return value.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(value);
-}
-
-function openBridgeLink(url: string): void {
-  window.location.href = url;
 }
 
 function modeLabel(mode: "launcher" | "open" | "port"): string {

@@ -1026,7 +1026,6 @@ async function connectRemoteBridgeThroughRelay(input: RemoteBridgeConnectRequest
   const sameUser = input.webUserId?.trim() ? input.webUserId.trim() === device.userId : undefined;
   const version = {
     bridgeVersion: device.bridgeVersion ?? "unknown",
-    bridgeAppVersion: device.bridgeAppVersion,
     protocolVersion: device.protocolVersion ?? "unknown",
     supportedFeatures: ["remote-ready"]
   };

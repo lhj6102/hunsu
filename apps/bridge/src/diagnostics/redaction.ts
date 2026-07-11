@@ -79,6 +79,7 @@ export function redactDiagnosticText(value: string): string {
     .replace(ENCODED_QUERY_PARAMETER, (_match, prefix: string, rawValue: string) => `${prefix}${redactedValue(rawValue)}`)
     .replace(/sk-[A-Za-z0-9_-]{10,}/gu, REDACTED_VALUE)
     .replace(/\bhunsu_bridge_[A-Za-z0-9_-]+\b/giu, REDACTED_VALUE)
+    .replace(/\bhunsu_control_[A-Za-z0-9_-]+\b/giu, REDACTED_VALUE)
     .replace(/(OPENAI_API_KEY|CODEX_ACCESS_TOKEN)(\s*=\s*)(?:"[^"]*"|'[^']*'|\S+)/giu, `$1$2${REDACTED_VALUE}`)
     .replace(/~\/\.codex\/auth\.json/giu, REDACTED_VALUE)
     .replace(SECRET_JSON_FIELD, `$1"${REDACTED_VALUE}"`)
@@ -127,7 +128,7 @@ function sanitizeDiagnosticsValue(value: unknown, ancestors: WeakSet<object>): u
   ancestors.add(value);
   const result: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    result[key] = isSensitiveDiagnosticKey(key)
+    result[key] = isSensitiveDiagnosticEntry(key, child)
       ? REDACTED_VALUE
       : sanitizeDiagnosticsValue(child, ancestors);
   }
@@ -154,7 +155,7 @@ function assertDiagnosticsValueSafe(value: unknown, ancestors: WeakSet<object>):
     if (Array.isArray(value) && isSensitiveCliFlag(value[index - 1]) && child !== REDACTED_VALUE) {
       throw unsafeDiagnosticsError();
     }
-    if (isSensitiveDiagnosticKey(key) && child !== REDACTED_VALUE) {
+    if (isSensitiveDiagnosticEntry(key, child) && child !== REDACTED_VALUE) {
       throw unsafeDiagnosticsError();
     }
     assertDiagnosticsValueSafe(child, ancestors);
@@ -195,6 +196,11 @@ function normalizedQueryParameterName(rawName: string): string {
 
 function isSensitiveDiagnosticKey(key: string): boolean {
   return /token|secret|api.?key|authorization|credential|auth\.json|password|cookie/iu.test(key);
+}
+
+function isSensitiveDiagnosticEntry(key: string, value: unknown): boolean {
+  return !(key === "credentialsPresent" && typeof value === "boolean")
+    && isSensitiveDiagnosticKey(key);
 }
 
 function isSensitiveCliFlag(value: unknown): boolean {

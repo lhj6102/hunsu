@@ -58,30 +58,23 @@ test("Connection Center card labels cover required Studio connection states", as
       warnings: ["version_mismatch"]
     })), "Feature unavailable on this Bridge version");
 
-    assert.equal(module.connectionCardLabel(onlineConnection({
-      mode: "remote",
-      transport: "relay",
-      compatibility: { compatible: false, reason: "bridge_app_update_needed", message: "Bridge App is too old." },
-      warnings: ["version_mismatch"]
-    })), "Remote Relay requires newer Bridge App");
   } finally {
     await close();
   }
 });
 
-test("Roadmap workspace preflight actions map to Bridge App destinations", async () => {
+test("Roadmap workspace preflight actions map to same-origin Studio destinations", async () => {
   const { module, close } = await loadPreflightActionsModule();
   try {
-    assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex" }), "hunsu://provider");
-    assert.equal(module.bridgeActionHref({ type: "login_provider", label: "Sign In" }), "hunsu://provider");
-    assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Open Workspaces" }), "hunsu://workspaces");
-    assert.equal(module.bridgeActionHref({ type: "activate_workspace", label: "Activate Workspace", workspaceId: "workspace 123" }), "hunsu://activate-workspace?workspaceId=workspace%20123");
-    assert.equal(module.bridgeActionHref({ type: "open_bridge_app", label: "Open Bridge App" }), "hunsu://open");
-    assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Server href", href: "hunsu://workspaces" }), "hunsu://workspaces");
-    assert.equal(module.bridgeActionHref({ type: "open_connection", label: "Open Connection" }), "hunsu://connection");
+    assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex" }), "/studio/setup?next=%2Fstudio");
+    assert.equal(module.bridgeActionHref({ type: "login_provider", label: "Sign In" }), "/studio/setup?next=%2Fstudio");
+    assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "Open Workspaces" }), "/studio");
+    assert.equal(module.bridgeActionHref({ type: "activate_workspace", label: "Activate Workspace", workspaceId: "workspace 123" }), "/studio");
+    assert.equal(module.bridgeActionHref({ type: "open_workspaces", label: "External href", href: "https://example.test/workspaces" }), "/studio");
+    assert.equal(module.bridgeActionHref({ type: "open_connection", label: "Open Connection" }), "/studio/setup?next=%2Fstudio");
     assert.equal(module.bridgeActionHref({ type: "edit_model_alias", label: "Edit Model Alias" }), "/studio/settings/model-aliases");
-    assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex", providerId: "codex" }), "hunsu://provider/codex");
-    assert.equal(module.bridgeActionHref({ type: "open_provider_setup", label: "Open Provider Setup" }), "hunsu://provider");
+    assert.equal(module.bridgeActionHref({ type: "install_provider", label: "Install Codex", providerId: "codex" }), "/studio/setup?next=%2Fstudio");
+    assert.equal(module.bridgeActionHref({ type: "open_provider_setup", label: "Open Provider Setup" }), "/studio/setup?next=%2Fstudio");
   } finally {
     await close();
   }
@@ -262,8 +255,8 @@ test("Roadmap workspace renders multiple server-provided preflight actions", asy
         message: "This Workspace is inactive.",
         workspaceId: "roadmap_123",
         actions: [
-          { type: "open_workspaces", label: "Open Workspaces", href: "hunsu://workspaces" },
-          { type: "activate_workspace", label: "Activate Workspace", href: "hunsu://activate-workspace?workspaceId=roadmap_123" }
+          { type: "open_workspaces", label: "Open Workspaces", href: "/studio" },
+          { type: "activate_workspace", label: "Activate Workspace", href: "/studio" }
         ]
       },
       open: () => undefined
@@ -560,9 +553,9 @@ test("Connection Center normal actions use Provider, Workspaces, and Connections
   assert.notEqual(actionStart, -1);
   assert.notEqual(actionEnd, -1);
   const normalActions = source.slice(actionStart, actionEnd);
-  assert.match(normalActions, /hunsu:\/\/provider/);
-  assert.match(normalActions, /hunsu:\/\/workspaces/);
-  assert.match(normalActions, /hunsu:\/\/connection/);
+  assert.match(normalActions, /setupPath/);
+  assert.match(normalActions, /pushStudioPath\("\/studio"\)/);
+  assert.doesNotMatch(normalActions, /download\/bridge|window\.location\.href/);
   assert.doesNotMatch(normalActions, /remote-disable|pairAgainLink|Project Grant|Project access/);
   assert.match(source, /BackendProviderList/);
   assert.match(source, /backend\.provider/);
@@ -613,7 +606,6 @@ test("Web remote Bridge client lists, connects, and routes commands directly thr
           lastSeenAt: "2026-07-08T00:01:00.000Z",
           status: "online",
           bridgeVersion: "0.1.2",
-          bridgeAppVersion: "0.1.0",
           protocolVersion: "local-bridge-v1"
         }]
       }), { status: 200, headers: { "content-type": "application/json" } });
@@ -732,7 +724,7 @@ test("Web remote Bridge client stores a session only after a usable connection",
     remoteConnectResult({ auth: "account_mismatch", account: { webUserId: "web@example.test", bridgeUserId: "bridge@example.test", sameUser: false } }),
     remoteConnectResult({ projectAccess: "needs_grant" }),
     remoteConnectResult({
-      compatibility: { compatible: false, reason: "bridge_app_update_needed", message: "Bridge App is too old." },
+      compatibility: { compatible: false, reason: "feature_unavailable", message: "Required feature is unavailable." },
       warnings: ["version_mismatch"]
     }),
     remoteConnectResult({ projectAccess: "granted" })
@@ -1570,7 +1562,6 @@ function remoteConnectResult(overrides: Partial<StudioConnectionStatus>) {
       lastSeenAt: "2026-07-08T00:01:00.000Z",
       status: "online" as const,
       bridgeVersion: "0.1.2",
-      bridgeAppVersion: "0.1.0",
       protocolVersion: "local-bridge-v1"
     },
     compatibility,
@@ -1819,7 +1810,6 @@ async function loadPreflightActionsModule(): Promise<{
   module: {
     bridgeActionHref: (action: {
       type:
-        | "open_bridge_app"
         | "open_provider_setup"
         | "open_workspaces"
         | "open_connection"

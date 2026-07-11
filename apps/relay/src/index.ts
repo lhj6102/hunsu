@@ -78,7 +78,6 @@ export type RemoteBridgeDevice = {
   projectGrants?: ProjectGrant[];
   lastSnapshotAt?: string;
   bridgeVersion?: string;
-  bridgeAppVersion?: string;
   protocolVersion?: string;
 };
 
@@ -367,8 +366,8 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
         return;
       }
       const token = url.searchParams.get("access_token") ?? bearerToken(request);
-      const session = token ? sessions.get(token) : undefined;
-      if (!session) {
+      let session = token ? sessions.get(token) : undefined;
+      if (token && !session) {
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
         return;
@@ -391,20 +390,36 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
         ""
       ].join("\r\n"));
       const peer = new WebSocketPeer(socket as Socket, head);
+      const authenticationTimeout = session ? undefined : setTimeout(() => peer.close(), 5_000);
+      authenticationTimeout?.unref();
       peer.onMessage = text => {
         const message = parseJsonObject(text);
         if (!message) {
           return;
         }
+        if (message.type === "authenticate" && !session) {
+          const authenticationToken = optionalString(message.token);
+          session = authenticationToken ? sessions.get(authenticationToken) : undefined;
+          if (!session) {
+            peer.close();
+            return;
+          }
+          if (authenticationTimeout) clearTimeout(authenticationTimeout);
+          return;
+        }
+        const authenticatedSession = session;
+        if (!authenticatedSession) {
+          return;
+        }
         if (message.type === "device.register") {
-          const device = registerDeviceFromBody(session, message, { connected: true });
-          connected.set(device.deviceId, { session, device, peer });
+          const device = registerDeviceFromBody(authenticatedSession, message, { connected: true });
+          connected.set(device.deviceId, { session: authenticatedSession, device, peer });
           persistState();
           return;
         }
         if (message.type === "device.heartbeat" && typeof message.deviceId === "string") {
           const device = devices.get(message.deviceId);
-          if (device && device.userId === session.userId) {
+          if (device && device.userId === authenticatedSession.userId) {
             devices.set(device.deviceId, { ...device, status: "online", lastSeenAt: new Date(now()).toISOString() });
             persistState();
           }
@@ -432,6 +447,7 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
         }
       };
       peer.onClose = () => {
+        if (authenticationTimeout) clearTimeout(authenticationTimeout);
         for (const [deviceId, value] of connected.entries()) {
           if (value.peer === peer) {
             connected.delete(deviceId);
@@ -520,7 +536,6 @@ export function createHunsuRelayServer(options: RelayServerOptions = {}): HunsuR
       workspaces,
       lastSnapshotAt,
       bridgeVersion: optionalString(candidate.bridgeVersion),
-      bridgeAppVersion: optionalString(candidate.bridgeAppVersion),
       protocolVersion: optionalString(candidate.protocolVersion),
       projectGrants
     };
@@ -936,7 +951,6 @@ function publicDevice(device: StoredRelayDevice): RemoteBridgeDevice {
     projectGrants: device.projectGrants,
     lastSnapshotAt: device.lastSnapshotAt,
     bridgeVersion: device.bridgeVersion,
-    bridgeAppVersion: device.bridgeAppVersion,
     protocolVersion: device.protocolVersion
   };
 }

@@ -17,17 +17,17 @@ import {
   type RoadmapRegistryWorkspaceEntry
 } from "../workspaces/workspaceRegistry.ts";
 import {
-  bridgeStatusAccountEvidenceFromBridgeAppState,
-  bridgeStatusProjectGrantsFromBridgeAppState,
+  bridgeStatusAccountEvidenceFromState,
+  bridgeStatusProjectGrantsFromState,
   mergeBridgeStatusProjectGrants,
   parseBridgeStatusProjectGrants
-} from "./bridgeAppState.ts";
+} from "./bridgeState.ts";
 
 export type BridgeStatusAccount = {
   signedIn: boolean;
   userId?: string;
   email?: string;
-  source?: "bridge_app" | "relay" | "env" | "query" | "none";
+  source?: "daemon" | "relay" | "env" | "query" | "none";
 };
 
 export type BridgeStatusResponse = {
@@ -56,14 +56,14 @@ export function accountStatusForBridgeRequest(
   const queryUserId = url.searchParams.get("userId")?.trim() || undefined;
   const queryEmail = url.searchParams.get("email")?.trim() || undefined;
   const persisted = accountStatusFromProcessEnv(runtimeConfig.processEnv);
-  const bridgeApp = bridgeStatusAccountEvidenceFromBridgeAppState(runtimeConfig.processEnv);
+  const daemonAccount = bridgeStatusAccountEvidenceFromState(runtimeConfig.processEnv);
   const relay = relayRequestConfig(request, runtimeConfig);
-  if (bridgeApp.signedIn) {
+  if (daemonAccount.signedIn) {
     return {
       signedIn: true,
-      userId: bridgeApp.userId ?? persisted.userId,
-      email: bridgeApp.email ?? persisted.email,
-      source: "bridge_app"
+      userId: daemonAccount.userId ?? persisted.userId,
+      email: daemonAccount.email ?? persisted.email,
+      source: "daemon"
     };
   }
   if (relay) {
@@ -77,11 +77,11 @@ export function accountStatusForBridgeRequest(
   if (persisted.signedIn) {
     return { ...persisted, source: "env" };
   }
-  if (!bridgeApp.available && queryAccountEvidenceAllowed(runtimeConfig.processEnv) && (queryUserId || queryEmail)) {
+  if (!daemonAccount.available && queryAccountEvidenceAllowed(runtimeConfig.processEnv) && (queryUserId || queryEmail)) {
     return { signedIn: true, userId: queryUserId, email: queryEmail, source: "query" };
   }
-  if (bridgeApp.available) {
-    return { signedIn: false, source: "bridge_app" };
+  if (daemonAccount.available) {
+    return { signedIn: false, source: "daemon" };
   }
   return { signedIn: false, source: "none" };
 }
@@ -89,7 +89,7 @@ export function accountStatusForBridgeRequest(
 export function projectGrantsForBridgeRequest(runtimeConfig: BridgeRuntimeConfig): RemoteWorkspaceProjectGrant[] {
   return mergeBridgeStatusProjectGrants([
     ...parseBridgeStatusProjectGrants(runtimeConfig.processEnv.HUNSU_BRIDGE_PROJECT_GRANTS_JSON),
-    ...bridgeStatusProjectGrantsFromBridgeAppState(runtimeConfig.processEnv)
+    ...bridgeStatusProjectGrantsFromState(runtimeConfig.processEnv)
   ]);
 }
 

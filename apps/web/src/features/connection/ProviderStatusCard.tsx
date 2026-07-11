@@ -1,4 +1,5 @@
 import { AlertCircle, CheckCircle2, LogIn, RefreshCw } from "lucide-react";
+import { currentStudioNext, pushStudioPath, setupPath } from "@/app/routes";
 import type { RuntimeProviderStatus } from "@/shared/api/bridgeTypes";
 import { cn } from "@/lib/utils";
 import { Button } from "@/shared/ui/button";
@@ -58,6 +59,6 @@ export function providerStatusLabel(provider: RuntimeProviderStatus): string {
   return "Unknown";
 }
 
-function openBridgeProvider(providerId?: string) {
-  window.location.href = providerId ? `hunsu://provider/${encodeURIComponent(providerId)}` : "hunsu://provider";
+function openBridgeProvider(_providerId?: string) {
+  pushStudioPath(setupPath(currentStudioNext(window.location)));
 }
