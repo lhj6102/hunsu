@@ -156,52 +156,29 @@ jobs:
                 Get-Content -LiteralPath $structuredLog | Out-Host
               }
 
-              Stop-ScheduledTask -TaskName "Hunsu Bridge" -ErrorAction SilentlyContinue
-              $directStdout = Join-Path $env:RUNNER_TEMP "hunsu-bridge-direct.stdout.log"
-              $directStderr = Join-Path $env:RUNNER_TEMP "hunsu-bridge-direct.stderr.log"
-              Remove-Item -Force -ErrorAction SilentlyContinue $directStdout, $directStderr
-              Write-Host "Starting the registered action directly in the workflow session."
-              $directProcessOptions = @{
-                FilePath = $task.Actions[0].Execute
-                ArgumentList = $task.Actions[0].Arguments
-                PassThru = $true
-                RedirectStandardOutput = $directStdout
-                RedirectStandardError = $directStderr
-              }
-              $direct = Start-Process @directProcessOptions
-              $directStatus = $null
-              try {
-                for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
-                  $candidate = Invoke-Bridge @("service", "status", "--json") | ConvertFrom-Json
-                  if ($candidate.value.health -eq "healthy" -and $candidate.value.authentication -eq "authenticated") {
-                    $directStatus = $candidate
-                    break
-                  }
-                  if ($direct.HasExited) {
-                    break
-                  }
-                  Start-Sleep -Milliseconds 100
-                }
-                Write-Host "Direct action Bridge status:"
-                $directStatus | ConvertTo-Json -Depth 8 | Out-Host
-                if ($direct.HasExited) {
-                  Write-Host "Direct action exit code: $($direct.ExitCode)"
-                } else {
-                  Write-Host "Direct action remained running."
-                }
-              } finally {
-                & node "apps/bridge/dist/cli.js" service stop --json | Out-Host
-                if (-not $direct.HasExited) {
-                  Stop-Process -Id $direct.Id -Force -ErrorAction SilentlyContinue
-                }
-                Wait-Process -Id $direct.Id -ErrorAction SilentlyContinue
-                Write-Host "Direct action stdout:"
-                Get-Content -LiteralPath $directStdout -ErrorAction SilentlyContinue | Out-Host
-                Write-Host "Direct action stderr:"
-                Get-Content -LiteralPath $directStderr -ErrorAction SilentlyContinue | Out-Host
-              }
             }
             throw "The installed user service never reached healthy authenticated status."
+          }
+          if ($IsWindows) {
+            $credentialsPath = Join-Path $env:HUNSU_HOME "credentials.json"
+            if (-not (Test-Path -LiteralPath $credentialsPath)) {
+              throw "The healthy Windows service did not persist its control credential."
+            }
+            $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $credentialAcl = Get-Acl -LiteralPath $credentialsPath
+            $credentialRules = @($credentialAcl.Access)
+            $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+            if (
+              $credentialAcl.Owner -ne $currentIdentity -or
+              -not $credentialAcl.AreAccessRulesProtected -or
+              $credentialRules.Count -ne 1 -or
+              $credentialRules[0].IdentityReference.Value -ne $currentIdentity -or
+              $credentialRules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+              ($credentialRules[0].FileSystemRights -band $fullControl) -ne $fullControl
+            ) {
+              throw "The Windows credential ACL was not restricted to one full-control rule for the current user."
+            }
+            Write-Host "Verified the protected current-user-only credential ACL."
           }
           if ($healthyStatus.value.packageVersion -ne $expectedPackageVersion) {
             throw "Service status reported the wrong installed package version."

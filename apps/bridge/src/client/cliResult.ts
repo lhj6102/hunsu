@@ -1,3 +1,5 @@
+import { BridgeStateError } from "../state/atomicJsonStore.ts";
+
 export const BRIDGE_CLI_RESULT_SCHEMA = "hunsu.bridge.cli-result.v1" as const;
 
 export const BRIDGE_NOT_RUNNING_MESSAGE = "Start Hunsu Bridge with `hunsu-bridge service start`.";
@@ -103,6 +105,9 @@ export function bridgeNotRunningResult(): BridgeCliFailure {
 export function bridgeErrorResult(error: unknown): BridgeCliFailure {
   if (error instanceof BridgeError) {
     return cliFailure(error.code, error.message, error.recovery);
+  }
+  if (error instanceof BridgeStateError) {
+    return cliFailure(error.code, error.message);
   }
   return cliFailure(
     "BRIDGE_CONTROL_UNAVAILABLE",

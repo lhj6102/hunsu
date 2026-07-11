@@ -13,6 +13,9 @@ import {
   resolveHunsuPaths
 } from "../apps/bridge/src/state/index.ts";
 import { BRIDGE_RUNTIME_SCHEMA } from "../apps/bridge/src/state/runtimeStore.ts";
+import { windowsCredentialAclPowerShellInvocation } from "../apps/bridge/src/state/credentialStore.ts";
+import { invalidState } from "../apps/bridge/src/state/atomicJsonStore.ts";
+import { bridgeErrorResult } from "../apps/bridge/src/client/cliResult.ts";
 import {
   createWorkspaceService,
   toWorkspaceSafeMetadata,
@@ -48,6 +51,45 @@ test("HUNSU_HOME resolves the platform defaults and complete state layout", () =
   assert.equal(paths.configFile, win32.join("C:\\Hunsu", "config.json"));
   assert.equal(paths.structuredLogFile, win32.join("C:\\Hunsu", "logs", "bridge.jsonl"));
   assert.equal(paths.runtimeVersionsDirectory, win32.join("C:\\Hunsu", "runtime", "versions"));
+});
+
+test("Windows credential ACL hardening uses one encoded injection-safe PowerShell command", () => {
+  const credentialPath = "C:\\Users\\O'Brien\\Hunsu Bridge\\credentials.json";
+  const invocation = windowsCredentialAclPowerShellInvocation(credentialPath);
+  assert.equal(invocation.command, "powershell.exe");
+  assert.deepEqual(invocation.args.slice(0, -1), [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand"
+  ]);
+  assert.equal(invocation.args.includes(credentialPath), false);
+  const command = Buffer.from(invocation.args.at(-1) ?? "", "base64").toString("utf16le");
+  assert.match(command, /\$CredentialPath = 'C:\\Users\\O''Brien\\Hunsu Bridge\\credentials\.json'/u);
+  assert.match(command, /Get-Acl -LiteralPath \$CredentialPath/u);
+  assert.match(command, /SetAccessRuleProtection\(\$true, \$false\)/u);
+  assert.match(command, /RemoveAccessRuleSpecific/u);
+  assert.match(command, /Set-Acl -LiteralPath \$CredentialPath/u);
+  assert.doesNotMatch(command, /param\(/u);
+  assert.throws(
+    () => windowsCredentialAclPowerShellInvocation("C:\\Hunsu\nInjected\\credentials.json"),
+    /control characters/u
+  );
+});
+
+test("Bridge state failures keep the stable code and expose only basename-safe context", () => {
+  const result = bridgeErrorResult(invalidState(
+    "/secret/runtime/credentials.json",
+    "credentials ACL could not be restricted to the current Windows user"
+  ));
+  assert.deepEqual(result, {
+    schema: "hunsu.bridge.cli-result.v1",
+    ok: false,
+    code: "BRIDGE_STATE_INVALID",
+    message: "Bridge state file is invalid (credentials.json): credentials ACL could not be restricted to the current Windows user"
+  });
+  assert.doesNotMatch(JSON.stringify(result), /\/secret\/runtime/u);
 });
 
 test("atomic state stores persist config, preserve credentials, and guard runtime identity", async () => {
