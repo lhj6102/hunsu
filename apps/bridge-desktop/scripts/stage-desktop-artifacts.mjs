@@ -18,6 +18,7 @@ const managedBridgeEvidenceName = "windows-managed-bridge-e2e-evidence.json";
 const installedAppEvidenceName = "windows-installed-app-e2e-evidence.json";
 const installedAppScreenshotName = "windows-installed-app-e2e-screenshot.png";
 const installerUpgradeEvidenceName = "windows-installer-upgrade-e2e-evidence.json";
+const dogfoodBuildOnlyNoticeName = "DOGFOOD-BUILD-ONLY.txt";
 const checksumFileName = "SHA256SUMS.txt";
 
 const targetArtifactRules = new Map([
@@ -62,6 +63,17 @@ export function stageDesktopArtifacts(input) {
   const includeSizeReport = input?.includeSizeReport ?? false;
   if (typeof includeSizeReport !== "boolean") {
     throw new Error("Desktop artifact staging includeSizeReport must be a boolean.");
+  }
+  const dogfoodBuildOnly = input?.dogfoodBuildOnly ?? false;
+  if (typeof dogfoodBuildOnly !== "boolean") {
+    throw new Error("Desktop artifact staging dogfoodBuildOnly must be a boolean.");
+  }
+  if (dogfoodBuildOnly && (includeSizeReport
+    || input?.evidencePath !== undefined
+    || input?.installedEvidencePath !== undefined
+    || input?.installedScreenshotPath !== undefined
+    || input?.upgradeEvidencePath !== undefined)) {
+    throw new Error("Dogfood build-only artifacts cannot include gated validation evidence or size reports.");
   }
 
   rmSync(outputRoot, { recursive: true, force: true });
@@ -135,6 +147,21 @@ export function stageDesktopArtifacts(input) {
     copyIntoStage(upgradeEvidencePath, outputRoot, installerUpgradeEvidenceName);
   }
 
+  if (dogfoodBuildOnly) {
+    writeFileSync(
+      join(outputRoot, dogfoodBuildOnlyNoticeName),
+      [
+        "Hunsu Bridge dogfood build-only artifact",
+        "",
+        "Automated repository, lifecycle, installed-app, upgrade, and size validation was skipped.",
+        "Use this artifact only for manual dogfooding QA.",
+        "releaseEligible=false",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+  }
+
   const stagedFiles = walkFiles(outputRoot)
     .map(path => portableRelativePath(outputRoot, path))
     .filter(path => path !== checksumFileName)
@@ -174,6 +201,13 @@ export function parseStageDesktopArtifactArguments(args) {
         throw new Error(`Desktop artifact staging option was provided more than once: ${option}`);
       }
       options.includeSizeReport = true;
+      continue;
+    }
+    if (option === "--dogfood-build-only") {
+      if (Object.hasOwn(options, "dogfoodBuildOnly")) {
+        throw new Error(`Desktop artifact staging option was provided more than once: ${option}`);
+      }
+      options.dogfoodBuildOnly = true;
       continue;
     }
     const property = optionNames.get(option);

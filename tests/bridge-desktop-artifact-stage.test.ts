@@ -17,6 +17,12 @@ import { spawnSync } from "node:child_process";
 
 type ArtifactStageModule = {
   supportedDesktopArtifactTargets: readonly string[];
+  parseStageDesktopArtifactArguments(args: string[]): {
+    bundleDir: string;
+    outputDir: string;
+    target: string;
+    dogfoodBuildOnly?: boolean;
+  };
   stageDesktopArtifacts(input: {
     bundleDir: string;
     outputDir: string;
@@ -26,6 +32,7 @@ type ArtifactStageModule = {
     installedEvidencePath?: string;
     installedScreenshotPath?: string;
     upgradeEvidencePath?: string;
+    dogfoodBuildOnly?: boolean;
   }): { files: string[] };
 };
 
@@ -99,6 +106,52 @@ test("desktop artifact staging omits a size report unless explicitly requested",
 
     assert.deepEqual(listFiles(outputDir), ["SHA256SUMS.txt", "dmg/Hunsu.dmg"]);
     assertChecksumsMatchEveryStagedFile(outputDir);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("desktop artifact staging clearly marks checksum-covered dogfood build-only artifacts", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-desktop-artifact-stage-dogfood-build-only-"));
+  const bundleDir = join(root, "bundle");
+  const outputDir = join(root, "staged");
+
+  try {
+    writeFixture(join(bundleDir, "nsis", "Hunsu Bridge_0.1.1_x64-setup.exe"), "windows-installer");
+    const parsed = artifactStage.parseStageDesktopArtifactArguments([
+      "--bundle-dir", bundleDir,
+      "--output-dir", outputDir,
+      "--target", "x86_64-pc-windows-msvc",
+      "--dogfood-build-only"
+    ]);
+    assert.equal(parsed.dogfoodBuildOnly, true);
+    artifactStage.stageDesktopArtifacts({
+      bundleDir,
+      outputDir,
+      target: "x86_64-pc-windows-msvc",
+      dogfoodBuildOnly: true
+    });
+
+    assert.deepEqual(listFiles(outputDir), [
+      "DOGFOOD-BUILD-ONLY.txt",
+      "SHA256SUMS.txt",
+      "nsis/Hunsu Bridge_0.1.1_x64-setup.exe"
+    ]);
+    const notice = readFileSync(join(outputDir, "DOGFOOD-BUILD-ONLY.txt"), "utf8");
+    assert.match(notice, /manual dogfooding QA/u);
+    assert.match(notice, /releaseEligible=false/u);
+    assertChecksumsMatchEveryStagedFile(outputDir);
+
+    assert.throws(
+      () => artifactStage.stageDesktopArtifacts({
+        bundleDir,
+        outputDir,
+        target: "x86_64-pc-windows-msvc",
+        dogfoodBuildOnly: true,
+        includeSizeReport: true
+      }),
+      /cannot include gated validation evidence or size reports/u
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

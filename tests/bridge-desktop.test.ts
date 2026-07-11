@@ -3098,7 +3098,10 @@ test("Bridge App protocol plan and sidecar supervisor expose native desktop foun
     assert.match(artifactWorkflow, /codesign --verify --deep --strict --verbose=2 "\$\{app_bundle\}"/);
     assert.match(artifactWorkflow, /test -x "\$\{SIDECAR_PATH\}"/);
     assert.match(artifactWorkflow, /stage-desktop-artifacts\.mjs/);
-    assert.match(artifactWorkflow, /if: inputs\.platform == 'all'/);
+    assert.match(
+      artifactWorkflow,
+      /if: inputs\.validation == 'gated' && inputs\.platform == 'all'/
+    );
     assert.match(artifactWorkflow, /--include-size-report/);
     assert.doesNotMatch(artifactWorkflow, /SIDECAR_SHA256SUM\.txt|bundle\/\*\*\/\*/);
     assert.equal(

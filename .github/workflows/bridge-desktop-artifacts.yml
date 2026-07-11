@@ -17,12 +17,20 @@ on:
           - linux
           - linux-arm64
           - all
+      validation:
+        description: Validation level before artifact upload
+        type: choice
+        required: true
+        default: gated
+        options:
+          - gated
+          - dogfood-build-only
 
 permissions:
   contents: read
 
 concurrency:
-  group: bridge-desktop-${{ github.ref }}-${{ inputs.platform }}
+  group: bridge-desktop-${{ github.ref }}-${{ inputs.platform }}-${{ inputs.validation }}
   cancel-in-progress: true
 
 jobs:
@@ -70,6 +78,7 @@ jobs:
 
   validate:
     name: Linux repository validation
+    if: inputs.validation == 'gated'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -125,6 +134,12 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     needs: [select, validate]
+    if: >-
+      ${{
+        always() &&
+        needs.select.result == 'success' &&
+        (inputs.validation == 'dogfood-build-only' || needs.validate.result == 'success')
+      }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -217,7 +232,7 @@ jobs:
           --timeout-ms 60000
 
       - name: Run Windows managed Bridge lifecycle E2E
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && inputs.validation == 'gated'
         timeout-minutes: 10
         shell: pwsh
         env:
@@ -228,7 +243,7 @@ jobs:
             -EvidencePath $env:MANAGED_BRIDGE_EVIDENCE_PATH
 
       - name: Run installed Windows Bridge App WebView E2E
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && inputs.validation == 'gated'
         timeout-minutes: 10
         shell: pwsh
         env:
@@ -248,7 +263,7 @@ jobs:
             -ScreenshotPath $env:INSTALLED_APP_SCREENSHOT_PATH
 
       - name: Run Windows same-directory installer upgrade E2E
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && inputs.validation == 'gated'
         timeout-minutes: 20
         shell: pwsh
         env:
@@ -282,11 +297,11 @@ jobs:
           fi
 
       - name: Report non-Windows artifact sizes
-        if: inputs.platform == 'all' && matrix.platform != 'windows'
+        if: inputs.validation == 'gated' && inputs.platform == 'all' && matrix.platform != 'windows'
         run: pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes -- --target "${{ matrix.rust_target }}"
 
       - name: Guard Windows artifact sizes
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && inputs.validation == 'gated'
         shell: pwsh
         env:
           ARTIFACT_ZIP_PREVIEW: ${{ runner.temp }}/hunsu-bridge-windows-x64-size-preview.zip
@@ -339,19 +354,23 @@ jobs:
             --output-dir "${ARTIFACT_STAGE}"
             --target "${SIDECAR_TARGET}"
           )
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            stage_args+=(--evidence-path "${MANAGED_BRIDGE_EVIDENCE_PATH}")
-            stage_args+=(--installed-evidence-path "${INSTALLED_APP_EVIDENCE_PATH}")
-            stage_args+=(--installed-screenshot-path "${INSTALLED_APP_SCREENSHOT_PATH}")
-            stage_args+=(--upgrade-evidence-path "${INSTALLER_UPGRADE_EVIDENCE_PATH}")
-          fi
-          if [[ "${{ matrix.platform }}" == "windows" || "${{ inputs.platform }}" == "all" ]]; then
-            stage_args+=(--include-size-report)
+          if [[ "${{ inputs.validation }}" == "gated" ]]; then
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              stage_args+=(--evidence-path "${MANAGED_BRIDGE_EVIDENCE_PATH}")
+              stage_args+=(--installed-evidence-path "${INSTALLED_APP_EVIDENCE_PATH}")
+              stage_args+=(--installed-screenshot-path "${INSTALLED_APP_SCREENSHOT_PATH}")
+              stage_args+=(--upgrade-evidence-path "${INSTALLER_UPGRADE_EVIDENCE_PATH}")
+            fi
+            if [[ "${{ matrix.platform }}" == "windows" || "${{ inputs.platform }}" == "all" ]]; then
+              stage_args+=(--include-size-report)
+            fi
+          else
+            stage_args+=(--dogfood-build-only)
           fi
           node apps/bridge-desktop/scripts/stage-desktop-artifacts.mjs "${stage_args[@]}"
 
       - name: Finalize Windows artifact ZIP size measurement
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && inputs.validation == 'gated'
         shell: pwsh
         env:
           ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
@@ -393,10 +412,18 @@ jobs:
           ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
         run: node apps/bridge-desktop/scripts/verify-desktop-artifact-checksums.mjs "${ARTIFACT_STAGE}"
 
+      - name: Summarize dogfood build-only artifact
+        if: inputs.validation == 'dogfood-build-only'
+        shell: bash
+        run: |
+          echo "### Dogfood build-only artifact" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Automated repository and Windows QA gates were intentionally skipped." >> "${GITHUB_STEP_SUMMARY}"
+          echo "The uploaded artifact is for manual dogfooding QA only and is not release eligible." >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ inputs.validation == 'dogfood-build-only' && format('{0}-dogfood-build-only', matrix.artifact) || matrix.artifact }}
           path: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
           if-no-files-found: error
           retention-days: 90

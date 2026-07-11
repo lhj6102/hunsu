@@ -19,6 +19,15 @@ same-directory installer upgrade/reinstall/uninstall gate before staging or
 uploading the installer. ARM64 and non-Windows jobs do not run those x64-only
 gates.
 
+The workflow's `validation` input defaults to `gated`, preserving every
+repository, lifecycle, installed-app, upgrade, evidence, checksum, and size
+gate described below. Select `dogfood-build-only` only when an installer is
+needed for manual dogfooding QA before those automated gates are useful. That
+mode skips repository and E2E validation but still builds the real bundle,
+checks the Windows GUI subsystem, runs the bounded native sidecar smoke, stages
+checksums, and uploads an artifact suffixed `-dogfood-build-only`. The archive
+also contains `DOGFOOD-BUILD-ONLY.txt`; it is explicitly not release eligible.
+
 Dogfood jobs stage installable outputs and a matching `SHA256SUMS.txt`:
 
 - Windows: `bundle/nsis/*.exe`
@@ -41,8 +50,9 @@ unpacked application directories are not uploaded for dogfood runs. A separate
 pre-upload verifier rejects missing, extra, duplicated, path-escaping, or
 digest-mismatched entries after the final staging pass.
 
-Windows x64 always runs the target-aware size report; the explicit `all`
-selection additionally emits the report for every other target:
+Gated Windows x64 runs always include the target-aware size report; the
+explicit gated `all` selection additionally emits the report for every other
+target:
 
 ```sh
 pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes -- --target x86_64-pc-windows-msvc

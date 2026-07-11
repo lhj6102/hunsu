@@ -133,3 +133,36 @@ test("Windows x64 workflow gates upload on installed WebView evidence and checks
   assert.match(artifactStage, /workspace-open-handoff-once/u);
   assert.match(artifactStage, /no-eaddrinuse-log/u);
 });
+
+test("desktop artifact workflow keeps gated validation by default and exposes an explicit dogfood build-only path", () => {
+  assert.match(
+    artifactWorkflow,
+    /validation:\s+description: Validation level before artifact upload\s+type: choice\s+required: true\s+default: gated\s+options:\s+- gated\s+- dogfood-build-only/u
+  );
+  assert.match(
+    artifactWorkflow,
+    /validate:\s+name: Linux repository validation\s+if: inputs\.validation == 'gated'/u
+  );
+  assert.match(
+    artifactWorkflow,
+    /needs\.select\.result == 'success'[\s\S]*inputs\.validation == 'dogfood-build-only'[\s\S]*needs\.validate\.result == 'success'/u
+  );
+  for (const step of [
+    "Run Windows managed Bridge lifecycle E2E",
+    "Run installed Windows Bridge App WebView E2E",
+    "Run Windows same-directory installer upgrade E2E",
+    "Guard Windows artifact sizes",
+    "Finalize Windows artifact ZIP size measurement"
+  ]) {
+    assert.match(
+      artifactWorkflow,
+      new RegExp(`${step}[\\s\\S]{0,180}inputs\\.validation == 'gated'`, "u")
+    );
+  }
+  assert.match(artifactWorkflow, /stage_args\+=\(--dogfood-build-only\)/u);
+  assert.match(artifactWorkflow, /Summarize dogfood build-only artifact/u);
+  assert.match(artifactWorkflow, /manual dogfooding QA only and is not release eligible/u);
+  assert.match(artifactWorkflow, /format\('\{0\}-dogfood-build-only', matrix\.artifact\)/u);
+  assert.match(artifactStage, /DOGFOOD-BUILD-ONLY\.txt/u);
+  assert.match(artifactStage, /releaseEligible=false/u);
+});
