@@ -130,23 +130,32 @@ pnpm --filter @hunsu/bridge-desktop desktop:build
 pnpm --filter @hunsu/bridge-desktop artifacts:report-sizes
 ```
 
-`build` compiles the headless command package, bundles the sidecar entrypoint,
-creates a Node SEA blob, downloads the pinned Node runtime archive for the
-selected Tauri target, verifies it against Node's `SHASUMS256.txt`, injects the
-SEA blob with `postject`, and writes that target's native ELF/Mach-O/PE sidecar
-plus `dist/sidecar-manifest.json`. The target defaults to the build host and can
-be selected with `HUNSU_BRIDGE_SIDECAR_TARGET` or `--target`. Desktop packaging
-uses Tauri `externalBin` for the active sidecar and keeps resources limited to
-the sidecar manifest; see [Windows Packaging](windows-packaging.md). The
-packaged sidecar is a native executable and does not require `node` on the
-installed user's `PATH`.
+`build` compiles the headless command package and runs the build-time sidecar
+pipeline in this order: bundle the sidecar entrypoint, create the Node SEA blob,
+inject that blob with `postject`, sign and verify the injected executable on
+macOS, validate the native ELF/Mach-O/PE artifact, and prepare the selected
+target plus `dist/sidecar-manifest.json`. Before injection, the build downloads
+the pinned Node runtime archive for the selected Tauri target and verifies it
+against Node's `SHASUMS256.txt`. The target defaults to the build host and can be
+selected with `HUNSU_BRIDGE_SIDECAR_TARGET` or `--target`. Desktop packaging uses
+Tauri `externalBin` for the active sidecar and keeps resources limited to the
+sidecar manifest; see [Windows Packaging](windows-packaging.md). The packaged
+sidecar is a native executable and does not require `node` on the installed
+user's `PATH`.
 
 SEA generation verifies that its Node executable reports exactly the pinned
 embedded runtime version before creating the blob. Local builds can set
 `HUNSU_BRIDGE_SEA_NODE_PATH` to an exact-version Node executable; mismatches
 fail before bundling or injection. After `postject` modifies a macOS sidecar,
 the build ad-hoc signs it and verifies the new signature before native
-validation and the `status` smoke test.
+validation and target preparation. Build-time sidecar preparation does not
+execute the prepared sidecar.
+
+The desktop artifact workflow performs the runtime `status` smoke only after
+the desktop bundle has been built, with a strict 60-second timeout. For Windows
+x64, the workflow next runs the managed Bridge lifecycle automation and then
+the installed Tauri WebView2 automation. Those automated gates produce QA
+evidence; passing them is not human approval to publish a dogfood release.
 
 `desktop:prepare` builds the UI and command package, removes stale prepared
 sidecars, and builds only the current host target plus its manifest. Therefore

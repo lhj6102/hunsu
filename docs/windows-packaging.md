@@ -8,12 +8,15 @@ prepared sidecar target to be copied into the installer payload.
 The desktop artifact workflow defaults to one Windows x64 dogfood job.
 `windows-arm64` selects only Windows ARM64, `windows-all` selects both Windows
 targets, and `all` explicitly selects the full six-target desktop matrix. Each
-matrix entry verifies the target sidecar path, builds the native bundle with
-`HUNSU_BRIDGE_SIDECAR_TARGET` set to that matrix target, and then runs exactly
-one native `status` smoke test with a 60-second timeout. Runtime smoke testing is
-never part of the Tauri `beforeBuildCommand` or native-sidecar preparation path.
-The Windows x64 job then runs the managed-runtime lifecycle E2E before staging
-or uploading the installer; ARM64 and non-Windows jobs do not run that x64 gate.
+matrix entry builds the desktop bundle with `HUNSU_BRIDGE_SIDECAR_TARGET` set to
+that matrix target. Its build-time sidecar path is bundle, SEA blob, injection,
+macOS signing and signature verification where applicable, native artifact
+validation, and target preparation; it does not execute the sidecar. Only after
+the bundle has been built does the workflow run exactly one native `status`
+smoke, with a strict 60-second timeout. The Windows x64 job then runs the managed
+Bridge lifecycle E2E followed by installed Tauri WebView2 automation before
+staging or uploading the installer. ARM64 and non-Windows jobs do not run those
+x64-only gates.
 
 Dogfood jobs stage installable outputs and a matching `SHA256SUMS.txt`:
 
@@ -114,7 +117,8 @@ sidecar: lifecycle button states and transitions, one Open Hunsu Web handoff,
 one fixture Workspace Open handoff, fresh copied/displayed Diagnostics,
 legacy-token migration, an EADDRINUSE-free app log, Validate and Recheck
 feedback, and all five version labels. It uninstalls the candidate and removes
-its isolated runtime state afterward. The resulting evidence deliberately keeps
+its isolated runtime state afterward. This is automated installed-app evidence,
+not human release approval. The resulting evidence deliberately keeps
 `releaseEligible` false until the following human visual QA is attested; an
 Actions candidate artifact is not a dogfood release.
 
