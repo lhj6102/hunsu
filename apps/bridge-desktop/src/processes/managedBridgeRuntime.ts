@@ -18,6 +18,7 @@ const CONTROL_TOKEN_HEADER = "x-hunsu-bridge-control-token";
 
 export type ManagedBridgeDiscovery =
   | ({ state: "running-managed" } & ManagedBridgeIdentity)
+  | ({ state: "stopping"; requestedAt: string } & ManagedBridgeIdentity)
   | {
       state: "running-unmanaged";
       bridgeApiUrl: string;
@@ -212,6 +213,36 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
     const probes = await Promise.all(candidates.map(bridgeApiUrl => probeEndpoint(bridgeApiUrl, state.controlToken)));
     const managed = probes.find((probe): probe is Extract<EndpointProbe, { kind: "managed" }> => probe.kind === "managed");
     if (managed) {
+      const transition = state.managedBridgeTransition;
+      const transitionMatches = transition?.state === "stopping"
+        && transition.instanceId === managed.instanceId
+        && normalizeBridgeApiUrl(transition.bridgeApiUrl) === normalizeBridgeApiUrl(managed.bridgeApiUrl)
+        && transition.daemonPid === managed.daemonPid;
+      const transitionExpired = transitionMatches
+        && now().getTime() - Date.parse(transition.requestedAt) > stopTimeoutMs + Math.max(5_000, pollIntervalMs * 2);
+      if (transitionMatches && !transitionExpired) {
+        const discovery: ManagedBridgeDiscovery = {
+          state: "stopping",
+          bridgeApiUrl: managed.bridgeApiUrl,
+          instanceId: managed.instanceId,
+          daemonPid: managed.daemonPid,
+          supervisorPid: managed.supervisorPid,
+          startedAt: managed.startedAt,
+          bridgeVersion: managed.bridgeVersion,
+          protocolVersion: managed.protocolVersion,
+          requestedAt: transition.requestedAt
+        };
+        options.writeStructuredLog?.({
+          event: "bridge.discovery.completed",
+          state: discovery.state,
+          bridgeApiUrl: discovery.bridgeApiUrl,
+          instanceId: discovery.instanceId
+        });
+        return discovery;
+      }
+      if (transition) {
+        safelyWriteState(writeState, { ...state, managedBridgeTransition: undefined });
+      }
       const discovery: ManagedBridgeDiscovery = {
         state: "running-managed",
         bridgeApiUrl: managed.bridgeApiUrl,
@@ -364,7 +395,9 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
     options.writeStructuredLog?.({
       event: discovery.state === "running-unmanaged"
         ? "bridge.ensure-running.unmanaged"
-        : "bridge.ensure-running.port-conflict",
+        : discovery.state === "stopping"
+          ? "bridge.ensure-running.stopping"
+          : "bridge.ensure-running.port-conflict",
       state: discovery.state,
       bridgeApiUrl: "bridgeApiUrl" in discovery ? discovery.bridgeApiUrl : undefined,
       code: result.error.code
@@ -474,10 +507,29 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
     if (discovery.state === "starting") {
       return fail("BRIDGE_CONTROL_UNAVAILABLE", "Bridge ownership is still being established.", false);
     }
+    if (discovery.state === "stopping") {
+      return waitForManagedBridgeStop(discovery);
+    }
     const stateRead = safelyReadState(readState);
-    const controlToken = stateRead.ok ? stateRead.value.controlToken : undefined;
+    if (!stateRead.ok) {
+      return fail("BRIDGE_CONTROL_UNAVAILABLE", "Bridge App state could not be read.", false);
+    }
+    const controlToken = stateRead.value.controlToken;
     if (!controlToken) {
       return fail("BRIDGE_NOT_OWNED", "The managed Bridge control credential is unavailable.", false);
+    }
+    if (!safelyWriteState(writeState, {
+      ...stateRead.value,
+      managedBridgeTransition: {
+        state: "stopping",
+        instanceId: discovery.instanceId,
+        bridgeApiUrl: discovery.bridgeApiUrl,
+        daemonPid: discovery.daemonPid,
+        supervisorPid: discovery.supervisorPid,
+        requestedAt: now().toISOString()
+      }
+    })) {
+      return fail("BRIDGE_CONTROL_UNAVAILABLE", "Bridge App state could not record the shutdown transition.", false);
     }
     options.writeStructuredLog?.({ event: "bridge.stop.requested", instanceId: discovery.instanceId, bridgeApiUrl: discovery.bridgeApiUrl });
     const response = await safeFetch(new URL("/api/bridge/control/shutdown", discovery.bridgeApiUrl).toString(), {
@@ -485,9 +537,20 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
       headers: { [CONTROL_TOKEN_HEADER]: controlToken }
     });
     if (!response?.ok) {
+      clearStoppingTransition(discovery.instanceId);
       options.writeStructuredLog?.({ event: "bridge.stop.failed", instanceId: discovery.instanceId, reason: "control-unavailable" });
       return fail("BRIDGE_CONTROL_UNAVAILABLE", "The managed Bridge did not accept the shutdown request.", false);
     }
+    return waitForManagedBridgeStop({
+      ...discovery,
+      state: "stopping",
+      requestedAt: now().toISOString()
+    });
+  }
+
+  async function waitForManagedBridgeStop(
+    discovery: Extract<ManagedBridgeDiscovery, { state: "stopping" }>
+  ): Promise<ManagedBridgeStopResult> {
     const deadline = now().getTime() + stopTimeoutMs;
     while (now().getTime() <= deadline) {
       const current = await discoverInternal();
@@ -503,8 +566,17 @@ export function createManagedBridgeRuntime(options: ManagedBridgeRuntimeOptions 
       }
       await sleep(pollIntervalMs);
     }
+    clearStoppingTransition(discovery.instanceId);
     options.writeStructuredLog?.({ event: "bridge.stop.failed", instanceId: discovery.instanceId, reason: "timeout" });
     return fail("BRIDGE_STOP_TIMEOUT", "Timed out waiting for the managed Bridge to stop.", false);
+  }
+
+  function clearStoppingTransition(instanceId: string): void {
+    const latest = safelyReadState(readState);
+    if (!latest.ok || latest.value.managedBridgeTransition?.instanceId !== instanceId) {
+      return;
+    }
+    safelyWriteState(writeState, { ...latest.value, managedBridgeTransition: undefined });
   }
 
   async function pairingOperation(
@@ -655,6 +727,7 @@ export function clearManagedBridgeRuntimeState(state: BridgeAppState): BridgeApp
     commandIdentity: undefined,
     controlToken: undefined,
     pairing: undefined,
+    managedBridgeTransition: undefined,
     startedAt: undefined
   };
 }
@@ -669,6 +742,9 @@ function managedEnsureSuccess(
 function ensureFailureForDiscovery(
   discovery: ManagedBridgeDiscovery
 ): Extract<ManagedBridgeEnsureResult, { ok: false }> | undefined {
+  if (discovery.state === "stopping") {
+    return fail("BRIDGE_CONTROL_UNAVAILABLE", "The managed Bridge is shutting down. Wait for Stop to finish before starting it again.");
+  }
   if (discovery.state === "running-unmanaged") {
     return fail("BRIDGE_ALREADY_RUNNING_UNMANAGED", "A Hunsu Bridge is already running but is not managed by this Bridge App.");
   }

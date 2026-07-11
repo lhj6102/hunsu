@@ -55,22 +55,15 @@ import {
   writeRemoteAccessState
 } from "./commands/connectionCommands.ts";
 import {
-  BRIDGE_PROCESS_NONCE_ENV,
   bridgeNodeExecArgs,
   bridgeProcessCommandIdentityForSpawn,
   bridgeProcessEnvWithNonce,
   bridgeProcessRuntimeMetadata,
-  commandLineLooksLikeBridgeApp,
   createBridgeAppSidecarSupervisor as createBridgeAppSidecarSupervisorFromProcess,
   currentBridgeCommandInvocation,
   currentBridgeProcessCommandIdentity,
   handleToRuntimeState,
-  inspectWindowsProcess,
-  processCommandLine,
-  processEnvironmentValue,
-  processIsAlive,
-  processStartMetadata,
-  sameProcessStartMetadata
+  processIsAlive
 } from "./processes/backgroundSpawn.ts";
 import {
   clearManagedBridgeRuntimeState,
@@ -81,6 +74,7 @@ import {
   type ManagedBridgeStartContext,
   type ManagedBridgeStopResult
 } from "./processes/managedBridgeRuntime.ts";
+import { stopVerifiedWindowsManagedBridge } from "./processes/windowsManagedBridgeTermination.ts";
 import {
   canonicalBridgeUiIntentTab,
   bridgeAppStatePath as appStatePath,
@@ -95,9 +89,7 @@ import {
   writeBridgeAppState as writeAppState,
   type BridgeAppSnapshot,
   type BridgeAppState,
-  type BridgeProcessCommandIdentity,
   type BridgeQuitBehavior,
-  type BridgeProcessRuntimeMetadata,
   type BridgeRoadmapAccessSnapshot,
   type BridgeServiceState,
   type LocalBridgeControl,
@@ -1747,6 +1739,18 @@ function localBridgeControlForDiscovery(discovery: ManagedBridgeDiscovery): Loca
         daemonPid: discovery.daemonPid,
         supervisorPid: discovery.supervisorPid
       };
+    case "stopping":
+      return {
+        state: "stopping",
+        ownership: "managed",
+        canStart: false,
+        canStop: false,
+        startReason: "Bridge shutdown is in progress.",
+        stopReason: "Bridge shutdown is in progress.",
+        instanceId: discovery.instanceId,
+        daemonPid: discovery.daemonPid,
+        supervisorPid: discovery.supervisorPid
+      };
     case "running-unmanaged":
       return {
         state: "connected",
@@ -1984,113 +1988,13 @@ function configuredBridgeApiUrl(): string | undefined {
 async function stopManagedBridgeWithVerifiedWindowsFallback(
   discovery: Extract<ManagedBridgeDiscovery, { state: "running-managed" }>
 ): Promise<ManagedBridgeStopResult> {
-  if (process.platform !== "win32") {
-    return {
-      ok: false,
-      error: {
-        code: "BRIDGE_CONTROL_UNAVAILABLE",
-        message: "The managed Bridge control endpoint is unavailable.",
-        canForceStop: false
-      }
-    };
-  }
   const state = readAppState();
-  const targetPids = uniqueNumberList([discovery.supervisorPid, discovery.daemonPid]);
-  if (targetPids.length === 0) {
-    return {
-      ok: false,
-      error: { code: "BRIDGE_NOT_OWNED", message: "No verified managed Bridge process is available.", canForceStop: false }
-    };
-  }
-  for (const pid of targetPids) {
-    const verification = verifyManagedBridgePid(pid, state);
-    if (!verification.ok) {
-      writeStructuredLog({ event: "bridge.stop.pid-verification-failed", pid, reason: verification.reason });
-      return {
-        ok: false,
-        error: { code: "BRIDGE_NOT_OWNED", message: "Bridge process ownership could not be verified.", canForceStop: false }
-      };
-    }
-  }
-  const treeRootPid = discovery.supervisorPid ?? discovery.daemonPid;
-  try {
-    execFileSync("taskkill", ["/PID", String(treeRootPid), "/T"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    });
-  } catch (_error) {
-    return {
-      ok: false,
-      error: { code: "BRIDGE_CONTROL_UNAVAILABLE", message: "Verified Bridge process termination failed.", canForceStop: false }
-    };
-  }
-  const deadline = Date.now() + 8_000;
-  while (Date.now() <= deadline) {
-    const health = await readBridgeHealth(state);
-    if (!health.ok) {
-      writeAppState(clearManagedBridgeRuntimeState(readAppState()));
-      writeStructuredLog({ event: "bridge.stop.completed", instanceId: discovery.instanceId, method: "verified-windows-taskkill" });
-      return { ok: true, value: { previousState: "running-managed", state: "stopped" } };
-    }
-    await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
-  }
-  return {
-    ok: false,
-    error: { code: "BRIDGE_STOP_TIMEOUT", message: "Timed out waiting for the managed Bridge to stop.", canForceStop: false }
-  };
-}
-
-function verifyManagedBridgePid(pid: number, state: BridgeAppState): { ok: true } | { ok: false; reason: string } {
-  if (!processIsAlive(pid)) {
-    return { ok: false, reason: "process_not_alive" };
-  }
-  const metadata = storedProcessMetadataForPid(pid, state);
-  if (!metadata?.startMetadata) {
-    return { ok: false, reason: "process_metadata_unavailable" };
-  }
-  const currentStartMetadata = processStartMetadata(pid);
-  if (!currentStartMetadata || !sameProcessStartMetadata(metadata.startMetadata, currentStartMetadata)) {
-    return { ok: false, reason: "process_start_metadata_mismatch" };
-  }
-  if (metadata.processNonce) {
-    const currentNonce = processEnvironmentValue(pid, BRIDGE_PROCESS_NONCE_ENV);
-    if (currentNonce !== metadata.processNonce) {
-      return { ok: false, reason: currentNonce ? "process_nonce_mismatch" : "process_nonce_unavailable" };
-    }
-  }
-  if (process.platform === "win32") {
-    const identity = inspectWindowsProcess(pid);
-    if (!identity) {
-      return { ok: false, reason: "windows_process_identity_unavailable" };
-    }
-    if (metadata.parentPid === undefined || identity.parentProcessId !== metadata.parentPid) {
-      return { ok: false, reason: "windows_parent_pid_mismatch" };
-    }
-    if (!metadata.executablePath || !identity.executablePath
-      || metadata.executablePath.toLowerCase() !== identity.executablePath.toLowerCase()) {
-      return { ok: false, reason: "windows_executable_path_mismatch" };
-    }
-  }
-  const commandLine = processCommandLine(pid);
-  if (!commandLine) {
-    return { ok: false, reason: "process_command_unavailable" };
-  }
-  const expectedKinds: BridgeProcessCommandIdentity["kind"][] = [metadata.commandIdentity.kind];
-  if (!commandLineLooksLikeBridgeApp(commandLine, expectedKinds)) {
-    return { ok: false, reason: "process_command_mismatch" };
-  }
-  return { ok: true };
-}
-
-function storedProcessMetadataForPid(pid: number, state: BridgeAppState): BridgeProcessRuntimeMetadata | undefined {
-  if (state.supervisorPid === pid && state.supervisorProcess?.pid === pid) {
-    return state.supervisorProcess;
-  }
-  if (state.pid === pid && state.bridgeProcess?.pid === pid) {
-    return state.bridgeProcess;
-  }
-  return undefined;
+  return stopVerifiedWindowsManagedBridge(discovery, state, {
+    platform: process.platform,
+    isBridgeOnline: async () => (await readBridgeHealth(state)).ok,
+    onStopped: () => writeAppState(clearManagedBridgeRuntimeState(readAppState())),
+    writeStructuredLog
+  });
 }
 
 function uniqueNumberList(values: Array<number | undefined>): number[] {

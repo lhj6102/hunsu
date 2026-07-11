@@ -140,6 +140,15 @@ export type LocalBridgeControl = {
   supervisorPid?: number;
 };
 
+export type ManagedBridgeTransition = {
+  state: "stopping";
+  instanceId: string;
+  bridgeApiUrl: string;
+  daemonPid: number;
+  supervisorPid?: number;
+  requestedAt: string;
+};
+
 export type BridgeAppState = {
   schema: "hunsu.bridge-app-state.v1";
   supervisorPid?: number;
@@ -152,6 +161,7 @@ export type BridgeAppState = {
   controlToken?: string;
   pairing?: BridgePairingMetadata;
   diagnosticsSecurityVersion?: number;
+  managedBridgeTransition?: ManagedBridgeTransition;
   instanceId?: string;
   cwd?: string;
   webUrl?: string;
@@ -309,7 +319,8 @@ export function writeBridgeAppState(state: BridgeAppState, path = bridgeAppState
   const { authToken: _legacyAuthToken, ...stateWithoutLegacyAuth } = state as BridgeAppState & { authToken?: unknown };
   const safeState: BridgeAppState = {
     ...stateWithoutLegacyAuth,
-    pairing: safePairingMetadata(state.pairing)
+    pairing: safePairingMetadata(state.pairing),
+    managedBridgeTransition: safeManagedBridgeTransition(state.managedBridgeTransition)
   };
   const temporaryPath = join(
     directory,
@@ -417,9 +428,10 @@ export function createBridgeAppSnapshot(input: {
   };
 }
 
-type ParsedBridgeAppState = Partial<BridgeAppState> & {
+type ParsedBridgeAppState = Omit<Partial<BridgeAppState>, "pairing" | "managedBridgeTransition"> & {
   authToken?: unknown;
   pairing?: unknown;
+  managedBridgeTransition?: unknown;
 };
 
 export function normalizeBridgeAppState(parsed: ParsedBridgeAppState): BridgeAppState {
@@ -462,7 +474,8 @@ export function normalizeBridgeAppState(parsed: ParsedBridgeAppState): BridgeApp
     pairing: safePairingMetadata(parsed.pairing),
     diagnosticsSecurityVersion: Number.isInteger(parsed.diagnosticsSecurityVersion) && (parsed.diagnosticsSecurityVersion ?? 0) >= 0
       ? parsed.diagnosticsSecurityVersion
-      : 0
+      : 0,
+    managedBridgeTransition: safeManagedBridgeTransition(parsed.managedBridgeTransition)
   };
 }
 
@@ -478,6 +491,35 @@ function safePairingMetadata(value: unknown): BridgePairingMetadata | undefined 
     issuedAt: record.issuedAt,
     expiresAt: record.expiresAt,
     revokedAt: typeof record.revokedAt === "string" ? record.revokedAt : undefined
+  };
+}
+
+function safeManagedBridgeTransition(value: unknown): ManagedBridgeTransition | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.state !== "stopping"
+    || typeof record.instanceId !== "string"
+    || !record.instanceId.trim()
+    || typeof record.bridgeApiUrl !== "string"
+    || !record.bridgeApiUrl.trim()
+    || !Number.isInteger(record.daemonPid)
+    || (record.daemonPid as number) < 1
+    || (record.supervisorPid !== undefined && (!Number.isInteger(record.supervisorPid) || (record.supervisorPid as number) < 1))
+    || typeof record.requestedAt !== "string"
+    || !Number.isFinite(Date.parse(record.requestedAt))
+  ) {
+    return undefined;
+  }
+  return {
+    state: "stopping",
+    instanceId: record.instanceId,
+    bridgeApiUrl: record.bridgeApiUrl,
+    daemonPid: record.daemonPid as number,
+    supervisorPid: record.supervisorPid as number | undefined,
+    requestedAt: record.requestedAt
   };
 }
 

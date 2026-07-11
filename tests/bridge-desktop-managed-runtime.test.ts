@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,8 +12,10 @@ import {
   type ManagedBridgeFetch
 } from "../apps/bridge-desktop/src/processes/managedBridgeRuntime.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
+import { main } from "../apps/bridge-desktop/src/main.ts";
 import {
   defaultBridgeAppState,
+  writeBridgeAppState,
   type BridgeAppState
 } from "../apps/bridge-desktop/src/state/appState.ts";
 
@@ -272,6 +275,269 @@ test("managed Stop is authenticated and idempotent while unmanaged Stop is refus
     if (!refused.ok) assert.equal(refused.error.code, "BRIDGE_NOT_OWNED");
     assert.equal(service.shutdowns, 1);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("authenticated Stop persists an observable stopping transition until the runtime exits", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-stopping-transition-"));
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL,
+    controlToken: CONTROL_TOKEN,
+    pid: 4321,
+    supervisorPid: 4000
+  };
+  const service = fakeBridgeService(() => state);
+  const fetchBeforeShutdownGate = service.fetch;
+  let acknowledgeShutdown: (() => void) | undefined;
+  const shutdownGate = new Promise<void>(resolve => { acknowledgeShutdown = resolve; });
+  let observeShutdownRequest: (() => void) | undefined;
+  const shutdownRequested = new Promise<void>(resolve => { observeShutdownRequest = resolve; });
+  service.fetch = async (input, init = {}) => {
+    if (new URL(input).pathname !== "/api/bridge/control/shutdown") {
+      return fetchBeforeShutdownGate(input, init);
+    }
+    service.shutdowns += 1;
+    observeShutdownRequest?.();
+    await shutdownGate;
+    service.online = false;
+    return jsonResponse({ shuttingDown: true }, 202);
+  };
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath: join(root, "bridge-start.lock"),
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    probeTcpEndpoint: async () => false,
+    processIsAlive: () => false,
+    pollIntervalMs: 1,
+    stopTimeoutMs: 200
+  });
+
+  try {
+    const stop = runtime.stopManagedBridge();
+    await shutdownRequested;
+
+    assert.deepEqual(state.managedBridgeTransition, {
+      state: "stopping",
+      instanceId: service.instanceId,
+      bridgeApiUrl: BRIDGE_URL,
+      daemonPid: 4321,
+      supervisorPid: 4000,
+      requestedAt: state.managedBridgeTransition?.requestedAt
+    });
+    assert.match(state.managedBridgeTransition?.requestedAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
+    const duringStop = await runtime.discoverManagedBridge();
+    assert.equal(duringStop.state, "stopping");
+    if (duringStop.state === "stopping") {
+      assert.equal(duringStop.instanceId, service.instanceId);
+      assert.equal(duringStop.daemonPid, 4321);
+    }
+    const startDuringStop = await runtime.ensureManagedBridgeRunning();
+    assert.equal(startDuringStop.ok, false);
+    if (!startDuringStop.ok) assert.equal(startDuringStop.error.code, "BRIDGE_CONTROL_UNAVAILABLE");
+
+    acknowledgeShutdown?.();
+    assert.deepEqual(await stop, { ok: true, value: { previousState: "running-managed", state: "stopped" } });
+    assert.equal(state.managedBridgeTransition, undefined);
+    assert.equal(state.controlToken, undefined);
+    assert.equal((await runtime.discoverManagedBridge()).state, "not-running");
+  } finally {
+    acknowledgeShutdown?.();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejected and timed-out Stops clear the stopping transition while preserving the managed runtime", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-stopping-failure-"));
+  let state: BridgeAppState = {
+    ...defaultBridgeAppState(),
+    bridgeApiUrl: BRIDGE_URL,
+    controlToken: CONTROL_TOKEN,
+    pid: 4321,
+    supervisorPid: 4000
+  };
+  const service = fakeBridgeService(() => state);
+  const normalFetch = service.fetch;
+  service.fetch = async (input, init = {}) => new URL(input).pathname === "/api/bridge/control/shutdown"
+    ? jsonResponse({ shuttingDown: false }, 503)
+    : normalFetch(input, init);
+  const runtime = createManagedBridgeRuntime({
+    canonicalBridgeApiUrl: BRIDGE_URL,
+    lockPath: join(root, "bridge-start.lock"),
+    readState: () => state,
+    writeState: next => { state = next; },
+    fetch: service.fetch,
+    processIsAlive: () => true,
+    pollIntervalMs: 1,
+    stopTimeoutMs: 12
+  });
+
+  try {
+    const rejected = await runtime.stopManagedBridge();
+    assert.equal(rejected.ok, false);
+    if (!rejected.ok) assert.equal(rejected.error.code, "BRIDGE_CONTROL_UNAVAILABLE");
+    assert.equal(state.managedBridgeTransition, undefined);
+    assert.equal((await runtime.discoverManagedBridge()).state, "running-managed");
+
+    service.fetch = async (input, init = {}) => new URL(input).pathname === "/api/bridge/control/shutdown"
+      ? jsonResponse({ shuttingDown: true }, 202)
+      : normalFetch(input, init);
+    const timedOutRuntime = createManagedBridgeRuntime({
+      canonicalBridgeApiUrl: BRIDGE_URL,
+      lockPath: join(root, "bridge-start.lock"),
+      readState: () => state,
+      writeState: next => { state = next; },
+      fetch: service.fetch,
+      processIsAlive: () => true,
+      pollIntervalMs: 1,
+      stopTimeoutMs: 12
+    });
+    const timedOut = await timedOutRuntime.stopManagedBridge();
+    assert.equal(timedOut.ok, false);
+    if (!timedOut.ok) assert.equal(timedOut.error.code, "BRIDGE_STOP_TIMEOUT");
+    assert.equal(state.managedBridgeTransition, undefined);
+    assert.equal((await timedOutRuntime.discoverManagedBridge()).state, "running-managed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the real app snapshot exposes stopping during an in-flight authenticated Stop", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-managed-stopping-snapshot-"));
+  const statePath = join(root, "bridge-app.json");
+  const logPath = join(root, "bridge-app.log");
+  const roadmapRegistryPath = join(root, "roadmaps.json");
+  const daemonPid = 987_651;
+  const supervisorPid = 987_652;
+  let shutdownResponse: import("node:http").ServerResponse | undefined;
+  let signalShutdownRequest: (() => void) | undefined;
+  const shutdownRequested = new Promise<void>(resolve => { signalShutdownRequest = resolve; });
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.setHeader("connection", "close");
+    if (request.url === "/health") {
+      response.writeHead(200).end(JSON.stringify({
+        ok: true,
+        service: "hunsu-bridge",
+        version: { bridgeVersion: "0.1.2", protocolVersion: "local-bridge-v1" }
+      }));
+      return;
+    }
+    if (request.url === "/api/bridge/control/status") {
+      if (request.headers["x-hunsu-bridge-control-token"] !== CONTROL_TOKEN) {
+        response.writeHead(401).end(JSON.stringify({ ok: false }));
+        return;
+      }
+      response.writeHead(200).end(JSON.stringify({
+        ok: true,
+        instanceId: "bridge_instance_snapshot_transition",
+        protocolVersion: "local-bridge-v1",
+        bridgeVersion: "0.1.2",
+        daemonPid,
+        supervisorPid,
+        startedAt: "2026-07-11T00:00:00.000Z",
+        state: "running"
+      }));
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/bridge/control/shutdown") {
+      assert.equal(request.headers["x-hunsu-bridge-control-token"], CONTROL_TOKEN);
+      shutdownResponse = response;
+      signalShutdownRequest?.();
+      return;
+    }
+    response.writeHead(404).end(JSON.stringify({ error: "not_found" }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const bridgeApiUrl = `http://127.0.0.1:${address.port}`;
+  writeBridgeAppState({
+    ...defaultBridgeAppState(),
+    diagnosticsSecurityVersion: 1,
+    bridgeApiUrl,
+    controlToken: CONTROL_TOKEN,
+    pid: daemonPid,
+    supervisorPid,
+    instanceId: "bridge_instance_snapshot_transition",
+    startedAt: "2026-07-11T00:00:00.000Z"
+  }, statePath);
+
+  const envKeys = [
+    "HUNSU_BRIDGE_APP_STATE_PATH",
+    "HUNSU_BRIDGE_APP_LOG_PATH",
+    "HUNSU_ROADMAP_REGISTRY_PATH",
+    "HUNSU_BRIDGE_HOST",
+    "HUNSU_BRIDGE_PORT"
+  ];
+  const previousEnv = new Map(envKeys.map(key => [key, process.env[key]]));
+  process.env.HUNSU_BRIDGE_APP_STATE_PATH = statePath;
+  process.env.HUNSU_BRIDGE_APP_LOG_PATH = logPath;
+  process.env.HUNSU_ROADMAP_REGISTRY_PATH = roadmapRegistryPath;
+  process.env.HUNSU_BRIDGE_HOST = "127.0.0.1";
+  process.env.HUNSU_BRIDGE_PORT = String(address.port);
+  const output: string[] = [];
+  const previousConsoleLog = console.log;
+  const previousConsoleError = console.error;
+  console.log = (...values: unknown[]) => { output.push(values.map(String).join(" ")); };
+  console.error = (...values: unknown[]) => { output.push(values.map(String).join(" ")); };
+
+  try {
+    const stopping = main(["stop", "--json"]);
+    await shutdownRequested;
+    const persistedDuringStop = JSON.parse(readFileSync(statePath, "utf8")) as BridgeAppState;
+    assert.equal(persistedDuringStop.managedBridgeTransition?.state, "stopping");
+
+    output.length = 0;
+    assert.equal(await main(["snapshot"]), 0);
+    const duringSnapshot = JSON.parse(output.at(-1) ?? "{}") as {
+      localBridgeControl?: { state?: string; ownership?: string; canStart?: boolean; canStop?: boolean };
+    };
+    assert.deepEqual(duringSnapshot.localBridgeControl, {
+      state: "stopping",
+      ownership: "managed",
+      canStart: false,
+      canStop: false,
+      startReason: "Bridge shutdown is in progress.",
+      stopReason: "Bridge shutdown is in progress.",
+      instanceId: "bridge_instance_snapshot_transition",
+      daemonPid,
+      supervisorPid
+    });
+
+    const serverClosed = new Promise<void>(resolve => {
+      shutdownResponse?.writeHead(202);
+      shutdownResponse?.end(JSON.stringify({ shuttingDown: true }), () => {
+        server.close(() => resolve());
+      });
+    });
+    assert.equal(await stopping, 0);
+    await serverClosed;
+    const persistedAfterStop = JSON.parse(readFileSync(statePath, "utf8")) as BridgeAppState;
+    assert.equal(persistedAfterStop.managedBridgeTransition, undefined);
+    assert.equal(persistedAfterStop.controlToken, undefined);
+
+    output.length = 0;
+    assert.equal(await main(["snapshot"]), 0);
+    const terminalSnapshot = JSON.parse(output.at(-1) ?? "{}") as { localBridgeControl?: { state?: string } };
+    assert.equal(terminalSnapshot.localBridgeControl?.state, "not-running");
+  } finally {
+    shutdownResponse?.end();
+    if (server.listening) {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+    console.log = previousConsoleLog;
+    console.error = previousConsoleError;
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });
