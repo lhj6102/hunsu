@@ -87,7 +87,7 @@ export const codexProviderMetadata: RuntimeProviderMetadata = {
   configKeys: codexConfigKeys,
   setupSteps: [
     "Choose the Codex executable Hunsu should use.",
-    "Choose the Codex Home that contains the auth.json file for this Bridge App session.",
+    "Choose the Codex Home that contains the auth.json file for this daemon.",
     "Sign in or recheck after saving."
   ]
 };

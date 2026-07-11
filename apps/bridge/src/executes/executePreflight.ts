@@ -40,7 +40,6 @@ export type ExecuteModelSelectionCandidate = {
 
 export type ExecutePreflightAction = {
   type:
-    | "open_bridge_app"
     | "open_provider_setup"
     | "open_workspaces"
     | "open_connection"
@@ -54,6 +53,9 @@ export type ExecutePreflightAction = {
   workspaceId?: string;
   providerId?: string;
 };
+
+const STUDIO_SETUP_HREF = "/studio/setup?next=%2Fstudio";
+const STUDIO_LAUNCHER_HREF = "/studio";
 
 export type ProviderAwareExecutePreflightError =
   | {
@@ -111,34 +113,34 @@ export type ProviderAwareExecutePreflightError =
 export function providerExecutePreflightError(provider: RuntimeProviderStatus): ProviderAwareExecutePreflightError | undefined {
   if (!provider.installed) {
     const action: ExecutePreflightAction = provider.recommendedAction === "select_binary"
-      ? { type: "open_provider_setup", label: `Select ${provider.label} Binary`, href: `hunsu://provider/${provider.providerId}`, providerId: provider.providerId }
-      : { type: "install_provider", label: `Install ${provider.label}`, href: `hunsu://provider/${provider.providerId}`, providerId: provider.providerId };
+      ? { type: "open_provider_setup", label: `Run hunsu-bridge provider set ${provider.providerId} --binary <path>`, href: STUDIO_SETUP_HREF, providerId: provider.providerId }
+      : { type: "install_provider", label: `Install ${provider.label}, then run hunsu-bridge provider check ${provider.providerId}`, href: STUDIO_SETUP_HREF, providerId: provider.providerId };
     return providerError(provider, "PROVIDER_MISSING", provider.safeMessage ?? `${provider.label} is not installed or could not be found.`, [action]);
   }
   if (!provider.configured) {
     return providerError(provider, "PROVIDER_UNAVAILABLE", `${provider.label} is installed but unavailable.`, [
-      { type: "recheck_provider", label: `Recheck ${provider.label}`, href: `hunsu://provider/${provider.providerId}`, providerId: provider.providerId }
+      { type: "recheck_provider", label: `Run hunsu-bridge provider check ${provider.providerId}`, href: STUDIO_SETUP_HREF, providerId: provider.providerId }
     ]);
   }
   if (provider.auth.state === "not_authenticated") {
     return providerError(provider, "PROVIDER_LOGIN_REQUIRED", `${provider.label} login is required before Execute can start.`, [
-      { type: "login_provider", label: `Sign in to ${provider.label}`, href: `hunsu://provider/${provider.providerId}`, providerId: provider.providerId }
+      { type: "login_provider", label: `Run hunsu-bridge provider check ${provider.providerId}`, href: STUDIO_SETUP_HREF, providerId: provider.providerId }
     ]);
   }
   if (provider.auth.state === "expired" || provider.auth.state === "invalid") {
     return providerError(provider, "PROVIDER_AUTH_EXPIRED", `${provider.label} authentication needs to be refreshed.`, [
-      { type: "login_provider", label: `Sign in to ${provider.label}`, href: `hunsu://provider/${provider.providerId}`, providerId: provider.providerId },
-      { type: "recheck_provider", label: `Recheck ${provider.label}`, href: `hunsu://provider/${provider.providerId}`, providerId: provider.providerId }
+      { type: "login_provider", label: `Run hunsu-bridge provider check ${provider.providerId}`, href: STUDIO_SETUP_HREF, providerId: provider.providerId },
+      { type: "recheck_provider", label: `Recheck with hunsu-bridge provider check ${provider.providerId}`, href: STUDIO_SETUP_HREF, providerId: provider.providerId }
     ]);
   }
   if (provider.usage?.rateLimited) {
     return providerError(provider, "PROVIDER_RATE_LIMITED", `${provider.label} is temporarily rate limited.`, [
-      { type: "recheck_provider", label: `Recheck ${provider.label}`, href: `hunsu://provider/${provider.providerId}`, providerId: provider.providerId }
+      { type: "recheck_provider", label: `Run hunsu-bridge provider check ${provider.providerId}`, href: STUDIO_SETUP_HREF, providerId: provider.providerId }
     ]);
   }
   if (!provider.capabilities.canExecute) {
     return providerError(provider, "PROVIDER_CAPABILITY_MISSING", `${provider.label} cannot execute Hunsu workspaces.`, [
-      { type: "open_provider_setup", label: "Open Provider Setup", href: "hunsu://provider" }
+      { type: "open_provider_setup", label: `Run hunsu-bridge provider status`, href: STUDIO_SETUP_HREF }
     ]);
   }
   return undefined;
@@ -382,23 +384,23 @@ export function connectionExecutePreflightError(input: {
 }): ProviderAwareExecutePreflightError | undefined {
   if (input.localBridgeConnected === false && !input.remoteRequested) {
     return connectionError(input.backendId ?? "local", "BRIDGE_NOT_CONNECTED", "Hunsu Bridge is not connected.", [
-      { type: "open_connection", label: "Open Connection", href: "hunsu://connection" }
+      { type: "open_connection", label: "Run hunsu-bridge status", href: STUDIO_SETUP_HREF }
     ]);
   }
   if (input.remoteRequested && input.accountSignedIn === false) {
     return connectionError(input.backendId, "REMOTE_LOGIN_REQUIRED", "Sign in to Hunsu before using Remote Bridge.", [
-      { type: "open_connection", label: "Open Connection", href: "hunsu://connection/remote" }
+      { type: "open_connection", label: "Run hunsu-bridge login", href: STUDIO_SETUP_HREF }
     ]);
   }
   if (!input.backend) {
     if (input.remoteRequested) {
       return connectionError(input.backendId, "REMOTE_NOT_CONNECTED", "Remote Bridge is not connected.", [
-        { type: "open_connection", label: "Open Connection", href: "hunsu://connection/remote" }
+        { type: "open_connection", label: "Run hunsu-bridge remote status", href: STUDIO_SETUP_HREF }
       ]);
     }
     return input.backendId
       ? connectionError(input.backendId, "BRIDGE_NOT_CONNECTED", `Backend ${input.backendId} is not connected to this Bridge.`, [
-          { type: "open_connection", label: "Open Connection", href: "hunsu://connection" }
+          { type: "open_connection", label: "Run hunsu-bridge status", href: STUDIO_SETUP_HREF }
         ])
       : undefined;
   }
@@ -407,16 +409,16 @@ export function connectionExecutePreflightError(input: {
   }
   if (input.backend.connection.state === "login_required") {
     return connectionError(input.backend.backendId, "REMOTE_LOGIN_REQUIRED", "Sign in to Hunsu before using Remote Bridge.", [
-      { type: "open_connection", label: "Open Connection", href: "hunsu://connection/remote" }
+      { type: "open_connection", label: "Run hunsu-bridge login", href: STUDIO_SETUP_HREF }
     ]);
   }
   if (input.backend.mode === "remote") {
     return connectionError(input.backend.backendId, "REMOTE_NOT_CONNECTED", "Remote Bridge is offline or unavailable.", [
-      { type: "open_connection", label: "Open Connection", href: "hunsu://connection/remote" }
+      { type: "open_connection", label: "Run hunsu-bridge remote status", href: STUDIO_SETUP_HREF }
     ]);
   }
   return connectionError(input.backend.backendId, "BRIDGE_NOT_CONNECTED", "Hunsu Bridge is not connected.", [
-    { type: "open_connection", label: "Open Connection", href: "hunsu://connection" }
+    { type: "open_connection", label: "Run hunsu-bridge status", href: STUDIO_SETUP_HREF }
   ]);
 }
 
@@ -460,7 +462,7 @@ function providerError(
     providerId: provider.providerId,
     error,
     message,
-    actions: [{ type: "open_provider_setup", label: "Open Provider Setup", href: `hunsu://provider/${provider.providerId}` }, ...actions]
+    actions: [{ type: "open_provider_setup", label: `Run hunsu-bridge provider status`, href: STUDIO_SETUP_HREF, providerId: provider.providerId }, ...actions]
   };
 }
 
@@ -490,8 +492,8 @@ function workspaceError(
     error,
     message,
     actions: [
-      { type: "open_workspaces", label: "Open Workspaces", href: "hunsu://workspaces" },
-      ...(workspaceId ? [{ type: "activate_workspace" as const, label: "Activate Workspace", href: `hunsu://activate-workspace?workspaceId=${encodeURIComponent(workspaceId)}`, workspaceId }] : [])
+      { type: "open_workspaces", label: "Run hunsu-bridge workspace list", href: STUDIO_LAUNCHER_HREF },
+      ...(workspaceId ? [{ type: "activate_workspace" as const, label: `Run hunsu-bridge workspace inspect ${workspaceId}`, href: STUDIO_LAUNCHER_HREF, workspaceId }] : [])
     ]
   };
 }

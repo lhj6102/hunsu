@@ -4,6 +4,7 @@ import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { currentProcessEnv, resolveCodexAppServerConfig } from "@hunsu/config";
 import { redactDiagnosticText, sanitizeDiagnostics } from "../../diagnostics/redaction.ts";
+import { HUNSU_BRIDGE_VERSION } from "../../version.ts";
 
 const execFileAsync = promisify(execFile);
 export const DEFAULT_CODEX_PROBE_TIMEOUT_MS = 3_500;
@@ -725,7 +726,7 @@ export class CodexAppServerProbeClient {
 
   async initialize(): Promise<unknown> {
     const initialized = await this.request("initialize", {
-      clientInfo: { name: "hunsu-bridge", title: "Hunsu Bridge", version: "0.1.0" }
+      clientInfo: { name: "hunsu-bridge", title: "Hunsu Bridge", version: HUNSU_BRIDGE_VERSION }
     });
     this.notify("initialized", {});
     return initialized;
