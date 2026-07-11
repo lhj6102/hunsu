@@ -228,7 +228,7 @@ try {
   $migratedState = $migratedStateText | ConvertFrom-Json
   Assert-True ([int]$migratedState.diagnosticsSecurityVersion -ge 1) "The fixed candidate did not record its completed security migration."
   Assert-True (-not $migratedStateText.Contains($legacySecret)) "The completed security migration retained the vulnerable pairing token."
-  Wait-Process -Id $vulnerableServerProcess.Id -Timeout 10 -ErrorAction Stop
+  Assert-True ($vulnerableServerProcess.WaitForExit(10000)) "The vulnerable-build pairing fixture did not exit after revocation."
   Remove-Item Env:HUNSU_BRIDGE_QA_CONTROL_TOKEN -ErrorAction SilentlyContinue
   $vulnerableServerProcess = $null
 

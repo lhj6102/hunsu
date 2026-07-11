@@ -41,6 +41,7 @@ test("installed Windows app gate silently installs an isolated NSIS candidate an
   assert.match(powershell, /vulnerable-pairing-server\.mjs/u);
   assert.match(powershell, /\/api\/bridge\/pairing\/revoke/u);
   assert.match(powershell, /pairing-revoked\.marker/u);
+  assert.match(powershell, /vulnerableServerProcess\.WaitForExit\(10000\)/u);
   assert.match(powershell, /\$installedSidecar\.FullName snapshot/u);
   assert.match(powershell, /Get-Clipboard -Raw/u);
   assert.match(powershell, /nativeClipboardRoundTrip/u);
