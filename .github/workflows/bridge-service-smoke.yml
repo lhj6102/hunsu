@@ -95,8 +95,10 @@ jobs:
           Invoke-Bridge @("service", "start", "--json") | Out-Host
 
           $healthyStatus = $null
+          $lastCandidate = $null
           for ($attempt = 0; $attempt -lt 100; $attempt += 1) {
             $candidate = Invoke-Bridge @("service", "status", "--json") | ConvertFrom-Json
+            $lastCandidate = $candidate
             if (
               $candidate.value.installed -eq $true -and
               $candidate.value.managerState -eq "running" -and
@@ -109,7 +111,74 @@ jobs:
             Start-Sleep -Milliseconds 100
           }
           if ($null -eq $healthyStatus) {
+            Write-Host "Last Bridge service status:"
+            $lastCandidate | ConvertTo-Json -Depth 8 | Out-Host
+
+            if ($IsWindows) {
+              $task = Get-ScheduledTask -TaskName "Hunsu Bridge"
+              $taskInfo = $task | Get-ScheduledTaskInfo
+              Write-Host "Scheduled task diagnostics:"
+              [pscustomobject]@{
+                CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+                CurrentSessionId = (Get-Process -Id $PID).SessionId
+                State = $task.State
+                LastRunTime = $taskInfo.LastRunTime
+                LastTaskResult = $taskInfo.LastTaskResult
+                Execute = $task.Actions[0].Execute
+                Arguments = $task.Actions[0].Arguments
+                WorkingDirectory = $task.Actions[0].WorkingDirectory
+                PrincipalUserId = $task.Principal.UserId
+                PrincipalLogonType = $task.Principal.LogonType
+                PrincipalRunLevel = $task.Principal.RunLevel
+              } | ConvertTo-Json -Depth 8 | Out-Host
+
+              Write-Host "HUNSU_HOME file inventory (contents excluded):"
+              Get-ChildItem -LiteralPath $env:HUNSU_HOME -Recurse -Force -ErrorAction SilentlyContinue |
+                Select-Object FullName, Length, Attributes |
+                ConvertTo-Json -Depth 4 |
+                Out-Host
+              $credentialsPath = Join-Path $env:HUNSU_HOME "credentials.json"
+              if (Test-Path -LiteralPath $credentialsPath) {
+                Write-Host "Credential ACL (credential contents excluded):"
+                Get-Acl -LiteralPath $credentialsPath |
+                  Select-Object Owner, AccessToString, AreAccessRulesProtected |
+                  ConvertTo-Json -Depth 4 |
+                  Out-Host
+              }
+              $runtimeFile = Join-Path $env:HUNSU_HOME "runtime.json"
+              if (Test-Path -LiteralPath $runtimeFile) {
+                Write-Host "Runtime identity:"
+                Get-Content -LiteralPath $runtimeFile -Raw | Out-Host
+              }
+              $structuredLog = Join-Path $env:HUNSU_HOME "logs/bridge.jsonl"
+              if (Test-Path -LiteralPath $structuredLog) {
+                Write-Host "Bridge structured log:"
+                Get-Content -LiteralPath $structuredLog | Out-Host
+              }
+
+            }
             throw "The installed user service never reached healthy authenticated status."
+          }
+          if ($IsWindows) {
+            $credentialsPath = Join-Path $env:HUNSU_HOME "credentials.json"
+            if (-not (Test-Path -LiteralPath $credentialsPath)) {
+              throw "The healthy Windows service did not persist its control credential."
+            }
+            $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $credentialAcl = Get-Acl -LiteralPath $credentialsPath
+            $credentialRules = @($credentialAcl.Access)
+            $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+            if (
+              $credentialAcl.Owner -ne $currentIdentity -or
+              -not $credentialAcl.AreAccessRulesProtected -or
+              $credentialRules.Count -ne 1 -or
+              $credentialRules[0].IdentityReference.Value -ne $currentIdentity -or
+              $credentialRules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+              ($credentialRules[0].FileSystemRights -band $fullControl) -ne $fullControl
+            ) {
+              throw "The Windows credential ACL was not restricted to one full-control rule for the current user."
+            }
+            Write-Host "Verified the protected current-user-only credential ACL."
           }
           if ($healthyStatus.value.packageVersion -ne $expectedPackageVersion) {
             throw "Service status reported the wrong installed package version."

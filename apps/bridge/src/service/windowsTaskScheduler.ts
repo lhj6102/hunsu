@@ -35,7 +35,7 @@ export function createWindowsTaskSchedulerServiceManager(options: WindowsTaskSch
   const probeTaskAction = async (): Promise<ServiceCommandResult> => runPowerShell([
     "$ErrorActionPreference = 'Stop'",
     `$Task = Get-ScheduledTask -TaskName ${powerShellQuote(taskName)}`,
-    "@{ Execute = $Task.Actions[0].Execute; Arguments = $Task.Actions[0].Arguments } | ConvertTo-Json -Compress"
+    "@{ Execute = $Task.Actions[0].Execute; Arguments = $Task.Actions[0].Arguments; WorkingDirectory = $Task.Actions[0].WorkingDirectory } | ConvertTo-Json -Compress"
   ].join("; "));
 
   const adapter: BridgeServiceAdapter = {
@@ -91,7 +91,7 @@ export function windowsTaskInstallScript(input: ServiceInstallInput, taskName = 
   return [
     "$ErrorActionPreference = 'Stop'",
     "$CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
-    `$Action = New-ScheduledTaskAction -Execute ${powerShellQuote(input.nodePath)} -Argument ${powerShellQuote(actionArguments)}`,
+    `$Action = New-ScheduledTaskAction -Execute ${powerShellQuote(input.nodePath)} -Argument ${powerShellQuote(actionArguments)} -WorkingDirectory ${powerShellQuote(input.runtimePath)}`,
     "$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser",
     "$Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited",
     "$Settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)",
@@ -114,10 +114,13 @@ function windowsTaskActionMatches(result: ServiceCommandResult, input: ServiceIn
     const value = JSON.parse(result.stdout.trim().replace(/^\uFEFF/u, "")) as {
       Execute?: unknown;
       Arguments?: unknown;
+      WorkingDirectory?: unknown;
     };
     return typeof value.Execute === "string"
       && value.Execute.toLowerCase() === input.nodePath.toLowerCase()
-      && value.Arguments === windowsTaskActionArguments(input);
+      && value.Arguments === windowsTaskActionArguments(input)
+      && typeof value.WorkingDirectory === "string"
+      && value.WorkingDirectory.toLowerCase() === input.runtimePath.toLowerCase();
   } catch (_error) {
     return false;
   }

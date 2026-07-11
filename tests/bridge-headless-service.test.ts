@@ -241,6 +241,7 @@ test("Windows Task Scheduler uses current-user ScheduledTasks, hidden settings, 
   };
   const script = windowsTaskInstallScript(input);
   assert.match(script, /New-ScheduledTaskAction -Execute 'C:\\Program Files\\nodejs\\node\.exe'/u);
+  assert.match(script, /-WorkingDirectory 'C:\\Users\\O''Brien\\AppData\\Local\\Hunsu\\Bridge\\runtime'/u);
   assert.match(script, /O''Brien/u);
   assert.match(script, /New-ScheduledTaskTrigger -AtLogOn -User \$CurrentUser/u);
   assert.match(script, /New-ScheduledTaskPrincipal -UserId \$CurrentUser -LogonType Interactive -RunLevel Limited/u);
@@ -267,7 +268,7 @@ test("Windows Task Scheduler uses current-user ScheduledTasks, hidden settings, 
   assert.doesNotMatch(commands[1]?.args.at(-1) ?? "", /Start-ScheduledTask/u);
 });
 
-test("Windows service install reports changes only when the stable action path changes", async () => {
+test("Windows service install reports changes when the stable action contract changes", async () => {
   const input: ServiceInstallInput = {
     nodePath: "C:\\Program Files\\nodejs\\node.exe",
     cliPath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.0\\cli.js",
@@ -277,13 +278,18 @@ test("Windows service install reports changes only when the stable action path c
   };
   const actionArguments = `"${input.cliPath}" daemon --home "${input.hunsuHome}"`;
   let existingArguments = actionArguments;
+  let existingWorkingDirectory = input.runtimePath;
   const manager = createWindowsTaskSchedulerServiceManager({
     commandRunner: async command => {
       const script = command.args.at(-1) ?? "";
       if (script.includes("ConvertTo-Json")) {
         return {
           exitCode: 0,
-          stdout: JSON.stringify({ Execute: input.nodePath.toUpperCase(), Arguments: existingArguments }),
+          stdout: JSON.stringify({
+            Execute: input.nodePath.toUpperCase(),
+            Arguments: existingArguments,
+            WorkingDirectory: existingWorkingDirectory.toUpperCase()
+          }),
           stderr: ""
         };
       }
@@ -300,6 +306,11 @@ test("Windows service install reports changes only when the stable action path c
   const changed = await manager.install(input);
   assert.equal(changed.ok, true);
   if (changed.ok) assert.equal(changed.changed, true);
+  existingArguments = actionArguments;
+  existingWorkingDirectory = "C:\\old\\runtime";
+  const workingDirectoryChanged = await manager.install(input);
+  assert.equal(workingDirectoryChanged.ok, true);
+  if (workingDirectoryChanged.ok) assert.equal(workingDirectoryChanged.changed, true);
 });
 
 test("Windows stop fallback targets only the owned task and install input rejects injection", async () => {

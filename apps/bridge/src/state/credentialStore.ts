@@ -135,23 +135,50 @@ export function createCredentialStore(
 const execFileAsync = promisify(execFile);
 
 async function hardenWindowsCredentialAcl(path: string): Promise<void> {
-  const script = [
-    "param([string]$CredentialPath)",
-    "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
-    "$acl = New-Object System.Security.AccessControl.FileSecurity",
-    "$acl.SetOwner((New-Object System.Security.Principal.NTAccount($identity)))",
-    "$acl.SetAccessRuleProtection($true, $false)",
-    "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')",
-    "$acl.AddAccessRule($rule)",
-    "Set-Acl -LiteralPath $CredentialPath -AclObject $acl"
-  ].join("; ");
+  const invocation = windowsCredentialAclPowerShellInvocation(path);
   try {
-    await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script, path], {
+    await execFileAsync(invocation.command, invocation.args, {
       windowsHide: true
     });
   } catch (_error) {
     throw invalidState(path, "credentials ACL could not be restricted to the current Windows user");
   }
+}
+
+export function windowsCredentialAclPowerShellInvocation(path: string): {
+  command: "powershell.exe";
+  args: string[];
+} {
+  if (/[\u0000-\u001f\u007f]/u.test(path)) {
+    throw invalidState(path, "credentials path cannot contain control characters");
+  }
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$CredentialPath = ${powerShellStringLiteral(path)}`,
+    "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
+    "$acl = Get-Acl -LiteralPath $CredentialPath",
+    "$acl.SetOwner((New-Object System.Security.Principal.NTAccount($identity)))",
+    "$acl.SetAccessRuleProtection($true, $false)",
+    "foreach ($existingRule in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($existingRule) | Out-Null }",
+    "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')",
+    "$acl.SetAccessRule($rule)",
+    "Set-Acl -LiteralPath $CredentialPath -AclObject $acl"
+  ].join("; ");
+  return {
+    command: "powershell.exe",
+    args: [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64")
+    ]
+  };
+}
+
+function powerShellStringLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
 }
 
 function createControlToken(randomBytes: (size: number) => Uint8Array): string {
