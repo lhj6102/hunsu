@@ -99,6 +99,12 @@ jobs:
           key: linux-repository-validation
           cache-on-failure: true
 
+      - name: Cache Linux sidecar Node runtime
+        uses: actions/cache@v4
+        with:
+          path: apps/bridge-desktop/.sidecar-cache
+          key: bridge-sidecar-node-${{ runner.os }}-x86_64-unknown-linux-gnu-22.22.0
+
       - name: Install Linux desktop dependencies
         shell: bash
         run: |
@@ -107,6 +113,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Prepare Linux sidecar resource for Rust validation
+        run: pnpm --filter @hunsu/bridge-desktop sidecars:build -- --target x86_64-unknown-linux-gnu
 
       - name: Run TypeScript, test, and Rust validation
         run: |

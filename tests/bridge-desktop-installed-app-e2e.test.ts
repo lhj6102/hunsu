@@ -99,8 +99,15 @@ test("Windows x64 workflow gates upload on installed WebView evidence and checks
   assert.match(artifactWorkflow, /--installed-screenshot-path "\$\{INSTALLED_APP_SCREENSHOT_PATH\}"/u);
   assert.match(artifactWorkflow, /Linux repository validation/u);
   assert.match(artifactWorkflow, /pnpm run check/u);
+  assert.match(artifactWorkflow, /Prepare Linux sidecar resource for Rust validation/u);
+  assert.match(artifactWorkflow, /sidecars:build -- --target x86_64-unknown-linux-gnu/u);
   assert.match(artifactWorkflow, /pnpm run check:desktop-rust/u);
   assert.match(artifactWorkflow, /needs: \[select, validate\]/u);
+  assert.equal(
+    artifactWorkflow.indexOf("Prepare Linux sidecar resource for Rust validation")
+      < artifactWorkflow.indexOf("pnpm run check:desktop-rust"),
+    true
+  );
   assert.equal(
     artifactWorkflow.indexOf("Run installed Windows Bridge App WebView E2E")
       < artifactWorkflow.indexOf("Upload desktop artifact"),
