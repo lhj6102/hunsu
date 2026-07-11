@@ -68,9 +68,54 @@ jobs:
           esac
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
+  validate:
+    name: Linux repository validation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.2
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/bridge-desktop/src-tauri -> target
+          key: linux-repository-validation
+          cache-on-failure: true
+
+      - name: Install Linux desktop dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run TypeScript, test, and Rust validation
+        run: |
+          pnpm run check
+          pnpm run check:desktop-rust
+
   build:
     name: Build ${{ matrix.label }}
-    needs: select
+    needs: [select, validate]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -177,6 +222,7 @@ jobs:
         shell: pwsh
         env:
           INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
+          INSTALLED_APP_SCREENSHOT_PATH: ${{ runner.temp }}/windows-installed-app-e2e-screenshot.png
         run: |
           $installer = Get-ChildItem `
             -Path "apps/bridge-desktop/src-tauri/target/release/bundle/nsis" `
@@ -187,7 +233,8 @@ jobs:
           }
           ./apps/bridge-desktop/scripts/windows-installed-app-e2e.ps1 `
             -InstallerPath $installer.FullName `
-            -EvidencePath $env:INSTALLED_APP_EVIDENCE_PATH
+            -EvidencePath $env:INSTALLED_APP_EVIDENCE_PATH `
+            -ScreenshotPath $env:INSTALLED_APP_SCREENSHOT_PATH
 
       - name: Verify final macOS application signature
         if: startsWith(matrix.platform, 'macos')
@@ -213,6 +260,7 @@ jobs:
         env:
           ARTIFACT_STAGE: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
           INSTALLED_APP_EVIDENCE_PATH: ${{ runner.temp }}/windows-installed-app-e2e-evidence.json
+          INSTALLED_APP_SCREENSHOT_PATH: ${{ runner.temp }}/windows-installed-app-e2e-screenshot.png
           MANAGED_BRIDGE_EVIDENCE_PATH: ${{ runner.temp }}/windows-managed-bridge-e2e-evidence.json
           SIDECAR_TARGET: ${{ matrix.rust_target }}
         run: |
@@ -224,6 +272,7 @@ jobs:
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
             stage_args+=(--evidence-path "${MANAGED_BRIDGE_EVIDENCE_PATH}")
             stage_args+=(--installed-evidence-path "${INSTALLED_APP_EVIDENCE_PATH}")
+            stage_args+=(--installed-screenshot-path "${INSTALLED_APP_SCREENSHOT_PATH}")
           fi
           if [[ "${{ inputs.platform }}" == "all" ]]; then
             stage_args+=(--include-size-report)
@@ -236,4 +285,4 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ runner.temp }}/hunsu-bridge-artifact-${{ matrix.rust_target }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90

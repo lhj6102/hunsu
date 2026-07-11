@@ -1,14 +1,20 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { createServer } from "node:net";
+import { basename, dirname } from "node:path";
 import { chromium } from "@playwright/test";
 
 const options = parseArguments(process.argv.slice(2));
 const browser = await chromium.connectOverCDP(options.endpoint, { timeout: 30_000 });
 const pageErrors = [];
+const consoleErrors = [];
 
 try {
   const page = await waitForBridgePage(browser);
   page.on("pageerror", error => pageErrors.push(String(error?.message ?? error)));
+  page.on("console", message => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
   await page.locator("#start-bridge").waitFor({ state: "attached", timeout: 30_000 });
 
   await openLifecycleControls(page);
@@ -32,15 +38,16 @@ try {
     expected: { localLabel: "Connected", startDisabled: true, stopDisabled: false }
   });
 
-  await verifyVersionLabels(page);
+  const versionLabels = await verifyVersionLabels(page);
   await verifyProviderRecheck(page);
   await verifyProviderValidation(page);
   const pairingToken = await verifyOpenHunsuWebHandoff(page, options.capturePath);
-  const workspaceToken = await verifyWorkspaceOpenHandoff(page, options.capturePath);
-  await verifyDiagnosticsCopy(page, {
+  const workspaceToken = await verifyWorkspaceOpenHandoff(page, options.capturePath, options.roadmapId);
+  const diagnosticsObservation = await verifyDiagnosticsCopy(page, {
     legacySecret: options.legacySecret,
     runtimeTokens: [pairingToken, workspaceToken],
-    logPath: options.logPath
+    logPath: options.logPath,
+    clipboardExpectationPath: options.clipboardExpectationPath
   });
 
   await openLifecycleControls(page);
@@ -50,8 +57,17 @@ try {
     terminalText: "Bridge stopped",
     expected: { localLabel: "Not Running", startDisabled: false, stopDisabled: true }
   });
+  await delay(2_500);
+  await page.locator("#refresh").click();
+  await waitForTerminalFeedback(page, "#action-status", "Bridge status refreshed", 60_000);
+  await waitForLifecycle(page, { localLabel: "Not Running", startDisabled: false, stopDisabled: true });
+  await verifyPortConflictFeedback(page, options.bridgePort);
+  await openAdvancedPanel(page, "advanced");
+  mkdirSync(dirname(options.screenshotPath), { recursive: true });
+  await page.screenshot({ path: options.screenshotPath, fullPage: true });
 
   assert(pageErrors.length === 0, `The installed WebView raised ${pageErrors.length} unhandled page error(s).`);
+  assert(consoleErrors.length === 0, `The installed WebView logged ${consoleErrors.length} console error(s).`);
   const evidence = {
     schemaVersion: 1,
     result: "passed",
@@ -63,11 +79,29 @@ try {
       "lifecycle-controls",
       "open-handoff-once",
       "workspace-open-handoff-once",
+      "exact-workspace-id",
       "diagnostics-copy-redaction",
+      "installed-native-clipboard",
       "no-eaddrinuse-log",
+      "installed-remains-stopped",
+      "ui-port-conflict-feedback",
+      "sidecar-no-console-window",
+      "live-migration-revocation",
+      "no-webview-console-errors",
+      "visual-screenshot",
       "provider-validate-recheck-feedback",
       "version-labels"
     ],
+    observations: {
+      lifecycleTransitions: ["connected-managed", "not-running", "connected-managed", "not-running"],
+      portConflictFeedback: "The local Bridge port is in use by another process.",
+      workspaceRoadmapIdMatched: true,
+      browserHandoffs: { web: 1, workspace: 1 },
+      diagnosticsSha256: diagnosticsObservation.diagnosticsSha256,
+      sanitizedLogSha256: diagnosticsObservation.logSha256,
+      screenshotFile: basename(options.screenshotPath),
+      versionLabels
+    },
     releaseGate: {
       automatedInstalledAppQa: "passed",
       manualVisualQa: "required",
@@ -93,15 +127,32 @@ function parseArguments(argv) {
     }
     values.set(key.slice(2), value);
   }
-  const required = ["endpoint", "capture-path", "log-path", "legacy-secret"];
+  const required = [
+    "endpoint",
+    "capture-path",
+    "log-path",
+    "legacy-secret",
+    "roadmap-id",
+    "bridge-port",
+    "screenshot-path",
+    "clipboard-expectation-path"
+  ];
   for (const key of required) {
     if (!values.get(key)) throw new Error(`Missing required installed-app E2E argument: --${key}`);
+  }
+  const bridgePort = Number(values.get("bridge-port"));
+  if (!Number.isInteger(bridgePort) || bridgePort < 1 || bridgePort > 65_535) {
+    throw new Error("Installed-app E2E --bridge-port must be an integer from 1 through 65535.");
   }
   return {
     endpoint: values.get("endpoint"),
     capturePath: values.get("capture-path"),
     logPath: values.get("log-path"),
     legacySecret: values.get("legacy-secret"),
+    roadmapId: values.get("roadmap-id"),
+    bridgePort,
+    screenshotPath: values.get("screenshot-path"),
+    clipboardExpectationPath: values.get("clipboard-expectation-path"),
     evidencePath: values.get("evidence-path")
   };
 }
@@ -179,6 +230,7 @@ async function verifyVersionLabels(page) {
   assert(labels.codexCli.includes("codex-qa 0.0.0"),
     `Codex CLI version did not come from the controlled installed-app fixture (received ${JSON.stringify(labels.codexCli)}).`);
   console.log(`[installed-app-e2e] version labels passed: ${JSON.stringify(labels)}`);
+  return labels;
 }
 
 async function verifyProviderRecheck(page) {
@@ -241,7 +293,7 @@ async function verifyOpenHunsuWebHandoff(page, capturePath) {
   return pairingToken;
 }
 
-async function verifyWorkspaceOpenHandoff(page, capturePath) {
+async function verifyWorkspaceOpenHandoff(page, capturePath, roadmapId) {
   await page.locator("#refresh").click();
   await waitForTerminalFeedback(page, "#action-status", "Bridge status refreshed", 60_000);
   await page.locator('nav button[data-tab="workspaces"]').click();
@@ -261,6 +313,8 @@ async function verifyWorkspaceOpenHandoff(page, capturePath) {
   const capturedUrl = new URL(after.at(-1));
   const workspaceToken = capturedUrl.searchParams.get("hunsuBridgeToken");
   assert(workspaceToken, "Workspace Open did not receive a transient pairing token.");
+  assert(capturedUrl.pathname === `/studio/roadmaps/${encodeURIComponent(roadmapId)}`,
+    "Workspace Open did not target the requested Roadmap ID.");
   const trace = await readTransitionTrace(page);
   assert(trace.some(entry => entry.state === "pending" && entry.text.includes("Opening Workspace")),
     "Workspace Open did not expose pending feedback.");
@@ -271,28 +325,24 @@ async function verifyWorkspaceOpenHandoff(page, capturePath) {
 
 async function verifyDiagnosticsCopy(page, input) {
   await openAdvancedPanel(page, "diagnostics");
-  await page.evaluate(() => {
-    const capture = {
-      writeText: async text => {
-        window.__hunsuQaClipboardText = String(text);
-      }
-    };
-    Object.defineProperty(navigator, "clipboard", { configurable: true, value: capture });
-  });
   await armTransitionTrace(page, "#action-status");
   await page.locator("#copy-diagnostics").click();
   await waitForTerminalFeedback(page, "#action-status", "Diagnostics copied", 60_000);
-  const clipboardText = await page.evaluate(() => window.__hunsuQaClipboardText ?? "");
   const displayedText = await page.locator("#diagnostics").textContent() ?? "";
-  assert(clipboardText.length > 0, "Copy Diagnostics did not write a payload.");
-  assert(clipboardText === displayedText, "The displayed and copied fresh Diagnostics payloads diverged.");
-  assertSafeDiagnosticsText(clipboardText, input.legacySecret, input.runtimeTokens);
+  assert(displayedText.length > 0, "Copy Diagnostics did not render a payload.");
+  assertSafeDiagnosticsText(displayedText, input.legacySecret, input.runtimeTokens);
+  mkdirSync(dirname(input.clipboardExpectationPath), { recursive: true });
+  writeFileSync(input.clipboardExpectationPath, displayedText, { encoding: "utf8", mode: 0o600 });
   const sanitizedLog = readFileSync(input.logPath, "utf8");
   assertSafeDiagnosticsText(sanitizedLog, input.legacySecret, input.runtimeTokens);
   assert(!sanitizedLog.includes("EADDRINUSE"), "The installed-app log contains EADDRINUSE.");
   const trace = await readTransitionTrace(page);
   assert(trace.some(entry => entry.state === "pending" && entry.text.includes("Preparing fresh diagnostics")),
     "Copy Diagnostics did not expose pending feedback.");
+  return {
+    diagnosticsSha256: sha256(displayedText),
+    logSha256: sha256(sanitizedLog)
+  };
 }
 
 function assertSafeDiagnosticsText(text, legacySecret, runtimeTokens) {
@@ -307,6 +357,33 @@ function assertSafeDiagnosticsText(text, legacySecret, runtimeTokens) {
     const value = decodeURIComponent(match[1]).toLowerCase();
     assert(["", "[redacted]", "redacted", "***"].includes(value),
       "Diagnostics retained an unredacted sensitive query value.");
+  }
+}
+
+async function verifyPortConflictFeedback(page, bridgePort) {
+  const server = createServer(socket => socket.destroy());
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(bridgePort, "127.0.0.1", resolve);
+  });
+  try {
+    await openLifecycleControls(page);
+    await armTransitionTrace(page, "#action-status");
+    await page.locator("#start-bridge").click();
+    await page.waitForFunction(() => {
+      const status = document.querySelector("#action-status");
+      return status?.dataset.state === "error"
+        && status.textContent?.includes("The local Bridge port is in use by another process.");
+    }, undefined, { timeout: 60_000 });
+    assert(!(await page.locator("#start-bridge").isDisabled()), "Start did not recover after actionable port-conflict feedback.");
+    assert(await page.locator("#stop-bridge").isDisabled(), "Stop became available for an unrelated port owner.");
+    const trace = await readTransitionTrace(page);
+    assert(trace.some(entry => entry.state === "pending" && entry.text.includes("Starting Bridge")),
+      "Port-conflict Start did not expose pending feedback.");
+    await delay(3_000);
+    assert(server.listening, "The Bridge disturbed the unrelated port-conflict listener.");
+  } finally {
+    await new Promise(resolve => server.close(resolve));
   }
 }
 
@@ -363,6 +440,10 @@ function nonemptyFileLines(path) {
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function delay(milliseconds) {

@@ -24,6 +24,7 @@ type ArtifactStageModule = {
     includeSizeReport?: boolean;
     evidencePath?: string;
     installedEvidencePath?: string;
+    installedScreenshotPath?: string;
   }): { files: string[] };
 };
 
@@ -111,6 +112,7 @@ test("desktop artifact staging retains safe passing Windows lifecycle evidence i
     writeFixture(evidencePath, JSON.stringify({
       schemaVersion: 1,
       result: "passed",
+      provenance: artifactProvenance("sidecarSha256"),
       scenarios: Object.fromEntries(["A", "B", "C", "D", "E", "F"].map(scenario => [scenario, { result: "passed" }]))
     }));
     artifactStage.stageDesktopArtifacts({
@@ -130,6 +132,7 @@ test("desktop artifact staging retains safe passing Windows lifecycle evidence i
     writeFixture(evidencePath, JSON.stringify({
       schemaVersion: 1,
       result: "passed",
+      provenance: artifactProvenance("sidecarSha256"),
       scenarios: Object.fromEntries(["A", "B", "C", "D", "E", "F"].map(scenario => [scenario, { result: "passed" }])),
       unsafe: "https://example.invalid/?hunsuBridgeToken=raw"
     }));
@@ -152,25 +155,48 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
   const bundleDir = join(root, "bundle");
   const outputDir = join(root, "staged");
   const installedEvidencePath = join(root, "installed-evidence.json");
+  const installedScreenshotPath = join(root, "installed-screenshot.png");
   const checks = [
     "silent-isolated-install",
     "installed-webview-cdp",
     "lifecycle-controls",
     "open-handoff-once",
     "workspace-open-handoff-once",
+    "exact-workspace-id",
     "diagnostics-copy-redaction",
+    "installed-native-clipboard",
     "no-eaddrinuse-log",
+    "installed-remains-stopped",
+    "ui-port-conflict-feedback",
+    "sidecar-no-console-window",
+    "live-migration-revocation",
+    "no-webview-console-errors",
+    "visual-screenshot",
     "provider-validate-recheck-feedback",
     "version-labels"
   ];
 
   try {
     writeFixture(join(bundleDir, "nsis", "Hunsu.exe"), "windows-installer");
+    writePngFixture(installedScreenshotPath);
+    const screenshotSha256 = createHash("sha256").update(readFileSync(installedScreenshotPath)).digest("hex");
     writeFixture(installedEvidencePath, JSON.stringify({
       schemaVersion: 1,
       result: "passed",
       candidateKind: "installed-nsis",
       checks,
+      provenance: {
+        ...artifactProvenance("installerSha256"),
+        screenshotSha256,
+        sanitizedLogSha256: "c".repeat(64)
+      },
+      observations: {
+        nativeClipboardRoundTrip: true,
+        sidecarConsoleWindows: 0,
+        liveLegacyPairingRevoked: true,
+        workspaceRoadmapIdMatched: true,
+        screenshotFile: "windows-installed-app-e2e-screenshot.png"
+      },
       releaseGate: {
         automatedInstalledAppQa: "passed",
         manualVisualQa: "required",
@@ -181,13 +207,15 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
       bundleDir,
       outputDir,
       target: "x86_64-pc-windows-msvc",
-      installedEvidencePath
+      installedEvidencePath,
+      installedScreenshotPath
     });
 
     assert.deepEqual(listFiles(outputDir), [
       "SHA256SUMS.txt",
       "nsis/Hunsu.exe",
-      "windows-installed-app-e2e-evidence.json"
+      "windows-installed-app-e2e-evidence.json",
+      "windows-installed-app-e2e-screenshot.png"
     ]);
     assertChecksumsMatchEveryStagedFile(outputDir);
 
@@ -196,6 +224,18 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
       result: "passed",
       candidateKind: "installed-nsis",
       checks,
+      provenance: {
+        ...artifactProvenance("installerSha256"),
+        screenshotSha256,
+        sanitizedLogSha256: "c".repeat(64)
+      },
+      observations: {
+        nativeClipboardRoundTrip: true,
+        sidecarConsoleWindows: 0,
+        liveLegacyPairingRevoked: true,
+        workspaceRoadmapIdMatched: true,
+        screenshotFile: "windows-installed-app-e2e-screenshot.png"
+      },
       releaseGate: {
         automatedInstalledAppQa: "passed",
         manualVisualQa: "required",
@@ -207,7 +247,8 @@ test("desktop artifact staging retains safe installed NSIS WebView evidence with
         bundleDir,
         outputDir,
         target: "x86_64-pc-windows-msvc",
-        installedEvidencePath
+        installedEvidencePath,
+        installedScreenshotPath
       }),
       /release gate closed pending manual QA/
     );
@@ -269,6 +310,25 @@ test("desktop artifact staging CLI accepts bundle, output, and target options", 
 function writeFixture(path: string, contents: string) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, contents, "utf8");
+}
+
+function writePngFixture(path: string) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, Buffer.from("89504e470d0a1a0a00", "hex"));
+}
+
+function artifactProvenance(digestName: "sidecarSha256" | "installerSha256") {
+  return {
+    runId: "123456",
+    runAttempt: "1",
+    headSha: "b".repeat(40),
+    target: "x86_64-pc-windows-msvc",
+    runnerOs: "Windows Server QA",
+    runnerImage: "windows-latest",
+    startedAt: "2026-07-11T00:00:00.000Z",
+    completedAt: "2026-07-11T00:01:00.000Z",
+    [digestName]: "a".repeat(64)
+  };
 }
 
 function listFiles(directory: string): string[] {

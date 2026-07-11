@@ -3,12 +3,15 @@ param(
   [string]$InstallerPath,
   [Parameter(Mandatory = $true)]
   [string]$EvidencePath,
-  [int]$BridgePort = 0,
+  [Parameter(Mandatory = $true)]
+  [string]$ScreenshotPath,
+  [int]$BridgePort = 19687,
   [int]$CdpPort = 0
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$runStartedAt = [DateTime]::UtcNow
 
 if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
   throw "The installed-app WebView2 E2E gate must run on Windows."
@@ -79,7 +82,6 @@ function Stop-InstalledProcesses {
     }
 }
 
-if ($BridgePort -eq 0) { $BridgePort = Get-FreeLoopbackPort }
 if ($CdpPort -eq 0) { $CdpPort = Get-FreeLoopbackPort }
 Assert-True ($BridgePort -ne $CdpPort) "Bridge and WebView2 CDP ports must be different."
 
@@ -93,23 +95,31 @@ $browserCapturePath = Join-Path $runtimeDir "browser-capture.log"
 $roadmapRegistryPath = Join-Path $runtimeDir "roadmaps.json"
 $fakeCodexPath = Join-Path $runtimeDir "codex-qa.exe"
 $fakeCodexSourcePath = Join-Path $runtimeDir "codex-qa.rs"
+$vulnerableServerPath = Join-Path $runtimeDir "vulnerable-pairing-server.mjs"
+$revocationMarkerPath = Join-Path $runtimeDir "pairing-revoked.marker"
+$uiEvidencePath = Join-Path $runtimeDir "ui-evidence.json"
+$clipboardExpectationPath = Join-Path $runtimeDir "clipboard-expectation.txt"
 $workspaceFixturePath = Join-Path $root "fixture-roadmap"
 $driverPath = Join-Path $PSScriptRoot "windows-installed-app-webview-e2e.mjs"
 $legacySecret = "qa_legacy_" + [guid]::NewGuid().ToString("N")
+$legacyControlToken = "qa_control_" + [guid]::NewGuid().ToString("N")
 $appProcess = $null
 $appExecutable = $null
 $installedSidecar = $null
+$vulnerableServerProcess = $null
 
 New-Item -ItemType Directory -Path $installDir, $runtimeDir, $webViewDataDir, $workspaceFixturePath -Force | Out-Null
 
 @{
   schema = "hunsu.bridge-app-state.v1"
   diagnosticsSecurityVersion = 0
+  bridgeApiUrl = "http://127.0.0.1:$BridgePort"
+  controlToken = $legacyControlToken
   authToken = $legacySecret
   pairing = @{
     token = $legacySecret
-    issuedAt = "2026-01-01T00:00:00.000Z"
-    expiresAt = "2026-01-01T00:05:00.000Z"
+    issuedAt = [DateTime]::UtcNow.AddMinutes(-1).ToString("o")
+    expiresAt = [DateTime]::UtcNow.AddMinutes(14).ToString("o")
   }
 } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $statePath -Encoding utf8
 
@@ -126,6 +136,38 @@ Set-Content -LiteralPath $fakeCodexSourcePath -Encoding utf8 -Value @(
   "    std::process::exit(1);",
   "}"
 )
+Set-Content -LiteralPath $vulnerableServerPath -Encoding utf8 -Value @'
+import { writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+
+const port = Number(process.argv[2]);
+const markerPath = process.argv[3];
+const controlToken = process.env.HUNSU_BRIDGE_QA_CONTROL_TOKEN;
+const server = createServer((request, response) => {
+  if (request.method === "GET" && request.url === "/health") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ status: "ok", service: "hunsu-bridge", bridgeVersion: "vulnerable-qa", protocolVersion: "local-bridge-v1" }));
+    return;
+  }
+  if (request.method === "GET" && request.url === "/api/bridge/control/status") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ state: "connected", ownership: "managed", pairingState: "active" }));
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/bridge/pairing/revoke"
+      && request.headers["x-hunsu-bridge-control-token"] === controlToken) {
+    writeFileSync(markerPath, "revoked\n", "utf8");
+    response.writeHead(202, { "content-type": "application/json" });
+    response.end(JSON.stringify({ revoked: true }));
+    setTimeout(() => server.close(() => process.exit(0)), 25);
+    return;
+  }
+  response.writeHead(403, { "content-type": "application/json" });
+  response.end(JSON.stringify({ error: "forbidden" }));
+});
+server.listen(port, "127.0.0.1");
+setTimeout(() => process.exit(2), 30_000).unref();
+'@
 $rustc = (Get-Command rustc -ErrorAction Stop).Source
 & $rustc --crate-name codex_qa_fixture $fakeCodexSourcePath -o $fakeCodexPath
 Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $fakeCodexPath -PathType Leaf)) "Could not compile the native Codex CLI fixture."
@@ -156,6 +198,40 @@ try {
     Select-Object -First 1
   Assert-True ($null -ne $installedSidecar) "The installed Bridge sidecar was not found."
 
+  # Recreate an active vulnerable-build pairing session and require the fixed candidate to revoke it.
+  $node = (Get-Command node -ErrorAction Stop).Source
+  $env:HUNSU_BRIDGE_QA_CONTROL_TOKEN = $legacyControlToken
+  $vulnerableServerProcess = Start-Process -FilePath $node -ArgumentList @(
+    $vulnerableServerPath,
+    [string]$BridgePort,
+    $revocationMarkerPath
+  ) -PassThru -WindowStyle Hidden
+  $deadline = [DateTime]::UtcNow.AddSeconds(10)
+  do {
+    $legacyListener = Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort $BridgePort -State Listen -ErrorAction SilentlyContinue
+    if ($null -ne $legacyListener) { break }
+    if ($vulnerableServerProcess.HasExited) { throw "The vulnerable-build pairing fixture exited before listening." }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $deadline)
+  Assert-True ($null -ne $legacyListener) "The vulnerable-build pairing fixture did not start."
+
+  $migrationOutput = & $installedSidecar.FullName snapshot 2>&1 | Out-String
+  $migrationExitCode = $LASTEXITCODE
+  try {
+    $null = $migrationOutput | ConvertFrom-Json
+  } catch {
+    throw "The installed sidecar returned invalid JSON during the live pairing migration (exit $migrationExitCode)."
+  }
+  Assert-True ($migrationExitCode -eq 0) "The installed sidecar failed its live pairing migration."
+  Assert-True (Test-Path -LiteralPath $revocationMarkerPath -PathType Leaf) "The fixed candidate did not revoke the active vulnerable-build pairing session."
+  $migratedStateText = Get-Content -LiteralPath $statePath -Raw
+  $migratedState = $migratedStateText | ConvertFrom-Json
+  Assert-True ([int]$migratedState.diagnosticsSecurityVersion -ge 1) "The fixed candidate did not record its completed security migration."
+  Assert-True (-not $migratedStateText.Contains($legacySecret)) "The completed security migration retained the vulnerable pairing token."
+  Wait-Process -Id $vulnerableServerProcess.Id -Timeout 10 -ErrorAction Stop
+  Remove-Item Env:HUNSU_BRIDGE_QA_CONTROL_TOKEN -ErrorAction SilentlyContinue
+  $vulnerableServerProcess = $null
+
   $fixtureOutput = & $installedSidecar.FullName create $workspaceFixturePath --no-open --json 2>&1 | Out-String
   $fixtureExitCode = $LASTEXITCODE
   try {
@@ -167,6 +243,8 @@ try {
     $fixtureCode = if ([string]::IsNullOrWhiteSpace([string]$fixtureResult.code)) { "UNKNOWN" } else { [string]$fixtureResult.code }
     throw "The installed sidecar could not prepare the fixture Workspace (exit $fixtureExitCode, code $fixtureCode)."
   }
+  $fixtureRoadmapId = [string]$fixtureResult.value.roadmapId
+  Assert-True (-not [string]::IsNullOrWhiteSpace($fixtureRoadmapId)) "The installed sidecar did not return the fixture Roadmap ID."
   Assert-True (-not (Test-Path -LiteralPath $browserCapturePath -PathType Leaf)) "No-open fixture preparation unexpectedly handed off to a browser."
 
   $snapshotOutput = & $installedSidecar.FullName snapshot 2>&1 | Out-String
@@ -184,20 +262,71 @@ try {
   $appProcess = Start-Process -FilePath $appExecutable -WorkingDirectory (Split-Path -Parent $appExecutable) -PassThru
   $cdpEndpoint = "http://127.0.0.1:$CdpPort"
   Wait-CdpEndpoint -Endpoint $cdpEndpoint -AppProcess $appProcess
+  $installedSidecarProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and
+    $_.ExecutablePath.StartsWith([System.IO.Path]::GetFullPath($installDir), [System.StringComparison]::OrdinalIgnoreCase) -and
+    $_.Name -like "hunsu-bridge-sidecar*"
+  })
+  Assert-True ($installedSidecarProcesses.Count -ge 2) "The installed managed runtime topology was not present."
+  foreach ($processInfo in $installedSidecarProcesses) {
+    $nativeProcess = Get-Process -Id ([int]$processInfo.ProcessId) -ErrorAction Stop
+    Assert-True ($nativeProcess.MainWindowHandle -eq 0) "An installed Bridge sidecar exposed a console window."
+  }
 
-  $node = (Get-Command node -ErrorAction Stop).Source
   & $node $driverPath `
     --endpoint $cdpEndpoint `
     --capture-path $browserCapturePath `
     --log-path $logPath `
     --legacy-secret $legacySecret `
-    --evidence-path $EvidencePath
+    --roadmap-id $fixtureRoadmapId `
+    --bridge-port "$BridgePort" `
+    --screenshot-path $ScreenshotPath `
+    --clipboard-expectation-path $clipboardExpectationPath `
+    --evidence-path $uiEvidencePath
   if ($LASTEXITCODE -ne 0) {
     throw "Installed Hunsu Bridge WebView2 E2E failed with exit code $LASTEXITCODE."
   }
 
+  $clipboardText = Get-Clipboard -Raw
+  $clipboardExpectation = Get-Content -LiteralPath $clipboardExpectationPath -Raw
+  $normalizedClipboard = $clipboardText.Replace("`r`n", "`n")
+  $normalizedExpectation = $clipboardExpectation.Replace("`r`n", "`n")
+  Assert-True ($normalizedClipboard -eq $normalizedExpectation) "The installed WebView Copy Diagnostics payload did not reach the native Windows clipboard."
+  Assert-True (-not $clipboardText.Contains($legacySecret)) "The native Windows clipboard retained the vulnerable pairing token."
+
+  $uiEvidence = Get-Content -LiteralPath $uiEvidencePath -Raw | ConvertFrom-Json
+  $uiEvidence | Add-Member -NotePropertyName provenance -NotePropertyValue ([ordered]@{
+    runId = if ([string]::IsNullOrWhiteSpace($env:GITHUB_RUN_ID)) { "local" } else { $env:GITHUB_RUN_ID }
+    runAttempt = if ([string]::IsNullOrWhiteSpace($env:GITHUB_RUN_ATTEMPT)) { "1" } else { $env:GITHUB_RUN_ATTEMPT }
+    headSha = if ([string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { "local" } else { $env:GITHUB_SHA }
+    target = "x86_64-pc-windows-msvc"
+    runnerOs = [System.Environment]::OSVersion.VersionString
+    runnerImage = if ([string]::IsNullOrWhiteSpace($env:ImageOS)) { "unknown" } else { $env:ImageOS }
+    startedAt = $runStartedAt.ToString("o")
+    completedAt = [DateTime]::UtcNow.ToString("o")
+    installerSha256 = (Get-FileHash -LiteralPath $resolvedInstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    screenshotSha256 = (Get-FileHash -LiteralPath $ScreenshotPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    sanitizedLogSha256 = (Get-FileHash -LiteralPath $logPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  })
+  $uiEvidence.observations | Add-Member -NotePropertyName nativeClipboardRoundTrip -NotePropertyValue $true
+  $uiEvidence.observations | Add-Member -NotePropertyName sidecarConsoleWindows -NotePropertyValue 0
+  $uiEvidence.observations | Add-Member -NotePropertyName liveLegacyPairingRevoked -NotePropertyValue $true
+  $evidenceParent = Split-Path -Parent $EvidencePath
+  if (-not [string]::IsNullOrWhiteSpace($evidenceParent)) {
+    New-Item -ItemType Directory -Path $evidenceParent -Force | Out-Null
+  }
+  [System.IO.File]::WriteAllText(
+    [System.IO.Path]::GetFullPath($EvidencePath),
+    ($uiEvidence | ConvertTo-Json -Depth 12) + [Environment]::NewLine,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+
   Write-Host "Windows installed Hunsu Bridge WebView2 E2E passed."
 } finally {
+  Remove-Item Env:HUNSU_BRIDGE_QA_CONTROL_TOKEN -ErrorAction SilentlyContinue
+  if ($null -ne $vulnerableServerProcess -and -not $vulnerableServerProcess.HasExited) {
+    Stop-Process -Id $vulnerableServerProcess.Id -Force -ErrorAction SilentlyContinue
+  }
   if ($null -ne $installedSidecar) {
     try { & $installedSidecar.FullName stop --json 2>$null | Out-Null } catch { }
   }
@@ -212,5 +341,6 @@ try {
   if ($null -ne $uninstaller) {
     try { Start-Process -FilePath $uninstaller.FullName -ArgumentList "/S" -PassThru -Wait | Out-Null } catch { }
   }
+  try { Set-Clipboard -Value "" } catch { }
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }

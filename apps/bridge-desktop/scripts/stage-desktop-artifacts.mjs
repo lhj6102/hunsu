@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 const artifactSizeReportName = "artifact-size-report.json";
 const managedBridgeEvidenceName = "windows-managed-bridge-e2e-evidence.json";
 const installedAppEvidenceName = "windows-installed-app-e2e-evidence.json";
+const installedAppScreenshotName = "windows-installed-app-e2e-screenshot.png";
 const checksumFileName = "SHA256SUMS.txt";
 
 const targetArtifactRules = new Map([
@@ -103,12 +104,21 @@ export function stageDesktopArtifacts(input) {
   }
 
   const installedEvidencePath = optionalSourceFile(input?.installedEvidencePath, "installed Bridge App E2E evidence");
+  const installedScreenshotPath = optionalSourceFile(input?.installedScreenshotPath, "installed Bridge App E2E screenshot");
+  if (Boolean(installedEvidencePath) !== Boolean(installedScreenshotPath)) {
+    throw new Error("Installed Bridge App E2E evidence and screenshot must be staged together.");
+  }
   if (installedEvidencePath) {
     if (containsPath(outputRoot, installedEvidencePath)) {
       throw new Error(`Installed Bridge App E2E evidence must be outside the artifact output directory: ${installedEvidencePath}`);
     }
-    validateInstalledAppEvidence(installedEvidencePath);
+    if (containsPath(outputRoot, installedScreenshotPath)) {
+      throw new Error(`Installed Bridge App E2E screenshot must be outside the artifact output directory: ${installedScreenshotPath}`);
+    }
+    validatePngScreenshot(installedScreenshotPath);
+    validateInstalledAppEvidence(installedEvidencePath, installedScreenshotPath);
     copyIntoStage(installedEvidencePath, outputRoot, installedAppEvidenceName);
+    copyIntoStage(installedScreenshotPath, outputRoot, installedAppScreenshotName);
   }
 
   const stagedFiles = walkFiles(outputRoot)
@@ -137,7 +147,8 @@ export function parseStageDesktopArtifactArguments(args) {
     ["--output-dir", "outputDir"],
     ["--target", "target"],
     ["--evidence-path", "evidencePath"],
-    ["--installed-evidence-path", "installedEvidencePath"]
+    ["--installed-evidence-path", "installedEvidencePath"],
+    ["--installed-screenshot-path", "installedScreenshotPath"]
   ]);
   const options = {};
 
@@ -166,7 +177,7 @@ export function parseStageDesktopArtifactArguments(args) {
   }
 
   for (const [option, property] of optionNames) {
-    if (property === "evidencePath" || property === "installedEvidencePath") {
+    if (property === "evidencePath" || property === "installedEvidencePath" || property === "installedScreenshotPath") {
       continue;
     }
     if (!Object.hasOwn(options, property)) {
@@ -251,12 +262,13 @@ function validateManagedBridgeEvidence(path) {
       throw new Error(`Managed Bridge E2E evidence is missing passing scenario ${scenario}: ${path}`);
     }
   }
+  validateArtifactProvenance(evidence?.provenance, "sidecarSha256", "Managed Bridge", path);
   if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken/iu.test(text)) {
     throw new Error(`Managed Bridge E2E evidence contains a URL or credential parameter: ${path}`);
   }
 }
 
-function validateInstalledAppEvidence(path) {
+function validateInstalledAppEvidence(path, screenshotPath) {
   const text = readFileSync(path, "utf8");
   let evidence;
   try {
@@ -270,8 +282,16 @@ function validateInstalledAppEvidence(path) {
     "lifecycle-controls",
     "open-handoff-once",
     "workspace-open-handoff-once",
+    "exact-workspace-id",
     "diagnostics-copy-redaction",
+    "installed-native-clipboard",
     "no-eaddrinuse-log",
+    "installed-remains-stopped",
+    "ui-port-conflict-feedback",
+    "sidecar-no-console-window",
+    "live-migration-revocation",
+    "no-webview-console-errors",
+    "visual-screenshot",
     "provider-validate-recheck-feedback",
     "version-labels"
   ];
@@ -286,9 +306,54 @@ function validateInstalledAppEvidence(path) {
     || evidence?.releaseGate?.releaseEligible !== false) {
     throw new Error(`Installed Bridge App E2E evidence must keep the candidate release gate closed pending manual QA: ${path}`);
   }
+  validateArtifactProvenance(evidence?.provenance, "installerSha256", "Installed Bridge App", path);
+  for (const digestName of ["screenshotSha256", "sanitizedLogSha256"]) {
+    if (!isSha256(evidence?.provenance?.[digestName])) {
+      throw new Error(`Installed Bridge App E2E evidence has invalid ${digestName} provenance: ${path}`);
+    }
+  }
+  const screenshotDigest = createHash("sha256").update(readFileSync(screenshotPath)).digest("hex");
+  if (evidence.provenance.screenshotSha256 !== screenshotDigest) {
+    throw new Error(`Installed Bridge App E2E screenshot does not match its evidence digest: ${path}`);
+  }
+  if (evidence?.observations?.nativeClipboardRoundTrip !== true
+    || evidence?.observations?.sidecarConsoleWindows !== 0
+    || evidence?.observations?.liveLegacyPairingRevoked !== true
+    || evidence?.observations?.workspaceRoadmapIdMatched !== true
+    || evidence?.observations?.screenshotFile !== installedAppScreenshotName) {
+    throw new Error(`Installed Bridge App E2E evidence is missing required native observations: ${path}`);
+  }
   if (/\b[a-z][a-z0-9+.-]*:\/\/|hunsuBridgeToken|hunsuRelayToken|authorization|access_token|refresh_token/iu.test(text)) {
     throw new Error(`Installed Bridge App E2E evidence contains a URL or credential parameter: ${path}`);
   }
+}
+
+function validateArtifactProvenance(provenance, binaryDigestName, label, path) {
+  if (!provenance || typeof provenance !== "object"
+    || !/^(?:local|\d+)$/u.test(provenance.runId ?? "")
+    || !/^(?:local|\d+)$/u.test(provenance.runAttempt ?? "")
+    || !/^(?:local|[a-f0-9]{40,64})$/u.test(provenance.headSha ?? "")
+    || provenance.target !== "x86_64-pc-windows-msvc"
+    || typeof provenance.runnerOs !== "string" || provenance.runnerOs.trim() === ""
+    || typeof provenance.runnerImage !== "string" || provenance.runnerImage.trim() === ""
+    || !Number.isFinite(Date.parse(provenance.startedAt ?? ""))
+    || !Number.isFinite(Date.parse(provenance.completedAt ?? ""))
+    || Date.parse(provenance.completedAt) < Date.parse(provenance.startedAt)
+    || !isSha256(provenance[binaryDigestName])) {
+    throw new Error(`${label} E2E evidence has invalid artifact provenance: ${path}`);
+  }
+}
+
+function validatePngScreenshot(path) {
+  const contents = readFileSync(path);
+  const pngSignature = "89504e470d0a1a0a";
+  if (contents.length <= 8 || contents.subarray(0, 8).toString("hex") !== pngSignature) {
+    throw new Error(`Installed Bridge App E2E screenshot is not a non-empty PNG: ${path}`);
+  }
+}
+
+function isSha256(value) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
 }
 
 function comparePaths(left, right) {

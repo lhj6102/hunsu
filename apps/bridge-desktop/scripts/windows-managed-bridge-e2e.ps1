@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$runStartedAt = [DateTime]::UtcNow
 
 if (-not (Test-Path -LiteralPath $SidecarPath -PathType Leaf)) {
   throw "Packaged Bridge sidecar was not found: $SidecarPath"
@@ -41,6 +42,16 @@ $env:HUNSU_BRIDGE_APP_JSON = "1"
 $evidence = [ordered]@{
   schemaVersion = 1
   result = "passed"
+  provenance = [ordered]@{
+    runId = if ([string]::IsNullOrWhiteSpace($env:GITHUB_RUN_ID)) { "local" } else { $env:GITHUB_RUN_ID }
+    runAttempt = if ([string]::IsNullOrWhiteSpace($env:GITHUB_RUN_ATTEMPT)) { "1" } else { $env:GITHUB_RUN_ATTEMPT }
+    headSha = if ([string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { "local" } else { $env:GITHUB_SHA }
+    target = "x86_64-pc-windows-msvc"
+    runnerOs = [System.Environment]::OSVersion.VersionString
+    runnerImage = if ([string]::IsNullOrWhiteSpace($env:ImageOS)) { "unknown" } else { $env:ImageOS }
+    startedAt = $runStartedAt.ToString("o")
+    sidecarSha256 = (Get-FileHash -LiteralPath $SidecarPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
   scenarios = [ordered]@{}
 }
 
@@ -187,7 +198,17 @@ function Assert-NoUnsafeDiagnostics {
     FreshDiagnostics = $true
     ClipboardRoundTrip = $true
     RawSecretsAbsent = $true
+    DiagnosticsSha256 = Get-TextSha256 $diagnostics
+    ClipboardSha256 = Get-TextSha256 $clipboard
+    LogSha256 = Get-TextSha256 $log
   }
+}
+
+function Get-TextSha256 {
+  param([AllowEmptyString()][string]$Text)
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+  $hash = [System.Security.Cryptography.SHA256]::HashData($bytes)
+  return [Convert]::ToHexString($hash).ToLowerInvariant()
 }
 
 function Write-SafeEvidence {
@@ -264,6 +285,10 @@ try {
     supervisorCount = $topology.SupervisorCount
     daemonCount = $topology.DaemonCount
     instanceReused = $true
+    instanceId = $firstInstance
+    listenerPid = $firstListenerPid
+    supervisorPid = $firstSupervisorPid
+    daemonPid = $firstDaemonPid
   }
 
   # Scenario B/F: Pair, Open, Open Hunsu Web, and Workspace Open each hand off once and reuse the daemon.
@@ -278,6 +303,9 @@ try {
   $openAction = Invoke-BrowserAction "Open" { Invoke-BridgeJson open-project $WorkspaceFixture --json }
   $webAction = Invoke-BrowserAction "Open Hunsu Web" { Invoke-BridgeJson pair --json }
   $workspaceAction = Invoke-BrowserAction "Workspace Open" { Invoke-BridgeJson open-roadmap $roadmapId --json }
+  $workspaceUri = [uri]$workspaceAction.Capture
+  $expectedWorkspacePath = "/studio/roadmaps/$([uri]::EscapeDataString($roadmapId))"
+  Assert-True ($workspaceUri.AbsolutePath -eq $expectedWorkspacePath) "Workspace Open did not target the requested Roadmap ID."
   $capturedSecrets = @(
     Get-ActionSecret $pairAction "Pair"
     Get-ActionSecret $openAction "Open"
@@ -304,6 +332,8 @@ try {
     distinctRotations = 4
     daemonReused = $true
     supervisorReused = $true
+    roadmapId = $roadmapId
+    workspacePathMatched = $true
   }
 
   $redaction = Assert-NoUnsafeDiagnostics $capturedSecrets
@@ -312,6 +342,9 @@ try {
     freshDiagnostics = $redaction.FreshDiagnostics
     clipboardRoundTrip = $redaction.ClipboardRoundTrip
     rawSecretsAbsent = $redaction.RawSecretsAbsent
+    diagnosticsSha256 = $redaction.DiagnosticsSha256
+    clipboardSha256 = $redaction.ClipboardSha256
+    logSha256 = $redaction.LogSha256
   }
 
   # Scenario C: authenticated Stop terminates daemon + supervisor and remains stopped past the old restart delay.
@@ -342,6 +375,9 @@ try {
     portReleased = $true
     noRestartAfterDelay = $true
     freshDaemonStarted = $true
+    stoppedDaemonPid = $firstDaemonPid
+    stoppedSupervisorPid = $firstSupervisorPid
+    restartedDaemonPid = [int]$afterRestart.localBridgeControl.daemonPid
   }
 
   # Scenario D: a Hunsu daemon owned by a different state/control credential is classified as unmanaged.
@@ -400,10 +436,12 @@ try {
     supervisorSamples = 12
     lingeringSupervisors = 0
     lingeringDaemons = 0
+    unrelatedListenerPid = $conflictListenerPid
   }
   Stop-Job $dummy
   Remove-Job $dummy -Force
 
+  $evidence.provenance.completedAt = [DateTime]::UtcNow.ToString("o")
   Write-SafeEvidence $capturedSecrets
   Write-Host "Windows managed Bridge E2E passed."
 } finally {

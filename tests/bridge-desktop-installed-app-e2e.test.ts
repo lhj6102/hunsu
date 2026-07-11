@@ -30,13 +30,24 @@ test("installed Windows app gate silently installs an isolated NSIS candidate an
   );
   assert.match(powershell, /existing managed daemon verifies reuse/u);
   assert.match(powershell, /\[string\]\$EvidencePath/u);
+  assert.match(powershell, /\[string\]\$ScreenshotPath/u);
+  assert.match(powershell, /\[int\]\$BridgePort = 19687/u);
   assert.match(powershell, /qa_legacy_.*NewGuid/u);
   assert.match(powershell, /Get-Command rustc/u);
   assert.match(powershell, /--crate-name codex_qa_fixture/u);
   assert.match(powershell, /codex-qa\.exe/u);
   assert.match(powershell, /fixtureVersionOutput/u);
   assert.match(powershell, /installedSnapshot\.versions\.codexCli/u);
-  assert.match(powershell, /--evidence-path \$EvidencePath/u);
+  assert.match(powershell, /vulnerable-pairing-server\.mjs/u);
+  assert.match(powershell, /\/api\/bridge\/pairing\/revoke/u);
+  assert.match(powershell, /pairing-revoked\.marker/u);
+  assert.match(powershell, /\$installedSidecar\.FullName snapshot/u);
+  assert.match(powershell, /Get-Clipboard -Raw/u);
+  assert.match(powershell, /nativeClipboardRoundTrip/u);
+  assert.match(powershell, /MainWindowHandle -eq 0/u);
+  assert.match(powershell, /installerSha256/u);
+  assert.match(powershell, /screenshotSha256/u);
+  assert.match(powershell, /--evidence-path \$uiEvidencePath/u);
   assert.match(powershell, /Stop-InstalledProcesses/u);
   assert.match(powershell, /uninst\|uninstall/u);
   assert.match(packageJson.scripts?.["e2e:windows-installed"] ?? "", /windows-installed-app-e2e\.ps1/u);
@@ -54,7 +65,8 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
   assert.match(driver, /#active-roadmap-list button/u);
   assert.match(driver, /hunsuBridgeToken/u);
   assert.match(driver, /#copy-diagnostics/u);
-  assert.match(driver, /__hunsuQaClipboardText/u);
+  assert.doesNotMatch(driver, /__hunsuQaClipboardText/u);
+  assert.match(driver, /clipboardExpectationPath/u);
   assert.match(driver, /legacySecret/u);
   assert.match(driver, /EADDRINUSE/u);
   assert.match(driver, /#validate-codex-config/u);
@@ -64,6 +76,11 @@ test("installed WebView driver verifies the real lifecycle, handoff, diagnostics
   }
   assert.match(driver, /version labels passed/u);
   assert.match(driver, /pageErrors\.length === 0/u);
+  assert.match(driver, /consoleErrors\.length === 0/u);
+  assert.match(driver, /verifyPortConflictFeedback/u);
+  assert.match(driver, /The local Bridge port is in use by another process\./u);
+  assert.match(driver, /capturedUrl\.pathname === `\/studio\/roadmaps\/\$\{encodeURIComponent\(roadmapId\)\}`/u);
+  assert.match(driver, /page\.screenshot/u);
   assert.match(driver, /silent-isolated-install/u);
   assert.match(driver, /candidateKind: "installed-nsis"/u);
   assert.match(driver, /automatedInstalledAppQa: "passed"/u);
@@ -77,15 +94,23 @@ test("Windows x64 workflow gates upload on installed WebView evidence and checks
   assert.match(artifactWorkflow, /windows-installed-app-e2e\.ps1/u);
   assert.match(artifactWorkflow, /-InstallerPath \$installer\.FullName/u);
   assert.match(artifactWorkflow, /-EvidencePath \$env:INSTALLED_APP_EVIDENCE_PATH/u);
+  assert.match(artifactWorkflow, /-ScreenshotPath \$env:INSTALLED_APP_SCREENSHOT_PATH/u);
   assert.match(artifactWorkflow, /--installed-evidence-path "\$\{INSTALLED_APP_EVIDENCE_PATH\}"/u);
+  assert.match(artifactWorkflow, /--installed-screenshot-path "\$\{INSTALLED_APP_SCREENSHOT_PATH\}"/u);
+  assert.match(artifactWorkflow, /Linux repository validation/u);
+  assert.match(artifactWorkflow, /pnpm run check/u);
+  assert.match(artifactWorkflow, /pnpm run check:desktop-rust/u);
+  assert.match(artifactWorkflow, /needs: \[select, validate\]/u);
   assert.equal(
     artifactWorkflow.indexOf("Run installed Windows Bridge App WebView E2E")
       < artifactWorkflow.indexOf("Upload desktop artifact"),
     true
   );
   assert.match(artifactStage, /windows-installed-app-e2e-evidence\.json/u);
-  assert.match(artifactStage, /validateInstalledAppEvidence\(installedEvidencePath\)/u);
+  assert.match(artifactStage, /validateInstalledAppEvidence\(installedEvidencePath, installedScreenshotPath\)/u);
   assert.match(artifactStage, /releaseEligible !== false/u);
+  assert.match(artifactStage, /windows-installed-app-e2e-screenshot\.png/u);
+  assert.match(artifactStage, /validatePngScreenshot/u);
   assert.match(artifactStage, /workspace-open-handoff-once/u);
   assert.match(artifactStage, /no-eaddrinuse-log/u);
 });
