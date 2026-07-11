@@ -95,8 +95,10 @@ jobs:
           Invoke-Bridge @("service", "start", "--json") | Out-Host
 
           $healthyStatus = $null
+          $lastCandidate = $null
           for ($attempt = 0; $attempt -lt 100; $attempt += 1) {
             $candidate = Invoke-Bridge @("service", "status", "--json") | ConvertFrom-Json
+            $lastCandidate = $candidate
             if (
               $candidate.value.installed -eq $true -and
               $candidate.value.managerState -eq "running" -and
@@ -109,6 +111,96 @@ jobs:
             Start-Sleep -Milliseconds 100
           }
           if ($null -eq $healthyStatus) {
+            Write-Host "Last Bridge service status:"
+            $lastCandidate | ConvertTo-Json -Depth 8 | Out-Host
+
+            if ($IsWindows) {
+              $task = Get-ScheduledTask -TaskName "Hunsu Bridge"
+              $taskInfo = $task | Get-ScheduledTaskInfo
+              Write-Host "Scheduled task diagnostics:"
+              [pscustomobject]@{
+                CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+                CurrentSessionId = (Get-Process -Id $PID).SessionId
+                State = $task.State
+                LastRunTime = $taskInfo.LastRunTime
+                LastTaskResult = $taskInfo.LastTaskResult
+                Execute = $task.Actions[0].Execute
+                Arguments = $task.Actions[0].Arguments
+                WorkingDirectory = $task.Actions[0].WorkingDirectory
+                PrincipalUserId = $task.Principal.UserId
+                PrincipalLogonType = $task.Principal.LogonType
+                PrincipalRunLevel = $task.Principal.RunLevel
+              } | ConvertTo-Json -Depth 8 | Out-Host
+
+              Write-Host "HUNSU_HOME file inventory (contents excluded):"
+              Get-ChildItem -LiteralPath $env:HUNSU_HOME -Recurse -Force -ErrorAction SilentlyContinue |
+                Select-Object FullName, Length, Attributes |
+                ConvertTo-Json -Depth 4 |
+                Out-Host
+              $credentialsPath = Join-Path $env:HUNSU_HOME "credentials.json"
+              if (Test-Path -LiteralPath $credentialsPath) {
+                Write-Host "Credential ACL (credential contents excluded):"
+                Get-Acl -LiteralPath $credentialsPath |
+                  Select-Object Owner, AccessToString, AreAccessRulesProtected |
+                  ConvertTo-Json -Depth 4 |
+                  Out-Host
+              }
+              $runtimeFile = Join-Path $env:HUNSU_HOME "runtime.json"
+              if (Test-Path -LiteralPath $runtimeFile) {
+                Write-Host "Runtime identity:"
+                Get-Content -LiteralPath $runtimeFile -Raw | Out-Host
+              }
+              $structuredLog = Join-Path $env:HUNSU_HOME "logs/bridge.jsonl"
+              if (Test-Path -LiteralPath $structuredLog) {
+                Write-Host "Bridge structured log:"
+                Get-Content -LiteralPath $structuredLog | Out-Host
+              }
+
+              Stop-ScheduledTask -TaskName "Hunsu Bridge" -ErrorAction SilentlyContinue
+              $directStdout = Join-Path $env:RUNNER_TEMP "hunsu-bridge-direct.stdout.log"
+              $directStderr = Join-Path $env:RUNNER_TEMP "hunsu-bridge-direct.stderr.log"
+              Remove-Item -Force -ErrorAction SilentlyContinue $directStdout, $directStderr
+              Write-Host "Starting the registered action directly in the workflow session."
+              $directProcessOptions = @{
+                FilePath = $task.Actions[0].Execute
+                ArgumentList = $task.Actions[0].Arguments
+                PassThru = $true
+                RedirectStandardOutput = $directStdout
+                RedirectStandardError = $directStderr
+              }
+              $direct = Start-Process @directProcessOptions
+              $directStatus = $null
+              try {
+                for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+                  $candidate = Invoke-Bridge @("service", "status", "--json") | ConvertFrom-Json
+                  if ($candidate.value.health -eq "healthy" -and $candidate.value.authentication -eq "authenticated") {
+                    $directStatus = $candidate
+                    break
+                  }
+                  if ($direct.HasExited) {
+                    break
+                  }
+                  Start-Sleep -Milliseconds 100
+                }
+                Write-Host "Direct action Bridge status:"
+                $directStatus | ConvertTo-Json -Depth 8 | Out-Host
+                if ($direct.HasExited) {
+                  Write-Host "Direct action exit code: $($direct.ExitCode)"
+                } else {
+                  Write-Host "Direct action remained running."
+                }
+              } finally {
+                & node "apps/bridge/dist/cli.js" service stop --json | Out-Host
+                if (-not $direct.HasExited) {
+                  Stop-Process -Id $direct.Id -Force -ErrorAction SilentlyContinue
+                }
+                Wait-Process -Id $direct.Id -ErrorAction SilentlyContinue
+                Write-Host "Direct action stdout:"
+                Get-Content -LiteralPath $directStdout -ErrorAction SilentlyContinue | Out-Host
+                Write-Host "Direct action stderr:"
+                Get-Content -LiteralPath $directStderr -ErrorAction SilentlyContinue | Out-Host
+              }
+            }
             throw "The installed user service never reached healthy authenticated status."
           }
           if ($healthyStatus.value.packageVersion -ne $expectedPackageVersion) {
