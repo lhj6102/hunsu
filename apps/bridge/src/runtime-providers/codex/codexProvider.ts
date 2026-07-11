@@ -9,7 +9,14 @@ import {
   settingsWithCodexConfigFields,
   type BridgeCodexSettings
 } from "./codexConfig.ts";
-import { codexInstallPlan, runDefaultCodexInstaller, type CodexInstaller } from "./codexInstall.ts";
+import {
+  codexInstallPlan,
+  detectCodexInstallerPrerequisite,
+  runDefaultCodexInstaller,
+  type CodexInstaller,
+  type CodexInstallerPrerequisite,
+  type CodexInstallerPrerequisiteProbe
+} from "./codexInstall.ts";
 import {
   clearCodexLoginState,
   spawnCodexAction,
@@ -28,6 +35,7 @@ import type {
   RuntimeProviderAuthKind,
   RuntimeProviderCapabilities,
   RuntimeProviderConfigField,
+  RuntimeProviderConfigValidationError,
   RuntimeProviderMetadata,
   RuntimeProviderConfigurationInput,
   RuntimeProviderInstallPlan,
@@ -57,6 +65,7 @@ export type CodexRuntimeProviderOptions = {
   loginState?: CodexLoginStateHost;
   onConfigure?: (settings: BridgeCodexSettings) => void;
   installer?: CodexInstaller;
+  installerPrerequisite?: CodexInstallerPrerequisiteProbe;
 };
 
 export class CodexRuntimeProvider implements RuntimeProviderAdapter {
@@ -84,6 +93,7 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
     valid: boolean;
     provider: RuntimeProviderStatus;
     diagnostics: NonNullable<RuntimeProviderStatus["diagnostics"]>;
+    errors: RuntimeProviderConfigValidationError[];
   }> {
     const settings = settingsWithCodexConfigFields(this.settings, fields);
     return this.validateSettings(settings);
@@ -131,13 +141,14 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
   }
 
   async installPlan(): Promise<RuntimeProviderInstallPlan> {
-    return codexInstallPlan();
+    return codexInstallPlan(await this.installerPrerequisite(this.statusEnv()));
   }
 
   async install(input: { confirmed?: boolean; dryRun?: boolean; env?: Record<string, string | undefined> } = {}): Promise<RuntimeProviderInstallResult> {
     const env = this.statusEnv(input.env);
     const before = await this.status({ force: true, env });
-    const plan = await this.installPlan();
+    const prerequisite = await this.installerPrerequisite(env);
+    const plan = codexInstallPlan(prerequisite);
     if (before.installed) {
       return {
         providerId: this.providerId,
@@ -145,6 +156,17 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
         started: false,
         status: "already_installed",
         message: "Codex is already installed.",
+        plan,
+        providerStatus: before
+      };
+    }
+    if (!prerequisite.available) {
+      return {
+        providerId: this.providerId,
+        confirmed: input.confirmed === true,
+        started: false,
+        status: "prerequisite_missing",
+        message: prerequisite.message,
         plan,
         providerStatus: before
       };
@@ -250,6 +272,10 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
     });
   }
 
+  private installerPrerequisite(env: Record<string, string | undefined>): Promise<CodexInstallerPrerequisite> {
+    return Promise.resolve((this.options.installerPrerequisite ?? detectCodexInstallerPrerequisite)({ env }));
+  }
+
   private baseEnv(inputEnv: Record<string, string | undefined> = {}): Record<string, string | undefined> {
     return {
       ...currentProcessEnv(),
@@ -262,6 +288,7 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
     valid: boolean;
     provider: RuntimeProviderStatus;
     diagnostics: NonNullable<RuntimeProviderStatus["diagnostics"]>;
+    errors: RuntimeProviderConfigValidationError[];
   }> {
     const env = codexProviderEnv({ baseEnv: this.baseEnv(), settings });
     const codex = await getCodexRuntimeStatus({
@@ -274,9 +301,36 @@ export class CodexRuntimeProvider implements RuntimeProviderAdapter {
     return {
       valid,
       provider,
-      diagnostics: provider.diagnostics ?? { effectiveEnv: codexEffectiveEnvSummary(env) }
+      diagnostics: provider.diagnostics ?? { effectiveEnv: codexEffectiveEnvSummary(env) },
+      errors: valid ? [] : codexConfigValidationErrors(settings, codex)
     };
   }
+}
+
+function codexConfigValidationErrors(
+  settings: BridgeCodexSettings,
+  codex: CodexRuntimeStatus
+): RuntimeProviderConfigValidationError[] {
+  if (!codex.cli.installed || !codex.cli.version) {
+    return [{
+      field: "binaryPath",
+      message: settings.binaryPath
+        ? "Select a Codex executable that Hunsu Bridge can run."
+        : "Select an existing Codex executable or install Codex first."
+    }];
+  }
+  if (!codex.appServer.available) {
+    const field = settings.appServerCommand
+      ? "appServerCommand"
+      : settings.appServerArgs
+        ? "appServerArgs"
+        : "binaryPath";
+    return [{
+      field,
+      message: "Codex app-server could not be started with this setting."
+    }];
+  }
+  return [];
 }
 
 export function normalizeCodexRuntimeStatus(

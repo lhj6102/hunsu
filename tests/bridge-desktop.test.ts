@@ -22,7 +22,10 @@ import {
 } from "../apps/bridge-desktop/src/auth.ts";
 import { main, normalizeBridgeAppArgv } from "../apps/bridge-desktop/src/main.ts";
 import { protocolRegistrationPlan } from "../apps/bridge-desktop/src/native-shell.ts";
-import { currentNodeRuntimeStatus } from "../apps/bridge-desktop/src/commands/diagnosticsCommands.ts";
+import {
+  currentNodeRuntimeStatus,
+  diagnosticToolLaunchCommand
+} from "../apps/bridge-desktop/src/commands/diagnosticsCommands.ts";
 import { currentBridgeCommandInvocation } from "../apps/bridge-desktop/src/processes/backgroundSpawn.ts";
 import { evaluateRelayCommand, FileRelayRegistry, forwardRelayCommand, forwardRelayCommandStream, LocalDevRelayService, RelayOutboundClient, relayHttpRequestForCommand, scopesForRelayCommand, type ProjectGrant, type RelayCommand, type RelayHttpRequest } from "../apps/bridge-desktop/src/relay.ts";
 import { BridgeSidecarSupervisor } from "../apps/bridge-desktop/src/sidecar-supervisor.ts";
@@ -134,6 +137,16 @@ test("Bridge App version and Node runtime checks never start the packaged sideca
     binaryPath: "C:\\Hunsu\\hunsu-bridge.exe",
     version: "v22.22.0"
   });
+});
+
+test("Bridge App probes Windows package-manager command shims through cmd.exe", () => {
+  assert.deepEqual(
+    diagnosticToolLaunchCommand("npm", ["--version"], { COMSPEC: "C:\\Windows\\System32\\cmd.exe" }, "win32"),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", '""npm" "--version""']
+    }
+  );
 });
 
 test("Bridge App Roadmap deep links record UI intents for native focus flows", async () => {
@@ -1405,6 +1418,20 @@ test("Bridge App Codex install requires confirmation and supports dry-run", asyn
   };
 
   try {
+    assert.equal(await main(["codex", "install"]), 0);
+    assert.equal(logs.some(line => line.includes("npm is required to install Codex")), true);
+    assert.equal(logs.some(line => line.includes("Select Existing Codex")), true);
+    assert.equal(logs.some(line => line.startsWith("Installer:")), false);
+    logs.length = 0;
+
+    const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+    const npmPath = join(root, npmCommand);
+    writeFileSync(npmPath, process.platform === "win32"
+      ? "@echo off\r\necho 11.0.0\r\n"
+      : "#!/bin/sh\nprintf '11.0.0\\n'\n", "utf8");
+    if (process.platform !== "win32") chmodSync(npmPath, 0o755);
+    process.env.PATH = root;
+
     assert.equal(await main(["codex", "install"]), 0);
     assert.equal(logs.some(line => line.includes("Confirm Codex installation")), true);
     assert.equal(logs.some(line => line.includes("--confirm")), true);

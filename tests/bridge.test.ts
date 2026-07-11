@@ -90,6 +90,7 @@ import {
 } from "../apps/bridge/src/index.ts";
 import { connectionExecutePreflightErrorForSelection } from "../apps/bridge/src/executes/executePreflight.ts";
 import { codexRuntimePreflightError } from "../apps/bridge/src/runtimes/codex.ts";
+import { codexInstallerLaunchCommand } from "../apps/bridge/src/runtime-providers/codex/codexInstall.ts";
 
 test("Bridge server exposes named modular HTTP boundaries", () => {
   const root = process.cwd();
@@ -198,6 +199,26 @@ test("Bridge server exposes named modular HTTP boundaries", () => {
   assert.doesNotMatch(indexSource, /roadmapInactivePreflight/);
   assert.doesNotMatch(indexSource, /repositoryActivePreflight/);
   assert.match(readFileSync(join(root, "apps/bridge/src/server/security.ts"), "utf8"), /createResponseSecurityHeaderStore/);
+});
+
+test("Bridge Codex npm prerequisite and installer launch Windows command shims through cmd.exe", () => {
+  assert.deepEqual(
+    codexInstallerLaunchCommand(
+      "npm.cmd",
+      ["install", "-g", "@openai/codex@latest"],
+      { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+      "win32"
+    ),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/c",
+        '""npm.cmd" "install" "-g" "@openai/codex@latest""'
+      ]
+    }
+  );
 });
 import { HUNSU_CURRENT_EXECUTION_PATH, HUNSU_DESTINATIONS_PATH, HUNSU_EXECUTORS_PATH, HUNSU_HARNESS_PATH, HUNSU_HUNSU_DRAFT_PATH, HUNSU_PREVIOUS_EXECUTION_PATH, HUNSU_RESOURCES_PATH, HUNSU_RUNTIME_PATHS, decodeHunsuRuntimeFileText, readHunsuRuntimeStateAtRef, readPreviousExecutionChain, writeCommands, type ArtifactActionCommandRunner } from "../packages/core/src/index.ts";
 import type { ArtifactActionDefinition, BoardProjection, Command, Destination, NodeRecord } from "../packages/protocol/src/index.ts";
@@ -2201,11 +2222,53 @@ test("Bridge provider config validation probes saved app-server command and pars
   }
 });
 
-test("Bridge provider install endpoint requires confirmation and supports dry-run recheck", async () => {
+test("Bridge provider install endpoint requires npm before confirmation and supports dry-run recheck", async () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-provider-install-test-"));
   try {
+    const nonNpmBin = join(root, "non-npm-bin");
+    mkdirSync(nonNpmBin, { recursive: true });
+    for (const manager of ["pnpm", "yarn"]) {
+      const managerPath = join(nonNpmBin, process.platform === "win32" ? `${manager}.cmd` : manager);
+      writeFileSync(managerPath, process.platform === "win32"
+        ? "@echo off\r\necho 1.0.0\r\n"
+        : "#!/bin/sh\nprintf '1.0.0\\n'\n", "utf8");
+      if (process.platform !== "win32") chmodSync(managerPath, 0o755);
+    }
+    const missingRuntimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
+      PATH: nonNpmBin,
+      HUNSU_CODEX_INSTALL_DRY_RUN: "1"
+    }, { cwd: root }));
+    const missingServer = createStudioServer({ cwd: root, persist: false, runner: new FakeRunner(), runtimeConfig: missingRuntimeConfig });
+
+    const missing = await requestStudioServerJson(missingServer, "POST", "/api/providers/current/install", { confirmed: true, dryRun: true });
+    assert.equal(missing.status, 202);
+    assert.equal(missing.body.providerId, "codex");
+    assert.equal(missing.body.status, "prerequisite_missing");
+    assert.equal(missing.body.started, false);
+    assert.equal(missing.body.plan.available, false);
+    assert.match(missing.body.message, /npm is required.*Select Existing Codex/i);
+    assert.equal(missing.body.command, undefined);
+
+    const invalidConfig = await requestStudioServerJson(missingServer, "POST", "/api/providers/current/validate", {
+      fields: [{ key: "binaryPath", value: join(root, "missing-codex"), isSet: true, isSecret: false }]
+    });
+    assert.equal(invalidConfig.status, 200);
+    assert.equal(invalidConfig.body.valid, false);
+    assert.deepEqual(invalidConfig.body.errors, [{
+      field: "binaryPath",
+      message: "Select a Codex executable that Hunsu Bridge can run."
+    }]);
+
+    const npmBin = join(root, "npm-bin");
+    mkdirSync(npmBin, { recursive: true });
+    const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+    const npmPath = join(npmBin, npmCommand);
+    writeFileSync(npmPath, process.platform === "win32"
+      ? "@echo off\r\necho 11.0.0\r\n"
+      : "#!/bin/sh\nprintf '11.0.0\\n'\n", "utf8");
+    if (process.platform !== "win32") chmodSync(npmPath, 0o755);
     const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig({
-      PATH: join(root, "missing-path"),
+      PATH: npmBin,
       HUNSU_CODEX_INSTALL_DRY_RUN: "1"
     }, { cwd: root }));
     const server = createStudioServer({ cwd: root, persist: false, runner: new FakeRunner(), runtimeConfig });
@@ -2214,6 +2277,7 @@ test("Bridge provider install endpoint requires confirmation and supports dry-ru
     assert.equal(plan.status, 202);
     assert.equal(plan.body.providerId, "codex");
     assert.equal(plan.body.status, "confirmation_required");
+    assert.equal(plan.body.plan.available, true);
     assert.equal(plan.body.plan.confirmationRequired, true);
     assert.deepEqual(plan.body.plan.args, ["install", "-g", "@openai/codex@latest"]);
 

@@ -19,11 +19,14 @@ type DiagnosticsCommandContext = {
   cwd?: () => string;
 };
 
-export function toolStatus(command: string, args: string[]): BridgeToolStatus {
+export function toolStatus(command: string, args: string[], platform = process.platform): BridgeToolStatus {
   try {
-    const result = spawnSync(command, args, {
+    const env = currentProcessEnv();
+    const launch = diagnosticToolLaunchCommand(command, args, env, platform);
+    const result = spawnSync(launch.command, launch.args, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      env,
       windowsHide: true
     });
     if (result.status === 0) {
@@ -34,6 +37,25 @@ export function toolStatus(command: string, args: string[]): BridgeToolStatus {
   } catch (error) {
     return { installed: false, binaryPath: command, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+export function diagnosticToolLaunchCommand(
+  command: string,
+  args: string[],
+  env: Record<string, string | undefined>,
+  platform = process.platform
+): { command: string; args: string[] } {
+  if (platform !== "win32") {
+    return { command, args };
+  }
+  return {
+    command: env.ComSpec ?? env.COMSPEC ?? "cmd.exe",
+    args: ["/d", "/s", "/c", `"${[command, ...args].map(quoteWindowsCmdArgument).join(" ")}"`]
+  };
+}
+
+function quoteWindowsCmdArgument(value: string): string {
+  return `"${value.replace(/"/g, "\"\"")}"`;
 }
 
 export function currentNodeRuntimeStatus(
@@ -48,7 +70,7 @@ export function currentNodeRuntimeStatus(
   };
 }
 
-export function packageManagerStatus(commands: readonly string[] = ["pnpm", "npm", "yarn"]): BridgeToolStatus {
+export function packageManagerStatus(commands: readonly string[] = ["npm", "pnpm", "yarn"]): BridgeToolStatus {
   for (const command of commands) {
     const status = toolStatus(command, ["--version"]);
     if (status.installed) {

@@ -51,6 +51,7 @@ let codexBinaryPath = undefined;
 let codexEnvHome = undefined;
 let latestProviderConfigMetadata = undefined;
 const providerConfigFieldElements = new Map();
+const providerConfigFieldErrorElements = new Map();
 let latestSnapshot = undefined;
 let selectedInspection = undefined;
 let lastHandledUiIntentId = undefined;
@@ -81,6 +82,7 @@ const uiErrorMessages = {
   BROWSER_OPEN_FAILED: "The browser could not be opened.",
   ROADMAP_NOT_FOUND: "That Workspace could not be found.",
   DIAGNOSTICS_SENSITIVE_DATA_DETECTED: "Diagnostics were not copied because sensitive data was detected.",
+  CODEX_INSTALL_PREREQUISITE_MISSING: "npm is required to install Codex. Install npm and retry, or use Select Existing Codex.",
   PROVIDER_CONFIG_INVALID: "Configuration is invalid.",
   PROVIDER_RECHECK_FAILED: "Recheck failed."
 };
@@ -267,7 +269,7 @@ async function runUiAction({
     const message = failureMessage
       ? `${failureMessage}${reason && reason !== failureMessage ? `\n${reason}` : ""}`
       : reason;
-    showActionFeedback("error", message, feedbackElement);
+    showActionFeedback("error", withCompletionTime(message, includeCompletionTime), feedbackElement);
     return { ...result, ok: false };
   } finally {
     pendingUiActions.delete(id);
@@ -809,10 +811,11 @@ function renderProviderCard(provider) {
     install.className = "primary";
     install.textContent = `Install ${provider.label}`;
     const packageManager = latestSnapshot?.prerequisites?.tools?.packageManager;
-    install.disabled = packageManager?.installed !== true;
-    install.title = install.disabled
-      ? "A package manager is required to install Codex. Select an existing Codex binary instead."
-      : "Install Codex through the detected package manager.";
+    const npmPrerequisite = npmInstallerPrerequisite(packageManager);
+    install.disabled = !npmPrerequisite.available;
+    install.title = npmPrerequisite.available
+      ? "Install Codex through npm."
+      : npmPrerequisite.message;
     install.addEventListener("click", () => void runUiAction({
       id: "install-codex",
       pendingMessage: "Installing Codex…",
@@ -829,7 +832,7 @@ function renderProviderCard(provider) {
         return { ok: true, code: "CANCELED", message: "Codex install was not started." };
       }
         const installArgs = ["codex", "install", "--confirm"];
-        return runCommand([...installArgs, "--json"]);
+        return codexInstallUiResult(await runCommand([...installArgs, "--json"]));
       }
     }));
     buttons.append(install);
@@ -912,11 +915,45 @@ function providerStatusDetails(provider) {
     effectiveEnv.CODEX_HOME ? `Codex Home: ${effectiveEnv.CODEX_HOME}` : codexHome?.effectiveCodexHome ? `Codex Home: ${codexHome.effectiveCodexHome}` : undefined,
     codexHome ? `Auth file at Codex Home: ${codexHome.authFileExistsAtEffectiveHome ? "Present" : "Missing"}` : undefined,
     codexHome?.likelyHomeMismatch ? codexHome.remediation?.message : undefined,
-    provider?.recommendedAction === "install" && latestSnapshot?.prerequisites?.tools?.packageManager?.installed !== true
-      ? "A package manager is not installed. It is optional for Bridge, but required to install Codex through npm. You can select an existing Codex binary instead."
+    provider?.recommendedAction === "install" && !npmInstallerPrerequisite(latestSnapshot?.prerequisites?.tools?.packageManager).available
+      ? npmInstallerPrerequisite(latestSnapshot?.prerequisites?.tools?.packageManager).message
       : undefined
   ].filter(Boolean).join("\n");
   return container;
+}
+
+function npmInstallerPrerequisite(packageManager) {
+  if (packageManager?.installed === true && packageManager?.name === "npm") {
+    return { available: true };
+  }
+  const detected = packageManager?.installed === true && packageManager?.name
+    ? `${packageManager.name} is available, but the Codex installer requires npm.`
+    : "npm was not found, and the Codex installer requires npm.";
+  return {
+    available: false,
+    message: `${detected} Install npm and retry, or use Select Existing Codex.`
+  };
+}
+
+function codexInstallUiResult(commandResult) {
+  if (!commandResult.ok) return commandResult;
+  const installResult = commandResult.value;
+  if (installResult?.status === "prerequisite_missing") {
+    return {
+      ok: false,
+      code: "CODEX_INSTALL_PREREQUISITE_MISSING",
+      message: safeDiagnosticText(installResult.message),
+      recovery: { label: "Select Existing Codex" }
+    };
+  }
+  if (installResult?.status === "failed") {
+    return {
+      ok: false,
+      code: "CODEX_INSTALL_FAILED",
+      message: safeDiagnosticText(installResult.message ?? "Codex installer failed.")
+    };
+  }
+  return commandResult;
 }
 
 function providerNeedsAttention(provider) {
@@ -1132,9 +1169,12 @@ function optionalPackageManagerRow(packageManager) {
   const installedLabel = packageManager?.installed
     ? [packageManager.name ?? "Installed", packageManager.version].filter(Boolean).join(" ")
     : "Not installed";
+  const npmPrerequisite = npmInstallerPrerequisite(packageManager);
   return labeledToolRow(
     "Package manager",
-    `${installedLabel} · Optional unless installing Codex through npm`
+    npmPrerequisite.available
+      ? `${installedLabel} · Optional for Bridge · Available for Codex installation`
+      : `${installedLabel} · Optional for Bridge · npm required for Codex installation`
   );
 }
 
@@ -1248,6 +1288,7 @@ function renderCodexSettings(providerConfig, settings, legacyCodexSettings) {
   latestProviderConfigMetadata = metadata;
   const savedFields = new Map((providerConfig.fields ?? []).map(field => [field.key, field]));
   providerConfigFieldElements.clear();
+  providerConfigFieldErrorElements.clear();
   const sections = [];
   const primaryKeys = metadata.configKeys.filter(key => key.primary);
   const authenticationKeys = metadata.configKeys.filter(key => key.name === "authenticationPreference");
@@ -1282,8 +1323,14 @@ function providerConfigControls(key, savedFields, settings, legacyCodexSettings)
   meta.textContent = key.envName ? `${key.label} · ${key.envName}` : key.label;
   const control = providerConfigControl(key);
   control.value = providerConfigFieldValue(key, savedFields, settings, legacyCodexSettings);
-  label.append(meta, control);
+  const error = document.createElement("span");
+  error.id = `${codexConfigElementId(key.name)}-error`;
+  error.className = "project-meta status-error";
+  error.hidden = true;
+  control.setAttribute("aria-describedby", error.id);
+  label.append(meta, control, error);
   providerConfigFieldElements.set(key.name, control);
+  providerConfigFieldErrorElements.set(key.name, error);
   const controls = [label];
   const picker = providerConfigPicker(key);
   if (picker) {
@@ -1404,9 +1451,14 @@ async function validateCodexConfig() {
 }
 
 function applyProviderValidationErrors(validation) {
-  for (const control of providerConfigFieldElements.values()) {
+  for (const [key, control] of providerConfigFieldElements) {
     control.setAttribute("aria-invalid", "false");
     control.title = "";
+    const error = providerConfigFieldErrorElements.get(key);
+    if (error) {
+      error.textContent = "";
+      error.hidden = true;
+    }
   }
   const errors = Array.isArray(validation?.errors)
     ? validation.errors
@@ -1416,12 +1468,26 @@ function applyProviderValidationErrors(validation) {
         ? Object.entries(validation.fieldErrors).map(([field, message]) => ({ field, message }))
         : [];
   for (const error of errors) {
-    const key = error?.field ?? error?.key ?? error?.path;
+    const key = providerValidationFieldKey(error?.field ?? error?.key ?? error?.path);
     const control = providerConfigFieldElements.get(key);
     if (!control) continue;
+    const message = safeDiagnosticText(error?.message ?? "Review this value.");
     control.setAttribute("aria-invalid", "true");
-    control.title = safeDiagnosticText(error?.message ?? "Review this value.");
+    control.title = message;
+    const fieldError = providerConfigFieldErrorElements.get(key);
+    if (fieldError) {
+      fieldError.textContent = message;
+      fieldError.hidden = false;
+    }
   }
+}
+
+function providerValidationFieldKey(value) {
+  if (Array.isArray(value)) {
+    return String(value.at(-1) ?? "");
+  }
+  const path = String(value ?? "");
+  return path.split(/[.[\]]+/u).filter(Boolean).at(-1) ?? path;
 }
 
 async function saveCodexConfig() {
