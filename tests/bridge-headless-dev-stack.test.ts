@@ -117,9 +117,9 @@ test("Bridge verification budget and production evidence contracts are explicit 
     relayEnvironment: "production-qa",
     workspaceFixtureId: "ws_disposable_001",
     platformEvidence: JSON.stringify({
-      windows: { os: "windows-latest", node: "22.18.0", serviceManager: "Task Scheduler" },
-      macos: { os: "macos-latest", node: "22.18.0", serviceManager: "LaunchAgent" },
-      linux: { os: "ubuntu-latest", node: "22.18.0", serviceManager: "systemd --user" }
+      windows: { os: "windows-latest", node: "24.18.0", serviceManager: "Task Scheduler" },
+      macos: { os: "macos-latest", node: "24.18.0", serviceManager: "LaunchAgent" },
+      linux: { os: "ubuntu-latest", node: "24.18.0", serviceManager: "systemd --user" }
     })
   });
   assert.equal(record.schema, "hunsu.bridge.production-evidence.v1");
@@ -164,9 +164,9 @@ test("Bridge verification budget and production evidence contracts are explicit 
     relayEnvironment: "production-qa",
     workspaceFixtureId: "ws_disposable_001",
     platformEvidence: JSON.stringify({
-      windows: { os: "windows-latest", node: "22.18.0", serviceManager: "Task Scheduler" },
-      macos: { os: "macos-latest", node: "22.18.0", serviceManager: "LaunchAgent" },
-      linux: { os: "ubuntu-latest", node: "22.18.0", serviceManager: "systemd --user" }
+      windows: { os: "windows-latest", node: "24.18.0", serviceManager: "Task Scheduler" },
+      macos: { os: "macos-latest", node: "24.18.0", serviceManager: "LaunchAgent" },
+      linux: { os: "ubuntu-latest", node: "24.18.0", serviceManager: "systemd --user" }
     })
   }));
   assert.throws(() => evidence.validateProductionEvidence({

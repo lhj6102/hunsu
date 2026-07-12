@@ -41,12 +41,12 @@ import {
 const INSTALLATION_ID = "install_setup_transaction_test";
 
 test("setup rejects unsupported Node and dry-run has no filesystem or service side effects", async () => {
-  assert.equal(nodeVersionIsSupported("v22.17.99"), false);
-  assert.equal(nodeVersionIsSupported("v22.18.0"), true);
-  assert.equal(nodeVersionIsSupported("v23.0.0"), true);
+  assert.equal(nodeVersionIsSupported("v24.17.99"), false);
+  assert.equal(nodeVersionIsSupported("v24.18.0"), true);
+  assert.equal(nodeVersionIsSupported("v25.0.0"), true);
   const fixture = await createFixture();
   try {
-    const unsupported = await setupBridge({ ...fixture.options(), nodeVersion: "v22.17.99" });
+    const unsupported = await setupBridge({ ...fixture.options(), nodeVersion: "v24.17.99" });
     assert.equal(unsupported.ok, false);
     if (!unsupported.ok) assert.equal(unsupported.code, "NODE_VERSION_UNSUPPORTED");
     assert.deepEqual(fixture.events, []);
@@ -384,7 +384,7 @@ function packageRunner(events: string[]): StagedRuntimeCommandRunner {
     await writeFile(join(packageRoot, "package.json"), `${JSON.stringify({
       name: "@hunsu/bridge",
       version: BRIDGE_PACKAGE_VERSION,
-      engines: { node: ">=22.18" }
+      engines: { node: ">=24.18" }
     })}\n`, "utf8");
     await writeFile(join(packageRoot, "dist", "cli.js"), "#!/usr/bin/env node\n", "utf8");
     return { exitCode: 0, stdout: "", stderr: "" };
@@ -481,7 +481,7 @@ async function seedRuntime(paths: HunsuPaths, version: string, cliText: string):
   await writeFile(join(packageRoot, "package.json"), `${JSON.stringify({
     name: "@hunsu/bridge",
     version,
-    engines: { node: ">=22.18" }
+    engines: { node: ">=24.18" }
   })}\n`, "utf8");
   await writeFile(cliPath, `${cliText}\n`, "utf8");
   return {

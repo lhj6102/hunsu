@@ -37,7 +37,7 @@
     }
   },
   "engines": {
-    "node": ">=22.18"
+    "node": ">=24.18"
   },
   "scripts": {
     "dev": "node --conditions=development src/cli.ts dev",

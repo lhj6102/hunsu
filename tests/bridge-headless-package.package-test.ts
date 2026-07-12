@@ -47,7 +47,7 @@ test("the published Bridge tarball is source-independent and runs in a clean npm
   });
   assert.equal(result.packageName, "@hunsu/bridge");
   assert.equal(result.version, "0.2.0-next.1");
-  assert.equal(result.nodeEngine, ">=22.18");
+  assert.equal(result.nodeEngine, ">=24.18");
   assert.ok(result.tarballBytes > 0);
   assert.deepEqual(result.files, [
     "LICENSE",

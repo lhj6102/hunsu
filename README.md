@@ -35,7 +35,7 @@ Hunsu exists for that human layer.
 
 Prerequisites:
 
-- Node.js 22.18 or newer
+- Node.js 24.18 or newer
 - Git
 - Codex CLI installed and authenticated when you want to run agent Executes
 
@@ -61,6 +61,8 @@ allows them.
 For repository development:
 
 ```sh
+nvm install
+nvm use
 corepack enable
 pnpm install --frozen-lockfile
 pnpm dev:stack
