@@ -41,7 +41,7 @@ test("deployment release manifest detects artifact changes", () => {
     createReleaseManifest(root, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.3",
+      bridgePackageVersion: "0.2.0-next.4",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -220,7 +220,7 @@ test("deployment preparation binds exact retained Connect bytes and target confi
     createReleaseManifest(release, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.3",
+      bridgePackageVersion: "0.2.0-next.4",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -375,7 +375,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
     assert.equal(binding.source.sha, SOURCE_SHA);
     assert.throws(() => verifyBridgeCandidate(root, {
       ...releaseManifest,
-      bridgePackageVersion: "0.2.0-next.3"
+      bridgePackageVersion: "0.2.0-next.4"
     }), /does not match retained release/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -391,6 +391,7 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   const headless = readFileSync(join(root, ".github/workflows/bridge-headless.yml"), "utf8");
   const gate = readFileSync(join(root, "scripts/deployment/promotion-gate.mjs"), "utf8");
   const smoke = readFileSync(join(root, "scripts/deployment/smoke-deployment.mjs"), "utf8");
+  const buildRelease = readFileSync(join(root, "scripts/deployment/build-release.mjs"), "utf8");
   const publish = readFileSync(join(root, ".github/workflows/publish-bridge.yml"), "utf8");
   assert.match(preview, /branches:\s*\n\s*- preview/u);
   assert.match(preview, /build_release: true/u);
@@ -451,6 +452,13 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   assert.match(preview, /if \[\[ "\$DEPLOY_RESULT" != "success" \]\]/u);
   assert.match(smoke, /5 \* 60 \* 1000/u);
   assert.match(smoke, /service !== "hunsu-connect"/u);
+  assert.match(buildRelease, /"@hunsu\/web\.\.\."/u);
+  assert.match(buildRelease, /"@hunsu\/hub-api\.\.\."/u);
+  assert.match(buildRelease, /"@hunsu\/connect-api\.\.\."/u);
+  assert.ok(
+    buildRelease.indexOf('"@hunsu/web..."') < buildRelease.indexOf("const webDist"),
+    "Release builds must compile workspace dependency closures before consuming Web output"
+  );
   assert.match(publish, /NPM_REGISTRY_URL: https:\/\/registry\.npmjs\.org/u);
   assert.match(publish, /--registry="\$NPM_REGISTRY_URL"/u);
   assert.match(publish, /git log --format='%T' origin\/main \| grep -Fqx "\$candidate_tree"/u);

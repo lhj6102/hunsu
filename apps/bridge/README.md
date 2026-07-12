@@ -32,7 +32,7 @@ For advanced local package verification only, run setup from an absolute
 tarball path:
 
 ```sh
-hunsu-bridge setup --runtime-package /absolute/path/hunsu-bridge-0.2.0-next.3.tgz
+hunsu-bridge setup --runtime-package /absolute/path/hunsu-bridge-0.2.0-next.4.tgz
 ```
 
 This option rejects URLs, dist-tags, ranges, Git specs, relative paths, and

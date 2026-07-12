@@ -27,7 +27,16 @@ rmSync(outputRoot, { recursive: true, force: true });
 mkdirSync(resolve(outputRoot, "hub/migrations"), { recursive: true });
 mkdirSync(resolve(outputRoot, "connect/migrations"), { recursive: true });
 
-run("pnpm", ["--filter", "@hunsu/web", "build"]);
+run("pnpm", [
+  "--filter",
+  "@hunsu/web...",
+  "--filter",
+  "@hunsu/hub-api...",
+  "--filter",
+  "@hunsu/connect-api...",
+  "run",
+  "build"
+]);
 const webDist = resolve(repositoryRoot, "apps/web/dist");
 const neutralRuntimeConfig = resolve(webDist, "hunsu-runtime-config.js");
 if (!existsSync(neutralRuntimeConfig) || !readFileSync(neutralRuntimeConfig, "utf8").includes("__HUNSU_WEB_RUNTIME_CONFIG__ = null")) {
