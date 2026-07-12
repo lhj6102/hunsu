@@ -42,7 +42,7 @@ import {
   type SetupTransactionStore
 } from "./setupTransaction.ts";
 
-export const MINIMUM_NODE_VERSION = Object.freeze({ major: 22, minor: 18, patch: 0 });
+export const MINIMUM_NODE_VERSION = Object.freeze({ major: 24, minor: 18, patch: 0 });
 
 export type SetupVerification = {
   health: boolean;
@@ -117,6 +117,7 @@ export type BridgeSetupOptions = {
   stagedFileSystem?: StagedRuntimeFileSystem;
   npmRunner?: StagedRuntimeCommandRunner;
   npmCommand?: string;
+  processEnv?: Readonly<Record<string, string | undefined>>;
   nodePath?: string;
   nodeVersion?: string;
   platform?: NodeJS.Platform;
@@ -136,7 +137,7 @@ type SetupAbort = {
 export async function setupBridge(options: BridgeSetupOptions): Promise<SetupResult> {
   const nodeVersion = options.nodeVersion ?? process.version;
   if (!nodeVersionIsSupported(nodeVersion)) {
-    return failure("NODE_VERSION_UNSUPPORTED", "Hunsu Bridge requires Node 22.18 or newer.");
+    return failure("NODE_VERSION_UNSUPPORTED", "Hunsu Bridge requires Node 24.18 or newer.");
   }
 
   const transactionId = options.createTransactionId?.() ?? `setup_${randomUUID()}`;
@@ -276,6 +277,7 @@ async function setupWhileLocked(
       const staged = await installStagedRuntime({
         plan,
         ...(options.npmRunner ? { commandRunner: options.npmRunner } : {}),
+        ...(options.processEnv ? { processEnv: options.processEnv } : {}),
         ...(options.stagedFileSystem ? { fileSystem: options.stagedFileSystem } : {}),
         ...(options.now ? { now: options.now } : {}),
         nodeVersion,

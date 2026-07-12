@@ -24,7 +24,7 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=22.18"
+    "node": ">=24.18"
   },
   "scripts": {
     "hunsu": "node --conditions=development src/index.ts",

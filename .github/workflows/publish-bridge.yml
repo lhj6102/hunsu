@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: Exact immutable Git tag, for example v0.2.0-next.1
+        description: Exact immutable Git tag, for example v0.2.0-next.2
         required: true
         type: string
       operation:
@@ -27,8 +27,8 @@ permissions:
   contents: read
 
 env:
-  NODE_VERSION: 22.18.0
-  NPM_VERSION: 11.13.0
+  NODE_VERSION: 24.18.0
+  NPM_VERSION: 11.16.0
   PNPM_VERSION: 10.30.2
 
 jobs:

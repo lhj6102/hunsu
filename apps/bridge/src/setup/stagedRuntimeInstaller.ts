@@ -12,6 +12,7 @@ import {
   unlink
 } from "node:fs/promises";
 import { isAbsolute, posix, relative, resolve, win32 } from "node:path";
+import { isWindowsPowerShellCommand, windowsPowerShellEnvironment } from "../windowsPowerShell.ts";
 import type { HunsuPaths } from "../state/paths.ts";
 import type { RuntimeInstallation } from "./runtimeInstaller.ts";
 import {
@@ -117,9 +118,14 @@ export const defaultStagedRuntimeFileSystem: StagedRuntimeFileSystem = {
   readFile
 };
 
-export const defaultStagedRuntimeCommandRunner: StagedRuntimeCommandRunner = command => new Promise(resolveResult => {
+export const createDefaultStagedRuntimeCommandRunner = (
+  processEnv: Readonly<Record<string, string | undefined>> = {}
+): StagedRuntimeCommandRunner => command => new Promise(resolveResult => {
   execFile(command.command, command.args, {
     encoding: "utf8",
+    ...(isWindowsPowerShellCommand(command.command)
+      ? { env: windowsPowerShellEnvironment(processEnv) }
+      : {}),
     windowsHide: true,
     maxBuffer: 1024 * 1024
   }, (error, stdout, stderr) => {
@@ -130,6 +136,8 @@ export const defaultStagedRuntimeCommandRunner: StagedRuntimeCommandRunner = com
     });
   });
 });
+
+export const defaultStagedRuntimeCommandRunner = createDefaultStagedRuntimeCommandRunner();
 
 export function planStagedRuntimeInstall(input: {
   paths: HunsuPaths;
@@ -194,6 +202,7 @@ export function planStagedRuntimeInstall(input: {
 export async function installStagedRuntime(input: {
   plan: StagedRuntimePlan;
   commandRunner?: StagedRuntimeCommandRunner;
+  processEnv?: Readonly<Record<string, string | undefined>>;
   fileSystem?: StagedRuntimeFileSystem;
   now?: () => Date;
   nodeVersion?: string;
@@ -201,7 +210,7 @@ export async function installStagedRuntime(input: {
   onPhase?: (phase: "npm-install" | "candidate-verification" | "staging-rename") => void | Promise<void>;
 }): Promise<StagedRuntimeInstallResult> {
   const fileSystem = input.fileSystem ?? defaultStagedRuntimeFileSystem;
-  const commandRunner = input.commandRunner ?? defaultStagedRuntimeCommandRunner;
+  const commandRunner = input.commandRunner ?? createDefaultStagedRuntimeCommandRunner(input.processEnv ?? {});
   const now = input.now ?? (() => new Date());
   const canonicalHome = await ensureSafeRuntimeRoots(input.plan, fileSystem);
   await recoverQuarantine(input.plan, fileSystem, canonicalHome, input.nodeVersion ?? process.version);

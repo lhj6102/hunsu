@@ -37,6 +37,17 @@ export async function runBridgeServiceSmoke(input) {
     npm_config_loglevel: "error",
     npm_config_update_notifier: "false"
   };
+  if (process.platform === "win32") {
+    const powerShell7Modules = join(
+      process.env.ProgramW6432 ?? process.env.ProgramFiles ?? "C:\\Program Files",
+      "PowerShell",
+      "7",
+      "Modules"
+    );
+    const poisonedModulePath = [powerShell7Modules, environment.PSModulePath].filter(Boolean).join(";");
+    environment.PSModulePath = poisonedModulePath;
+    environment.WinPSModulePath = poisonedModulePath;
+  }
 
   try {
     await Promise.all([
@@ -342,8 +353,14 @@ function npxCommand() {
 async function runPowerShell(script) {
   return runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
     cwd: repositoryRoot,
-    env: process.env
+    env: withoutPowerShellModulePaths(process.env)
   });
+}
+
+function withoutPowerShellModulePaths(environment) {
+  return Object.fromEntries(Object.entries(environment).filter(([key, value]) =>
+    value !== undefined && !["psmodulepath", "winpsmodulepath"].includes(key.toLowerCase())
+  ));
 }
 
 async function reportWindowsTaskFailure(input) {

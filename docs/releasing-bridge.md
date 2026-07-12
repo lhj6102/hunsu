@@ -1,7 +1,7 @@
 # Releasing Hunsu Bridge
 
 Bridge releases are immutable, tag-bound, provenance-bearing npm
-publications. `0.2.0-next.1` is published under `candidate-next` first. Neither
+publications. `0.2.0-next.2` is published under `candidate-next` first. Neither
 `next` nor `latest` moves until exact registry setup and production evidence
 for the same Git SHA, tag, npm version, and integrity have passed.
 
@@ -49,12 +49,12 @@ commit to `main`. Create a new immutable tag; never move or reuse an earlier
 release tag:
 
 ~~~sh
-git tag -a v0.2.0-next.1 -m "Release @hunsu/bridge 0.2.0-next.1 candidate"
-git push origin v0.2.0-next.1
+git tag -a v0.2.0-next.2 -m "Release @hunsu/bridge 0.2.0-next.2 candidate"
+git push origin v0.2.0-next.2
 # Wait for bridge-service-smoke.yml on this exact tag to pass on all three OSes.
 gh workflow run publish-bridge.yml \
-  --ref v0.2.0-next.1 \
-  -f version_tag=v0.2.0-next.1 \
+  --ref v0.2.0-next.2 \
+  -f version_tag=v0.2.0-next.2 \
   -f operation=publish-candidate \
   -f confirm_promotion=false
 ~~~
@@ -77,8 +77,8 @@ Dispatch registry setup from the exact tag:
 
 ~~~sh
 gh workflow run bridge-registry-smoke.yml \
-  --ref v0.2.0-next.1 \
-  -f version_tag=v0.2.0-next.1
+  --ref v0.2.0-next.2 \
+  -f version_tag=v0.2.0-next.2
 ~~~
 
 The workflow first proves `candidate-next` and the exact npm version agree. Its
@@ -128,19 +128,19 @@ immutable candidate tag:
 
 ~~~sh
 gh workflow run publish-bridge.yml \
-  --ref v0.2.0-next.1 \
-  -f version_tag=v0.2.0-next.1 \
+  --ref v0.2.0-next.2 \
+  -f version_tag=v0.2.0-next.2 \
   -f operation=promote-next \
   -f confirm_promotion=true
 ~~~
 
 The workflow requires successful registry-smoke and production-attestation
 runs whose `head_sha` and dispatch tag match the candidate, confirms
-`candidate-next=0.2.0-next.1`, and passes the protected promotion environment.
+`candidate-next=0.2.0-next.2`, and passes the protected promotion environment.
 It records the proof-of-presence command. An npm owner then runs:
 
 ~~~sh
-npm dist-tag add @hunsu/bridge@0.2.0-next.1 next
+npm dist-tag add @hunsu/bridge@0.2.0-next.2 next
 npm dist-tag rm @hunsu/bridge candidate-next
 ~~~
 

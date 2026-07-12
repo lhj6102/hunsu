@@ -2,6 +2,7 @@ import { chmod } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
+import { windowsPowerShellEnvironment } from "../windowsPowerShell.ts";
 import type { HunsuPaths } from "./paths.ts";
 import { invalidState, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
 
@@ -48,12 +49,14 @@ export function createCredentialStore(
   options: {
     randomBytes?: (size: number) => Uint8Array;
     platform?: NodeJS.Platform;
+    processEnv?: Readonly<Record<string, string | undefined>>;
     windowsAclHardener?: (path: string) => Promise<void>;
   } = {}
 ): CredentialStore {
   const secureRandomBytes = options.randomBytes ?? nodeRandomBytes;
   const platform = options.platform ?? process.platform;
-  const windowsAclHardener = options.windowsAclHardener ?? hardenWindowsCredentialAcl;
+  const windowsAclHardener = options.windowsAclHardener
+    ?? (path => hardenWindowsCredentialAcl(path, options.processEnv ?? {}));
   let writeQueue = Promise.resolve();
 
   const readCurrent = async (): Promise<BridgeCredentials | undefined> => {
@@ -134,10 +137,14 @@ export function createCredentialStore(
 
 const execFileAsync = promisify(execFile);
 
-async function hardenWindowsCredentialAcl(path: string): Promise<void> {
+async function hardenWindowsCredentialAcl(
+  path: string,
+  processEnv: Readonly<Record<string, string | undefined>>
+): Promise<void> {
   const invocation = windowsCredentialAclPowerShellInvocation(path);
   try {
     await execFileAsync(invocation.command, invocation.args, {
+      env: windowsPowerShellEnvironment(processEnv),
       windowsHide: true
     });
   } catch (_error) {
@@ -155,14 +162,13 @@ export function windowsCredentialAclPowerShellInvocation(path: string): {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$CredentialPath = ${powerShellStringLiteral(path)}`,
-    "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
-    "$acl = Get-Acl -LiteralPath $CredentialPath",
-    "$acl.SetOwner((New-Object System.Security.Principal.NTAccount($identity)))",
+    "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+    "$acl = [System.Security.AccessControl.FileSecurity]::new()",
+    "$acl.SetOwner($sid)",
     "$acl.SetAccessRuleProtection($true, $false)",
-    "foreach ($existingRule in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($existingRule) | Out-Null }",
-    "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')",
+    "$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)",
     "$acl.SetAccessRule($rule)",
-    "Set-Acl -LiteralPath $CredentialPath -AclObject $acl"
+    "[System.IO.File]::SetAccessControl($CredentialPath, $acl)"
   ].join("; ");
   return {
     command: "powershell.exe",

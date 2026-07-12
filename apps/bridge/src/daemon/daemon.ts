@@ -78,7 +78,7 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
   const runtimePath = resolve(requestedRuntimePath);
   await mkdir(paths.home, { recursive: true, mode: 0o700 });
   const configStore = createConfigStore(paths);
-  const credentialStore = createCredentialStore(paths);
+  const credentialStore = createCredentialStore(paths, { processEnv: environment });
   const runtimeStore = createRuntimeStore(paths);
   const config = await configStore.read();
   const requestedHost = options.host ?? config.host;

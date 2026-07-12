@@ -26,11 +26,11 @@
     "hunsu": "pnpm --filter hunsu hunsu"
   },
   "engines": {
-    "node": ">=22.18"
+    "node": ">=24.18"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.0",
-    "@types/node": "^22.15.17",
+    "@types/node": "^24.13.3",
     "turbo": "^2.6.1",
     "typescript": "^5.8.3"
   }

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: Exact candidate Git tag, for example v0.2.0-next.1
+        description: Exact candidate Git tag, for example v0.2.0-next.2
         required: true
         type: string
 
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  NODE_VERSION: 22.18.0
+  NODE_VERSION: 24.18.0
 
 jobs:
   identity:

@@ -13,7 +13,7 @@ const common = {
   bundle: true,
   platform: "node",
   format: "esm",
-  target: "node22.18",
+  target: "node24.18",
   conditions: ["development", "node", "import", "default"],
   legalComments: "eof",
   minify: true,

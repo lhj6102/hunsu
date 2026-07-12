@@ -231,7 +231,7 @@ test("runtime staging refuses intermediate links and manifest or CLI links witho
           await writeFile(join(packageRoot, "package.json"), JSON.stringify({
             name: "@hunsu/bridge",
             version: HUNSU_BRIDGE_VERSION,
-            engines: { node: ">=22.18" }
+            engines: { node: ">=24.18" }
           }), "utf8");
           await symlink(join(external, "survives.txt"), join(packageRoot, "dist", "cli.js"), "file");
           return { exitCode: 0, stdout: "", stderr: "" };
@@ -259,7 +259,7 @@ test("Windows runtime plan invokes npm.cmd through an encoded non-interactive Po
   const script = Buffer.from(encoded, "base64").toString("utf16le");
   assert.match(script, /npm\.cmd/u);
   assert.match(script, /--prefix/u);
-  assert.match(script, /0\.2\.0-next\.1/u);
+  assert.match(script, /0\.2\.0-next\.2/u);
 });
 
 test("local tarball setup keeps the local file URL internal and still targets the exact stable version directory", async () => {
@@ -302,7 +302,7 @@ function packageRunner(
     await writeFile(join(packageRoot, "package.json"), `${JSON.stringify({
       name: overrides.name ?? "@hunsu/bridge",
       version: overrides.version ?? HUNSU_BRIDGE_VERSION,
-      engines: { node: overrides.engine ?? ">=22.18" },
+      engines: { node: overrides.engine ?? ">=24.18" },
       ...(overrides.dependencies ? { dependencies: overrides.dependencies } : {})
     })}\n`, "utf8");
     await writeFile(join(packageRoot, "dist", "cli.js"), overrides.cliText ?? "#!/usr/bin/env node\n", "utf8");

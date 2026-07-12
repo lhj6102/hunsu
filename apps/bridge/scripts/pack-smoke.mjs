@@ -269,7 +269,7 @@ export async function runBridgePackSmoke(options = {}) {
 
 function auditManifest(manifest) {
   assert.equal(manifest.name, "@hunsu/bridge");
-  assert.equal(manifest.version, "0.2.0-next.1");
+  assert.equal(manifest.version, "0.2.0-next.2");
   assert.equal(manifest.private, false);
   assert.equal(manifest.type, "module");
   assert.deepEqual(manifest.repository, {
@@ -278,7 +278,7 @@ function auditManifest(manifest) {
     directory: "apps/bridge"
   });
   assert.deepEqual(manifest.bin, { "hunsu-bridge": "./dist/cli.js" });
-  assert.equal(manifest.engines?.node, ">=22.18");
+  assert.equal(manifest.engines?.node, ">=24.18");
   assertNodeEngineSupported(process.versions.node);
   assert.deepEqual(manifest.exports, {
     ".": {
@@ -329,7 +329,7 @@ function auditRuntimeImports(contents, file) {
 
 function assertNodeEngineSupported(version) {
   const [major = 0, minor = 0] = version.split(".").map(Number);
-  assert.ok(major > 22 || (major === 22 && minor >= 18), `package smoke requires Node >=22.18, received ${version}`);
+  assert.ok(major > 24 || (major === 24 && minor >= 18), `package smoke requires Node >=24.18, received ${version}`);
 }
 
 function assertCliSuccess(result, expectedCode = "OK") {
