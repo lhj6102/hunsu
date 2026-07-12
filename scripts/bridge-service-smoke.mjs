@@ -132,6 +132,9 @@ export async function runBridgeServiceSmoke(input) {
     const durationMs = Math.round(performance.now() - startedAt);
     process.stdout.write(`[bridge-service-smoke] ${process.platform} ${launcher.version}: ${(durationMs / 1_000).toFixed(2)}s\n`);
     return { platform: process.platform, version: launcher.version, durationMs };
+  } catch (error) {
+    await reportWindowsTaskFailure();
+    throw error;
   } finally {
     if (setupCompleted && launcher) {
       await runCliBestEffort(launcher, ["service", "stop", "--home", home, "--json"], environment, bootstrap);
@@ -290,7 +293,13 @@ async function createFakeCodexExecutable(root) {
 }
 
 async function runCli(launcher, args, env, cwd, options = {}) {
-  const result = await runCommand(launcher.command, [...launcher.prefix, ...args], { cwd, env }, { allowFailure: options.allowFailure });
+  const action = safeCliAction(args);
+  let result;
+  try {
+    result = await runCommand(launcher.command, [...launcher.prefix, ...args], { cwd, env }, { allowFailure: options.allowFailure });
+  } catch (error) {
+    throw new Error(`${action} failed: ${error instanceof Error ? error.message : "Bridge CLI process failed."}`, { cause: error });
+  }
   const lines = result.stdout.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
   if (lines.length !== 1) throw new Error(`Bridge CLI emitted ${lines.length} stdout lines instead of one JSON result.`);
   let value;
@@ -301,8 +310,8 @@ async function runCli(launcher, args, env, cwd, options = {}) {
   }
   ensure(value?.schema === "hunsu.bridge.cli-result.v1", "Bridge CLI emitted the wrong result schema");
   if (options.allowFailure !== true) {
-    ensure(result.code === 0 && value.ok === true, `Bridge CLI failed: ${safeJson(value)}`);
-    ensure(result.stderr.trim() === "", "Bridge CLI wrote stderr for a successful product operation");
+    ensure(result.code === 0 && value.ok === true, `${action} failed: ${safeJson(value)}`);
+    ensure(result.stderr.trim() === "", `${action} wrote stderr for a successful product operation`);
   }
   return value;
 }
@@ -332,6 +341,20 @@ async function runPowerShell(script) {
     cwd: repositoryRoot,
     env: process.env
   });
+}
+
+async function reportWindowsTaskFailure() {
+  if (process.platform !== "win32") return;
+  try {
+    const result = await runPowerShell([
+      "$Task = Get-ScheduledTask -TaskName 'Hunsu Bridge'",
+      "$Info = $Task | Get-ScheduledTaskInfo",
+      "@{ State = $Task.State.ToString(); LastTaskResult = $Info.LastTaskResult; MissedRuns = $Info.NumberOfMissedRuns } | ConvertTo-Json -Compress"
+    ].join("; "));
+    process.stderr.write(`[bridge-service-smoke] Windows task diagnostic: ${sanitize(result.stdout.trim())}\n`);
+  } catch (_error) {
+    process.stderr.write("[bridge-service-smoke] Windows task diagnostic was unavailable.\n");
+  }
 }
 
 async function runCommand(command, args, options, behavior = {}) {
@@ -412,6 +435,15 @@ function shellQuote(value) {
 
 function safeJson(value) {
   return sanitize(JSON.stringify(value));
+}
+
+function safeCliAction(args) {
+  const command = typeof args[0] === "string" ? args[0] : "command";
+  const nested = new Set(["credential", "provider", "remote", "service", "workspace"]);
+  const subcommand = nested.has(command) && typeof args[1] === "string" && !args[1].startsWith("-")
+    ? args[1]
+    : undefined;
+  return sanitize(subcommand ? `${command} ${subcommand}` : command);
 }
 
 function sanitize(value) {
