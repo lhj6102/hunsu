@@ -41,7 +41,7 @@ test("deployment release manifest detects artifact changes", () => {
     createReleaseManifest(root, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.5",
+      bridgePackageVersion: "0.2.0-next.6",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -220,7 +220,7 @@ test("deployment preparation binds exact retained Connect bytes and target confi
     createReleaseManifest(release, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.5",
+      bridgePackageVersion: "0.2.0-next.6",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -375,7 +375,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
     assert.equal(binding.source.sha, SOURCE_SHA);
     assert.throws(() => verifyBridgeCandidate(root, {
       ...releaseManifest,
-      bridgePackageVersion: "0.2.0-next.5"
+      bridgePackageVersion: "0.2.0-next.6"
     }), /does not match retained release/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -444,7 +444,9 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   assert.match(rollback, /core\.setOutput\("tooling_sha", mainBranch\.data\.commit\.sha\)/u);
   assert.match(rollback, /tooling_ref: \$\{\{ needs\.authorize\.outputs\.tooling_sha \}\}/u);
   assert.doesNotMatch(rollback, /tooling_ref: main/u);
-  assert.doesNotMatch(reusable, /workflow_call:\s*[\s\S]*?secrets:\s*\n\s+CLOUDFLARE_API_TOKEN:/u);
+  assert.match(reusable, /workflow_call:\s*[\s\S]*?secrets:\s*\n\s+CLOUDFLARE_API_TOKEN:[\s\S]*?required: false[\s\S]*?HUNSU_CONNECT_SIGNING_PRIVATE_JWK:[\s\S]*?required: false/u);
+  assert.match(reusable, /name: Require protected environment secrets/u);
+  assert.match(reusable, /selected protected environment is missing its deployment secrets/u);
   assert.doesNotMatch(`${preview}\n${production}\n${rollback}`, /secrets: inherit/u);
   assert.match(headless, /pull_request:\s*\n\s*branches:\s*\n\s*- preview/u);
   assert.doesNotMatch(headless, /name: Promotion candidate ready/u);

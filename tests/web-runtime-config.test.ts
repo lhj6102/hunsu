@@ -20,7 +20,7 @@ test("Web runtime config validates and normalizes a hosted preview identity", ()
     schema: HUNSU_WEB_RUNTIME_CONFIG_SCHEMA,
     target: "preview",
     sourceSha: SOURCE_SHA.toUpperCase(),
-    bridgePackageVersion: "0.2.0-next.5",
+    bridgePackageVersion: "0.2.0-next.6",
     bridgeApiBaseUrl: "https://preview.hunsu.app/",
     hubApiBaseUrl: "https://api.preview.hunsu.app/",
     connectApiBaseUrl: "https://connect.preview.hunsu.app/"
@@ -32,7 +32,7 @@ test("Web runtime config validates and normalizes a hosted preview identity", ()
     schema: HUNSU_WEB_RUNTIME_CONFIG_SCHEMA,
     target: "preview",
     sourceSha: SOURCE_SHA,
-    bridgePackageVersion: "0.2.0-next.5",
+    bridgePackageVersion: "0.2.0-next.6",
     bridgeApiBaseUrl: "https://preview.hunsu.app",
     hubApiBaseUrl: "https://api.preview.hunsu.app",
     connectApiBaseUrl: "https://connect.preview.hunsu.app"
@@ -97,7 +97,7 @@ test("Web generates profile-bound Bridge setup commands from the immutable hoste
     schema: HUNSU_WEB_RUNTIME_CONFIG_SCHEMA,
     target: "preview",
     sourceSha: SOURCE_SHA,
-    bridgePackageVersion: "0.2.0-next.5",
+    bridgePackageVersion: "0.2.0-next.6",
     bridgeApiBaseUrl: "",
     hubApiBaseUrl: "https://api.preview.hunsu.app",
     connectApiBaseUrl: "https://connect.preview.hunsu.app"
@@ -106,7 +106,7 @@ test("Web generates profile-bound Bridge setup commands from the immutable hoste
   assert.equal(
     bridgeSetupCommands(preview),
     [
-      "npx @hunsu/bridge@0.2.0-next.5 setup --profile preview",
+      "npx @hunsu/bridge@0.2.0-next.6 setup --profile preview",
       "hunsu-bridge status",
       "hunsu-bridge open"
     ].join("\n")
