@@ -134,7 +134,10 @@ export function createBridgeControlClient(options: BridgeControlClientOptions = 
           signal: AbortSignal.timeout(timeoutMs)
         });
       } catch (_error) {
-        return bridgeNotRunningResult();
+        return cliFailure(
+          "BRIDGE_CONTROL_UNAVAILABLE",
+          "Hunsu Bridge was healthy, but the authenticated control request did not complete."
+        );
       }
 
       if (response.status === 401 || response.status === 403) {

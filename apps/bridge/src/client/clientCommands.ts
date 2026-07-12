@@ -21,6 +21,7 @@ const CLIENT_COMMANDS = new Set([
   "logout",
   "remote"
 ]);
+const PROVIDER_CONTROL_TIMEOUT_MS = 20_000;
 
 export type BridgeClientCommandOptions = {
   parsed: ParsedBridgeCliArgs;
@@ -90,16 +91,22 @@ export async function runBridgeClientCommand(options: BridgeClientCommandOptions
 async function runProviderCommand(parsed: ParsedBridgeCliArgs, client: BridgeControlClient): Promise<BridgeCliResult> {
   const action = parsed.positionals[1] ?? "status";
   if (action === "list" || action === "status") {
-    return client.request(`/v1/control/provider${action === "status" ? "" : "?list=1"}`);
+    return client.request(`/v1/control/provider${action === "status" ? "" : "?list=1"}`, {
+      timeoutMs: PROVIDER_CONTROL_TIMEOUT_MS
+    });
   }
   if (action === "check") {
     assertCodex(parsed.positionals[2]);
-    return client.request("/v1/control/provider/check", { method: "POST" });
+    return client.request("/v1/control/provider/check", {
+      method: "POST",
+      timeoutMs: PROVIDER_CONTROL_TIMEOUT_MS
+    });
   }
   if (action === "set") {
     assertCodex(parsed.positionals[2]);
     const result = await client.request("/v1/control/provider", {
       method: "PUT",
+      timeoutMs: PROVIDER_CONTROL_TIMEOUT_MS,
       body: {
         providerId: "codex",
         ...(getFlag(parsed, "binary") ? { binaryPath: getFlag(parsed, "binary") } : {}),
@@ -119,7 +126,11 @@ async function runProviderCommand(parsed: ParsedBridgeCliArgs, client: BridgeCon
   }
   if (action === "reset") {
     assertCodex(parsed.positionals[2]);
-    return client.request("/v1/control/provider", { method: "PUT", body: { providerId: "codex", reset: true } });
+    return client.request("/v1/control/provider", {
+      method: "PUT",
+      timeoutMs: PROVIDER_CONTROL_TIMEOUT_MS,
+      body: { providerId: "codex", reset: true }
+    });
   }
   throw new BridgeError("BRIDGE_STATE_INVALID", `Unknown provider command: ${action}`);
 }

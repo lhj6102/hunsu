@@ -5,8 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseBridgeCliArgs, runBridgeCli } from "../apps/bridge/src/cli.ts";
-import { bridgeNotRunningResult } from "../apps/bridge/src/client/cliResult.ts";
+import { runBridgeClientCommand } from "../apps/bridge/src/client/clientCommands.ts";
+import { bridgeNotRunningResult, cliSuccess } from "../apps/bridge/src/client/cliResult.ts";
+import type { BridgeControlClient, BridgeControlRequest } from "../apps/bridge/src/client/controlClient.ts";
 import { startBridgeDaemon, type RunningBridgeDaemon } from "../apps/bridge/src/daemon/daemon.ts";
+import { resolveHunsuPaths } from "../apps/bridge/src/state/paths.ts";
 
 const fakeCodexPath = fileURLToPath(new URL("fixtures/fake-codex.mjs", import.meta.url));
 
@@ -147,6 +150,40 @@ test("--home always selects HUNSU_HOME while --codex-home configures Codex Home"
     assert.equal(await exists(codexHome), false);
   } finally {
     await daemon?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provider client operations use a bounded probe-and-control deadline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-provider-timeout-"));
+  const calls: Array<{ path: string; input?: BridgeControlRequest }> = [];
+  const client: BridgeControlClient = {
+    endpoint: async () => "http://127.0.0.1:43127",
+    probe: async () => ({ state: "hunsu-healthy" }),
+    health: async () => undefined,
+    async request(path, input) {
+      calls.push({ path, input });
+      return cliSuccess("Provider operation completed.");
+    }
+  };
+  try {
+    for (const argv of [
+      ["provider", "list"],
+      ["provider", "status"],
+      ["provider", "check", "codex"],
+      ["provider", "set", "codex", "--binary", fakeCodexPath],
+      ["provider", "reset", "codex"]
+    ]) {
+      assert.equal(await runBridgeClientCommand({
+        parsed: parseBridgeCliArgs(argv),
+        paths: resolveHunsuPaths({ home: root }),
+        client,
+        emit: result => result.ok ? 0 : 1
+      }), 0);
+    }
+    assert.equal(calls.length, 5);
+    assert.equal(calls.every(call => call.input?.timeoutMs === 20_000), true);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

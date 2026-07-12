@@ -141,6 +141,28 @@ test("a malformed authenticated control response maps to BRIDGE_CONTROL_UNAVAILA
   }
 });
 
+test("an authenticated transport failure after healthy preflight remains control-unavailable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-control-transport-"));
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
+  try {
+    await createCredentialStore(paths).write({ controlToken: "hunsu_control_test" });
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      if (calls === 1) return healthResponse();
+      throw new DOMException("request timed out", "TimeoutError");
+    };
+    const result = await createBridgeControlClient({ paths, fetchImpl }).request("/v1/control/provider", {
+      method: "PUT",
+      timeoutMs: 20_000
+    });
+    assertFailure(result, "BRIDGE_CONTROL_UNAVAILABLE");
+    assert.equal(calls, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function healthResponse(): Response {
   return jsonResponse({
     ok: true,

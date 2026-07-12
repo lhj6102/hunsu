@@ -64,7 +64,8 @@ Unknown, missing, or invalid credentials fail with
 - a foreign loopback listener: `BRIDGE_PORT_IN_USE`;
 - healthy Hunsu with a missing/wrong control credential:
   `BRIDGE_CONTROL_UNAUTHORIZED`;
-- healthy Hunsu with a malformed control response:
+- healthy Hunsu whose authenticated request times out or returns a malformed
+  control response:
   `BRIDGE_CONTROL_UNAVAILABLE`.
 
 Authenticated `GET /v1/control/status` includes the daemon's exact package
