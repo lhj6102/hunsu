@@ -2,6 +2,13 @@ name: Deploy Retained Cloudflare Release
 
 on:
   workflow_call:
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: Protected-environment Cloudflare deployment token
+        required: false
+      HUNSU_CONNECT_SIGNING_PRIVATE_JWK:
+        description: Protected-environment Connect P-256 private signing JWK
+        required: false
     inputs:
       deploy_target:
         description: Logical Cloudflare target
@@ -96,6 +103,16 @@ jobs:
           fi
           if [[ "$BUILD_RELEASE" == "true" && "$HUNSU_DEPLOY_TARGET" != "preview" ]]; then
             echo "Only the preview workflow may build a release artifact." >&2
+            exit 1
+          fi
+      - name: Require protected environment secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HUNSU_CONNECT_SIGNING_PRIVATE_JWK: ${{ secrets.HUNSU_CONNECT_SIGNING_PRIVATE_JWK }}
+        shell: bash
+        run: |
+          if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$HUNSU_CONNECT_SIGNING_PRIVATE_JWK" ]]; then
+            echo "The selected protected environment is missing its deployment secrets." >&2
             exit 1
           fi
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
