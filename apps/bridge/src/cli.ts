@@ -55,7 +55,8 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
 
     const command = parsed.positionals[0]!;
     const home = getFlag(parsed, "home");
-    const paths = resolveHunsuPaths({ home, env: process.env });
+    const processEnv = { ...process.env };
+    const paths = resolveHunsuPaths({ home, env: processEnv });
     const client = createBridgeControlClient({ paths });
 
     if (command === "dev" || command === "daemon") {
@@ -66,7 +67,8 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
         cwd: getFlag(parsed, "cwd"),
         runtimePath: getFlag(parsed, "runtime-path"),
         webUrl: getFlag(parsed, "web-url"),
-        development: command === "dev"
+        development: command === "dev",
+        env: processEnv
       });
       const result = cliSuccess(
         command === "dev" ? "Hunsu Bridge development daemon is ready." : "Hunsu Bridge daemon is ready.",
@@ -77,14 +79,15 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
       return 0;
     }
 
-    const serviceManager = createDefaultBridgeServiceManager({ paths, controlClient: client });
+    const serviceManager = createDefaultBridgeServiceManager({ paths, controlClient: client, processEnv });
     if (command === "setup") {
       const channel = getFlag(parsed, "channel") ?? "next";
       if (channel !== "next") throw new BridgeError("RUNTIME_INSTALL_FAILED", "The initial headless prerelease supports only the next channel.");
       const result = await setupBridge({
         paths,
-        credentialStore: createCredentialStore(paths),
+        credentialStore: createCredentialStore(paths, { processEnv }),
         serviceManager,
+        processEnv,
         ...(getFlag(parsed, "runtime-package")
           ? { runtimeSource: localBridgeTarballSource(getFlag(parsed, "runtime-package")!) }
           : {}),

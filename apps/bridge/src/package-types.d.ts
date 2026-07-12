@@ -1,4 +1,4 @@
-export const HUNSU_BRIDGE_VERSION: "0.2.0-next.1";
+export const HUNSU_BRIDGE_VERSION: "0.2.0-next.2";
 export const HUNSU_BRIDGE_PROTOCOL_VERSION: "local-bridge-v1";
 export const BRIDGE_CLI_RESULT_SCHEMA: "hunsu.bridge.cli-result.v1";
 

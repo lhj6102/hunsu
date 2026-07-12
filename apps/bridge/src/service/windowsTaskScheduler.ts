@@ -1,6 +1,6 @@
 import {
+  createDefaultServiceCommandRunner,
   createManagedBridgeService,
-  defaultServiceCommandRunner,
   defaultServiceFileSystem,
   powerShellQuote,
   windowsArgument,
@@ -14,10 +14,11 @@ const WINDOWS_TASK_NAME = "Hunsu Bridge";
 export type WindowsTaskSchedulerOptions = ServiceAdapterDependencies & {
   taskName?: string;
   powershellPath?: string;
+  processEnv?: Readonly<Record<string, string | undefined>>;
 };
 
 export function createWindowsTaskSchedulerServiceManager(options: WindowsTaskSchedulerOptions): BridgeServiceManager {
-  const commandRunner = options.commandRunner ?? defaultServiceCommandRunner;
+  const commandRunner = options.commandRunner ?? createDefaultServiceCommandRunner(options.processEnv ?? {});
   const taskName = options.taskName ?? WINDOWS_TASK_NAME;
   const powershellPath = options.powershellPath ?? "powershell.exe";
   let installed = false;

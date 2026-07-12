@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, win32 } from "node:path";
+import { isWindowsPowerShellCommand, windowsPowerShellEnvironment } from "../windowsPowerShell.ts";
 import type {
   AuthenticatedServiceStatus,
   BridgeServiceManager,
@@ -194,9 +195,14 @@ export const defaultServiceFileSystem: ServiceFileSystem = {
   }
 };
 
-export const defaultServiceCommandRunner: ServiceCommandRunner = command => new Promise(resolve => {
+export const createDefaultServiceCommandRunner = (
+  processEnv: Readonly<Record<string, string | undefined>> = {}
+): ServiceCommandRunner => command => new Promise(resolve => {
   execFile(command.command, command.args, {
     encoding: "utf8",
+    ...(isWindowsPowerShellCommand(command.command)
+      ? { env: windowsPowerShellEnvironment(processEnv) }
+      : {}),
     windowsHide: true,
     maxBuffer: 1024 * 1024
   }, (error, stdout, stderr) => {
@@ -208,6 +214,8 @@ export const defaultServiceCommandRunner: ServiceCommandRunner = command => new 
     });
   });
 });
+
+export const defaultServiceCommandRunner = createDefaultServiceCommandRunner();
 
 export async function writeServiceDefinition(
   fileSystem: ServiceFileSystem,
@@ -342,4 +350,3 @@ function failure(
 function containsControlCharacter(value: string): boolean {
   return /[\u0000-\u001f\u007f]/u.test(value);
 }
-

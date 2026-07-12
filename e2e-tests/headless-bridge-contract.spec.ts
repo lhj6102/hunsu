@@ -4,7 +4,7 @@ import { startHeadlessBrowserHarness, type HeadlessBrowserHarness, type Headless
 const EXPECTED_HEALTH = {
   ok: true,
   service: "hunsu-bridge",
-  version: "0.2.0-next.1",
+  version: "0.2.0-next.2",
   protocolVersion: "local-bridge-v1"
 };
 
@@ -34,7 +34,7 @@ test.describe.serial("headless Bridge browser contract", () => {
           health: "connected",
           auth: "paired",
           version: {
-            bridgeVersion: "0.2.0-next.1",
+            bridgeVersion: "0.2.0-next.2",
             protocolVersion: "local-bridge-v1"
           }
         });

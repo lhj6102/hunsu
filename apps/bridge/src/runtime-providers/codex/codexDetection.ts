@@ -6,6 +6,7 @@ import { currentProcessEnv, resolveCodexAppServerConfig } from "@hunsu/config";
 import { codexCommandLaunch, type CodexCommandLaunch } from "./windowsCommandShim.ts";
 import { redactDiagnosticText, sanitizeDiagnostics } from "../../diagnostics/redaction.ts";
 import { HUNSU_BRIDGE_VERSION } from "../../version.ts";
+import { windowsPowerShellEnvironment } from "../../windowsPowerShell.ts";
 
 const execFileAsync = promisify(execFile);
 export const DEFAULT_CODEX_PROBE_TIMEOUT_MS = 3_500;
@@ -535,7 +536,7 @@ async function powershellCodexCandidates(env: Record<string, string | undefined>
   for (const command of ["powershell.exe", "pwsh"]) {
     try {
       const { stdout } = await execFileAsync(command, ["-NoProfile", "-Command", script], {
-        env,
+        env: command === "powershell.exe" ? windowsPowerShellEnvironment(env) : env,
         timeout: 2_000,
         windowsHide: true,
         maxBuffer: 64 * 1024

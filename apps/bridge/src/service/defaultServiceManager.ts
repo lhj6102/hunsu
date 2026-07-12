@@ -8,6 +8,7 @@ import type { BridgeServiceManager, ServiceLifecycleDependencies } from "./types
 export function createDefaultBridgeServiceManager(input: {
   paths: HunsuPaths;
   controlClient: BridgeControlClient;
+  processEnv: Readonly<Record<string, string | undefined>>;
   platform?: NodeJS.Platform;
   userHome?: string;
 }): BridgeServiceManager {
@@ -36,6 +37,6 @@ export function createDefaultBridgeServiceManager(input: {
     platform,
     ...(platform === "linux" ? { linux: { ...dependencies, homeDirectory: userHome } } : {}),
     ...(platform === "darwin" ? { macos: { ...dependencies, homeDirectory: userHome } } : {}),
-    ...(platform === "win32" ? { windows: dependencies } : {})
+    ...(platform === "win32" ? { windows: { ...dependencies, processEnv: input.processEnv } } : {})
   });
 }

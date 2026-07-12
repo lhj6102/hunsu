@@ -117,6 +117,7 @@ export type BridgeSetupOptions = {
   stagedFileSystem?: StagedRuntimeFileSystem;
   npmRunner?: StagedRuntimeCommandRunner;
   npmCommand?: string;
+  processEnv?: Readonly<Record<string, string | undefined>>;
   nodePath?: string;
   nodeVersion?: string;
   platform?: NodeJS.Platform;
@@ -276,6 +277,7 @@ async function setupWhileLocked(
       const staged = await installStagedRuntime({
         plan,
         ...(options.npmRunner ? { commandRunner: options.npmRunner } : {}),
+        ...(options.processEnv ? { processEnv: options.processEnv } : {}),
         ...(options.stagedFileSystem ? { fileSystem: options.stagedFileSystem } : {}),
         ...(options.now ? { now: options.now } : {}),
         nodeVersion,

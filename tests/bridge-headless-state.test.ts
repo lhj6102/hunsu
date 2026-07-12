@@ -17,6 +17,10 @@ import { windowsCredentialAclPowerShellInvocation } from "../apps/bridge/src/sta
 import { invalidState } from "../apps/bridge/src/state/atomicJsonStore.ts";
 import { bridgeErrorResult } from "../apps/bridge/src/client/cliResult.ts";
 import {
+  isWindowsPowerShellCommand,
+  windowsPowerShellEnvironment
+} from "../apps/bridge/src/windowsPowerShell.ts";
+import {
   createWorkspaceService,
   toWorkspaceSafeMetadata,
   workspaceIdForPath
@@ -67,15 +71,39 @@ test("Windows credential ACL hardening uses one encoded injection-safe PowerShel
   assert.equal(invocation.args.includes(credentialPath), false);
   const command = Buffer.from(invocation.args.at(-1) ?? "", "base64").toString("utf16le");
   assert.match(command, /\$CredentialPath = 'C:\\Users\\O''Brien\\Hunsu Bridge\\credentials\.json'/u);
-  assert.match(command, /Get-Acl -LiteralPath \$CredentialPath/u);
+  assert.match(command, /WindowsIdentity\]::GetCurrent\(\)\.User/u);
+  assert.match(command, /FileSecurity\]::new\(\)/u);
+  assert.match(command, /SetOwner\(\$sid\)/u);
   assert.match(command, /SetAccessRuleProtection\(\$true, \$false\)/u);
-  assert.match(command, /RemoveAccessRuleSpecific/u);
-  assert.match(command, /Set-Acl -LiteralPath \$CredentialPath/u);
-  assert.doesNotMatch(command, /param\(/u);
+  assert.match(command, /FileSystemAccessRule\]::new\(\$sid/u);
+  assert.match(command, /FileSystemRights\]::FullControl/u);
+  assert.match(command, /AccessControlType\]::Allow/u);
+  assert.match(command, /System\.IO\.File\]::SetAccessControl\(\$CredentialPath, \$acl\)/u);
+  assert.doesNotMatch(command, /param\(|Get-Acl|Set-Acl|New-Object|NTAccount/u);
   assert.throws(
     () => windowsCredentialAclPowerShellInvocation("C:\\Hunsu\nInjected\\credentials.json"),
     /control characters/u
   );
+});
+
+test("Windows PowerShell 5.1 children cannot inherit PowerShell 7 module paths", () => {
+  assert.equal(isWindowsPowerShellCommand("powershell.exe"), true);
+  assert.equal(isWindowsPowerShellCommand("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE"), true);
+  assert.equal(isWindowsPowerShellCommand("pwsh.exe"), false);
+  const environment = {
+    Path: "C:\\Windows\\System32",
+    PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules",
+    pSmOdUlEpAtH: "C:\\poisoned-user-modules",
+    WinPSModulePath: "C:\\poisoned-windows-modules",
+    wInPsMoDuLePaTh: "C:\\poisoned-case-variant",
+    SAFE_VALUE: "preserved",
+    OMITTED_VALUE: undefined
+  };
+  assert.deepEqual(windowsPowerShellEnvironment(environment), {
+    Path: "C:\\Windows\\System32",
+    SAFE_VALUE: "preserved"
+  });
+  assert.equal(environment.PSModulePath, "C:\\Program Files\\PowerShell\\7\\Modules");
 });
 
 test("Bridge state failures keep the stable code and expose only basename-safe context", () => {
@@ -155,11 +183,11 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-one",
       daemonPid: 1234,
-      version: "0.2.0-next.1",
+      version: "0.2.0-next.2",
       protocolVersion: "local-bridge-v1",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",
-      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.1",
+      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.2",
       serviceManager: "development",
       lastHealthyAt: "2026-07-12T00:00:00.000Z"
     });
@@ -168,7 +196,7 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-invalid",
       daemonPid: 1234,
-      version: "0.2.0-next.1",
+      version: "0.2.0-next.2",
       protocolVersion: "local-bridge-v1",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",

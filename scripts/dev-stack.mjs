@@ -17,7 +17,7 @@ const fakeCodexPath = join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs"
 const EXPECTED_HEALTH = Object.freeze({
   ok: true,
   service: "hunsu-bridge",
-  version: "0.2.0-next.1",
+  version: "0.2.0-next.2",
   protocolVersion: "local-bridge-v1"
 });
 
