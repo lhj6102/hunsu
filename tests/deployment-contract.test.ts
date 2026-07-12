@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
+  assertRetainedWorkerModule,
   createReleaseManifest,
   verifyRelease,
   type ReleaseManifest
@@ -41,7 +42,7 @@ test("deployment release manifest detects artifact changes", () => {
     createReleaseManifest(root, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.6",
+      bridgePackageVersion: "0.2.0-next.7",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -52,6 +53,23 @@ test("deployment release manifest detects artifact changes", () => {
     assert.deepEqual(verified.manifest.migrations.map(migration => migration.component), ["connect", "hub"]);
     writeFileSync(join(root, "hub/worker.mjs"), "tampered\n");
     assert.throws(() => verifyRelease(root), /integrity mismatch/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("retained Worker validation rejects Wrangler multipart upload bodies", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-worker-module-"));
+  const workerPath = join(root, "worker.mjs");
+  try {
+    writeFileSync(workerPath, "------formdata-undici-123\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{}\r\n");
+    assert.throws(() => assertRetainedWorkerModule(workerPath, "Hub"), /multipart upload body/u);
+    writeFileSync(workerPath, "const worker = {};\n");
+    assert.throws(() => assertRetainedWorkerModule(workerPath, "Hub"), /ES module export/u);
+    writeFileSync(workerPath, "export default { fetch( }\n");
+    assert.throws(() => assertRetainedWorkerModule(workerPath, "Hub"), /syntactically valid JavaScript/u);
+    writeFileSync(workerPath, "export default { fetch() {} };\n");
+    assert.doesNotThrow(() => assertRetainedWorkerModule(workerPath, "Hub"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -220,7 +238,7 @@ test("deployment preparation binds exact retained Connect bytes and target confi
     createReleaseManifest(release, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.6",
+      bridgePackageVersion: "0.2.0-next.7",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -375,7 +393,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
     assert.equal(binding.source.sha, SOURCE_SHA);
     assert.throws(() => verifyBridgeCandidate(root, {
       ...releaseManifest,
-      bridgePackageVersion: "0.2.0-next.6"
+      bridgePackageVersion: "0.2.0-next.7"
     }), /does not match retained release/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -392,6 +410,7 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   const gate = readFileSync(join(root, "scripts/deployment/promotion-gate.mjs"), "utf8");
   const smoke = readFileSync(join(root, "scripts/deployment/smoke-deployment.mjs"), "utf8");
   const buildRelease = readFileSync(join(root, "scripts/deployment/build-release.mjs"), "utf8");
+  const connectConfig = readFileSync(join(root, "apps/connect-api/scripts/cloudflare-config.mjs"), "utf8");
   const publish = readFileSync(join(root, ".github/workflows/publish-bridge.yml"), "utf8");
   assert.match(preview, /branches:\s*\n\s*- preview/u);
   assert.match(preview, /build_release: true/u);
@@ -461,6 +480,12 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   assert.match(buildRelease, /"@hunsu\/web\.\.\."/u);
   assert.match(buildRelease, /"@hunsu\/hub-api\.\.\."/u);
   assert.match(buildRelease, /"@hunsu\/connect-api\.\.\."/u);
+  assert.match(buildRelease, /"--outdir"/u);
+  assert.match(buildRelease, /assertRetainedWorkerModule/u);
+  assert.doesNotMatch(buildRelease, /"--outfile"/u);
+  assert.match(connectConfig, /"--outdir"/u);
+  assert.match(connectConfig, /copyFileSync\(bundledEntry, output\)/u);
+  assert.doesNotMatch(connectConfig, /"--outfile"/u);
   assert.ok(
     buildRelease.indexOf('"@hunsu/web..."') < buildRelease.indexOf("const webDist"),
     "Release builds must compile workspace dependency closures before consuming Web output"
