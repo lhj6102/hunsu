@@ -2,7 +2,9 @@ const REDACTED_VALUE = "[redacted]";
 
 const SENSITIVE_QUERY_PARAMETER_NAMES = new Set([
   "hunsuBridgeToken",
-  "hunsuRelayToken",
+  "hunsuConnectAccessToken",
+  "hunsuConnectRefreshToken",
+  "hunsuConnectDeviceCode",
   "token",
   "access_token",
   "refresh_token",
@@ -15,7 +17,9 @@ const SENSITIVE_QUERY_PARAMETER_NAMES = new Set([
 
 const SENSITIVE_QUERY_PARAMETER_PATTERN = [
   "hunsuBridgeToken",
-  "hunsuRelayToken",
+  "hunsuConnectAccessToken",
+  "hunsuConnectRefreshToken",
+  "hunsuConnectDeviceCode",
   "access_token",
   "refresh_token",
   "authorization",

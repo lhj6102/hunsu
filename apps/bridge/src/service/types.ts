@@ -1,3 +1,5 @@
+import type { BridgeDeploymentProfile } from "../deploymentProfile.ts";
+
 export type BridgeServiceManagerKind =
   | "systemd-user"
   | "launchd-user"
@@ -9,6 +11,7 @@ export type ServiceInstallInput = {
   hunsuHome: string;
   packageVersion: string;
   runtimePath: string;
+  deploymentProfile: BridgeDeploymentProfile;
 };
 
 export type ServiceErrorCode =
@@ -47,6 +50,7 @@ export type ServiceStatus = {
   definitionPath: string;
   packageVersion?: string;
   runtimePath?: string;
+  deploymentProfile?: BridgeDeploymentProfile;
   detail?: string;
 };
 
@@ -88,6 +92,7 @@ export type AuthenticatedServiceStatus =
 export type InstalledRuntimeInfo = {
   packageVersion: string;
   runtimePath: string;
+  deploymentProfile: BridgeDeploymentProfile;
 };
 
 export type ServiceLifecycleDependencies = {
@@ -99,4 +104,3 @@ export type ServiceLifecycleDependencies = {
   stopTimeoutMs?: number;
   pollIntervalMs?: number;
 };
-

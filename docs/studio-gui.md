@@ -44,13 +44,14 @@ Required visible states include:
 
 Connection Center explains missing Bridge setup, Bridge not running, missing
 pairing token, wrong allowed origin, old Bridge version, missing Workspace
-access, Remote Bridge offline, Relay unavailable, and Web/Bridge account
+access, Remote Bridge offline, Connect unavailable, peer negotiation failure, and Web/Bridge account
 mismatch. Recovery actions show stable hunsu-bridge commands or in-Web flows
 for Provider, Workspaces, pairing, and Remote status.
 
-When a paired local Bridge exposes Relay registry data, Connection Center also
+When Connect exposes account-owned device metadata, Connection Center also
 lists available Remote Bridges with online/offline state so the same panel can
-represent both local direct and Remote Relay modes.
+represent both local and direct remote peer modes. Workspace metadata appears
+only after an authenticated peer is established.
 
 ## Launcher
 

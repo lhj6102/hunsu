@@ -20,16 +20,16 @@ export function validateProductionEvidence(input) {
   const evidenceSha256 = requiredMatch(input.evidenceSha256, /^sha256:[a-f0-9]{64}$/u, "retained evidence digest");
   const hunsuAppDeployment = safeHttpsUrl(input.hunsuAppDeployment, "hunsu.app deployment");
   const codexVersion = safeText(input.codexVersion, "Codex version");
-  const relayEnvironment = requiredMatch(safeText(input.relayEnvironment, "Relay environment"), /^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/u, "Relay environment");
+  const connectEnvironment = requiredMatch(safeText(input.connectEnvironment, "Connect environment"), /^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/u, "Connect environment");
   const workspaceFixtureId = requiredMatch(safeText(input.workspaceFixtureId, "Workspace fixture ID"), /^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/u, "Workspace fixture ID");
   const platforms = platformEvidence(input.platformEvidence);
   return {
-    schema: "hunsu.bridge.production-evidence.v1",
+    schema: "hunsu.bridge.production-evidence.v2",
     npm: { version, integrity },
     evidence: { url: evidenceUrl, sha256: evidenceSha256 },
     hunsuAppDeployment,
     codexVersion,
-    relayEnvironment,
+    connectEnvironment,
     workspaceFixtureId,
     platforms
   };
@@ -156,7 +156,7 @@ function unsafeEvidenceText(value) {
 }
 
 function secretLike(value) {
-  return /hunsu_(?:control|bridge_pair|pairing|relay)_[A-Za-z0-9_-]+|(?:access|refresh)[_-]?token|authorization\s*[:=]|x-amz-signature|\bbearer\s+[A-Za-z0-9._~+/=-]+|\bsk-[A-Za-z0-9_-]{16,}/iu.test(value);
+  return /hunsu_(?:control|bridge_pair|pairing|connect)_[A-Za-z0-9_-]+|(?:access|refresh)[_-]?token|authorization\s*[:=]|x-amz-signature|\bbearer\s+[A-Za-z0-9._~+/=-]+|\bsk-[A-Za-z0-9_-]{16,}/iu.test(value);
 }
 
 function privatePathLike(value) {
@@ -191,7 +191,7 @@ if (resolve(process.argv[1] ?? "") === scriptPath) {
       evidenceSha256: process.env.HUNSU_EVIDENCE_SHA256,
       hunsuAppDeployment: process.env.HUNSU_EVIDENCE_HUNSU_APP_DEPLOYMENT,
       codexVersion: process.env.HUNSU_EVIDENCE_CODEX_VERSION,
-      relayEnvironment: process.env.HUNSU_EVIDENCE_RELAY_ENVIRONMENT,
+      connectEnvironment: process.env.HUNSU_EVIDENCE_CONNECT_ENVIRONMENT,
       workspaceFixtureId: process.env.HUNSU_EVIDENCE_WORKSPACE_FIXTURE_ID,
       platformEvidence: process.env.HUNSU_EVIDENCE_PLATFORMS
     };

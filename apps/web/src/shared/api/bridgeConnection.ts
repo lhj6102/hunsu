@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { postRemoteBridgeConnect } from "@/shared/api/bridgeClient";
 import { bridgeApiHttpUrl, bridgeApiRequestHeaders, clearRemoteBridgeSession, currentRemoteBridgeSession, hasBridgeApiAuthToken } from "@/shared/api/bridgeApiBase";
 import type { BridgeVersionInfo, StudioConnectionStatus } from "@/shared/api/bridgeTypes";
+import { bridgeProfileCompatibilityError, HUNSU_WEB_RUNTIME_CONFIG } from "@/shared/config/runtimeConfig";
 
 export type BridgeConnectionState =
   | { status: "idle"; tokenPresent: boolean }
@@ -100,8 +101,8 @@ export function useVerifiedRemoteBridgeSession({ enabled = true }: { enabled?: b
     setState({ status: "remote_checking", sessionPresent: true });
     postRemoteBridgeConnect({
       deviceId: session.deviceId,
-      webUserId: session.webUserId,
-      projectPath: session.projectPath
+      workspaceId: session.workspaceId,
+      workspaceLabel: session.workspaceLabel
     })
       .then(result => {
         if (cancelled) return;
@@ -136,11 +137,28 @@ export async function checkBridgeHealth(timeoutMs = 1200): Promise<{ ok: true; v
     if (!response.ok) {
       return { ok: false, error: `Bridge returned ${response.status}` };
     }
-    const body = await response.json().catch(() => undefined) as { ok?: unknown; service?: unknown; version?: BridgeVersionInfo } | undefined;
+    const body = await response.json().catch(() => undefined) as {
+      ok?: unknown;
+      service?: unknown;
+      version?: unknown;
+      protocolVersion?: unknown;
+      deploymentProfile?: unknown;
+    } | undefined;
     if (body?.ok !== true || body.service !== "hunsu-bridge") {
       return { ok: false, error: "Unexpected Bridge response" };
     }
-    return { ok: true, version: body.version };
+    const profileError = bridgeProfileCompatibilityError(HUNSU_WEB_RUNTIME_CONFIG.target, body.deploymentProfile);
+    if (profileError) {
+      return { ok: false, error: profileError };
+    }
+    const version = typeof body.version === "string" && typeof body.protocolVersion === "string"
+      ? {
+          bridgeVersion: body.version,
+          protocolVersion: body.protocolVersion,
+          supportedFeatures: []
+        }
+      : undefined;
+    return { ok: true, version };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : "Bridge is not reachable" };
   } finally {

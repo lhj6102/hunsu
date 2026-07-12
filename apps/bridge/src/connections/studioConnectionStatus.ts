@@ -1,6 +1,5 @@
 import { existsSync } from "node:fs";
 import type { BridgeRuntimeConfig } from "@hunsu/config";
-import type { RemoteBridgeDeviceRecord } from "./remoteConnection.ts";
 import { HUNSU_BRIDGE_PROTOCOL_VERSION, HUNSU_BRIDGE_VERSION } from "../version.ts";
 
 export type BridgeVersionInfo = {
@@ -22,7 +21,7 @@ export type BridgeCompatibility =
 
 export type StudioConnectionStatus = {
   mode: "none" | "local" | "remote";
-  transport: "direct" | "relay" | "unreachable";
+  transport: "direct" | "peer" | "unreachable";
   health: "checking" | "connected" | "disconnected" | "error";
   auth: "paired" | "missing_token" | "expired" | "invalid" | "account_mismatch" | "unknown";
   projectAccess: "granted" | "needs_grant" | "denied" | "not_applicable";
@@ -36,7 +35,7 @@ export type StudioConnectionStatus = {
   };
   endpoint?: {
     apiUrl?: string;
-    relayLabel?: string;
+    connectLabel?: string;
   };
   account?: {
     webUserId?: string;
@@ -52,7 +51,7 @@ export type StudioConnectionStatus = {
     | "public_bind"
     | "version_mismatch"
     | "origin_not_allowed"
-    | "relay_unavailable"
+    | "remote_unavailable"
     | "project_missing"
   >;
   error?: string;
@@ -189,60 +188,6 @@ export function createDisconnectedStudioConnectionStatus(error?: string): Studio
     error,
     version: bridgeVersionInfo(),
     compatibility: { compatible: true }
-  };
-}
-
-export function createRemoteStudioConnectionStatus(input: {
-  device: RemoteBridgeDeviceRecord;
-  account?: StudioConnectionStatus["account"];
-  projectAccess?: StudioConnectionStatus["projectAccess"];
-  projectPath?: string;
-  roadmapId?: string;
-  roadmapDisplayName?: string;
-  requirement?: StudioBridgeRequirement;
-  studioVersion?: string;
-  error?: string;
-}): StudioConnectionStatus {
-  const connected = input.device.status === "online" && input.error === undefined;
-  const version: BridgeVersionInfo = {
-    ...bridgeVersionInfo(),
-    bridgeVersion: input.device.bridgeVersion ?? "unknown",
-    protocolVersion: input.device.protocolVersion ?? "unknown"
-  };
-  const compatibility = evaluateBridgeCompatibility(version, input.requirement ?? DEFAULT_STUDIO_BRIDGE_REQUIREMENT, input.studioVersion);
-  const warnings: StudioConnectionStatus["warnings"] = [];
-  if (!connected) {
-    warnings.push("relay_unavailable");
-  }
-  if (!compatibility.compatible) {
-    warnings.push("version_mismatch");
-  }
-  return {
-    mode: "remote",
-    transport: "relay",
-    health: connected && compatibility.compatible ? "connected" : input.error || !compatibility.compatible ? "error" : "disconnected",
-    auth: input.account?.sameUser === false ? "account_mismatch" : "paired",
-    projectAccess: input.projectAccess ?? "needs_grant",
-    bridge: {
-      id: input.device.deviceId,
-      name: input.device.deviceName,
-      version: input.device.bridgeVersion,
-      protocolVersion: input.device.protocolVersion,
-      lastSeenAt: input.device.lastSeenAt
-    },
-    endpoint: {
-      relayLabel: "Hunsu Relay"
-    },
-    account: input.account,
-    project: input.projectPath ? {
-      roadmapId: input.roadmapId,
-      displayName: input.roadmapDisplayName,
-      repositoryPath: input.projectPath
-    } : undefined,
-    warnings,
-    error: input.error ?? (compatibility.compatible ? undefined : compatibility.message),
-    version,
-    compatibility
   };
 }
 

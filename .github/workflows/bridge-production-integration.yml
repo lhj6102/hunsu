@@ -35,8 +35,8 @@ on:
         description: Exact Codex version tested on the controlled QA device
         required: true
         type: string
-      relay_environment:
-        description: Non-secret Relay environment identifier
+      connect_environment:
+        description: Non-secret Connect auth/signaling environment identifier
         required: true
         type: string
       workspace_fixture_id:
@@ -53,8 +53,18 @@ on:
         required: true
         default: false
         type: boolean
-      relay_round_trip:
-        description: Granted Relay round-trip, revocation, disable, and local-path redaction passed
+      p2p_round_trip:
+        description: Granted direct WebRTC round-trip, revocation, disable, and local-path redaction passed
+        required: true
+        default: false
+        type: boolean
+      stun_only:
+        description: ICE used only stun:stun.cloudflare.com:3478 with no TURN or hosted command fallback
+        required: true
+        default: false
+        type: boolean
+      connect_signaling_only:
+        description: Connect evidence contains auth, presence, and opaque signaling only; no command or Workspace data
         required: true
         default: false
         type: boolean
@@ -75,6 +85,8 @@ permissions:
 env:
   NODE_VERSION: 24.18.0
   NPM_VERSION: 11.16.0
+  NPM_REGISTRY_URL: https://registry.npmjs.org
+  npm_config_registry: https://registry.npmjs.org
 
 jobs:
   attest:
@@ -89,9 +101,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          registry-url: https://registry.npmjs.org
+          registry-url: ${{ env.NPM_REGISTRY_URL }}
       - name: Use npm with signed-attestation audit support
-        run: npm install --global "npm@${NPM_VERSION}"
+        run: npm install --global "npm@${NPM_VERSION}" --registry="$NPM_REGISTRY_URL"
       - name: Pin the immutable candidate tag and checkout
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
@@ -134,7 +146,7 @@ jobs:
           mkdir -p "$audit_root"
           cd "$audit_root"
           npm init --yes >/dev/null
-          npm install --ignore-scripts --no-audit --no-fund --save-exact "@hunsu/bridge@$HUNSU_EVIDENCE_NPM_VERSION"
+          npm install --ignore-scripts --no-audit --no-fund --save-exact "@hunsu/bridge@$HUNSU_EVIDENCE_NPM_VERSION" --registry="$NPM_REGISTRY_URL"
           npm audit signatures --json --include-attestations > "$audit_root/audit.json"
           cd "$GITHUB_WORKSPACE"
           HUNSU_NPM_AUDIT_PATH="$audit_root/audit.json" node scripts/verify-bridge-npm-provenance.mjs > npm-provenance.json
@@ -150,23 +162,25 @@ jobs:
           HUNSU_EVIDENCE_PLATFORMS: ${{ inputs.platform_evidence }}
           HUNSU_EVIDENCE_HUNSU_APP_DEPLOYMENT: ${{ inputs.hunsu_app_deployment }}
           HUNSU_EVIDENCE_CODEX_VERSION: ${{ inputs.codex_version }}
-          HUNSU_EVIDENCE_RELAY_ENVIRONMENT: ${{ inputs.relay_environment }}
+          HUNSU_EVIDENCE_CONNECT_ENVIRONMENT: ${{ inputs.connect_environment }}
           HUNSU_EVIDENCE_WORKSPACE_FIXTURE_ID: ${{ inputs.workspace_fixture_id }}
           HUNSU_APP_PAIRING: ${{ inputs.hunsu_app_pairing }}
           HUNSU_LOGIN: ${{ inputs.hunsu_login }}
-          RELAY_ROUND_TRIP: ${{ inputs.relay_round_trip }}
+          P2P_ROUND_TRIP: ${{ inputs.p2p_round_trip }}
+          STUN_ONLY: ${{ inputs.stun_only }}
+          CONNECT_SIGNALING_ONLY: ${{ inputs.connect_signaling_only }}
           CODEX_PROVIDER: ${{ inputs.codex_provider }}
           GRANTED_WORKSPACE: ${{ inputs.granted_workspace }}
         shell: bash
         run: |
-          for result in "$HUNSU_APP_PAIRING" "$HUNSU_LOGIN" "$RELAY_ROUND_TRIP" "$CODEX_PROVIDER" "$GRANTED_WORKSPACE"; do
+          for result in "$HUNSU_APP_PAIRING" "$HUNSU_LOGIN" "$P2P_ROUND_TRIP" "$STUN_ONLY" "$CONNECT_SIGNALING_ONLY" "$CODEX_PROVIDER" "$GRANTED_WORKSPACE"; do
             if [[ "$result" != "true" ]]; then
               echo "Every production integration result must be explicitly attested." >&2
               exit 1
             fi
           done
           record=$(node scripts/validate-bridge-production-evidence.mjs)
-          registry=$(npm view "@hunsu/bridge@$HUNSU_EVIDENCE_NPM_VERSION" version dist.integrity --json)
+          registry=$(npm view "@hunsu/bridge@$HUNSU_EVIDENCE_NPM_VERSION" version dist.integrity --json --registry="$NPM_REGISTRY_URL")
           EVIDENCE_RECORD="$record" REGISTRY_RECORD="$registry" node --input-type=module -e '
             import { readFileSync, writeFileSync } from "node:fs";
             const record = JSON.parse(process.env.EVIDENCE_RECORD);
@@ -175,8 +189,8 @@ jobs:
             if (registry.version !== record.npm.version || registry["dist.integrity"] !== record.npm.integrity) {
               throw new Error("npm registry identity does not match the supplied production evidence.");
             }
-            if (provenance.source.gitSha !== process.env.GITHUB_SHA || provenance.source.ref !== `refs/tags/${process.env.VERSION_TAG}`) {
-              throw new Error("Verified npm provenance does not match the immutable candidate tag and SHA.");
+            if (provenance.source.gitSha !== process.env.GITHUB_SHA || provenance.source.ref !== "refs/heads/preview") {
+              throw new Error("Verified npm provenance does not match the protected preview publication and immutable candidate SHA.");
             }
             const bound = {
               ...record,
@@ -185,7 +199,9 @@ jobs:
               results: {
                 hunsuAppPairing: true,
                 hunsuLogin: true,
-                relayRoundTrip: true,
+                p2pRoundTrip: true,
+                stunOnly: true,
+                connectSignalingOnly: true,
                 codexProvider: true,
                 grantedWorkspace: true
               }
@@ -205,9 +221,9 @@ jobs:
               `- Platforms: ${platforms}`,
               `- hunsu.app deployment: ${bound.hunsuAppDeployment}`,
               `- Codex: ${bound.codexVersion}`,
-              `- Relay environment: ${bound.relayEnvironment}`,
+              `- Connect environment: ${bound.connectEnvironment}`,
               `- Workspace fixture: ${bound.workspaceFixtureId}`,
-              "- Results: pairing, login, Relay round-trip/revocation, Codex readiness, and Workspace grant isolation passed",
+              "- Results: pairing, login, direct STUN-only P2P round-trip/revocation, signaling-only Connect, Codex readiness, and Workspace grant isolation passed",
               `- Retained evidence: ${bound.evidence.url}`,
               `- Retained evidence digest: ${bound.evidence.sha256}`,
               ""

@@ -88,6 +88,26 @@ test("global options are position-independent and duplicate, unknown, or command
     }
 
     assert.equal(parseBridgeCliArgs(["daemon", "--runtime-path", root]).flags.get("runtime-path"), root);
+    assert.equal(parseBridgeCliArgs(["setup", "--profile", "preview"]).flags.get("profile"), "preview");
+    assert.equal(parseBridgeCliArgs(["daemon", "--profile", "production"]).flags.get("profile"), "production");
+
+    const invalidProfile = await invoke(["setup", "--profile", "staging", "--json"]);
+    assert.equal(invalidProfile.code, 1);
+    assert.equal((JSON.parse(invalidProfile.stdout[0]!) as { code?: string }).code, "BRIDGE_STATE_INVALID");
+
+    const mismatchedChannel = await invoke([
+      "setup",
+      "--profile",
+      "preview",
+      "--channel",
+      "next",
+      "--json"
+    ]);
+    assert.equal(mismatchedChannel.code, 1);
+    assert.match(
+      (JSON.parse(mismatchedChannel.stdout[0]!) as { message?: string }).message ?? "",
+      /preview profile requires the candidate-next channel/u
+    );
 
     const help = await invoke(["--json", "help"]);
     assert.equal(help.code, 0);
@@ -96,6 +116,7 @@ test("global options are position-independent and duplicate, unknown, or command
     const helpResult = JSON.parse(help.stdout[0]!) as { value?: { usage?: string } };
     assert.match(helpResult.value?.usage ?? "", /--codex-home <path>/u);
     assert.match(helpResult.value?.usage ?? "", /--home <path>\s+Use an explicit HUNSU_HOME/u);
+    assert.match(helpResult.value?.usage ?? "", /--profile production\|preview/u);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

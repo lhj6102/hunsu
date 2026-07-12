@@ -4,6 +4,24 @@ import { createDefaultHarness, createDefaultManagerConfig, harnessEntityFromSnap
 import { HUB_PACKAGE_MANIFEST_SCHEMA } from "../packages/protocol-registry/src/index.ts";
 import { routeHubRequest, type HubApiEnv } from "../apps/hub-api/src/index.ts";
 
+const RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567";
+
+test("Hub API health exposes credential-free deployment identity", async () => {
+  const env = createMemoryHubEnv();
+  const response = await routeHubRequest(new Request("https://hub.example.test/health"), env);
+  const body = await response.json() as any;
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(body, {
+    status: "ok",
+    service: "hunsu-hub-api",
+    target: "preview",
+    origin: "motorhome",
+    release: RELEASE_SHA
+  });
+});
+
 test("Hub API publishes, lists, and serves immutable package manifests", async () => {
   const env = createMemoryHubEnv();
   const manifest = {
@@ -335,6 +353,8 @@ function createMemoryHubEnv(): HubApiEnv {
       }
     },
     HUNSU_HUB_ORIGIN_NAME: "motorhome",
+    HUNSU_DEPLOY_TARGET: "preview",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
     HUNSU_HUB_ADMIN_TOKEN: "test-token"
   } as HubApiEnv;
   Object.defineProperties(env, {

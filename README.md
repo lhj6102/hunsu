@@ -29,8 +29,8 @@ Hunsu exists for that human layer.
 ## Public Alpha Quickstart
 
 > [!WARNING]
-> The current headless prerelease is experimental. `0.2.0-next.2` is published
-> under `candidate-next` first; the `next` tag moves only after exact registry,
+> The current headless prerelease is experimental. `0.2.0-next.3` is the next
+> candidate and is published under `candidate-next` first; the `next` tag moves only after exact registry,
 > cross-platform service, and production integration verification succeeds.
 
 Prerequisites:
@@ -54,9 +54,10 @@ until the local Codex binary, app-server, and authentication are ready.
 
 The operating system user service manager owns the production daemon. Client
 commands connect to that daemon and never create a temporary fallback process.
-Login is optional for local use; signing in enables outbound Remote Relay
-access. Remote responses redact local paths unless an explicit Workspace grant
-allows them.
+Login is optional for local use; signing in enables Remote Bridge access over
+an end-to-end encrypted WebRTC peer connection. Bridge keeps only an outbound
+Connect signaling socket. Remote responses redact local paths unless an
+explicit Workspace grant allows them.
 
 For repository development:
 
@@ -69,12 +70,14 @@ pnpm dev:stack
 ```
 
 The local stack uses an isolated temporary HUNSU_HOME, random ports, a
-hunsu.localhost Web origin, deterministic provider and Relay fixtures, and a
+hunsu.localhost Web origin, deterministic provider and Connect/P2P fixtures, and a
 same-origin development proxy. See
 [Local Development](docs/local-development.md).
 
-Hunsu Bridge must not be exposed directly to a public network. Remote access
-uses authenticated outbound Relay commands rather than a public HTTP proxy.
+Hunsu Bridge must not be exposed directly to a public network. Remote commands,
+results, and streams travel directly between the browser and Bridge over
+encrypted DataChannels. The hosted Connect Worker handles only authentication,
+device presence, and opaque encrypted signaling.
 
 ## Open Source Model
 
@@ -257,6 +260,19 @@ MOVE-scoped checks from depending on hardcoded ports.
   `HUNSU_HUB_D1_DATABASE_NAME`, `HUNSU_HUB_D1_DATABASE_ID`,
   `HUNSU_HUB_R2_BUCKET_NAME`, and `HUNSU_HUB_PUBLISH_QUEUE_NAME` configure Hub
   API deploy and local Worker development.
+- `HUNSU_DEPLOY_TARGET` selects `local`, `dev`, `preview`, or `production` for
+  generated Cloudflare configuration. Hosted targets also require a complete
+  `HUNSU_RELEASE_SHA`, which is returned by the Hub API `/health` endpoint.
+- Hosted Web deployments replace the credential-free
+  `/hunsu-runtime-config.js` overlay after one shared build. The validated
+  overlay selects the target, exact Bridge package version, source SHA, and
+  Bridge, Hub, and Connect API bases without baking environment values into the
+  application bundle.
+- `HUNSU_CONNECT_API_BASE_URL`, `HUNSU_CONNECT_WORKER_NAME`,
+  `HUNSU_CONNECT_D1_DATABASE_NAME`, and `HUNSU_CONNECT_D1_DATABASE_ID`
+  identify the hosted auth/signaling service. Access issuer/AUD and public
+  signing-key identity are protected GitHub environment variables; the private
+  P-256 signing JWK is an environment secret.
 - `HUNSU_AGENT_PREVIEW_PORT` reserves the default Preview debug fallback port:
   `19673`.
 - `HUNSU_HOME` overrides the Bridge state root. Provider, Workspace,
@@ -302,8 +318,8 @@ Troubleshooting:
   deterministic fixtures, and browser modes.
 - [Web Pairing](docs/web-pairing.md): browser credential separation and
   compatibility behavior.
-- [Remote Bridge](docs/remote-bridge.md): outbound Relay, login, grants, and
-  path redaction.
+- [Remote Bridge](docs/remote-bridge.md): P2P connection, Connect signaling,
+  login, grants, and path redaction.
 - [Bridge Security](docs/security.md): credential classes, filesystem
   permissions, redaction, and ownership-safe removal.
 - [Bridge Releases](docs/releasing-bridge.md): protected OIDC publication,

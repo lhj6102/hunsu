@@ -14,7 +14,7 @@
     "e2e:local": "PLAYWRIGHT_HTML_OPEN=never playwright test",
     "e2e:local:headed": "PLAYWRIGHT_HTML_OPEN=never playwright test --headed",
     "test": "node --conditions=development --test tests/*.test.ts",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && pnpm --filter @hunsu/connect-api typecheck",
     "check": "pnpm run typecheck && pnpm test",
     "check:no-desktop-prototype": "node scripts/check-no-desktop-prototype.mjs",
     "check:bridge-state-boundaries": "node scripts/check-bridge-state-boundaries.mjs",
@@ -33,5 +33,10 @@
     "@types/node": "^24.13.3",
     "turbo": "^2.6.1",
     "typescript": "^5.8.3"
+  },
+  "pnpm": {
+    "overrides": {
+      "ip": "link:packages/ip-safe"
+    }
   }
 }

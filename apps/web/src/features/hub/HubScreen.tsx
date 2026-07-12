@@ -1,13 +1,14 @@
 import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import { BookOpen, Clipboard, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { HUNSU_WEB_RUNTIME_CONFIG } from "@/shared/config/runtimeConfig";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/shared/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/shared/ui/dialog";
 import { hubCatalogDetailPath, hubMarketplacePath, hubMarketplaceSections, hubResourceDetailPath, hubVersionRef, kindLabel, marketplaceSection, matchesHubResourceRouteDetail, matchesHubRouteDetail, normalizeHubTags, packagesForMarketplace, parseHubPath, resourcesForMarketplace, type HubMarketplaceId, type HubPackageSummary, type HubResourceSummary, type HubRouteState, type HubTagId } from "./hubMarketplace.js";
 
-const HUB_API_BASE_URL = __HUNSU_HUB_API_BASE_URL__;
+const HUB_API_BASE_URL = HUNSU_WEB_RUNTIME_CONFIG.hubApiBaseUrl;
 
 export function HubScreen() {
   const [packages, setPackages] = useState<HubPackageSummary[]>([]);

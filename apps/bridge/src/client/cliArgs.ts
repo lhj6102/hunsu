@@ -24,6 +24,7 @@ const VALUE_OPTIONS = new Set([
   "port",
   "cwd",
   "web-url",
+  "profile",
   "channel",
   "runtime-package",
   "runtime-path",
@@ -98,13 +99,17 @@ function validateCommandOptions(parsed: ParsedBridgeCliArgs): void {
   switch (command) {
     case "dev":
     case "daemon":
-      addOptions(commandOptions, "host", "port", "cwd", "web-url", "runtime-path");
+      addOptions(commandOptions, "host", "port", "cwd", "web-url", "runtime-path", "profile");
       break;
     case "setup":
-      addOptions(commandOptions, "channel", "runtime-package", "dry-run");
+      addOptions(commandOptions, "channel", "runtime-package", "dry-run", "profile");
       break;
     case "remove":
-      addOptions(commandOptions, "delete-data", "confirm-delete-data", "dry-run");
+      addOptions(commandOptions, "delete-data", "confirm-delete-data", "dry-run", "profile");
+      break;
+    case "status":
+    case "doctor":
+      addOptions(commandOptions, "profile");
       break;
     case "logs":
       addOptions(commandOptions, "follow");

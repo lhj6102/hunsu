@@ -28,7 +28,8 @@ export function createDefaultBridgeServiceManager(input: {
       const install = await createRuntimeInstallStore(input.paths).read();
       return install ? {
         packageVersion: install.current.packageVersion,
-        runtimePath: install.current.runtimePath
+        runtimePath: install.current.runtimePath,
+        deploymentProfile: install.serviceInput.deploymentProfile
       } : undefined;
     }
   };

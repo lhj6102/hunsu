@@ -18,7 +18,7 @@ GET /health is unauthenticated and returns only safe service identity:
 {
   "ok": true,
   "service": "hunsu-bridge",
-  "version": "0.2.0-next.2",
+  "version": "0.2.0-next.3",
   "protocolVersion": "local-bridge-v1"
 }
 ~~~
@@ -101,6 +101,7 @@ CLI commands do not call those compatibility routes, and domain services do
 not depend on either API shape.
 
 The `remote-access` body is `{ enabled, scopes }`. New Workspaces default to
-disabled with no scopes. Remote Relay registration and command routing include
-only explicitly enabled Workspaces with `remoteRelay.access`; revocation is
-persisted before the next outbound registration.
+disabled with no scopes. Bridge exposes path-free metadata to an authenticated
+peer only for Workspaces with `remote.access`; it rechecks the persisted grant
+before dispatching every peer command. Connect never receives this registry or
+its scopes. Revocation is persisted before the next peer request is authorized.

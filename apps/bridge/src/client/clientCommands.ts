@@ -160,7 +160,7 @@ async function runWorkspaceCommand(parsed: ParsedBridgeCliArgs, client: BridgeCo
 }
 
 function parseRemoteScopes(value: string | undefined): BridgeRemoteWorkspaceScope[] {
-  const requested = (value ?? "remoteRelay.access")
+  const requested = (value ?? "remote.access")
     .split(",")
     .map(scope => scope.trim())
     .filter(Boolean);
@@ -170,8 +170,8 @@ function parseRemoteScopes(value: string | undefined): BridgeRemoteWorkspaceScop
     }
     return scope as BridgeRemoteWorkspaceScope;
   });
-  if (!scopes.includes("remoteRelay.access")) {
-    throw new BridgeError("BRIDGE_STATE_INVALID", "Workspace Remote grants require remoteRelay.access.");
+  if (!scopes.includes("remote.access")) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Workspace Remote grants require remote.access.");
   }
   return [...new Set(scopes)];
 }

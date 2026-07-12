@@ -15,6 +15,7 @@ import { acquireDaemonStartupLock } from "../apps/bridge/src/daemon/singleton.ts
 import { createStructuredLog, STRUCTURED_LOG_SCHEMA } from "../apps/bridge/src/diagnostics/structuredLog.ts";
 import { createPairingService } from "../apps/bridge/src/pairing/pairingService.ts";
 import { createCredentialStore } from "../apps/bridge/src/state/credentialStore.ts";
+import { createConfigStore } from "../apps/bridge/src/state/configStore.ts";
 import { resolveHunsuPaths } from "../apps/bridge/src/state/paths.ts";
 import { HUNSU_BRIDGE_VERSION } from "../apps/bridge/src/version.ts";
 
@@ -26,7 +27,8 @@ test("the daemon exposes the exact health contract, rejects unauthenticated cont
       ok: true,
       service: "hunsu-bridge",
       version: HUNSU_BRIDGE_VERSION,
-      protocolVersion: "local-bridge-v1"
+      protocolVersion: "local-bridge-v1",
+      deploymentProfile: "production"
     });
 
     const unauthorized = await fetch(`${daemon.identity.endpoint}/v1/control/status`);
@@ -75,6 +77,89 @@ test("daemon runtime identity rejects a relative runtime path before startup", a
   }
 });
 
+test("installed preview daemons persist their profile and ignore ambient production URL overrides", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-preview-profile-"));
+  const home = join(root, "state");
+  const opened: string[] = [];
+  const upstream: string[] = [];
+  let daemon: RunningBridgeDaemon | undefined;
+  try {
+    const fetchImpl: typeof fetch = async resource => {
+      const url = resource instanceof URL
+        ? resource
+        : new URL(typeof resource === "string" ? resource : resource.url);
+      if (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]") {
+        throw new TypeError("connection refused");
+      }
+      upstream.push(url.toString());
+      if (url.pathname === "/v1/device-enrollments") {
+        return new Response(JSON.stringify({
+          schema: "hunsu.connect.enrollment-created.v1",
+          enrollmentId: "preview-enrollment",
+          deviceCode: "preview-device-code",
+          userCode: "PREVIEW",
+          verificationUri: "https://connect.preview.hunsu.app/auth/device-enrollments",
+          verificationUriComplete: "https://connect.preview.hunsu.app/auth/device-enrollments?user_code=PREVIEW",
+          expiresIn: 600,
+          interval: 5
+        }), { status: 201, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ error: "not_found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" }
+      });
+    };
+    daemon = await startBridgeDaemon({
+      home,
+      port: 0,
+      cwd: root,
+      deploymentProfile: "preview",
+      env: {
+        HUNSU_WEB_URL: "https://hunsu.app/studio",
+        HUNSU_CONNECT_API_BASE_URL: "https://connect.hunsu.app",
+        HUNSU_CONNECT_WS_URL: "wss://connect.hunsu.app/v1/connect/device"
+      },
+      fetchImpl,
+      openBrowser: async url => { opened.push(url); }
+    });
+
+    assert.equal(daemon.identity.deploymentProfile, "preview");
+    assert.equal((await createConfigStore(daemon.paths).read()).deploymentProfile, "preview");
+    const previewHealth = await fetch(`${daemon.identity.endpoint}/health`, {
+      headers: { Origin: "https://preview.hunsu.app" }
+    });
+    assert.equal(previewHealth.status, 200);
+    assert.equal(previewHealth.headers.get("access-control-allow-origin"), "https://preview.hunsu.app");
+    const productionHealth = await fetch(`${daemon.identity.endpoint}/health`, {
+      headers: { Origin: "https://hunsu.app" }
+    });
+    assert.equal(productionHealth.status, 403);
+
+    const client = createBridgeControlClient({ paths: daemon.paths });
+    const paired = await client.request("/v1/control/pair", {
+      method: "POST",
+      body: { openBrowser: true }
+    });
+    assert.equal(paired.ok, true);
+    assert.equal(new URL(opened[0]!).origin, "https://preview.hunsu.app");
+    const login = await client.request("/v1/control/login", {
+      method: "POST",
+      body: { openBrowser: false }
+    });
+    assert.equal(login.ok, true);
+    assert.equal(upstream.some(url => url.startsWith("https://connect.preview.hunsu.app/v1/device-enrollments")), true);
+    assert.equal(upstream.some(url => url.includes("connect.hunsu.app") && !url.includes("connect.preview.hunsu.app")), false);
+
+    await assert.rejects(
+      () => startBridgeDaemon({ home, port: 0, cwd: root, deploymentProfile: "production", fetchImpl }),
+      /cannot switch to production/u
+    );
+  } finally {
+    await daemon?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("control client verifies exact loopback health before sending its credential", async () => {
   const root = await mkdtemp(join(tmpdir(), "hunsu-headless-control-preflight-"));
   const paths = resolveHunsuPaths({ home: join(root, "state") });
@@ -111,10 +196,9 @@ test("an ambiguous post-commit rotation failure resyncs the daemon token from au
         },
         async read() {
           return {
-            schema: "hunsu.bridge.credentials.v1",
+            schema: "hunsu.bridge.credentials.v2",
             controlToken: "hunsu_control_authoritative",
-            account: null,
-            relay: null
+            connect: null
           };
         }
       },

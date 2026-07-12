@@ -1,5 +1,9 @@
 import { unlink } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import {
+  isBridgeDeploymentProfile,
+  type BridgeDeploymentProfile
+} from "../deploymentProfile.ts";
 import type { HunsuPaths } from "./paths.ts";
 import { invalidState, isNodeError, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
 
@@ -13,6 +17,7 @@ export type BridgeRuntimeIdentity = {
   daemonPid: number;
   version: string;
   protocolVersion: "local-bridge-v1";
+  deploymentProfile: BridgeDeploymentProfile;
   startedAt: string;
   endpoint: string;
   runtimePath: string;
@@ -72,12 +77,21 @@ function decodeRuntimeIdentity(file: string, value: unknown): BridgeRuntimeIdent
     daemonPid: value.daemonPid as number,
     version: requiredString(file, "version", value.version),
     protocolVersion: requiredProtocolVersion(file, value.protocolVersion),
+    deploymentProfile: decodeDeploymentProfile(file, value.deploymentProfile),
     startedAt: requiredString(file, "startedAt", value.startedAt),
     endpoint: requiredString(file, "endpoint", value.endpoint),
     runtimePath: requiredAbsolutePath(file, "runtimePath", value.runtimePath),
     serviceManager,
     lastHealthyAt: requiredString(file, "lastHealthyAt", value.lastHealthyAt)
   };
+}
+
+function decodeDeploymentProfile(file: string, value: unknown): BridgeDeploymentProfile {
+  if (value === undefined) return "production";
+  if (!isBridgeDeploymentProfile(value)) {
+    throw invalidState(file, "deploymentProfile must be production or preview");
+  }
+  return value;
 }
 
 function requiredProtocolVersion(file: string, value: unknown): "local-bridge-v1" {

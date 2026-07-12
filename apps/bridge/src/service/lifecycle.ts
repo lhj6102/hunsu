@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, win32 } from "node:path";
 import { isWindowsPowerShellCommand, windowsPowerShellEnvironment } from "../windowsPowerShell.ts";
+import { isBridgeDeploymentProfile } from "../deploymentProfile.ts";
 import type {
   AuthenticatedServiceStatus,
   BridgeServiceManager,
@@ -68,6 +69,7 @@ export function createManagedBridgeService(
       definitionPath: adapter.definitionPath,
       packageVersion: runtime?.packageVersion,
       runtimePath: runtime?.runtimePath,
+      deploymentProfile: runtime?.deploymentProfile,
       detail: adapterStatus.detail
     };
   };
@@ -117,7 +119,8 @@ export function createManagedBridgeService(
         const result = await adapter.install(input);
         installedRuntime = {
           packageVersion: input.packageVersion,
-          runtimePath: input.runtimePath
+          runtimePath: input.runtimePath,
+          deploymentProfile: input.deploymentProfile
         };
         return result.changed
           ? success(adapter.manager, "Hunsu Bridge user service installed. It was not started.", true)
@@ -245,6 +248,9 @@ export function assertServiceInstallInput(input: ServiceInstallInput, platform: 
   }
   if (!input.packageVersion.trim() || containsControlCharacter(input.packageVersion)) {
     throw new Error("packageVersion must be non-empty and contain no control characters.");
+  }
+  if (!isBridgeDeploymentProfile(input.deploymentProfile)) {
+    throw new Error("deploymentProfile must be production or preview.");
   }
 }
 

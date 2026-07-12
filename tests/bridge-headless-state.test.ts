@@ -5,6 +5,7 @@ import { join, win32 } from "node:path";
 import test from "node:test";
 import {
   BRIDGE_CONFIG_SCHEMA,
+  LEGACY_BRIDGE_CONFIG_SCHEMA,
   createConfigStore,
   createCredentialStore,
   createRuntimeStore,
@@ -27,6 +28,15 @@ import {
 } from "../apps/bridge/src/workspaces/workspaceService.ts";
 import { createPairingService } from "../apps/bridge/src/pairing/pairingService.ts";
 import { createStructuredLog } from "../apps/bridge/src/diagnostics/structuredLog.ts";
+import {
+  bridgeDeploymentEndpoints,
+  bridgeSetupPackageTag
+} from "../apps/bridge/src/deploymentProfile.ts";
+import {
+  LEGACY_RUNTIME_INSTALL_SCHEMA,
+  RUNTIME_INSTALL_SCHEMA,
+  createRuntimeInstallStore
+} from "../apps/bridge/src/setup/runtimeInstaller.ts";
 
 test("HUNSU_HOME resolves the platform defaults and complete state layout", () => {
   assert.equal(
@@ -127,6 +137,7 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
     const configStore = createConfigStore(paths);
     assert.deepEqual(await configStore.read(), {
       schema: BRIDGE_CONFIG_SCHEMA,
+      deploymentProfile: "production",
       host: "127.0.0.1",
       port: 19687,
       provider: { kind: "unconfigured" },
@@ -134,6 +145,7 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
     });
     await configStore.write({
       schema: BRIDGE_CONFIG_SCHEMA,
+      deploymentProfile: "production",
       host: "127.0.0.1",
       port: 43127,
       provider: { kind: "codex", binaryPath: "/opt/codex", home: "/tmp/codex-home" },
@@ -149,27 +161,27 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
     const second = await credentialStore.ensure();
     assert.equal(first.controlToken, second.controlToken);
     assert.match(first.controlToken, /^hunsu_control_/u);
-    const withAccount = await credentialStore.write({
-      account: {
-        accountId: "account-1",
-        accessToken: "account-secret",
-        refreshToken: null,
-        expiresAt: null
-      }
-    });
+    const coordinate = Buffer.alloc(32, 3).toString("base64url");
+    const withAccount = await credentialStore.write({ connect: {
+      signingPrivateKey: { kty: "EC", crv: "P-256", x: coordinate, y: coordinate, d: coordinate },
+      signingPublicKey: { kty: "EC", crv: "P-256", x: coordinate, y: coordinate },
+      agreementPrivateKey: { kty: "EC", crv: "P-256", x: coordinate, y: coordinate, d: coordinate },
+      agreementPublicKey: { kty: "EC", crv: "P-256", x: coordinate, y: coordinate },
+      state: "registered",
+      deviceId: "device-1",
+      accountId: "account-1",
+      accessToken: "account-secret",
+      refreshToken: "refresh-secret",
+      expiresAt: "2026-07-12T02:00:00.000Z",
+      connectWsUrl: "wss://connect.preview.hunsu.app/v1/connect/device"
+    } });
     assert.equal(withAccount.controlToken, first.controlToken);
     const rotated = await credentialStore.rotateControlToken();
     assert.notEqual(rotated.controlToken, first.controlToken);
-    assert.deepEqual(rotated.account, withAccount.account);
-    assert.equal(rotated.relay, null);
+    assert.deepEqual(rotated.connect, withAccount.connect);
     assert.equal((await stat(paths.credentialsFile)).mode & 0o777, 0o600);
     await assert.rejects(() => credentialStore.write({
-      account: {
-        accountId: "account-1",
-        accessToken: "account-secret",
-        refreshToken: null,
-        expiresAt: "not-a-timestamp"
-      }
+      connect: { ...withAccount.connect!, expiresAt: "not-a-timestamp" }
     }), /valid timestamp/u);
     const hardened: string[] = [];
     await createCredentialStore(paths, {
@@ -183,11 +195,12 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-one",
       daemonPid: 1234,
-      version: "0.2.0-next.2",
+      version: "0.2.0-next.3",
       protocolVersion: "local-bridge-v1",
+      deploymentProfile: "preview",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",
-      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.2",
+      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.3",
       serviceManager: "development",
       lastHealthyAt: "2026-07-12T00:00:00.000Z"
     });
@@ -196,8 +209,9 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-invalid",
       daemonPid: 1234,
-      version: "0.2.0-next.2",
+      version: "0.2.0-next.3",
       protocolVersion: "local-bridge-v1",
+      deploymentProfile: "preview",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",
       runtimePath: "relative/runtime",
@@ -212,6 +226,145 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       (await readdir(home)).filter(name => name.endsWith(".tmp")),
       []
     );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("deployment profiles migrate v1 homes to production and reject populated-home switching", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-profile-state-"));
+  const legacyPaths = resolveHunsuPaths({ home: join(root, "legacy") });
+  const previewPaths = resolveHunsuPaths({ home: join(root, "preview") });
+  const populatedPaths = resolveHunsuPaths({ home: join(root, "populated") });
+  try {
+    await mkdir(legacyPaths.home, { recursive: true });
+    await writeFile(legacyPaths.configFile, `${JSON.stringify({
+      schema: LEGACY_BRIDGE_CONFIG_SCHEMA,
+      host: "127.0.0.1",
+      port: 19687,
+      provider: { kind: "unconfigured" },
+      remote: { enabled: false }
+    })}\n`, "utf8");
+    const legacyStore = createConfigStore(legacyPaths);
+    assert.equal((await legacyStore.read()).deploymentProfile, "production");
+    assert.equal(JSON.parse(await readFile(legacyPaths.configFile, "utf8")).schema, LEGACY_BRIDGE_CONFIG_SCHEMA);
+    await legacyStore.ensureDeploymentProfile("production");
+    assert.deepEqual(
+      JSON.parse(await readFile(legacyPaths.configFile, "utf8")),
+      {
+        schema: BRIDGE_CONFIG_SCHEMA,
+        deploymentProfile: "production",
+        host: "127.0.0.1",
+        port: 19687,
+        provider: { kind: "unconfigured" },
+        remote: { enabled: false }
+      }
+    );
+    await assert.rejects(
+      () => legacyStore.ensureDeploymentProfile("preview"),
+      /cannot switch to preview/u
+    );
+
+    const previewStore = createConfigStore(previewPaths);
+    assert.equal((await previewStore.ensureDeploymentProfile("preview")).deploymentProfile, "preview");
+    await assert.rejects(
+      () => previewStore.ensureDeploymentProfile("production"),
+      /cannot switch to production/u
+    );
+
+    await mkdir(populatedPaths.home, { recursive: true });
+    await writeFile(populatedPaths.credentialsFile, "legacy durable state\n", "utf8");
+    await assert.rejects(
+      () => createConfigStore(populatedPaths).ensureDeploymentProfile("preview"),
+      /treated as production/u
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("deployment profiles resolve exact Web, Connect, signing-key, and setup-channel allowlists", () => {
+  assert.deepEqual(bridgeDeploymentEndpoints("production"), {
+    webUrl: "https://hunsu.app/studio",
+    connectApiUrl: "https://connect.hunsu.app",
+    connectWsUrl: "wss://connect.hunsu.app/v1/connect/device",
+    connectTicketIssuer: "https://connect.hunsu.app",
+    connectTicketSigningKeyId: "connect-Ea21pgXVRp5WfId1kXKSeyea",
+    connectTicketSigningPublicJwk: {
+      kty: "EC", crv: "P-256",
+      x: "SekGyUfv_HqJlJ35q9uE4cUzM7jWW6V6B7k4_HGy6ck",
+      y: "zY0W0qv5kHQKxF6aynjmy0kGv1XodPwF4MX4yvTW_C8"
+    }
+  });
+  assert.deepEqual(bridgeDeploymentEndpoints("preview"), {
+    webUrl: "https://preview.hunsu.app/studio",
+    connectApiUrl: "https://connect.preview.hunsu.app",
+    connectWsUrl: "wss://connect.preview.hunsu.app/v1/connect/device",
+    connectTicketIssuer: "https://connect.preview.hunsu.app",
+    connectTicketSigningKeyId: "connect-vd_GiPDTK2lPIDS3Y2dDIEck",
+    connectTicketSigningPublicJwk: {
+      kty: "EC", crv: "P-256",
+      x: "DZDAFyOricZ4dOBOhNrNtAS2X_EdqrE2wQxB23raNcc",
+      y: "qLXw7DinTp-5T0i_MdU9jN15Wpnxu0dXh-Owo5ydL1U"
+    }
+  });
+  assert.equal(bridgeSetupPackageTag("production"), "next");
+  assert.equal(bridgeSetupPackageTag("preview"), "candidate-next");
+});
+
+test("runtime install state migrates v1 without trusting an unversioned digest and validates v2 CLI integrity", async () => {
+  const home = await mkdtemp(join(tmpdir(), "hunsu-headless-runtime-install-state-"));
+  const paths = resolveHunsuPaths({ home });
+  const timestamp = "2026-07-12T00:00:00.000Z";
+  const runtimePath = join(paths.runtimeVersionsDirectory, "0.2.0-next.3");
+  const cliPath = join(runtimePath, "node_modules", "@hunsu", "bridge", "dist", "cli.js");
+  const legacy = {
+    schema: LEGACY_RUNTIME_INSTALL_SCHEMA,
+    installationId: "install_runtime_state_test",
+    current: {
+      packageVersion: "0.2.0-next.3",
+      runtimePath,
+      nodePath: process.execPath,
+      cliPath,
+      cliSha256: "a".repeat(64),
+      installedAt: timestamp
+    },
+    previous: null,
+    serviceInput: {
+      nodePath: process.execPath,
+      cliPath,
+      hunsuHome: home,
+      packageVersion: "0.2.0-next.3",
+      runtimePath,
+      deploymentProfile: "production"
+    },
+    updatedAt: timestamp
+  };
+  try {
+    await mkdir(paths.runtimeDirectory, { recursive: true });
+    await writeFile(paths.runtimeInstallFile, `${JSON.stringify(legacy)}\n`, "utf8");
+    const store = createRuntimeInstallStore(paths);
+    const migrated = await store.read();
+    assert.equal(migrated?.schema, RUNTIME_INSTALL_SCHEMA);
+    assert.equal(migrated?.current.cliSha256, null);
+    assert.equal(JSON.parse(await readFile(paths.runtimeInstallFile, "utf8")).schema, LEGACY_RUNTIME_INSTALL_SCHEMA);
+
+    assert.ok(migrated);
+    const trustedSha256 = "b".repeat(64);
+    await store.write({
+      ...migrated,
+      current: { ...migrated.current, cliSha256: trustedSha256 }
+    });
+    const persisted = JSON.parse(await readFile(paths.runtimeInstallFile, "utf8")) as {
+      schema: string;
+      current: { cliSha256: string };
+    };
+    assert.equal(persisted.schema, RUNTIME_INSTALL_SCHEMA);
+    assert.equal(persisted.current.cliSha256, trustedSha256);
+
+    persisted.current.cliSha256 = "not-a-sha256";
+    await writeFile(paths.runtimeInstallFile, `${JSON.stringify(persisted)}\n`, "utf8");
+    await assert.rejects(store.read(), /current\.cliSha256 must be a lowercase SHA-256 digest/u);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -289,10 +442,10 @@ test("Workspace service uses canonical stable IDs and typed Result failures", as
     assert.deepEqual(added.value.remoteAccess, { enabled: false, scopes: [] });
     const granted = await service.setRemoteAccess(added.value.workspaceId, {
       enabled: true,
-      scopes: ["remoteRelay.access"]
+      scopes: ["remote.access"]
     });
     assert.equal(granted.ok, true);
-    if (granted.ok) assert.deepEqual(granted.value.remoteAccess, { enabled: true, scopes: ["remoteRelay.access"] });
+    if (granted.ok) assert.deepEqual(granted.value.remoteAccess, { enabled: true, scopes: ["remote.access"] });
 
     const duplicate = await service.add(repository);
     assert.equal(duplicate.ok, false);

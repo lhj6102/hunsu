@@ -1,6 +1,12 @@
+import { execFile } from "node:child_process";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, resolve, win32 } from "node:path";
+import { promisify } from "node:util";
 import type { HunsuPaths } from "../state/paths.ts";
+import {
+  windowsCurrentUserOnlyFileAclPowerShellInvocation,
+  windowsPowerShellEnvironment
+} from "../windowsPowerShell.ts";
 import {
   invalidState,
   isNodeError,
@@ -31,7 +37,17 @@ export class HomeOwnershipError extends Error {
   }
 }
 
-export function createHomeOwnershipStore(paths: HunsuPaths): HomeOwnershipStore {
+export function createHomeOwnershipStore(
+  paths: HunsuPaths,
+  options: {
+    platform?: NodeJS.Platform;
+    processEnv?: Readonly<Record<string, string | undefined>>;
+    windowsAclHardener?: (path: string) => Promise<void>;
+  } = {}
+): HomeOwnershipStore {
+  const platform = options.platform ?? process.platform;
+  const windowsAclHardener = options.windowsAclHardener
+    ?? (path => hardenWindowsHomeOwnershipAcl(path, options.processEnv ?? {}));
   return {
     async read() {
       let stats;
@@ -51,7 +67,10 @@ export function createHomeOwnershipStore(paths: HunsuPaths): HomeOwnershipStore 
       await writeJsonStateAtomic(
         paths.homeOwnershipFile,
         decodeHomeOwnershipMarker(paths.homeOwnershipFile, marker),
-        { mode: 0o600 }
+        {
+          mode: 0o600,
+          ...(platform === "win32" ? { prepareTemporaryFile: windowsAclHardener } : {})
+        }
       );
     },
     async canonicalHome(create) {
@@ -85,6 +104,7 @@ export async function ensureHomeOwnership(input: {
     if (input.expectedInstallationId && existing.installationId !== input.expectedInstallationId) {
       throw new HomeOwnershipError("The Hunsu home ownership marker does not match the installed runtime.");
     }
+    await input.store.write(existing);
     return existing;
   }
 
@@ -107,6 +127,33 @@ export function sameCanonicalPath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
     : resolvedLeft === resolvedRight;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function hardenWindowsHomeOwnershipAcl(
+  path: string,
+  processEnv: Readonly<Record<string, string | undefined>>
+): Promise<void> {
+  const invocation = windowsHomeOwnershipAclPowerShellInvocation(path);
+  try {
+    await execFileAsync(invocation.command, invocation.args, {
+      env: windowsPowerShellEnvironment(processEnv),
+      windowsHide: true
+    });
+  } catch (_error) {
+    throw new HomeOwnershipError("The Hunsu home ownership marker ACL could not be restricted to the current Windows user.");
+  }
+}
+
+export function windowsHomeOwnershipAclPowerShellInvocation(path: string): {
+  command: "powershell.exe";
+  args: string[];
+} {
+  if (/[\u0000-\u001f\u007f]/u.test(path)) {
+    throw new HomeOwnershipError("The Hunsu home ownership marker path cannot contain control characters.");
+  }
+  return windowsCurrentUserOnlyFileAclPowerShellInvocation(path, "OwnershipMarkerPath");
 }
 
 function decodeHomeOwnershipMarker(file: string, value: unknown): HomeOwnershipMarker {

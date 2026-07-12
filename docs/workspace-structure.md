@@ -20,8 +20,9 @@ apps/hub-api
   -> packages/config
   -> packages/protocol-registry
 
-apps/relay
+apps/connect-api
   -> packages/config
+  -> packages/protocol
 
 packages/cli
   -> apps/bridge
@@ -67,11 +68,13 @@ Domain services do not contain CLI parsing, HTTP request objects, or
 service-manager logic. CLI-only code performs no direct product-state writes;
 setup and service installation are the narrow filesystem exceptions.
 
-## apps/hub-api and apps/relay
+## apps/hub-api and apps/connect-api
 
-Hub API serves immutable reusable package metadata and versions. Relay
-authenticates accounts and routes typed commands to outbound Bridge device
-connections. Neither service receives arbitrary local repository access.
+Hub API serves immutable reusable package metadata and versions. Connect
+authenticates accounts and devices, records device presence, issues short-lived
+peer tickets, and forwards only bounded opaque signaling between live sockets.
+It has no command or Workspace protocol. Neither service receives arbitrary
+local repository access.
 
 ## packages
 

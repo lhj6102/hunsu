@@ -522,7 +522,7 @@ function safeCliAction(args) {
 function sanitize(value) {
   return String(value)
     .replace(/([?&](?:hunsuBridgeToken|token|authorization)=)[^&#\s]+/giu, "$1[redacted]")
-    .replace(/\bhunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+\b/giu, "[redacted]")
+    .replace(/\bhunsu_(?:bridge|control|pairing|connect)_[A-Za-z0-9_-]+\b/giu, "[redacted]")
     .replace(/(Bearer\s+)[^\s,"']+/giu, "$1[redacted]")
     .slice(-16_000);
 }

@@ -2,11 +2,15 @@ name: Bridge Headless
 
 on:
   pull_request:
+    branches:
+      - preview
   push:
     branches:
       - main
+      - preview
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:

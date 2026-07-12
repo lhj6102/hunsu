@@ -3,14 +3,14 @@ export type ConfigResult<T> =
   | { ok: false; error: CloudflareConfigError };
 
 export type CloudflareConfigError = {
-  code: "invalid_enum" | "invalid_url" | "missing_required_env";
+  code: "invalid_enum" | "invalid_json" | "invalid_sha" | "invalid_url" | "invalid_value" | "missing_required_env";
   message: string;
   env?: string;
   value?: string;
   allowed?: readonly string[];
 };
 
-export type HunsuDeployTarget = "local" | "dev" | "production";
+export type HunsuDeployTarget = "local" | "dev" | "preview" | "production";
 
 export type HubCloudflareConfig = {
   target: HunsuDeployTarget;
@@ -20,6 +20,7 @@ export type HubCloudflareConfig = {
   compatibilityFlags: string[];
   originName: string;
   publicHubApiUrl: string;
+  releaseSha: string;
   d1DatabaseName: string;
   d1DatabaseId: string;
   r2BucketName: string;
@@ -27,24 +28,49 @@ export type HubCloudflareConfig = {
 };
 
 export type HubApiWorkerRuntimeConfig = {
+  target: HunsuDeployTarget;
   originName: string;
   publicHubApiUrl?: string;
+  releaseSha: string;
   adminToken?: string;
 };
 
 export type HubApiWorkerRuntimeEnv = {
+  HUNSU_DEPLOY_TARGET?: string;
   HUNSU_HUB_ORIGIN_NAME?: string;
   HUNSU_HUB_PUBLIC_API_URL?: string;
+  HUNSU_RELEASE_SHA?: string;
   HUNSU_HUB_ADMIN_TOKEN?: string;
+};
+
+export type ConnectCloudflareConfig = {
+  target: HunsuDeployTarget;
+  workerName: string;
+  workerMain: string;
+  compatibilityDate: string;
+  compatibilityFlags: string[];
+  apiBaseUrl: string;
+  webPublicUrl: string;
+  accessIssuer: string;
+  accessAud: string;
+  releaseSha: string;
+  d1DatabaseName: string;
+  d1DatabaseId: string;
+  signingPublicJwk: string;
+  signingKeyId: string;
 };
 
 export type Env = Record<string, string | undefined>;
 
-export const HUNSU_DEPLOY_TARGETS = ["local", "dev", "production"] as const;
+export const HUNSU_DEPLOY_TARGETS = ["local", "dev", "preview", "production"] as const;
 export const HUB_WRANGLER_GENERATED_CONFIG_PATH = ".wrangler/generated.toml";
 export const HUB_WORKER_MAIN = "../src/index.ts";
 export const HUB_WORKER_COMPATIBILITY_DATE = "2026-06-25";
 export const HUB_WORKER_COMPATIBILITY_FLAGS = ["nodejs_compat"] as const;
+export const CONNECT_WRANGLER_GENERATED_CONFIG_PATH = ".generated/wrangler.json";
+export const CONNECT_WORKER_MAIN = "../src/index.ts";
+export const CONNECT_WORKER_COMPATIBILITY_DATE = "2026-07-12";
+export const CONNECT_WORKER_COMPATIBILITY_FLAGS = ["nodejs_compat"] as const;
 
 const LOCAL_HUB_DEFAULTS = {
   HUNSU_HUB_WORKER_NAME: "hunsu-hub-api-local",
@@ -55,26 +81,31 @@ const LOCAL_HUB_DEFAULTS = {
   HUNSU_HUB_R2_BUCKET_NAME: "hunsu-hub-packages-local"
 } as const;
 
+const RELEASE_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
+
 export function resolveHubCloudflareConfig(env: Env): ConfigResult<HubCloudflareConfig> {
   return flatMapConfigResult(readDeployTarget(env), target =>
     flatMapConfigResult(readRequiredString(env, "HUNSU_HUB_WORKER_NAME", target), workerName =>
       flatMapConfigResult(readRequiredString(env, "HUNSU_HUB_ORIGIN_NAME", target), originName =>
         flatMapConfigResult(readRequiredUrl(env, "HUNSU_HUB_PUBLIC_API_URL", target), publicHubApiUrl =>
-          flatMapConfigResult(readRequiredString(env, "HUNSU_HUB_D1_DATABASE_NAME", target), d1DatabaseName =>
-            flatMapConfigResult(readRequiredString(env, "HUNSU_HUB_D1_DATABASE_ID", target), d1DatabaseId =>
-              mapConfigResult(readRequiredString(env, "HUNSU_HUB_R2_BUCKET_NAME", target), r2BucketName => ({
-                target,
-                workerName,
-                workerMain: HUB_WORKER_MAIN,
-                compatibilityDate: HUB_WORKER_COMPATIBILITY_DATE,
-                compatibilityFlags: [...HUB_WORKER_COMPATIBILITY_FLAGS],
-                originName,
-                publicHubApiUrl,
-                d1DatabaseName,
-                d1DatabaseId,
-                r2BucketName,
-                publishQueueName: readOptionalString(env, "HUNSU_HUB_PUBLISH_QUEUE_NAME")
-              }))
+          flatMapConfigResult(readReleaseSha(env, target), releaseSha =>
+            flatMapConfigResult(readRequiredString(env, "HUNSU_HUB_D1_DATABASE_NAME", target), d1DatabaseName =>
+              flatMapConfigResult(readRequiredString(env, "HUNSU_HUB_D1_DATABASE_ID", target), d1DatabaseId =>
+                mapConfigResult(readRequiredString(env, "HUNSU_HUB_R2_BUCKET_NAME", target), r2BucketName => ({
+                  target,
+                  workerName,
+                  workerMain: HUB_WORKER_MAIN,
+                  compatibilityDate: HUB_WORKER_COMPATIBILITY_DATE,
+                  compatibilityFlags: [...HUB_WORKER_COMPATIBILITY_FLAGS],
+                  originName,
+                  publicHubApiUrl,
+                  releaseSha,
+                  d1DatabaseName,
+                  d1DatabaseId,
+                  r2BucketName,
+                  publishQueueName: readOptionalString(env, "HUNSU_HUB_PUBLISH_QUEUE_NAME")
+                }))
+              )
             )
           )
         )
@@ -85,11 +116,17 @@ export function resolveHubCloudflareConfig(env: Env): ConfigResult<HubCloudflare
 
 export function resolveHubApiWorkerRuntimeConfig(env: HubApiWorkerRuntimeEnv): ConfigResult<HubApiWorkerRuntimeConfig> {
   return flatMapConfigResult(readRequiredRuntimeString(env, "HUNSU_HUB_ORIGIN_NAME"), originName =>
-    mapConfigResult(readOptionalRuntimeUrl(env, "HUNSU_HUB_PUBLIC_API_URL"), publicHubApiUrl => ({
-      originName,
-      publicHubApiUrl,
-      adminToken: readOptionalRuntimeString(env, "HUNSU_HUB_ADMIN_TOKEN")
-    }))
+    flatMapConfigResult(readRuntimeDeployTarget(env), target =>
+      flatMapConfigResult(readRuntimeReleaseSha(env, target), releaseSha =>
+        mapConfigResult(readOptionalRuntimeUrl(env, "HUNSU_HUB_PUBLIC_API_URL"), publicHubApiUrl => ({
+          target,
+          originName,
+          publicHubApiUrl,
+          releaseSha,
+          adminToken: readOptionalRuntimeString(env, "HUNSU_HUB_ADMIN_TOKEN")
+        }))
+      )
+    )
   );
 }
 
@@ -99,11 +136,25 @@ export function renderHubWranglerToml(config: HubCloudflareConfig): string {
     `name = ${tomlString(config.workerName)}`,
     `main = ${tomlString(config.workerMain)}`,
     `compatibility_date = ${tomlString(config.compatibilityDate)}`,
-    `compatibility_flags = [${config.compatibilityFlags.map(tomlString).join(", ")}]`,
+    `compatibility_flags = [${config.compatibilityFlags.map(tomlString).join(", ")}]`
+  ];
+
+  if (config.target === "preview" || config.target === "production") {
+    lines.push(
+      "",
+      "[[routes]]",
+      `pattern = ${tomlString(new URL(config.publicHubApiUrl).hostname)}`,
+      "custom_domain = true"
+    );
+  }
+
+  lines.push(
     "",
     "[vars]",
+    `HUNSU_DEPLOY_TARGET = ${tomlString(config.target)}`,
     `HUNSU_HUB_ORIGIN_NAME = ${tomlString(config.originName)}`,
     `HUNSU_HUB_PUBLIC_API_URL = ${tomlString(config.publicHubApiUrl)}`,
+    `HUNSU_RELEASE_SHA = ${tomlString(config.releaseSha)}`,
     "",
     "[[d1_databases]]",
     `binding = ${tomlString("HUB_DB")}`,
@@ -114,7 +165,7 @@ export function renderHubWranglerToml(config: HubCloudflareConfig): string {
     "[[r2_buckets]]",
     `binding = ${tomlString("HUB_PACKAGES")}`,
     `bucket_name = ${tomlString(config.r2BucketName)}`
-  ];
+  );
 
   if (config.publishQueueName) {
     lines.push(
@@ -126,6 +177,110 @@ export function renderHubWranglerToml(config: HubCloudflareConfig): string {
   }
 
   return `${lines.join("\n")}\n`;
+}
+
+export function resolveConnectCloudflareConfig(env: Env): ConfigResult<ConnectCloudflareConfig> {
+  return flatMapConfigResult(readDeployTarget(env), target =>
+    flatMapConfigResult(readRequiredConnectString(env, "HUNSU_CONNECT_WORKER_NAME"), workerName =>
+      flatMapConfigResult(readRequiredConnectUrl(env, "HUNSU_CONNECT_API_BASE_URL"), apiBaseUrl =>
+        flatMapConfigResult(readRequiredConnectUrl(env, "HUNSU_WEB_PUBLIC_URL"), webPublicUrl =>
+          flatMapConfigResult(readRequiredConnectUrl(env, "HUNSU_CONNECT_ACCESS_ISSUER"), accessIssuer =>
+            flatMapConfigResult(readRequiredConnectString(env, "HUNSU_CONNECT_ACCESS_AUD"), accessAud =>
+              flatMapConfigResult(readReleaseSha(env, target), releaseSha =>
+                flatMapConfigResult(readRequiredConnectString(env, "HUNSU_CONNECT_D1_DATABASE_NAME"), d1DatabaseName =>
+                  flatMapConfigResult(readRequiredConnectString(env, "HUNSU_CONNECT_D1_DATABASE_ID"), d1DatabaseId =>
+                    flatMapConfigResult(readRequiredConnectString(env, "HUNSU_CONNECT_SIGNING_PUBLIC_JWK"), publicJwk =>
+                      flatMapConfigResult(validateConnectPublicJwk(publicJwk), signingPublicJwk =>
+                        flatMapConfigResult(readRequiredConnectString(env, "HUNSU_CONNECT_SIGNING_KEY_ID"), signingKeyId => {
+                          if (!/^connect-[A-Za-z0-9_-]{16,64}$/u.test(signingKeyId)) {
+                            return err({
+                              code: "invalid_value",
+                              env: "HUNSU_CONNECT_SIGNING_KEY_ID",
+                              value: signingKeyId,
+                              message: "HUNSU_CONNECT_SIGNING_KEY_ID must be a stable credential-free Connect key id."
+                            });
+                          }
+                          if (!/^[A-Za-z0-9_-]{16,128}$/u.test(accessAud)) {
+                            return err({
+                              code: "invalid_value",
+                              env: "HUNSU_CONNECT_ACCESS_AUD",
+                              value: accessAud,
+                              message: "HUNSU_CONNECT_ACCESS_AUD must be one exact Cloudflare Access application audience."
+                            });
+                          }
+                          const accessUrl = new URL(accessIssuer);
+                          if (accessUrl.protocol !== "https:" || !accessUrl.hostname.endsWith(".cloudflareaccess.com") || accessUrl.pathname !== "/") {
+                            return err({
+                              code: "invalid_url",
+                              env: "HUNSU_CONNECT_ACCESS_ISSUER",
+                              value: accessIssuer,
+                              message: "HUNSU_CONNECT_ACCESS_ISSUER must be an HTTPS Cloudflare Access team issuer."
+                            });
+                          }
+                          return ok({
+                            target,
+                            workerName,
+                            workerMain: CONNECT_WORKER_MAIN,
+                            compatibilityDate: CONNECT_WORKER_COMPATIBILITY_DATE,
+                            compatibilityFlags: [...CONNECT_WORKER_COMPATIBILITY_FLAGS],
+                            apiBaseUrl,
+                            webPublicUrl,
+                            accessIssuer,
+                            accessAud,
+                            releaseSha,
+                            d1DatabaseName,
+                            d1DatabaseId,
+                            signingPublicJwk,
+                            signingKeyId
+                          });
+                        })
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  );
+}
+
+export function renderConnectWranglerJson(config: ConnectCloudflareConfig): string {
+  const hosted = config.target === "preview" || config.target === "production";
+  return `${JSON.stringify({
+    $schema: "../node_modules/wrangler/config-schema.json",
+    name: config.workerName,
+    main: config.workerMain,
+    compatibility_date: config.compatibilityDate,
+    compatibility_flags: config.compatibilityFlags,
+    workers_dev: !hosted,
+    preview_urls: false,
+    upload_source_maps: false,
+    observability: { enabled: true },
+    vars: {
+      HUNSU_DEPLOY_TARGET: config.target,
+      HUNSU_RELEASE_SHA: config.releaseSha,
+      HUNSU_CONNECT_API_BASE_URL: config.apiBaseUrl,
+      HUNSU_WEB_PUBLIC_URL: config.webPublicUrl,
+      HUNSU_CONNECT_ACCESS_ISSUER: config.accessIssuer,
+      HUNSU_CONNECT_ACCESS_AUD: config.accessAud,
+      HUNSU_CONNECT_SIGNING_PUBLIC_JWK: config.signingPublicJwk,
+      HUNSU_CONNECT_SIGNING_KEY_ID: config.signingKeyId
+    },
+    d1_databases: [{
+      binding: "CONNECT_DB",
+      database_name: config.d1DatabaseName,
+      database_id: config.d1DatabaseId,
+      migrations_dir: "../migrations"
+    }],
+    durable_objects: {
+      bindings: [{ name: "DEVICE_SIGNAL", class_name: "DeviceSignalDO" }]
+    },
+    migrations: [{ tag: "v1", new_sqlite_classes: ["DeviceSignalDO"] }],
+    ...(hosted ? { routes: [{ pattern: new URL(config.apiBaseUrl).hostname, custom_domain: true }] } : {})
+  }, null, 2)}\n`;
 }
 
 function ok<T>(value: T): ConfigResult<T> {
@@ -158,6 +313,23 @@ function readDeployTarget(env: Env): ConfigResult<HunsuDeployTarget> {
   });
 }
 
+function readRuntimeDeployTarget(env: HubApiWorkerRuntimeEnv): ConfigResult<HunsuDeployTarget> {
+  const raw = readOptionalRuntimeString(env, "HUNSU_DEPLOY_TARGET");
+  if (!raw) {
+    return missing("HUNSU_DEPLOY_TARGET");
+  }
+  if (isDeployTarget(raw)) {
+    return ok(raw);
+  }
+  return err({
+    code: "invalid_enum",
+    env: "HUNSU_DEPLOY_TARGET",
+    value: raw,
+    allowed: HUNSU_DEPLOY_TARGETS,
+    message: `Invalid HUNSU_DEPLOY_TARGET: ${raw}. Expected one of: ${HUNSU_DEPLOY_TARGETS.join(", ")}.`
+  });
+}
+
 function isDeployTarget(value: string): value is HunsuDeployTarget {
   return (HUNSU_DEPLOY_TARGETS as readonly string[]).includes(value);
 }
@@ -176,6 +348,68 @@ function readRequiredUrl(env: Env, envName: "HUNSU_HUB_PUBLIC_API_URL", target: 
     return missing(envName);
   }
   return validateUrl(raw, envName);
+}
+
+function readRequiredConnectString(env: Env, envName: string): ConfigResult<string> {
+  const raw = readOptionalString(env, envName);
+  return raw ? ok(raw) : missing(envName);
+}
+
+function readRequiredConnectUrl(env: Env, envName: string): ConfigResult<string> {
+  const raw = readOptionalString(env, envName);
+  return raw ? validateUrl(raw, envName) : missing(envName);
+}
+
+function validateConnectPublicJwk(value: string): ConfigResult<string> {
+  let jwk: unknown;
+  try {
+    jwk = JSON.parse(value);
+  } catch {
+    return err({
+      code: "invalid_json",
+      env: "HUNSU_CONNECT_SIGNING_PUBLIC_JWK",
+      message: "HUNSU_CONNECT_SIGNING_PUBLIC_JWK must be valid JSON."
+    });
+  }
+  if (!isRecord(jwk)
+    || jwk.kty !== "EC"
+    || jwk.crv !== "P-256"
+    || typeof jwk.x !== "string"
+    || typeof jwk.y !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(jwk.x)
+    || !/^[A-Za-z0-9_-]{43}$/u.test(jwk.y)
+    || "d" in jwk) {
+    return err({
+      code: "invalid_value",
+      env: "HUNSU_CONNECT_SIGNING_PUBLIC_JWK",
+      message: "HUNSU_CONNECT_SIGNING_PUBLIC_JWK must be a public P-256 JWK without private material."
+    });
+  }
+  return ok(JSON.stringify({ kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y }));
+}
+
+function readReleaseSha(env: Env, target: HunsuDeployTarget): ConfigResult<string> {
+  const raw = readOptionalString(env, "HUNSU_RELEASE_SHA") ?? (target === "local" ? "local" : undefined);
+  return validateReleaseSha(raw, target);
+}
+
+function readRuntimeReleaseSha(env: HubApiWorkerRuntimeEnv, target: HunsuDeployTarget): ConfigResult<string> {
+  return validateReleaseSha(readOptionalRuntimeString(env, "HUNSU_RELEASE_SHA"), target);
+}
+
+function validateReleaseSha(raw: string | undefined, target: HunsuDeployTarget): ConfigResult<string> {
+  if (!raw) {
+    return missing("HUNSU_RELEASE_SHA");
+  }
+  if ((target === "local" && raw === "local") || RELEASE_SHA_PATTERN.test(raw)) {
+    return ok(raw.toLowerCase());
+  }
+  return err({
+    code: "invalid_sha",
+    env: "HUNSU_RELEASE_SHA",
+    value: raw,
+    message: `Invalid HUNSU_RELEASE_SHA: ${raw}. Expected a complete 40- or 64-character Git commit SHA.`
+  });
 }
 
 function readRequiredRuntimeString(env: HubApiWorkerRuntimeEnv, envName: "HUNSU_HUB_ORIGIN_NAME"): ConfigResult<string> {
@@ -230,4 +464,8 @@ function missing(envName: string): ConfigResult<never> {
 
 function tomlString(value: string): string {
   return JSON.stringify(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

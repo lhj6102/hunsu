@@ -38,6 +38,8 @@ export * from "./result.ts";
 export * from "./primitives.ts";
 export * from "./prompt-template.ts";
 export * from "./lifecycle.ts";
+export * from "./connect.ts";
+export * from "./remote-peer.ts";
 export {
   decodeArtifactActionDefinition,
   decodeArtifactActionDefinitionArray

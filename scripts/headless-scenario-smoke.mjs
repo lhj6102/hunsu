@@ -13,7 +13,6 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHunsuRelayServer } from "../apps/relay/src/index.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -27,10 +26,6 @@ export async function runHeadlessScenario(options = {}) {
   const root = await mkdtemp(join(tmpdir(), "hunsu-headless-scenario-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  const relay = createHunsuRelayServer({
-    config: relayConfig(join(root, "relay-state.json")),
-    commandTimeoutMs: 4_000
-  });
   let daemon;
   let web;
   const captured = [];
@@ -41,7 +36,6 @@ export async function runHeadlessScenario(options = {}) {
   try {
     await initializeRepository(workspace, captured);
     const codexBinary = await createFakeCodexExecutable(root);
-    const relayUrls = await relay.listen();
     const webPort = await allocateFreePort();
     webUrl = `http://127.0.0.1:${webPort}`;
     const environment = {
@@ -52,10 +46,6 @@ export async function runHeadlessScenario(options = {}) {
       HUNSU_CODEX_APP_SERVER_COMMAND: codexBinary,
       HUNSU_CODEX_APP_SERVER_ARGS: JSON.stringify(["app-server", "--stdio"]),
       HUNSU_FAKE_CODEX_MODE: "ready",
-      HUNSU_BRIDGE_AUTH_BASE_URL: relayUrls.apiUrl,
-      HUNSU_RELAY_API_URL: relayUrls.apiUrl,
-      HUNSU_RELAY_PUBLIC_API_URL: relayUrls.apiUrl,
-      HUNSU_RELAY_WS_URL: relayUrls.wsUrl,
       NODE_OPTIONS: [
         process.env.NODE_OPTIONS,
         "--no-warnings",
@@ -119,46 +109,18 @@ export async function runHeadlessScenario(options = {}) {
     await waitForHealth(webUrl, web, captured);
     const webReadyMs = Math.round(performance.now() - startedAt);
 
-    const login = await runCli(["login", "--no-open", "--json"], environment, captured);
-    const approvalUrl = requiredUrl(login.value?.verificationUriComplete, "device approval URL");
-    const approval = await fetch(approvalUrl, { signal: AbortSignal.timeout(2_000) });
-    ensure(approval.ok, `device approval failed with HTTP ${approval.status}`);
-    await waitFor(async () => {
-      const remoteStatus = await runCli(["remote", "status", "--json"], environment, captured, { quiet: true });
-      return remoteStatus.value?.signedIn === true;
-    }, 8_000, "headless login completion");
-
     await runCli([
       "workspace", "grant", workspaceId,
-      "--scopes", "remoteRelay.access",
+      "--scopes", "remote.access",
       "--json"
     ], environment, captured);
-    await runCli(["remote", "enable", "--json"], environment, captured);
-    const connected = await waitFor(async () => {
-      const remoteStatus = await runCli(["remote", "status", "--json"], environment, captured, { quiet: true });
-      return remoteStatus.value?.connection === "connected" ? remoteStatus : undefined;
-    }, 8_000, "outbound Relay connection");
-    const credentials = JSON.parse(await readFile(join(home, "credentials.json"), "utf8"));
-    const accountToken = requiredString(credentials.account?.accessToken, "temporary account token");
-    const deviceId = requiredString(connected.value?.deviceId ?? credentials.relay?.deviceId, "Relay device id");
-    const roundTripResponse = await fetch(`${relayUrls.apiUrl}/v1/commands`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${accountToken}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ deviceId, command: "bridge.status" }),
-      signal: AbortSignal.timeout(5_000)
-    });
-    const roundTrip = await roundTripResponse.json();
-    ensure(roundTripResponse.ok && roundTrip.ok === true, "Relay command did not round-trip through Bridge");
-    ensure(!JSON.stringify(roundTrip).includes(workspace), "Relay status response exposed the local Workspace path");
+    const granted = await runCli(["workspace", "inspect", workspaceId, "--json"], environment, captured);
+    ensure(granted.value?.remoteAccess?.enabled === true, "Workspace grant was not persisted");
 
     await runCli(["workspace", "revoke", workspaceId, "--json"], environment, captured);
     const revoked = await runCli(["workspace", "inspect", workspaceId, "--json"], environment, captured);
     ensure(revoked.value?.remoteAccess?.enabled === false, "Workspace revoke did not persist before shutdown");
-    await runCli(["remote", "disable", "--json"], environment, captured);
-
+    const credentials = JSON.parse(await readFile(join(home, "credentials.json"), "utf8"));
     const controlToken = requiredString(credentials.controlToken, "temporary control token");
     const shutdown = await fetch(new URL("/v1/control/shutdown", endpoint), {
       method: "POST",
@@ -172,7 +134,7 @@ export async function runHeadlessScenario(options = {}) {
 
     const persistedLogs = await readTextTree(join(home, "logs"));
     const evidence = `${captured.join("\n")}\n${persistedLogs}`;
-    assertNoCredentialLeak(evidence, [controlToken, accountToken, credentials.account?.refreshToken, credentials.relay?.token]);
+    assertNoCredentialLeak(evidence, [controlToken]);
     const totalMs = Math.round(performance.now() - startedAt);
     process.stdout.write(`[headless-scenario] daemon ready: ${formatElapsed(daemonReadyMs)}\n`);
     process.stdout.write(`[headless-scenario] Web ready: ${formatElapsed(webReadyMs)}\n`);
@@ -181,7 +143,8 @@ export async function runHeadlessScenario(options = {}) {
   } finally {
     if (web) await terminateChildTree(web);
     if (daemon && !authenticatedShutdown) await terminateChildTree(daemon);
-    await relay.close().catch(() => undefined);
+    releaseChildHandles(web);
+    releaseChildHandles(daemon);
     if (options.keepState !== true) await rm(root, { recursive: true, force: true });
     else process.stdout.write(`[headless-scenario] state preserved at ${root}\n`);
   }
@@ -193,24 +156,13 @@ export function assertNoCredentialLeak(evidence, credentials = []) {
     ensure(!evidence.includes(credential), "scenario output or persisted logs contained a raw credential");
   }
   ensure(
-    !/\bhunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+\b/iu.test(evidence),
+    !/\bhunsu_(?:bridge|control|pairing|connect)_[A-Za-z0-9_-]+\b/iu.test(evidence),
     "scenario evidence contained token-shaped material"
   );
   ensure(
     !/authorization\s*[=:]\s*Bearer\s+(?!\[redacted\])/iu.test(evidence),
     "scenario evidence contained an Authorization value"
   );
-}
-
-function relayConfig(storagePath) {
-  return {
-    relay: { name: "relay", host: "127.0.0.1", hostSource: "override", port: 0, portSource: "override", reserved: false },
-    publicApiUrl: "http://127.0.0.1:0",
-    publicWsUrl: "ws://127.0.0.1:0/v1/device/connect",
-    issuer: "http://127.0.0.1:0",
-    storagePath,
-    processEnv: {}
-  };
 }
 
 async function initializeRepository(path, captured) {
@@ -353,17 +305,20 @@ async function assertPortReleased(endpoint) {
 
 async function waitForChildExit(child, timeoutMs) {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  await Promise.race([
-    new Promise(resolveExit => child.once("exit", resolveExit)),
-    delay(timeoutMs).then(() => { throw new Error("Foreground daemon did not exit after authenticated shutdown."); })
-  ]);
+  if (!await waitForExitWithin(child, timeoutMs)) {
+    throw new Error("Foreground daemon did not exit after authenticated shutdown.");
+  }
 }
 
 async function terminateChildTree(child) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
+    releaseChildHandles(child);
+    return;
+  }
   if (process.platform === "win32") {
     const killer = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
     await new Promise(resolveExit => killer.once("exit", resolveExit));
+    releaseChildHandles(child);
     return;
   }
   try {
@@ -371,14 +326,37 @@ async function terminateChildTree(child) {
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
   }
-  await Promise.race([new Promise(resolveExit => child.once("exit", resolveExit)), delay(2_000)]);
+  await waitForExitWithin(child, 2_000);
   if (child.exitCode === null && child.signalCode === null) {
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
     }
+    await waitForExitWithin(child, 500);
   }
+  releaseChildHandles(child);
+}
+
+function waitForExitWithin(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise(resolveExit => {
+    const finish = exited => {
+      clearTimeout(timeout);
+      child.removeListener("exit", onExit);
+      resolveExit(exited);
+    };
+    const onExit = () => finish(true);
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+function releaseChildHandles(child) {
+  child?.stdin?.destroy();
+  child?.stdout?.destroy();
+  child?.stderr?.destroy();
+  child?.unref();
 }
 
 function childOptions(env) {
@@ -417,7 +395,7 @@ async function readTextTree(root) {
 function sanitizeEvidence(value) {
   return String(value)
     .replace(/([?&](?:hunsuBridgeToken|token|authorization)=)[^&#\s]+/giu, "$1[redacted]")
-    .replace(/\bhunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+\b/giu, "[redacted]")
+    .replace(/\bhunsu_(?:bridge|control|pairing|connect)_[A-Za-z0-9_-]+\b/giu, "[redacted]")
     .replace(/(Bearer\s+)[^\s,"']+/giu, "$1[redacted]")
     .slice(-24_000);
 }

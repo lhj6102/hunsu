@@ -55,7 +55,7 @@ export const codexProviderCapabilities: RuntimeProviderCapabilities = {
   supportsSubscriptionAuth: true,
   supportsDeviceAuth: true,
   supportsApiKeyAuth: true,
-  supportsRemoteRelay: true,
+  supportsRemoteAccess: true,
   supportsAcp: false
 };
 

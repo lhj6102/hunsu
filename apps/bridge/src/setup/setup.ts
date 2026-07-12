@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
+import {
+  bridgeSetupPackageTag,
+  isBridgeDeploymentProfile,
+  type BridgeDeploymentProfile
+} from "../deploymentProfile.ts";
 import type { BridgeServiceManager, ServiceErrorCode, ServiceInstallInput, ServiceResult } from "../service/types.ts";
+import { createConfigStore, type ConfigStore } from "../state/configStore.ts";
 import type { CredentialStore } from "../state/credentialStore.ts";
 import type { HunsuPaths } from "../state/paths.ts";
 import {
@@ -14,7 +20,8 @@ import {
   serviceInputForInstallation,
   type RuntimeInstallDocument,
   type RuntimeInstallation,
-  type RuntimeInstallStore
+  type RuntimeInstallStore,
+  type VerifiedRuntimeInstallation
 } from "./runtimeInstaller.ts";
 import {
   executingBridgeRuntimeSource,
@@ -49,9 +56,11 @@ export type SetupVerification = {
   authenticated: boolean;
   version: string;
   runtimePath: string;
+  deploymentProfile: BridgeDeploymentProfile;
 };
 
 export type SetupFailurePhase =
+  | "profile-persistence"
   | "ownership-marker"
   | "credential-ensure"
   | "npm-install"
@@ -64,6 +73,7 @@ export type SetupFailurePhase =
   | "health-verification"
   | "authentication-verification"
   | "version-verification"
+  | "profile-verification"
   | "install-record-commit"
   | "candidate-service-cleanup"
   | "candidate-runtime-cleanup"
@@ -85,6 +95,7 @@ export type SetupResult =
       message: string;
       value: {
         packageVersion: string;
+        deploymentProfile: BridgeDeploymentProfile;
         runtimePath: string;
         cliPath: string;
         npmCommand: StagedRuntimeCommand;
@@ -107,6 +118,8 @@ export type SetupResult =
 
 export type BridgeSetupOptions = {
   paths: HunsuPaths;
+  deploymentProfile?: BridgeDeploymentProfile;
+  configStore?: Pick<ConfigStore, "ensureDeploymentProfile">;
   credentialStore: Pick<CredentialStore, "ensure">;
   serviceManager: BridgeServiceManager;
   verifyRuntime: (installation: RuntimeInstallation) => Promise<SetupVerification>;
@@ -135,6 +148,10 @@ type SetupAbort = {
 };
 
 export async function setupBridge(options: BridgeSetupOptions): Promise<SetupResult> {
+  const deploymentProfile = options.deploymentProfile ?? "production";
+  if (!isBridgeDeploymentProfile(deploymentProfile)) {
+    return failure("RUNTIME_INSTALL_FAILED", "Bridge deployment profile must be production or preview.");
+  }
   const nodeVersion = options.nodeVersion ?? process.version;
   if (!nodeVersionIsSupported(nodeVersion)) {
     return failure("NODE_VERSION_UNSUPPORTED", "Hunsu Bridge requires Node 24.18 or newer.");
@@ -156,7 +173,7 @@ export async function setupBridge(options: BridgeSetupOptions): Promise<SetupRes
   }
 
   if (options.dryRun) {
-    return success(plan, {
+    return success(plan, deploymentProfile, {
       idempotent: false,
       upgraded: false,
       started: false,
@@ -176,7 +193,7 @@ export async function setupBridge(options: BridgeSetupOptions): Promise<SetupRes
 
   let result: SetupResult;
   try {
-    result = await setupWhileLocked(options, plan, nodeVersion);
+    result = await setupWhileLocked(options, plan, nodeVersion, deploymentProfile);
   } catch (_error) {
     result = failure("RUNTIME_INSTALL_FAILED", "Hunsu Bridge setup failed unexpectedly before activation.");
   }
@@ -194,12 +211,26 @@ export async function setupBridge(options: BridgeSetupOptions): Promise<SetupRes
 async function setupWhileLocked(
   options: BridgeSetupOptions,
   plan: StagedRuntimePlan,
-  nodeVersion: string
+  nodeVersion: string,
+  deploymentProfile: BridgeDeploymentProfile
 ): Promise<SetupResult> {
   const installStore = options.installStore ?? createRuntimeInstallStore(options.paths);
   const transactionStore = options.transactionStore ?? createSetupTransactionStore(options.paths);
-  const ownershipStore = options.ownershipStore ?? createHomeOwnershipStore(options.paths);
+  const ownershipStore = options.ownershipStore ?? createHomeOwnershipStore(options.paths, {
+    ...(options.platform ? { platform: options.platform } : {}),
+    ...(options.processEnv ? { processEnv: options.processEnv } : {})
+  });
   const now = options.now ?? (() => new Date());
+
+  try {
+    await runPhase(options, "profile-persistence");
+    await (options.configStore ?? createConfigStore(options.paths)).ensureDeploymentProfile(deploymentProfile);
+  } catch (_error) {
+    return failure(
+      "RUNTIME_INSTALL_FAILED",
+      `HUNSU_HOME is already bound to a different Bridge deployment profile; use a clean home for ${deploymentProfile}.`
+    );
+  }
 
   let pending: SetupTransaction | undefined;
   try {
@@ -224,6 +255,12 @@ async function setupWhileLocked(
   } catch (_error) {
     return failure("RUNTIME_INSTALL_FAILED", "The installed Hunsu Bridge runtime record is invalid.");
   }
+  if (existing && existing.serviceInput.deploymentProfile !== deploymentProfile) {
+    return failure(
+      "RUNTIME_INSTALL_FAILED",
+      `The installed Bridge runtime is ${existing.serviceInput.deploymentProfile} and cannot switch to ${deploymentProfile} in the same HUNSU_HOME.`
+    );
+  }
 
   let installationId: string;
   try {
@@ -246,27 +283,32 @@ async function setupWhileLocked(
     return failure("RUNTIME_INSTALL_FAILED", "Hunsu Bridge credentials could not be created or preserved.");
   }
 
-  let candidate: RuntimeInstallation | undefined;
+  let candidate: VerifiedRuntimeInstallation | undefined;
   let transaction: SetupTransaction | undefined;
   let reusedStableRuntime = false;
+  let replacedRecordedRuntime = false;
   try {
     if (existing
       && existing.current.packageVersion === plan.packageVersion
       && samePath(existing.current.runtimePath, plan.runtimePath)
       && samePath(existing.current.cliPath, plan.cliPath)) {
       try {
-        await verifyExistingStableRuntime({
+        const verified = await verifyExistingStableRuntime({
           plan,
           ...(options.stagedFileSystem ? { fileSystem: options.stagedFileSystem } : {}),
           nodeVersion
         });
-        candidate = {
-          ...existing.current,
-          nodePath: plan.nodePath,
-          runtimePath: plan.runtimePath,
-          cliPath: plan.cliPath
-        };
-        reusedStableRuntime = true;
+        if (existing.current.cliSha256 !== null
+          && existing.current.cliSha256 === verified.cliSha256) {
+          candidate = {
+            ...existing.current,
+            nodePath: plan.nodePath,
+            runtimePath: plan.runtimePath,
+            cliPath: plan.cliPath,
+            cliSha256: verified.cliSha256
+          };
+          reusedStableRuntime = true;
+        }
       } catch (_error) {
         // A recorded same-version runtime is protected from automatic deletion;
         // the staged installer below will fail closed with repair guidance.
@@ -286,6 +328,11 @@ async function setupWhileLocked(
       });
       candidate = staged.installation;
       reusedStableRuntime = staged.reused;
+      replacedRecordedRuntime = Boolean(
+        existing
+        && samePath(existing.current.runtimePath, candidate.runtimePath)
+        && !staged.reused
+      );
     }
 
     const timestamp = now().toISOString();
@@ -301,7 +348,7 @@ async function setupWhileLocked(
     await runPhase(options, "transaction-write");
     await transactionStore.write(transaction);
 
-    const candidateServiceInput = serviceInputForInstallation(candidate, options.paths.home);
+    const candidateServiceInput = serviceInputForInstallation(candidate, options.paths.home, deploymentProfile);
     if (existing && !sameServiceInput(existing.serviceInput, candidateServiceInput)) {
       await runPhase(options, "previous-service-stop");
       const stopped = await options.serviceManager.stop();
@@ -317,7 +364,8 @@ async function setupWhileLocked(
     let started = false;
     const status = await options.serviceManager.status().catch(() => undefined);
     if (!status) throw abort("SERVICE_STATUS_UNAVAILABLE", "The candidate service status could not be read.");
-    if (installed.changed && (status.managerState === "running" || status.health === "healthy")) {
+    if ((installed.changed || replacedRecordedRuntime)
+      && (status.managerState === "running" || status.health === "healthy")) {
       await runPhase(options, "service-start");
       const restarted = await options.serviceManager.restart();
       if (!restarted.ok) throw serviceAbort(restarted);
@@ -341,6 +389,10 @@ async function setupWhileLocked(
     if (verification.version !== candidate.packageVersion || !samePath(verification.runtimePath, candidate.runtimePath)) {
       throw abort("SETUP_VERIFICATION_FAILED", "The candidate runtime version or stable path check failed.");
     }
+    await runPhase(options, "profile-verification");
+    if (verification.deploymentProfile !== deploymentProfile) {
+      throw abort("SETUP_VERIFICATION_FAILED", "The candidate runtime deployment profile check failed.");
+    }
     transaction = await updateTransaction(transactionStore, transaction, "candidate-verified", now);
     transaction = await updateTransaction(transactionStore, transaction, "committing", now);
 
@@ -355,7 +407,7 @@ async function setupWhileLocked(
     await installStore.write(document);
     await transactionStore.clear();
 
-    return success(plan, {
+    return success(plan, deploymentProfile, {
       idempotent: Boolean(existing && reusedStableRuntime && samePath(existing.current.runtimePath, candidate.runtimePath)),
       upgraded: Boolean(existing && existing.current.packageVersion !== candidate.packageVersion),
       started,
@@ -433,7 +485,11 @@ async function compensateTransaction(input: {
     });
     await attemptRollback(failures, "previous runtime verification", async () => {
       const verification = await safeVerify(options.verifyRuntime, previous.current);
-      if (!verificationSucceeded(verification, previous.current)) throw new Error("previous runtime verification failed");
+      if (!verificationSucceeded(
+        verification,
+        previous.current,
+        previous.serviceInput.deploymentProfile
+      )) throw new Error("previous runtime verification failed");
     });
     await attemptRollback(failures, "previous install record restore", () => installStore.write({
       ...previous,
@@ -481,7 +537,7 @@ async function updateTransaction(
 
 function nextInstallDocument(
   installationId: string,
-  current: RuntimeInstallation,
+  current: VerifiedRuntimeInstallation,
   existing: RuntimeInstallDocument | undefined,
   serviceInput: ServiceInstallInput,
   now: () => Date
@@ -510,16 +566,22 @@ async function safeVerify(
       health: false,
       authenticated: false,
       version: "unavailable",
-      runtimePath: "unavailable"
+      runtimePath: "unavailable",
+      deploymentProfile: "production"
     };
   }
 }
 
-function verificationSucceeded(verification: SetupVerification, installation: RuntimeInstallation): boolean {
+function verificationSucceeded(
+  verification: SetupVerification,
+  installation: RuntimeInstallation,
+  deploymentProfile: BridgeDeploymentProfile
+): boolean {
   return verification.health
     && verification.authenticated
     && verification.version === installation.packageVersion
-    && samePath(verification.runtimePath, installation.runtimePath);
+    && samePath(verification.runtimePath, installation.runtimePath)
+    && verification.deploymentProfile === deploymentProfile;
 }
 
 async function runPhase(options: BridgeSetupOptions, phase: SetupFailurePhase): Promise<void> {
@@ -591,7 +653,8 @@ function sameServiceInput(left: ServiceInstallInput, right: ServiceInstallInput)
     && samePath(left.cliPath, right.cliPath)
     && samePath(left.hunsuHome, right.hunsuHome)
     && left.packageVersion === right.packageVersion
-    && samePath(left.runtimePath, right.runtimePath);
+    && samePath(left.runtimePath, right.runtimePath)
+    && left.deploymentProfile === right.deploymentProfile;
 }
 
 function samePath(left: string, right: string): boolean {
@@ -615,8 +678,10 @@ function rollbackFailure(failures: readonly string[]): SetupResult {
 
 function success(
   plan: StagedRuntimePlan,
+  deploymentProfile: BridgeDeploymentProfile,
   state: Pick<Extract<SetupResult, { ok: true }>["value"], "idempotent" | "upgraded" | "started" | "dryRun">
 ): SetupResult {
+  const packageTag = bridgeSetupPackageTag(deploymentProfile);
   return {
     ok: true,
     code: "OK",
@@ -627,13 +692,14 @@ function success(
         : "Hunsu Bridge installed and verified.",
     value: {
       packageVersion: plan.packageVersion,
+      deploymentProfile,
       runtimePath: plan.runtimePath,
       cliPath: plan.cliPath,
       npmCommand: plan.npmCommand,
       commands: {
-        status: "npx @hunsu/bridge@next status",
-        doctor: "npx @hunsu/bridge@next doctor",
-        remove: "npx @hunsu/bridge@next remove"
+        status: `npx @hunsu/bridge@${packageTag} status --profile ${deploymentProfile}`,
+        doctor: `npx @hunsu/bridge@${packageTag} doctor --profile ${deploymentProfile}`,
+        remove: `npx @hunsu/bridge@${packageTag} remove --profile ${deploymentProfile}`
       },
       ...state
     }

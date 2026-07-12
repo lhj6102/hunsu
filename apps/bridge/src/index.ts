@@ -106,6 +106,7 @@ import {
   type CodexRuntimeStatus
 } from "./runtimes/codex.ts";
 import { sanitizeDiagnostics } from "./diagnostics/redaction.ts";
+import type { BridgeDeploymentProfile } from "./deploymentProfile.ts";
 import { createRuntimeProviderRegistry } from "./runtime-providers/registry.ts";
 import { createBridgeRuntimeProviderStore } from "./runtime-providers/currentProviderStore.ts";
 import {
@@ -117,29 +118,18 @@ import {
 import { handleProviderRoute } from "./providers/providerRoutes.ts";
 import type { RuntimeProviderRegistry, RuntimeProviderStatus } from "./runtime-providers/types.ts";
 import {
-  connectRemoteBridgeForRequest,
-  deactivateRemoteWorkspaceAccess,
-  localRemoteBridgeDevice,
-  publishRemoteWorkspaceAccess,
-  relayRequestConfig,
-  remoteBridgeDeviceStoreAccess,
-  type RemoteBridgeConnectRequest,
-  type BridgeCommandScope
-} from "./connections/remoteConnection.ts";
-import {
   bridgeVersionInfo,
   createStudioConnectionStatus
 } from "./connections/studioConnectionStatus.ts";
 import { handleConnectionRoute } from "./connections/connectionRoutes.ts";
 import { handleWorkspaceRoute } from "./workspaces/workspaceRoutes.ts";
 import {
-  accountStatusForBridgeRequest,
   createBridgeStatusForRequest,
   currentRuntimeProviderStatus
 } from "./server/bridgeStatus.ts";
-import { bridgeCodexSettingsFromState } from "./server/bridgeState.ts";
+import { bridgeCodexSettingsFromState, type BridgeCommandScope } from "./server/bridgeState.ts";
 import { createStudioHttpServer, studioRequestUrl } from "./server/createStudioServer.ts";
-import { handleRemoteBridgeRoute, handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
+import { handleScopedRoadmapRoute, handleStudioResourceRoute, isBridgeControlRoute, isHealthRoute, isPublicBridgeRoute } from "./server/routes.ts";
 import { baseCorsHeaders, createResponseSecurityHeaderStore } from "./server/security.ts";
 import type { HeadlessControlRouteHandler } from "./server/controlRoutes.ts";
 import { createPairingService, type PairingService } from "./pairing/pairingService.ts";
@@ -220,32 +210,10 @@ export {
 export type { ConnectedWorkspaceSummary } from "./workspaces/workspaceRegistry.ts";
 export { createLocalBackendStatus } from "./connections/localConnection.ts";
 export type { BridgeBackendStatus } from "./connections/localConnection.ts";
-export {
-  connectRemoteBridge,
-  connectRemoteBridgeForRequest,
-  createRemoteBackendStatus,
-  createRemoteWorkspacePublication,
-  listRemoteBridgeDevices,
-  listRemoteBridgeDevicesForRequest,
-  routeRemoteBridgeCommand,
-  streamRemoteBridgeCommand
-} from "./connections/remoteConnection.ts";
-export type {
-  BridgeCommandScope,
-  RelayCommandName,
-  RemoteBridgeCommandRequest,
-  RemoteBridgeCommandResult,
-  RemoteBridgeConnectRequest,
-  RemoteBridgeConnectResult,
-  RemoteBridgeDevice,
-  RemoteProjectGrantStatus,
-  RemoteProjectGrantStatusRequest,
-  RemoteProjectGrantStatusResult
-} from "./connections/remoteConnection.ts";
+export type { BridgeCommandScope } from "./server/bridgeState.ts";
 export {
   bridgeVersionInfo,
   createDisconnectedStudioConnectionStatus,
-  createRemoteStudioConnectionStatus,
   createStudioConnectionStatus,
   evaluateBridgeCompatibility
 } from "./connections/studioConnectionStatus.ts";
@@ -758,12 +726,14 @@ export type BridgeControlStatusResponse = {
   daemonPid: number;
   startedAt: string;
   state: "running";
+  deploymentProfile: BridgeDeploymentProfile;
 };
 
 export type StudioServerControlStatusOptions = {
   instanceId?: string;
   daemonPid?: number;
   startedAt?: string;
+  deploymentProfile?: BridgeDeploymentProfile;
 };
 
 type StudioServerSecurity = {
@@ -820,6 +790,7 @@ export type StudioServerOptions = {
   providerInventory?: ExecuteProviderInventorySource;
   security?: StudioServerSecurityOptions;
   controlStatus?: StudioServerControlStatusOptions;
+  deploymentProfile?: BridgeDeploymentProfile;
   controlRouteHandler?: HeadlessControlRouteHandler;
   providerService?: HeadlessProviderService;
   headlessRemote?: {
@@ -853,7 +824,7 @@ export type RoadmapRegistryEntry = {
   localAccess?: { enabled: boolean };
   remoteAccess?: {
     enabled: boolean;
-    scopes: Array<"remoteRelay.access" | "execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose">;
+    scopes: Array<"remote.access" | "execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose">;
   };
   codex?: {
     readyForExecute: boolean;
@@ -2355,7 +2326,8 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           ok: true,
           service: "hunsu-bridge",
           version: bridgeVersionInfo().bridgeVersion,
-          protocolVersion: "local-bridge-v1"
+          protocolVersion: "local-bridge-v1",
+          deploymentProfile: options.deploymentProfile ?? "production"
         });
         return;
       }
@@ -2442,15 +2414,6 @@ export function createStudioServer(options: StudioServerOptions = {}) {
         return;
       }
 
-      if (await handleRemoteBridgeRoute(request, response, pathname, url, {
-        runtimeConfig,
-        readJson,
-        sendJson,
-        responseHeaders: targetResponse => responseSecurityHeaders.get(targetResponse)
-      })) {
-        return;
-      }
-
       if (request.method === "GET" && pathname === "/api/prerequisites") {
         sendJson(response, 200, await prerequisiteStatus(runtimeConfig.processEnv, state));
         return;
@@ -2525,23 +2488,7 @@ export function createStudioServer(options: StudioServerOptions = {}) {
           providerRegistry,
           managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath })
         }),
-        account: () => accountStatusForBridgeRequest(request, runtimeConfig),
-        currentProvider: () => currentRuntimeProviderStatus(providerRegistry, runtimeConfig.processEnv),
-        remoteDevice: input => localRemoteBridgeDevice(runtimeConfig, input.account, input.status, input.provider),
-        relay: () => relayRequestConfig(request, runtimeConfig),
-        deviceStore: remoteBridgeDeviceStoreAccess({ relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH }),
-        managedRoadmaps: () => listManagedRoadmapRegistry({ roadmapRegistryPath }),
-        publishWorkspaceAccess: publication => publishRemoteWorkspaceAccess(publication, {
-          setWorkspaceRemoteAccess: (remoteAccessRequest, remoteAccess) => setRoadmapRemoteAccess(remoteAccessRequest, remoteAccess, { roadmapRegistryPath })
-        }),
-        deactivateWorkspaceAccess: () => deactivateRemoteWorkspaceAccess(listManagedRoadmapRegistry({ roadmapRegistryPath }), {
-          setWorkspaceRemoteAccess: (remoteAccessRequest, remoteAccess) => setRoadmapRemoteAccess(remoteAccessRequest, remoteAccess, { roadmapRegistryPath })
-        }),
         headlessRemote: options.headlessRemote,
-        connectRemote: body => connectRemoteBridgeForRequest(body as RemoteBridgeConnectRequest, request, runtimeConfig, {
-          relayRegistryPath: runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH
-        }),
-        readJson,
         sendJson
       })) {
         return;
@@ -2787,7 +2734,8 @@ function createBridgeControlStatus(
     bridgeVersion: version.bridgeVersion,
     daemonPid: positiveProcessId(options?.daemonPid) ?? process.pid,
     startedAt: options?.startedAt ?? new Date().toISOString(),
-    state: "running"
+    state: "running",
+    deploymentProfile: options?.deploymentProfile ?? "production"
   };
 }
 
@@ -6258,7 +6206,7 @@ function isPersistedBridgeCommandScope(value: string): value is BridgeCommandSco
     || value === "artifactAction.run"
     || value === "env.read"
     || value === "hostAlias.expose"
-    || value === "remoteRelay.access";
+    || value === "remote.access";
 }
 
 function readHeadlessWorkspaceTimestamps(path: string): Map<string, { createdAt: string }> {

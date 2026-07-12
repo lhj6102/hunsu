@@ -21,6 +21,8 @@ import {
 } from "../apps/bridge/src/setup/setupTransaction.ts";
 import { HUNSU_BRIDGE_VERSION } from "../apps/bridge/src/version.ts";
 
+const CLI_SHA256 = "0".repeat(64);
+
 test("setup operation lock serializes setup, removal, and service mutations", async () => {
   const home = await mkdtemp(join(tmpdir(), "hunsu-setup-lock-"));
   const paths = resolveHunsuPaths({ home });
@@ -86,6 +88,7 @@ test("setup transaction journal round-trips only the explicit transaction contra
       runtimePath: join(paths.runtimeVersionsDirectory, HUNSU_BRIDGE_VERSION),
       nodePath: process.execPath,
       cliPath: join(paths.runtimeVersionsDirectory, HUNSU_BRIDGE_VERSION, "node_modules", "@hunsu", "bridge", "dist", "cli.js"),
+      cliSha256: CLI_SHA256,
       installedAt: timestamp
     },
     previous: null,
@@ -117,6 +120,7 @@ test("offline doctor reports an incomplete setup phase without exposing transact
         runtimePath: join(paths.runtimeVersionsDirectory, HUNSU_BRIDGE_VERSION),
         nodePath: process.execPath,
         cliPath: join(paths.runtimeVersionsDirectory, HUNSU_BRIDGE_VERSION, "node_modules", "@hunsu", "bridge", "dist", "cli.js"),
+        cliSha256: CLI_SHA256,
         installedAt: timestamp
       },
       previous: null,
@@ -149,6 +153,7 @@ test("setup transaction journal strips unknown fields and rejects malformed cand
         runtimePath: join(paths.runtimeVersionsDirectory, HUNSU_BRIDGE_VERSION),
         nodePath: process.execPath,
         cliPath: join(paths.runtimeVersionsDirectory, HUNSU_BRIDGE_VERSION, "node_modules", "@hunsu", "bridge", "dist", "cli.js"),
+        cliSha256: CLI_SHA256,
         installedAt: timestamp,
         accidentalToken: "hunsu_control_must_not_persist"
       },

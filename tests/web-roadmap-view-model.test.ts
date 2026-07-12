@@ -1118,7 +1118,7 @@ async function loadRoadmapModule(): Promise<{ module: typeof RoadmapModule; clos
 	    },
 	    define: {
 	      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
-	      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+	      __HUNSU_CONNECT_API_BASE_URL__: JSON.stringify(""),
 	      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
 	    },
 	    server: {
@@ -1152,7 +1152,7 @@ async function loadStudioDataModule(): Promise<{ module: typeof StudioDataModule
 	    },
 	    define: {
 	      __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
-	      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+	      __HUNSU_CONNECT_API_BASE_URL__: JSON.stringify(""),
 	      __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
 	    },
 	    server: {
@@ -1186,7 +1186,7 @@ async function loadAgentChatModule(): Promise<{ module: { formatDurationMs: (dur
     },
     define: {
       __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
-      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_CONNECT_API_BASE_URL__: JSON.stringify(""),
       __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
     },
     server: {

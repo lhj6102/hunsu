@@ -8,7 +8,7 @@ OS user service manager
        -> local provider
        -> Workspace registry
        -> Local Bridge API and pairing
-       -> optional outbound Remote Relay
+       -> optional outbound Connect signaling and direct browser peer
 
 hunsu-bridge CLI
   -> authenticated local control API
@@ -20,6 +20,21 @@ hunsu.app
 The npm package remains @hunsu/bridge and the executable remains
 hunsu-bridge. The package owns the daemon, CLI client, service adapters, setup,
 state stores, and supported public library exports.
+
+## Deployment profiles
+
+The daemon has one durable `production | preview` deployment profile. This is
+an environment selection, not a second npm package, daemon, service name, or
+port. `config.json` is the authority and legacy v1 configuration migrates to
+`production`. A populated home cannot switch profiles because its account,
+device identity, and Connect credentials belong to that environment.
+
+Installed daemons resolve Web and Connect URLs plus the environment's exact
+ticket-signing public JWK from a fixed profile allowlist. Ambient variables
+cannot redirect an installed service. Preview uses `preview.hunsu.app` and
+`connect.preview.hunsu.app`; production uses `hunsu.app` and
+`connect.hunsu.app`. Development mode retains explicit injectable adapters for
+isolated local testing.
 
 ## Ownership
 

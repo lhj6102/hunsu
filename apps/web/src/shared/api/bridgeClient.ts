@@ -1,19 +1,26 @@
-import type { BoardProjection, Command } from "@hunsu/protocol";
+import {
+  type BoardProjection,
+  type Command
+} from "@hunsu/protocol";
 import { roadmapApiPath } from "@/app/routes";
 import {
   BRIDGE_API_BASE_URL,
-  RELAY_API_BASE_URL,
+  CONNECT_API_BASE_URL,
   bridgeApiEventUrl,
   bridgeApiRequestHeaders,
-  currentRelayAccessToken,
   currentRemoteBridgeSession,
   hasBridgeApiAuthToken,
-  hasDirectRelaySession,
-  relayApiHttpUrl,
-  relayApiRequestHeaders,
+  hasConnectConfigured,
   storeRemoteBridgeSession,
   type RemoteBridgeSession
 } from "@/shared/api/bridgeApiBase";
+import { fetchConnectDevices, type ConnectDevice } from "@/shared/api/connectClient";
+import {
+  currentActiveRemotePeer,
+  ensureActiveRemotePeer,
+  type PeerCommandDescriptor,
+  type PeerWorkspaceGrant
+} from "@/shared/api/peerTransport";
 import type {
   AgentSessionEvent,
   AgentSessionListResult,
@@ -51,8 +58,8 @@ import type {
   ProjectInspectionResult,
   RemoteBridgeConnectRequest,
   RemoteBridgeConnectResult,
+  RemoteBridgeDevice,
   RemoteBridgeDeviceListResult,
-  RemoteProjectGrantStatusResult,
   StudioRunSummary,
   StudioSkillSummary,
   WorktreeStatus
@@ -80,7 +87,7 @@ async function requestJson<T>(path: string, init?: RequestInit, label = "Bridge 
   try {
     response = await fetch(`${SERVER_URL}${path}`, {
       ...init,
-      headers: bridgeClientRequestHeaders(path, init?.headers)
+      headers: bridgeApiRequestHeaders(init?.headers)
     });
   } catch (error) {
     if (remoteStatusFallback) {
@@ -114,79 +121,46 @@ function remoteBridgeStatusFallbackCommand(path: string, method: string, body: u
   return remoteBridgeCommandForRequest(path, method, body, currentRemoteBridgeSession());
 }
 
-function bridgeClientRequestHeaders(path: string, headers: HeadersInit = {}): HeadersInit {
-  const next = new Headers(bridgeApiRequestHeaders(headers));
-  const relayToken = currentRelayAccessToken();
-  if (path.startsWith("/api/remote/") && relayToken) {
-    next.set("x-hunsu-relay-token", relayToken);
-  }
-  return next;
-}
-
 async function requestRemoteJson<T>(command: RemoteBridgeCommandRequest, label: string): Promise<T> {
-  if (hasDirectRelaySession()) {
-    const response = await fetch(relayApiHttpUrl("/v1/commands"), {
-      method: "POST",
-      headers: relayApiRequestHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify(command)
-    });
-    const result = await response.json().catch(() => ({ ok: false, error: `${label} failed through Relay with ${response.status}` })) as RemoteBridgeCommandResult;
-    if (result.ok === false) {
-      throw new Error(result.error ?? result.message ?? `${label} failed through Relay with ${response.status}`);
-    }
-    if (!response.ok) {
-      throw new Error(`${label} failed through Relay with ${response.status}`);
-    }
-    return normalizeRemoteCommandBody<T>(command, result.body);
+  const peer = currentActiveRemotePeer();
+  if (!peer || peer.device.deviceId !== command.deviceId) {
+    throw new Error(`${label} requires an authenticated Remote Bridge peer.`);
   }
-  const session = currentRemoteBridgeSession();
-  const nextHeaders = new Headers(bridgeApiRequestHeaders({ "content-type": "application/json" }));
-  if (session?.relayAccessToken) {
-    nextHeaders.set("x-hunsu-relay-token", session.relayAccessToken);
-  }
-  const response = await fetch(`${SERVER_URL}/api/remote/commands`, {
-    method: "POST",
-    headers: nextHeaders,
-    body: JSON.stringify(command)
-  });
-  const result = await response.json().catch(() => ({ ok: false, error: `${label} failed through Relay with ${response.status}` })) as RemoteBridgeCommandResult;
-  if (result.ok === false) {
-    throw new Error(result.error ?? result.message ?? `${label} failed through Relay with ${response.status}`);
-  }
-  if (!response.ok) {
-    throw new Error(`${label} failed through Relay with ${response.status}`);
-  }
-  return normalizeRemoteCommandBody<T>(command, result.body);
+  const body = await peer.request<unknown>(command.workspaceId, command.command);
+  return normalizeRemoteCommandBody<T>(command, body);
 }
 
 function normalizeRemoteCommandBody<T>(command: RemoteBridgeCommandRequest, body: unknown): T {
-  if (command.command !== "bridge.status") {
-    return body as T;
+  if (command.command.name !== "bridge.status") {
+    return sanitizeRemotePayload(body) as T;
   }
-  return normalizeRemoteBridgeStatus(body, currentRemoteBridgeSession() ?? { deviceId: command.deviceId }) as T;
+  return normalizeRemoteBridgeStatus(body, currentRemoteBridgeSession() ?? {
+    deviceId: command.deviceId,
+    workspaceId: command.workspaceId
+  }) as T;
 }
 
 function normalizeRemoteBridgeStatus(body: unknown, session: RemoteBridgeSession): unknown {
-  if (!isBridgeStatusLike(body)) {
-    return body;
+  const safeBody = sanitizeRemotePayload(body);
+  if (!isBridgeStatusLike(safeBody)) {
+    return safeBody;
   }
-  const local = body.connections.find(connection => connection.mode === "local") ?? body.connections[0];
-  const label = session.deviceName ?? local?.label ?? "Remote Bridge";
+  const local = safeBody.connections.find(connection => connection.mode === "local") ?? safeBody.connections[0];
+  const label = session.deviceLabel ?? local?.label ?? "Remote Bridge";
   const normalizeWorkspace = (workspace: BridgeStatusResponse["workspaces"]["active"][number]) => {
-    const granted = typeof session.projectPath === "string"
-      && typeof workspace.path === "string"
-      && normalizePathForRemoteSession(workspace.path) === normalizePathForRemoteSession(session.projectPath);
+    const granted = typeof session.workspaceId === "string" && workspace.workspaceId === session.workspaceId;
     return {
       ...workspace,
       backendId: `remote:${session.deviceId}`,
       connectionMode: "remote" as const,
-      path: granted ? workspace.path : undefined,
-      pathRedacted: granted ? undefined : true
+      path: undefined,
+      pathRedacted: true,
+      displayName: granted && session.workspaceLabel ? session.workspaceLabel : workspace.displayName
     };
   };
-  const workspaces = (local?.workspaces ?? body.workspaces.active).map(normalizeWorkspace);
+  const workspaces = (local?.workspaces ?? safeBody.workspaces.active).map(normalizeWorkspace);
   return {
-    ...body,
+    ...safeBody,
     connections: [{
       ...(local ?? {}),
       backendId: `remote:${session.deviceId}`,
@@ -204,18 +178,12 @@ function normalizeRemoteBridgeStatus(body: unknown, session: RemoteBridgeSession
     }],
     workspaces: {
       active: workspaces,
-      managed: body.workspaces.managed.map(normalizeWorkspace)
+      managed: safeBody.workspaces.managed.map(normalizeWorkspace)
     },
     account: {
-      ...body.account,
-      signedIn: true,
-      userId: body.account.userId ?? session.webUserId
+      signedIn: true
     }
   };
-}
-
-function normalizePathForRemoteSession(path: string): string {
-  return path.replace(/[\\/]+$/, "");
 }
 
 function isBridgeStatusLike(value: unknown): value is BridgeStatusResponse {
@@ -366,36 +334,64 @@ export async function postProjectInspect(input: string | { browseToken?: string;
 }
 
 export async function fetchRemoteBridgeDevices(): Promise<RemoteBridgeDeviceListResult["devices"]> {
-  if (hasDirectRelaySession()) {
-    const result = await requestDirectRelayJson<RemoteBridgeDeviceListResult>("/v1/devices", undefined, "Remote Bridge devices request");
-    return result.devices;
+  if (!hasConnectConfigured()) {
+    return [];
   }
-  const result = await requestJson<RemoteBridgeDeviceListResult>("/api/remote/devices", undefined, "Remote Bridge devices request");
-  return result.devices;
+  return (await fetchConnectDevices()).map(device => remoteDeviceFromConnect(device));
+}
+
+export async function connectRemoteBridgeDevice(deviceId: string): Promise<RemoteBridgeDevice> {
+  const devices = await fetchConnectDevices();
+  const connectDevice = devices.find(candidate => candidate.deviceId === deviceId);
+  if (!connectDevice) throw new Error("Remote Bridge device is not registered.");
+  if (connectDevice.status !== "online") throw new Error("Remote Bridge device is offline.");
+  const peer = await ensureActiveRemotePeer(connectDevice);
+  return remoteDeviceFromConnect(connectDevice, peer.grantedWorkspaces());
 }
 
 export async function postRemoteBridgeConnect(input: RemoteBridgeConnectRequest): Promise<RemoteBridgeConnectResult> {
-  if (hasDirectRelaySession()) {
-    const result = await connectRemoteBridgeThroughRelay(input);
-    if (shouldStoreRemoteBridgeSession(result)) {
-      storeRemoteBridgeSession({
-        deviceId: result.device.deviceId,
-        deviceName: result.device.deviceName,
-        projectPath: input.projectPath,
-        webUserId: input.webUserId,
-        relayAccessToken: currentRelayAccessToken()
-      });
-    }
-    return result;
+  if (!hasConnectConfigured()) {
+    throw new Error("Hunsu Connect is not configured for this Studio deployment.");
   }
-  const result = await postJson<RemoteBridgeConnectResult>("/api/remote/connect", input, "Remote Bridge connect");
+  const device = await connectRemoteBridgeDevice(input.deviceId);
+  const workspace = device.workspaces?.find(candidate => candidate.workspaceId === input.workspaceId);
+  if (!workspace) throw new Error("Bridge did not grant this Workspace to the peer session.");
+  const compatibility = remoteCompatibility(device, input);
+  const result: RemoteBridgeConnectResult = {
+    device,
+    compatibility,
+    connection: {
+      mode: "remote",
+      transport: "p2p",
+      health: compatibility.compatible ? "connected" : "error",
+      auth: "paired",
+      projectAccess: "granted",
+      bridge: {
+        id: device.deviceId,
+        name: device.deviceName,
+        version: device.bridgeVersion,
+        protocolVersion: device.protocolVersion,
+        lastSeenAt: device.lastSeenAt
+      },
+      endpoint: { connectLabel: CONNECT_API_BASE_URL || "Hunsu Connect" },
+      project: { roadmapId: workspace.roadmapId, displayName: workspace.displayName },
+      warnings: compatibility.compatible ? [] : ["version_mismatch"],
+      error: compatibility.compatible ? undefined : compatibility.message,
+      version: {
+        bridgeVersion: device.bridgeVersion ?? "unknown",
+        protocolVersion: device.protocolVersion,
+        supportedFeatures: ["remote-peer"]
+      },
+      compatibility
+    }
+  };
   if (shouldStoreRemoteBridgeSession(result)) {
-      storeRemoteBridgeSession({
-        deviceId: result.device.deviceId,
-        deviceName: result.device.deviceName,
-        projectPath: input.projectPath,
-        webUserId: input.webUserId
-      });
+    storeRemoteBridgeSession({
+      deviceId: result.device.deviceId,
+      deviceLabel: result.device.deviceName,
+      workspaceId: input.workspaceId,
+      workspaceLabel: input.workspaceLabel
+    });
   }
   return result;
 }
@@ -583,57 +579,9 @@ export function subscribeAgentSessionEvents(roadmapId: string, sessionId: string
 
 export type RemoteBridgeCommandRequest = {
   deviceId: string;
-  command:
-    | "health"
-    | "bridge.status"
-    | "connection.status"
-    | "provider.inventory"
-    | "modelAlias.validate"
-    | "modelAlias.resolve"
-    | "roadmap.registry.list"
-    | "roadmap.registry.remove"
-    | "roadmap.open"
-    | "roadmap.port.inspect"
-    | "roadmap.port.apply"
-    | "roadmap.create"
-    | "roadmap.board"
-    | "roadmap.worktree"
-    | "roadmap.skills"
-    | "roadmap.commands"
-    | "execute.start"
-    | "execute.pause"
-    | "execute.resume"
-    | "execute.stop"
-    | "execute.completeMove"
-    | "execute.status"
-    | "artifactAction.list"
-    | "artifactAction.runs"
-    | "artifactAction.start"
-    | "artifactAction.stop"
-    | "moveFile.tree"
-    | "moveFile.blob"
-    | "moveFile.diff"
-    | "hunsuDraft.list"
-    | "hunsuDraft.start"
-    | "hunsuDraft.get"
-    | "hunsuDraft.message"
-    | "hunsuDraft.diffArtifact.create"
-    | "hunsuDraft.diffArtifact.get"
-    | "hunsuDraft.approve"
-    | "hunsuDraft.discard"
-    | "line.accept"
-    | "line.reject"
-    | "agentSession.list"
-    | "agentSession.get"
-    | "agentSession.events"
-    | "live.events";
-  projectPath?: string;
-  payload?: unknown;
+  workspaceId: string;
+  command: PeerCommandDescriptor;
 };
-
-type RemoteBridgeCommandResult =
-  | { ok: true; status: number; body?: unknown }
-  | { ok: false; status?: number; error?: string; reason?: string; message?: string };
 
 export function remoteBridgeCommandForRequest(
   path: string,
@@ -643,7 +591,7 @@ export function remoteBridgeCommandForRequest(
 ): RemoteBridgeCommandRequest | undefined {
   const requestUrl = new URL(path, "http://hunsu.local");
   const pathname = requestUrl.pathname;
-  if (!session || pathname.startsWith("/api/remote/")) {
+  if (!session || !session.workspaceId?.trim() || pathname.startsWith("/api/remote/")) {
     return undefined;
   }
   const backendSelection = selectedWebBridgeBackend(requestUrl, body);
@@ -654,163 +602,182 @@ export function remoteBridgeCommandForRequest(
   const roadmapMatch = pathname.match(/^\/api\/roadmaps\/([^/]+)(\/.*)?$/);
   const roadmapId = roadmapMatch ? decodeURIComponent(roadmapMatch[1] ?? "") : undefined;
   const suffix = roadmapMatch?.[2] ?? "";
-  const projectPath = stringField(payload, "path") ?? session.projectPath;
+  const workspaceId = selectedWorkspaceId(payload, session, roadmapId);
   if (method === "GET" && pathname === "/api/roadmaps/recent") {
-    return { deviceId: session.deviceId, command: "roadmap.registry.list" };
+    return remoteCommand(session, "roadmap.registry.list");
   }
   if (method === "GET" && pathname === "/api/bridge/status") {
-    return { deviceId: session.deviceId, command: "bridge.status" };
+    return remoteCommand(session, "bridge.status");
   }
   if (method === "GET" && pathname === "/api/providers/inventory") {
     const backendId = requestUrl.searchParams.get("backendId")?.trim();
-    return {
-      deviceId: session.deviceId,
-      command: "provider.inventory",
-      ...(backendId ? { payload: { backendId } } : {})
-    };
+    return remoteCommand(session, "provider.inventory", backendId ? { backendId } : undefined);
   }
   if (method === "POST" && pathname === "/api/model-aliases/validate") {
-    return { deviceId: session.deviceId, command: "modelAlias.validate", payload: body };
+    return remoteCommand(session, "modelAlias.validate", body);
   }
   if (method === "POST" && pathname === "/api/model-aliases/resolve") {
-    return { deviceId: session.deviceId, command: "modelAlias.resolve", payload: body };
+    return remoteCommand(session, "modelAlias.resolve", body);
   }
   if (method === "POST" && pathname === "/api/roadmaps/recent/remove") {
-    return { deviceId: session.deviceId, command: "roadmap.registry.remove", projectPath, payload: body };
+    return workspaceId ? remoteCommand(session, "roadmap.registry.remove", body, workspaceId) : undefined;
   }
   if (method === "POST" && pathname === "/api/roadmaps/open") {
-    return { deviceId: session.deviceId, command: "roadmap.open", projectPath, payload: body };
+    return workspaceId ? remoteCommand(session, "roadmap.open", body, workspaceId) : undefined;
   }
   if (method === "POST" && pathname === "/api/roadmaps/create") {
-    return { deviceId: session.deviceId, command: "roadmap.create", projectPath, payload: body };
+    return workspaceId ? remoteCommand(session, "roadmap.create", body, workspaceId) : undefined;
   }
   if (method === "POST" && pathname === "/api/roadmaps/port/inspect") {
-    return { deviceId: session.deviceId, command: "roadmap.port.inspect", projectPath, payload: body };
+    return workspaceId ? remoteCommand(session, "roadmap.port.inspect", body, workspaceId) : undefined;
   }
   if (method === "POST" && pathname === "/api/roadmaps/port/apply") {
-    return { deviceId: session.deviceId, command: "roadmap.port.apply", projectPath, payload: body };
+    return workspaceId ? remoteCommand(session, "roadmap.port.apply", body, workspaceId) : undefined;
   }
-  if (!roadmapId) {
+  if (!roadmapId || !workspaceId) {
     return undefined;
   }
   if (method === "GET" && suffix === "/board") {
-    return { deviceId: session.deviceId, command: "roadmap.board", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "roadmap.board", { roadmapId }, workspaceId);
   }
   if (method === "GET" && suffix === "/worktree") {
-    return { deviceId: session.deviceId, command: "roadmap.worktree", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "roadmap.worktree", { roadmapId }, workspaceId);
   }
   if (method === "GET" && suffix === "/skills") {
-    return { deviceId: session.deviceId, command: "roadmap.skills", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "roadmap.skills", { roadmapId }, workspaceId);
   }
   if (method === "POST" && suffix === "/commands") {
-    return { deviceId: session.deviceId, command: "roadmap.commands", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "roadmap.commands", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "GET" && suffix === "/runs") {
-    return { deviceId: session.deviceId, command: "execute.status", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "execute.status", { roadmapId }, workspaceId);
   }
   if (method === "GET" && suffix === "/runs/events") {
-    return { deviceId: session.deviceId, command: "live.events", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "live.events", { roadmapId }, workspaceId);
   }
   if (method === "POST" && suffix === "/runs/start") {
-    return { deviceId: session.deviceId, command: "execute.start", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "execute.start", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "POST" && suffix === "/runs/pause") {
-    return { deviceId: session.deviceId, command: "execute.pause", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "execute.pause", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "POST" && suffix === "/runs/resume") {
-    return { deviceId: session.deviceId, command: "execute.resume", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "execute.resume", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "POST" && suffix === "/runs/stop") {
-    return { deviceId: session.deviceId, command: "execute.stop", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "execute.stop", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "POST" && suffix === "/runs/complete-move") {
-    return { deviceId: session.deviceId, command: "execute.completeMove", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "execute.completeMove", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "GET" && suffix === "/artifact-actions") {
-    return { deviceId: session.deviceId, command: "artifactAction.list", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "artifactAction.list", { roadmapId }, workspaceId);
   }
   if (method === "GET" && suffix === "/action-runs") {
-    return { deviceId: session.deviceId, command: "artifactAction.runs", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "artifactAction.runs", { roadmapId }, workspaceId);
   }
   const artifactStart = suffix.match(/^\/artifact-actions\/([^/]+)\/runs$/);
   if (method === "POST" && artifactStart) {
-    return { deviceId: session.deviceId, command: "artifactAction.start", projectPath, payload: { ...(payload ?? {}), roadmapId, actionId: decodeURIComponent(artifactStart[1] ?? "") } };
+    return remoteCommand(session, "artifactAction.start", { ...(payload ?? {}), roadmapId, actionId: decodeURIComponent(artifactStart[1] ?? "") }, workspaceId);
   }
   const artifactStop = suffix.match(/^\/action-runs\/([^/]+)\/stop$/);
   if (method === "POST" && artifactStop) {
-    return { deviceId: session.deviceId, command: "artifactAction.stop", projectPath, payload: { ...(payload ?? {}), roadmapId, runId: decodeURIComponent(artifactStop[1] ?? "") } };
+    return remoteCommand(session, "artifactAction.stop", { ...(payload ?? {}), roadmapId, runId: decodeURIComponent(artifactStop[1] ?? "") }, workspaceId);
   }
   const moveFilesRoute = suffix.match(/^\/moves\/([^/]+)\/files\/(tree|blob|diff)$/);
   if (method === "GET" && moveFilesRoute) {
     const action = moveFilesRoute[2];
-    return {
-      deviceId: session.deviceId,
-      command: action === "tree" ? "moveFile.tree" : action === "blob" ? "moveFile.blob" : "moveFile.diff",
-      projectPath,
-      payload: {
+    return remoteCommand(
+      session,
+      action === "tree" ? "moveFile.tree" : action === "blob" ? "moveFile.blob" : "moveFile.diff",
+      {
         roadmapId,
         moveId: decodeURIComponent(moveFilesRoute[1] ?? ""),
         path: requestUrl.searchParams.get("path") ?? undefined
-      }
-    };
+      },
+      workspaceId
+    );
   }
   if (method === "GET" && suffix === "/hunsu/drafts") {
-    return { deviceId: session.deviceId, command: "hunsuDraft.list", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "hunsuDraft.list", { roadmapId }, workspaceId);
   }
   if (method === "POST" && suffix === "/hunsu/drafts") {
-    return { deviceId: session.deviceId, command: "hunsuDraft.start", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "hunsuDraft.start", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   const hunsuDraft = suffix.match(/^\/hunsu\/drafts\/([^/]+)(?:\/(messages|diff-artifacts|approve|discard))?$/);
   if (hunsuDraft) {
     const draftSessionId = decodeURIComponent(hunsuDraft[1] ?? "");
     const action = hunsuDraft[2];
     if (method === "GET" && !action) {
-      return { deviceId: session.deviceId, command: "hunsuDraft.get", projectPath, payload: { roadmapId, draftSessionId } };
+      return remoteCommand(session, "hunsuDraft.get", { roadmapId, draftSessionId }, workspaceId);
     }
     if (method === "POST" && action === "messages") {
-      return { deviceId: session.deviceId, command: "hunsuDraft.message", projectPath, payload: { ...(payload ?? {}), roadmapId, draftSessionId } };
+      return remoteCommand(session, "hunsuDraft.message", { ...(payload ?? {}), roadmapId, draftSessionId }, workspaceId);
     }
     if (method === "POST" && action === "diff-artifacts") {
-      return { deviceId: session.deviceId, command: "hunsuDraft.diffArtifact.create", projectPath, payload: { ...(payload ?? {}), roadmapId, draftSessionId } };
+      return remoteCommand(session, "hunsuDraft.diffArtifact.create", { ...(payload ?? {}), roadmapId, draftSessionId }, workspaceId);
     }
     if (method === "POST" && action === "approve") {
-      return { deviceId: session.deviceId, command: "hunsuDraft.approve", projectPath, payload: { ...(payload ?? {}), roadmapId, draftSessionId } };
+      return remoteCommand(session, "hunsuDraft.approve", { ...(payload ?? {}), roadmapId, draftSessionId }, workspaceId);
     }
     if (method === "POST" && action === "discard") {
-      return { deviceId: session.deviceId, command: "hunsuDraft.discard", projectPath, payload: { ...(payload ?? {}), roadmapId, draftSessionId } };
+      return remoteCommand(session, "hunsuDraft.discard", { ...(payload ?? {}), roadmapId, draftSessionId }, workspaceId);
     }
   }
   const hunsuDraftDiffArtifact = suffix.match(/^\/hunsu\/drafts\/([^/]+)\/diff-artifacts\/([^/]+)$/);
   if (method === "GET" && hunsuDraftDiffArtifact) {
-    return {
-      deviceId: session.deviceId,
-      command: "hunsuDraft.diffArtifact.get",
-      projectPath,
-      payload: {
+    return remoteCommand(session, "hunsuDraft.diffArtifact.get", {
         roadmapId,
         draftSessionId: decodeURIComponent(hunsuDraftDiffArtifact[1] ?? ""),
         diffArtifactId: decodeURIComponent(hunsuDraftDiffArtifact[2] ?? "")
-      }
-    };
+      }, workspaceId);
   }
   if (method === "POST" && suffix === "/lines/accept") {
-    return { deviceId: session.deviceId, command: "line.accept", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "line.accept", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "POST" && suffix === "/lines/reject") {
-    return { deviceId: session.deviceId, command: "line.reject", projectPath, payload: payloadWithRoadmapId(payload, roadmapId) };
+    return remoteCommand(session, "line.reject", payloadWithRoadmapId(payload, roadmapId), workspaceId);
   }
   if (method === "GET" && suffix === "/agent-sessions") {
-    return { deviceId: session.deviceId, command: "agentSession.list", projectPath, payload: { roadmapId } };
+    return remoteCommand(session, "agentSession.list", { roadmapId }, workspaceId);
   }
   const agentSessionShow = suffix.match(/^\/agent-sessions\/([^/]+)$/);
   if (method === "GET" && agentSessionShow) {
-    return { deviceId: session.deviceId, command: "agentSession.get", projectPath, payload: { roadmapId, sessionId: decodeURIComponent(agentSessionShow[1] ?? "") } };
+    return remoteCommand(session, "agentSession.get", { roadmapId, sessionId: decodeURIComponent(agentSessionShow[1] ?? "") }, workspaceId);
   }
   const agentSessionEvents = suffix.match(/^\/agent-sessions\/([^/]+)\/events$/);
   if (method === "GET" && agentSessionEvents) {
-    return { deviceId: session.deviceId, command: "agentSession.events", projectPath, payload: { roadmapId, sessionId: decodeURIComponent(agentSessionEvents[1] ?? "") } };
+    return remoteCommand(session, "agentSession.events", { roadmapId, sessionId: decodeURIComponent(agentSessionEvents[1] ?? "") }, workspaceId);
   }
   return undefined;
+}
+
+function remoteCommand(
+  session: RemoteBridgeSession,
+  name: string,
+  payload?: unknown,
+  workspaceId?: string
+): RemoteBridgeCommandRequest {
+  return {
+    deviceId: session.deviceId,
+    workspaceId: workspaceId ?? session.workspaceId,
+    command: {
+      name,
+      ...(payload === undefined ? {} : { payload: sanitizeRemotePayload(payload) })
+    }
+  };
+}
+
+function selectedWorkspaceId(
+  payload: Record<string, unknown> | undefined,
+  session: RemoteBridgeSession,
+  roadmapId?: string
+): string {
+  return stringField(objectBody(payload?.workspace), "workspaceId")
+    ?? stringField(payload, "workspaceId")
+    ?? stringField(payload, "roadmapId")
+    ?? session.workspaceId
+    ?? roadmapId;
 }
 
 function payloadWithRoadmapId(payload: Record<string, unknown> | undefined, roadmapId: string): Record<string, unknown> {
@@ -818,59 +785,12 @@ function payloadWithRoadmapId(payload: Record<string, unknown> | undefined, road
 }
 
 function subscribeRemoteCommand<T>(command: RemoteBridgeCommandRequest, onEvent: (event: T) => void, onError: () => void): () => void {
-  const source = new EventSource(remoteBridgeCommandEventUrl(command));
-  const handleEvent = (event: Event) => {
-    const message = event as MessageEvent<string>;
-    if (message.type === "relay.error") {
-      onError();
-      return;
-    }
-    try {
-      onEvent(JSON.parse(message.data) as T);
-    } catch {
-      onError();
-    }
-  };
-  for (const eventName of REMOTE_STREAM_EVENT_NAMES) {
-    source.addEventListener(eventName, handleEvent);
+  const peer = currentActiveRemotePeer();
+  if (!peer || peer.device.deviceId !== command.deviceId) {
+    queueMicrotask(onError);
+    return () => undefined;
   }
-  source.onerror = () => onError();
-  return () => {
-    for (const eventName of REMOTE_STREAM_EVENT_NAMES) {
-      source.removeEventListener(eventName, handleEvent);
-    }
-    source.close();
-  };
-}
-
-const REMOTE_STREAM_EVENT_NAMES = [
-  "runs.snapshot",
-  "run.updated",
-  "agentSession.snapshot",
-  "agentSession.lifecycle",
-  "agentMessage.delta",
-  "agentMessage.completed",
-  "relay.error",
-  "message"
-] as const;
-
-function remoteBridgeCommandEventUrl(command: RemoteBridgeCommandRequest): string {
-  if (hasDirectRelaySession()) {
-    const url = new URL(relayApiHttpUrl("/v1/commands/events"));
-    url.searchParams.set("command", JSON.stringify(command));
-    const relayToken = currentRemoteBridgeSession()?.relayAccessToken || currentRelayAccessToken();
-    if (relayToken) {
-      url.searchParams.set("access_token", relayToken);
-    }
-    return url.toString();
-  }
-  const url = new URL(bridgeApiEventUrl("/api/remote/commands/events"), window.location.origin);
-  url.searchParams.set("command", JSON.stringify(command));
-  const relayToken = currentRemoteBridgeSession()?.relayAccessToken || currentRelayAccessToken();
-  if (relayToken) {
-    url.searchParams.set("hunsuRelayToken", relayToken);
-  }
-  return BRIDGE_API_BASE_URL ? url.toString() : `${url.pathname}${url.search}`;
+  return peer.subscribe(command.workspaceId, command.command, value => onEvent(sanitizeRemotePayload(value) as T), onError);
 }
 
 type WebBridgeBackendSelection = {
@@ -983,109 +903,64 @@ function stringField(value: Record<string, unknown> | undefined, field: string):
   return typeof candidate === "string" && candidate.trim() ? candidate.trim() : undefined;
 }
 
-async function requestDirectRelayJson<T>(path: string, init: RequestInit | undefined, label: string): Promise<T> {
-  const response = await fetch(relayApiHttpUrl(path), {
-    ...init,
-    headers: relayApiRequestHeaders(init?.headers)
-  });
-  if (!response.ok) {
-    const result = await response.json().catch(() => ({ error: `${label} failed with ${response.status}` })) as { error?: string; message?: string };
-    throw new Error(result.error ?? result.message ?? `${label} failed with ${response.status}`);
-  }
-  return response.json() as Promise<T>;
+function remoteDeviceFromConnect(device: ConnectDevice, grants?: PeerWorkspaceGrant[]): RemoteBridgeDeviceListResult["devices"][number] {
+  return {
+    deviceId: device.deviceId,
+    deviceName: device.deviceName,
+    status: device.status,
+    signingPublicKeyJwk: device.signingPublicKeyJwk,
+    agreementPublicKeyJwk: device.agreementPublicKeyJwk,
+    lastSeenAt: device.lastSeenAt,
+    protocolVersion: device.protocolVersion,
+    ...(grants ? {
+      workspaces: grants.map(grant => ({
+        workspaceId: grant.workspaceId,
+        roadmapId: grant.workspaceId,
+        displayName: grant.displayName,
+        pathRedacted: true,
+        lifecycle: "active",
+        health: "ok",
+        backendId: `remote:${device.deviceId}`,
+        connectionMode: "remote",
+        provider: { providerId: "remote", label: "Remote provider", readyForExecute: grant.scopes.includes("execute.start") },
+        actions: ["open_studio"]
+      }))
+    } : {})
+  };
 }
 
-async function connectRemoteBridgeThroughRelay(input: RemoteBridgeConnectRequest): Promise<RemoteBridgeConnectResult> {
-  const devices = await fetchRemoteBridgeDevices();
-  const device = devices.find(candidate => candidate.deviceId === input.deviceId);
-  if (!device) {
-    const compatibility = {
-      compatible: false as const,
-      reason: "bridge_update_needed" as const,
-      message: "Remote Bridge device is not registered."
-    };
-    return {
-      compatibility,
-      connection: {
-        mode: "remote",
-        transport: "relay",
-        health: "disconnected",
-        auth: "unknown",
-        projectAccess: "not_applicable",
-        warnings: ["relay_unavailable"],
-        error: "Remote Bridge device is not registered.",
-        version: unknownRemoteVersion(),
-        compatibility
-      }
-    };
+function sanitizeRemotePayload(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sanitizeRemotePayload);
   }
-  const projectAccess = input.projectPath?.trim()
-    ? await directRemoteProjectAccess(input)
-    : "not_applicable";
-  const compatibility = remoteCompatibility(device, input);
-  const sameUser = input.webUserId?.trim() ? input.webUserId.trim() === device.userId : undefined;
-  const version = {
-    bridgeVersion: device.bridgeVersion ?? "unknown",
-    protocolVersion: device.protocolVersion ?? "unknown",
-    supportedFeatures: ["remote-ready"]
-  };
-  return {
-    device,
-    compatibility,
-    connection: {
-      mode: "remote",
-      transport: "relay",
-      health: device.status === "online" ? "connected" : "disconnected",
-      auth: sameUser === false ? "account_mismatch" : "paired",
-      projectAccess,
-      bridge: {
-        id: device.deviceId,
-        name: device.deviceName,
-        version: device.bridgeVersion,
-        protocolVersion: device.protocolVersion,
-        lastSeenAt: device.lastSeenAt
-      },
-      endpoint: {
-        relayLabel: RELAY_API_BASE_URL || "Hunsu Relay"
-      },
-      account: {
-        webUserId: input.webUserId,
-        bridgeUserId: device.userId,
-        sameUser
-      },
-      project: input.projectPath?.trim() ? { repositoryPath: input.projectPath.trim() } : undefined,
-      warnings: [
-        ...(device.status === "online" ? [] : ["relay_unavailable" as const]),
-        ...(compatibility.compatible ? [] : ["version_mismatch" as const])
-      ],
-      error: device.status === "online"
-        ? compatibility.compatible ? undefined : compatibility.message
-        : "Remote Bridge device is offline.",
-      version,
-      compatibility
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (isHostedSecretField(key) || isCanonicalLocationField(key, child)) {
+      continue;
     }
-  };
+    sanitized[key] = sanitizeRemotePayload(child);
+  }
+  return sanitized;
 }
 
-async function directRemoteProjectAccess(input: RemoteBridgeConnectRequest): Promise<RemoteBridgeConnectResult["connection"]["projectAccess"]> {
-  const result = await requestDirectRelayJson<RemoteProjectGrantStatusResult>("/v1/project-grants/status", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      deviceId: input.deviceId,
-      projectPath: input.projectPath,
-      requestedScopes: ["remoteRelay.access"]
-    })
-  }, "Remote Project Grant status");
-  return result.projectAccess;
+function isHostedSecretField(field: string): boolean {
+  const normalized = field.toLowerCase();
+  return normalized.includes("token") || normalized.includes("authorization") || normalized.includes("credential");
 }
 
-function unknownRemoteVersion() {
-  return {
-    bridgeVersion: "unknown",
-    protocolVersion: "unknown",
-    supportedFeatures: []
-  };
+function isCanonicalLocationField(field: string, value: unknown): boolean {
+  const normalized = field.toLowerCase();
+  if (normalized.endsWith("path")
+    && (normalized.includes("repository") || normalized.includes("project") || normalized.includes("canonical") || normalized.includes("workspace") || normalized.includes("root"))) {
+    return true;
+  }
+  if ((normalized === "path" || normalized === "root" || normalized === "cwd") && typeof value === "string") {
+    return /^(?:\/|[a-z]:[\\/]|\\\\)/iu.test(value.trim());
+  }
+  return false;
 }
 
 function remoteCompatibility(device: RemoteBridgeDeviceListResult["devices"][number], input: RemoteBridgeConnectRequest): RemoteBridgeConnectResult["compatibility"] {

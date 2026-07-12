@@ -248,7 +248,8 @@ HUNSU_DEPLOY_TARGET=production pnpm --filter @hunsu/hub-api deploy
 The deploy contract is:
 
 ```text
-HUNSU_DEPLOY_TARGET=local|dev|production
+HUNSU_DEPLOY_TARGET=local|dev|preview|production
+HUNSU_RELEASE_SHA=... # complete Git commit SHA; required outside local
 HUNSU_HUB_WORKER_NAME=...
 HUNSU_HUB_ORIGIN_NAME=...
 HUNSU_HUB_PUBLIC_API_URL=...
@@ -259,9 +260,20 @@ HUNSU_HUB_PUBLISH_QUEUE_NAME=... # optional
 ```
 
 `local` has deterministic defaults so developers can print, migrate, and run a
-local Worker without provisioning Cloudflare resources first. `dev` and
-`production` require explicit resource names and IDs so a deployment cannot
-silently point at the wrong D1 database or R2 bucket.
+local Worker without provisioning Cloudflare resources first. `dev`, `preview`,
+and `production` require an immutable release SHA plus explicit resource names
+and IDs so a deployment cannot silently point at the wrong D1 database or R2
+bucket. The Worker exposes the configured service, target, origin, and release
+identity from the credential-free, non-cacheable `/health` endpoint.
+
+Cloudflare Pages loads `/hunsu-runtime-config.js` before the Web module bundle.
+The deployment-specific file is not part of the hashed application assets, so
+the same build output can move from preview to production with only this
+credential-free overlay changed. It assigns
+`window.__HUNSU_WEB_RUNTIME_CONFIG__` using schema
+`hunsu.web-runtime-config.v1` and supplies the deploy target, source SHA, exact
+Bridge package version, and Bridge, Hub, and Connect API base URLs. Hosted
+runtime config rejects mutable npm selectors and incomplete source SHAs.
 
 Bridge Hub development seeds the built-in Team and Manager examples after the Worker becomes
 reachable. `pnpm run dev` runs the Hub package `dev` script through Turbo; for
