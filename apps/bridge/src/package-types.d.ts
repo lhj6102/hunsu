@@ -69,6 +69,7 @@ export type BridgeDaemonOptions = HunsuPathInput & {
   host?: string;
   port?: number;
   cwd?: string;
+  runtimePath?: string;
   webUrl?: string;
   development?: boolean;
   serviceManager?: "windows-task-scheduler" | "macos-launch-agent" | "linux-systemd-user" | "development";
@@ -85,6 +86,7 @@ export type BridgeRuntimeIdentity = {
   protocolVersion: "local-bridge-v1";
   startedAt: string;
   endpoint: string;
+  runtimePath: string;
   serviceManager: NonNullable<BridgeDaemonOptions["serviceManager"]>;
   lastHealthyAt: string;
 };

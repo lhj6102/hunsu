@@ -198,6 +198,7 @@ export async function runBridgePackSmoke(options = {}) {
     assertCliSuccess(statusResult);
     assert.equal(statusResult.value?.endpoint, endpoint.toString().replace(/\/$/u, ""));
     assert.equal(statusResult.value?.version, manifest.version);
+    assert.equal(statusResult.value?.runtimePath, installDirectory);
 
     const credentialRotationRun = await run(command("npx"), [
       "--no-install",

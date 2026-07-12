@@ -15,12 +15,12 @@ on:
         description: Exact sha512 integrity reported by npm
         required: true
         type: string
-      npm_provenance_url:
-        description: Credential-free HTTPS provenance or transparency-log URL
+      evidence_url:
+        description: Public credential-free HTTPS URL to the retained redacted QA record
         required: true
         type: string
-      evidence_url:
-        description: Credential-free HTTPS URL to the retained redacted QA record
+      evidence_sha256:
+        description: Immutable sha256:<64 lowercase hex> digest of the retained QA record
         required: true
         type: string
       platform_evidence:
@@ -72,6 +72,10 @@ on:
 permissions:
   contents: read
 
+env:
+  NODE_VERSION: 22.18.0
+  NPM_VERSION: 11.13.0
+
 jobs:
   attest:
     name: Bind redacted production evidence
@@ -80,20 +84,69 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.version_tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22.18.0
+          node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
+      - name: Use npm with signed-attestation audit support
+        run: npm install --global "npm@${NPM_VERSION}"
+      - name: Pin the immutable candidate tag and checkout
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+          HUNSU_EVIDENCE_NPM_VERSION: ${{ inputs.npm_version }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
+            echo "Dispatch this attestation from the exact reviewed tag." >&2
+            exit 1
+          fi
+          checked_out_sha=$(git rev-parse HEAD)
+          if [[ "$checked_out_sha" != "$GITHUB_SHA" ]]; then
+            echo "The production attestation checkout does not match the dispatch SHA." >&2
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/${VERSION_TAG}:refs/tags/hunsu-production-attestation-tag"
+          remote_tag_sha=$(git rev-parse "refs/tags/hunsu-production-attestation-tag^{commit}")
+          if [[ "$remote_tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "The candidate tag moved after this production attestation was dispatched." >&2
+            exit 1
+          fi
+          if [[ "$VERSION_TAG" != "v$HUNSU_EVIDENCE_NPM_VERSION" ]]; then
+            echo "The Git tag and npm exact version do not match." >&2
+            exit 1
+          fi
+          package_version=$(node -p "require('./apps/bridge/package.json').version")
+          if [[ "$package_version" != "$HUNSU_EVIDENCE_NPM_VERSION" ]]; then
+            echo "The checked-out package version does not match the evidence." >&2
+            exit 1
+          fi
+      - name: Cryptographically verify exact npm provenance
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+          HUNSU_EVIDENCE_NPM_VERSION: ${{ inputs.npm_version }}
+          HUNSU_EVIDENCE_NPM_INTEGRITY: ${{ inputs.npm_integrity }}
+          npm_config_cache: ${{ runner.temp }}/npm-cache
+        shell: bash
+        run: |
+          audit_root="$RUNNER_TEMP/bridge-provenance-audit"
+          mkdir -p "$audit_root"
+          cd "$audit_root"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund --save-exact "@hunsu/bridge@$HUNSU_EVIDENCE_NPM_VERSION"
+          npm audit signatures --json --include-attestations > "$audit_root/audit.json"
+          cd "$GITHUB_WORKSPACE"
+          HUNSU_NPM_AUDIT_PATH="$audit_root/audit.json" node scripts/verify-bridge-npm-provenance.mjs > npm-provenance.json
       - name: Validate and bind the production evidence record
         id: evidence
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
           HUNSU_EVIDENCE_NPM_VERSION: ${{ inputs.npm_version }}
           HUNSU_EVIDENCE_NPM_INTEGRITY: ${{ inputs.npm_integrity }}
-          HUNSU_EVIDENCE_NPM_PROVENANCE_URL: ${{ inputs.npm_provenance_url }}
           HUNSU_EVIDENCE_URL: ${{ inputs.evidence_url }}
+          HUNSU_EVIDENCE_SHA256: ${{ inputs.evidence_sha256 }}
+          HUNSU_EVIDENCE_COPY_PATH: retained-qa-evidence.record
           HUNSU_EVIDENCE_PLATFORMS: ${{ inputs.platform_evidence }}
           HUNSU_EVIDENCE_HUNSU_APP_DEPLOYMENT: ${{ inputs.hunsu_app_deployment }}
           HUNSU_EVIDENCE_CODEX_VERSION: ${{ inputs.codex_version }}
@@ -106,19 +159,6 @@ jobs:
           GRANTED_WORKSPACE: ${{ inputs.granted_workspace }}
         shell: bash
         run: |
-          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
-            echo "Dispatch this attestation from the exact reviewed tag." >&2
-            exit 1
-          fi
-          if [[ "$VERSION_TAG" != "v$HUNSU_EVIDENCE_NPM_VERSION" ]]; then
-            echo "The Git tag and npm exact version do not match." >&2
-            exit 1
-          fi
-          package_version=$(node -p "require('./apps/bridge/package.json').version")
-          if [[ "$package_version" != "$HUNSU_EVIDENCE_NPM_VERSION" ]]; then
-            echo "The checked-out package version does not match the evidence." >&2
-            exit 1
-          fi
           for result in "$HUNSU_APP_PAIRING" "$HUNSU_LOGIN" "$RELAY_ROUND_TRIP" "$CODEX_PROVIDER" "$GRANTED_WORKSPACE"; do
             if [[ "$result" != "true" ]]; then
               echo "Every production integration result must be explicitly attested." >&2
@@ -128,14 +168,19 @@ jobs:
           record=$(node scripts/validate-bridge-production-evidence.mjs)
           registry=$(npm view "@hunsu/bridge@$HUNSU_EVIDENCE_NPM_VERSION" version dist.integrity --json)
           EVIDENCE_RECORD="$record" REGISTRY_RECORD="$registry" node --input-type=module -e '
-            import { writeFileSync } from "node:fs";
+            import { readFileSync, writeFileSync } from "node:fs";
             const record = JSON.parse(process.env.EVIDENCE_RECORD);
             const registry = JSON.parse(process.env.REGISTRY_RECORD);
+            const provenance = JSON.parse(readFileSync("npm-provenance.json", "utf8"));
             if (registry.version !== record.npm.version || registry["dist.integrity"] !== record.npm.integrity) {
               throw new Error("npm registry identity does not match the supplied production evidence.");
             }
+            if (provenance.source.gitSha !== process.env.GITHUB_SHA || provenance.source.ref !== `refs/tags/${process.env.VERSION_TAG}`) {
+              throw new Error("Verified npm provenance does not match the immutable candidate tag and SHA.");
+            }
             const bound = {
               ...record,
+              npm: { ...record.npm, provenance },
               git: { sha: process.env.GITHUB_SHA, tag: process.env.VERSION_TAG },
               results: {
                 hunsuAppPairing: true,
@@ -155,14 +200,16 @@ jobs:
               `- Tag: ${bound.git.tag}`,
               `- npm: @hunsu/bridge@${bound.npm.version}`,
               `- npm integrity: ${bound.npm.integrity}`,
-              `- npm provenance: ${bound.npm.provenanceUrl}`,
+              `- npm provenance: ${bound.npm.provenance.url}`,
+              `- Signed provenance source: ${bound.npm.provenance.source.repository}@${bound.npm.provenance.source.gitSha}`,
               `- Platforms: ${platforms}`,
               `- hunsu.app deployment: ${bound.hunsuAppDeployment}`,
               `- Codex: ${bound.codexVersion}`,
               `- Relay environment: ${bound.relayEnvironment}`,
               `- Workspace fixture: ${bound.workspaceFixtureId}`,
               "- Results: pairing, login, Relay round-trip/revocation, Codex readiness, and Workspace grant isolation passed",
-              `- Retained evidence: ${bound.evidenceUrl}`,
+              `- Retained evidence: ${bound.evidence.url}`,
+              `- Retained evidence digest: ${bound.evidence.sha256}`,
               ""
             ].join("\n");
             writeFileSync(process.env.GITHUB_STEP_SUMMARY, summary, { flag: "a" });
@@ -170,6 +217,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bridge-production-evidence-${{ github.sha }}
-          path: production-evidence.json
+          path: |
+            production-evidence.json
+            npm-provenance.json
+            retained-qa-evidence.record
           if-no-files-found: error
           retention-days: 90

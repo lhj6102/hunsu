@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.version_tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -39,6 +39,17 @@ jobs:
             echo "Dispatch registry smoke from the exact candidate tag." >&2
             exit 1
           fi
+          checked_out_sha=$(git rev-parse HEAD)
+          if [[ "$checked_out_sha" != "$GITHUB_SHA" ]]; then
+            echo "The registry smoke checkout does not match the dispatch SHA." >&2
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/${VERSION_TAG}:refs/tags/hunsu-registry-smoke-tag"
+          remote_tag_sha=$(git rev-parse "refs/tags/hunsu-registry-smoke-tag^{commit}")
+          if [[ "$remote_tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "The candidate tag moved after this registry smoke was dispatched." >&2
+            exit 1
+          fi
           version=$(node -p "require('./apps/bridge/package.json').version")
           if [[ "$VERSION_TAG" != "v$version" ]]; then
             echo "Candidate tag does not match the Bridge package version." >&2
@@ -51,7 +62,7 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "verified_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "verified_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
   service:
     name: Registry setup (${{ matrix.os }})

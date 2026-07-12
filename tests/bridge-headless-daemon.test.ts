@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import test from "node:test";
 import { createBridgeControlClient } from "../apps/bridge/src/client/controlClient.ts";
 import { BridgeError } from "../apps/bridge/src/client/cliResult.ts";
@@ -51,10 +51,28 @@ test("the daemon exposes the exact health contract, rejects unauthenticated cont
     assert.equal(statuses.every(result => result.ok && result.value && (result.value as { instanceId?: string }).instanceId === daemon.identity.instanceId), true);
     assert.deepEqual(await Promise.all(tracked.map(path => readFile(path, "utf8"))), before);
     assert.equal(process.pid, daemon.identity.daemonPid);
+    assert.equal(isAbsolute(daemon.identity.runtimePath), true);
+    assert.equal(statuses.every(result => result.ok
+      && result.value
+      && (result.value as { runtimePath?: string }).runtimePath === daemon.identity.runtimePath), true);
     const doctor = await client.request<{ state?: { credentialsPresent?: unknown } }>("/v1/control/doctor");
     assert.equal(doctor.ok, true);
     if (doctor.ok) assert.equal(typeof doctor.value?.state?.credentialsPresent, "boolean");
   });
+});
+
+test("daemon runtime identity rejects a relative runtime path before startup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-runtime-path-"));
+  try {
+    await assert.rejects(
+      () => startBridgeDaemon({ home: join(root, "state"), runtimePath: "relative/runtime" }),
+      (error: unknown) => error instanceof BridgeError
+        && error.code === "BRIDGE_STATE_INVALID"
+        && /runtime path must be absolute/u.test(error.message)
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("control client verifies exact loopback health before sending its credential", async () => {

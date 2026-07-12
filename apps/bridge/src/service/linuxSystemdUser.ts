@@ -75,7 +75,7 @@ export function linuxSystemdUserUnit(input: ServiceInstallInput): string {
     "",
     "[Service]",
     "Type=simple",
-    `ExecStart=${[input.nodePath, input.cliPath, "daemon"].map(systemdQuote).join(" ")}`,
+    `ExecStart=${[input.nodePath, input.cliPath, "daemon", "--runtime-path", input.runtimePath].map(systemdQuote).join(" ")}`,
     `Environment=${systemdQuote(`HUNSU_HOME=${input.hunsuHome}`)}`,
     "Restart=on-failure",
     "RestartSec=2",
@@ -91,4 +91,3 @@ function requireCommandSuccess(result: ServiceCommandResult, action: string): vo
     throw new Error(`Unable to ${action}.`);
   }
 }
-

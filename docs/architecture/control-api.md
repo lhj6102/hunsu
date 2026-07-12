@@ -67,6 +67,11 @@ Unknown, missing, or invalid credentials fail with
 - healthy Hunsu with a malformed control response:
   `BRIDGE_CONTROL_UNAVAILABLE`.
 
+Authenticated `GET /v1/control/status` includes the daemon's exact package
+version and stable runtime path. Transactional setup compares both values with
+the staged candidate before committing `runtime/install.json`; the
+unauthenticated health route never exposes the path.
+
 Safe state errors expose only a basename, stable code, and recovery guidance.
 Offline `doctor` still returns a successful diagnostic envelope; corrupt state
 appears as `BRIDGE_STATE_INVALID` issue entries without full paths or contents.

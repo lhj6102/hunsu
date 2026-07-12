@@ -95,6 +95,7 @@ export async function runBridgeServiceSmoke(input) {
     await runCli(launcher, ["workspace", "inspect", workspaceId, "--home", home, "--json"], environment, bootstrap);
     await runCli(launcher, ["pair", "--workspace", workspaceId, "--home", home, "--json"], environment, bootstrap);
     await assertPlatformDefinition(install, home);
+    const macOsLaunchAgentBeforeReplacement = await inspectMacOsLaunchAgent(install);
     await makeMacOsDefinitionStale(install);
 
     const secondSetup = await runCli(launcher, ["setup", ...launcher.setupArgs, "--home", home, "--json"], environment, bootstrap);
@@ -105,6 +106,7 @@ export async function runBridgeServiceSmoke(input) {
     const secondEndpoint = await waitForHealthyService(launcher, environment, bootstrap, launcher.version);
     ensure(secondEndpoint === endpoint, "same-version setup changed the configured endpoint or created another daemon");
     await assertPlatformDefinition(secondInstall, home);
+    await assertMacOsLaunchAgentReplaced(macOsLaunchAgentBeforeReplacement, secondInstall);
 
     await mkdir(home, { recursive: true });
     await writeFile(preservedFile, "preserve this user-owned smoke marker\n", "utf8");
@@ -198,6 +200,7 @@ async function assertPlatformDefinition(install, home) {
     const plist = await readFile(join(homedir(), "Library", "LaunchAgents", "app.hunsu.bridge.plist"), "utf8");
     ensure(plist.includes(nodePath) && plist.includes(cliPath), "LaunchAgent ProgramArguments did not use stable paths");
     ensure(plist.includes(`<string>${home}</string>`), "LaunchAgent did not bind the selected HUNSU_HOME");
+    await inspectMacOsLaunchAgent(install);
     return;
   }
   if (process.platform === "win32") {
@@ -224,6 +227,35 @@ async function assertPlatformDefinition(install, home) {
     ensure(String(aclValue.Rules[0]?.Identity).toLowerCase() === String(aclValue.CurrentIdentity).toLowerCase(), "Windows credentials ACL identity was not the current user");
     ensure(aclValue.Rules[0]?.Type === "Allow" && String(aclValue.Rules[0]?.Rights).includes("FullControl"), "Windows credentials ACL did not grant only current-user FullControl");
   }
+}
+
+async function inspectMacOsLaunchAgent(install) {
+  if (process.platform !== "darwin") return undefined;
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const loaded = await runCommand("launchctl", ["print", `gui/${uid}/app.hunsu.bridge`], {
+    cwd: repositoryRoot,
+    env: process.env
+  });
+  const pidMatch = loaded.stdout.match(/^\s*pid\s*=\s*(\d+)\s*$/imu);
+  const pid = Number(pidMatch?.[1]);
+  ensure(Number.isSafeInteger(pid) && pid > 0, "LaunchAgent did not expose one running daemon PID");
+  for (const argument of [
+    install.current.nodePath,
+    install.current.cliPath,
+    "daemon",
+    "--runtime-path",
+    install.current.runtimePath
+  ]) {
+    ensure(loaded.stdout.includes(argument), `loaded LaunchAgent arguments omitted ${basename(argument)}`);
+  }
+  return { pid };
+}
+
+async function assertMacOsLaunchAgentReplaced(previous, install) {
+  if (process.platform !== "darwin") return;
+  ensure(previous, "The initial loaded LaunchAgent state was not captured");
+  const current = await inspectMacOsLaunchAgent(install);
+  ensure(current.pid !== previous.pid, "changed LaunchAgent plist was rewritten without booting out the cached job");
 }
 
 async function makeMacOsDefinitionStale(install) {

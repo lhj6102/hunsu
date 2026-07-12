@@ -1,4 +1,5 @@
 import { unlink } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import type { HunsuPaths } from "./paths.ts";
 import { invalidState, isNodeError, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
 
@@ -14,6 +15,7 @@ export type BridgeRuntimeIdentity = {
   protocolVersion: "local-bridge-v1";
   startedAt: string;
   endpoint: string;
+  runtimePath: string;
   serviceManager: BridgeServiceManagerKind;
   lastHealthyAt: string;
 };
@@ -72,6 +74,7 @@ function decodeRuntimeIdentity(file: string, value: unknown): BridgeRuntimeIdent
     protocolVersion: requiredProtocolVersion(file, value.protocolVersion),
     startedAt: requiredString(file, "startedAt", value.startedAt),
     endpoint: requiredString(file, "endpoint", value.endpoint),
+    runtimePath: requiredAbsolutePath(file, "runtimePath", value.runtimePath),
     serviceManager,
     lastHealthyAt: requiredString(file, "lastHealthyAt", value.lastHealthyAt)
   };
@@ -85,6 +88,14 @@ function requiredProtocolVersion(file: string, value: unknown): "local-bridge-v1
 function requiredString(file: string, field: string, value: unknown): string {
   if (typeof value !== "string" || value.trim() === "") throw invalidState(file, `${field} must be non-empty`);
   return value;
+}
+
+function requiredAbsolutePath(file: string, field: string, value: unknown): string {
+  const path = requiredString(file, field, value);
+  if (!isAbsolute(path) || /[\u0000-\u001f\u007f]/u.test(path)) {
+    throw invalidState(file, `${field} must be an absolute path without control characters`);
+  }
+  return path;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

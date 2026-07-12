@@ -28,7 +28,7 @@ permissions:
 
 env:
   NODE_VERSION: 22.18.0
-  NPM_VERSION: 11.5.1
+  NPM_VERSION: 11.13.0
   PNPM_VERSION: 10.30.2
 
 jobs:
@@ -41,9 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.version_tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Require the selected exact tag on main
+      - name: Require the selected immutable tag merged to main
         id: identity
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
@@ -51,8 +51,8 @@ jobs:
           CONFIRM_PROMOTION: ${{ inputs.confirm_promotion }}
         shell: bash
         run: |
-          if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF_NAME" != "main" ]]; then
-            echo "Dispatch this protected workflow from main; version_tag selects the immutable release tag." >&2
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
+            echo "Dispatch this protected workflow from the exact immutable release tag." >&2
             exit 1
           fi
           node --input-type=module -e '
@@ -72,19 +72,24 @@ jobs:
               throw new Error("Promotion requires explicit confirmation after every exact-version gate passes.");
             }
           '
-          verified_sha=$(git rev-parse "${VERSION_TAG}^{commit}")
           checked_out_sha=$(git rev-parse HEAD)
-          if [[ "$verified_sha" != "$checked_out_sha" ]]; then
-            echo "The selected tag does not resolve to the checked-out commit." >&2
+          if [[ "$checked_out_sha" != "$GITHUB_SHA" ]]; then
+            echo "The release checkout does not match the dispatch SHA." >&2
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/${VERSION_TAG}:refs/tags/hunsu-release-dispatch-tag"
+          remote_tag_sha=$(git rev-parse "refs/tags/hunsu-release-dispatch-tag^{commit}")
+          if [[ "$remote_tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "The release tag moved after this workflow was dispatched." >&2
             exit 1
           fi
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$verified_sha" origin/main; then
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "Bridge releases must point to a commit already merged into main." >&2
             exit 1
           fi
           echo "package_version=${VERSION_TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "verified_sha=$verified_sha" >> "$GITHUB_OUTPUT"
+          echo "verified_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - name: Require successful Bridge Headless run for this commit
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -125,6 +130,7 @@ jobs:
             const successful = response.data.workflow_runs.find(run =>
               run.conclusion === "success"
               && run.event === "push"
+              && run.head_branch === process.env.VERSION_TAG
             );
             if (!successful) {
               core.setFailed(`No successful cross-platform local tarball setup run exists for ${process.env.VERSION_TAG}.`);
@@ -155,6 +161,7 @@ jobs:
               const successful = response.data.workflow_runs.find(run =>
                 run.conclusion === "success"
                 && run.event === "workflow_dispatch"
+                && run.head_branch === process.env.VERSION_TAG
               );
               if (!successful) {
                 core.setFailed(`No successful ${requirement.label} run exists for ${process.env.VERSION_TAG} (${process.env.VERIFIED_SHA}).`);

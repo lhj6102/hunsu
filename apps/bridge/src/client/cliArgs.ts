@@ -26,6 +26,7 @@ const VALUE_OPTIONS = new Set([
   "web-url",
   "channel",
   "runtime-package",
+  "runtime-path",
   "binary",
   "codex-home",
   "workspace",
@@ -97,7 +98,7 @@ function validateCommandOptions(parsed: ParsedBridgeCliArgs): void {
   switch (command) {
     case "dev":
     case "daemon":
-      addOptions(commandOptions, "host", "port", "cwd", "web-url");
+      addOptions(commandOptions, "host", "port", "cwd", "web-url", "runtime-path");
       break;
     case "setup":
       addOptions(commandOptions, "channel", "runtime-package", "dry-run");

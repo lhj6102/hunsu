@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { runBridgeCli } from "../apps/bridge/src/cli.ts";
+import { parseBridgeCliArgs, runBridgeCli } from "../apps/bridge/src/cli.ts";
 import { bridgeNotRunningResult } from "../apps/bridge/src/client/cliResult.ts";
 import { startBridgeDaemon, type RunningBridgeDaemon } from "../apps/bridge/src/daemon/daemon.ts";
 
@@ -70,6 +70,7 @@ test("global options are position-independent and duplicate, unknown, or command
       ["status", "--home", home, "--home", home, "--json"],
       ["status", "--unknown", "value", "--json"],
       ["status", "--binary", fakeCodexPath, "--json"],
+      ["status", "--runtime-path", root, "--json"],
       ["status", "--json=false"]
     ];
     for (const command of invalidCommands) {
@@ -82,6 +83,8 @@ test("global options are position-independent and duplicate, unknown, or command
       assert.equal(parsed.code, "BRIDGE_STATE_INVALID", command.join(" "));
       assert.equal(typeof parsed.message, "string", command.join(" "));
     }
+
+    assert.equal(parseBridgeCliArgs(["daemon", "--runtime-path", root]).flags.get("runtime-path"), root);
 
     const help = await invoke(["--json", "help"]);
     assert.equal(help.code, 0);

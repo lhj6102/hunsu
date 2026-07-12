@@ -64,6 +64,7 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
         host: getFlag(parsed, "host"),
         port: parseOptionalPort(getFlag(parsed, "port")),
         cwd: getFlag(parsed, "cwd"),
+        runtimePath: getFlag(parsed, "runtime-path"),
         webUrl: getFlag(parsed, "web-url"),
         development: command === "dev"
       });

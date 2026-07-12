@@ -53,15 +53,16 @@ git tag -a v0.2.0-next.1 -m "Release @hunsu/bridge 0.2.0-next.1 candidate"
 git push origin v0.2.0-next.1
 # Wait for bridge-service-smoke.yml on this exact tag to pass on all three OSes.
 gh workflow run publish-bridge.yml \
-  --ref main \
+  --ref v0.2.0-next.1 \
   -f version_tag=v0.2.0-next.1 \
   -f operation=publish-candidate \
   -f confirm_promotion=false
 ~~~
 
-The protected workflow verifies that the tag matches `apps/bridge/package.json`,
-resolves to a commit already merged into `main`, and has successful headless
-main and cross-platform local-tarball service runs. It builds and tests one
+The protected workflow pins the dispatch SHA, verifies that the remote tag has
+not moved, checks that the tag matches `apps/bridge/package.json`, resolves to a
+commit already merged into `main`, and has successful headless main and
+cross-platform local-tarball service runs. It builds and tests one
 pnpm-normalized tarball, retains its checksum, rechecks the tag and artifact,
 then publishes the exact version under `candidate-next` with provenance. It
 does not move `next` or `latest`.
@@ -97,30 +98,44 @@ Production QA then uses the same exact candidate on controlled devices. Test:
   rejection of an ungranted Workspace, revocation, and Remote disable;
 - local path redaction before and after grant changes.
 
-Dispatch `bridge-production-integration.yml` from the exact tag. Its inputs
-bind a retained redacted HTTPS record to Git SHA/tag, npm version/integrity and
-provenance, each OS/Node/service manager, hunsu.app deployment, Codex version,
-Relay environment, and opaque Workspace fixture ID. It validates the registry
-identity, rejects credential-like evidence, uploads a sanitized evidence
-record, and requires explicit booleans for every real integration gate.
+Dispatch `bridge-production-integration.yml` from the exact tag. Publish the
+redacted QA record at a public, credential-free HTTPS URL and calculate its
+immutable digest locally, for example:
+
+~~~sh
+sha256sum bridge-production-qa.json
+~~~
+
+Pass the digest as `sha256:<64 lowercase hex>`. The workflow pins the dispatch
+SHA, rechecks the remote tag, downloads the retained record without redirects,
+verifies its digest, rejects credential-like evidence, and retains the exact
+verified bytes with the attestation. It installs the exact npm candidate and
+uses npm 11.13's signed-attestation audit to verify the registry signature and
+SLSA provenance. The signed subject digest, Hunsu repository,
+`publish-bridge.yml`, candidate tag, and candidate Git SHA must all agree. The
+result binds those facts to each OS/Node/service manager, hunsu.app deployment,
+Codex version, Relay environment, and opaque Workspace fixture ID, and requires
+explicit booleans for every real integration gate. Do not supply provenance as
+an unchecked manual URL; it is derived from the verified npm attestation.
 
 Never include a control, pairing, account, refresh, or Relay token;
 Authorization header; token-bearing URL; or private repository path.
 
 ## Promotion
 
-After both exact-version workflows succeed, authorize promotion from `main`:
+After both exact-version workflows succeed, authorize promotion from the exact
+immutable candidate tag:
 
 ~~~sh
 gh workflow run publish-bridge.yml \
-  --ref main \
+  --ref v0.2.0-next.1 \
   -f version_tag=v0.2.0-next.1 \
   -f operation=promote-next \
   -f confirm_promotion=true
 ~~~
 
 The workflow requires successful registry-smoke and production-attestation
-runs whose `head_sha` and tag match the candidate, confirms
+runs whose `head_sha` and dispatch tag match the candidate, confirms
 `candidate-next=0.2.0-next.1`, and passes the protected promotion environment.
 It records the proof-of-presence command. An npm owner then runs:
 

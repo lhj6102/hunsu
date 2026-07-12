@@ -90,7 +90,8 @@ setup does not fabricate a marker immediately before a removal attempt.
 ## Release evidence
 
 Candidate evidence binds the Git SHA and tag, exact npm version and integrity,
-provenance URL, OS/Node/service-manager matrix, hunsu.app deployment, Codex
+npm-verified signed provenance, the immutable digest and retained bytes of the
+redacted QA record, OS/Node/service-manager matrix, hunsu.app deployment, Codex
 version, Relay environment, and an opaque disposable Workspace fixture ID.
 The record never contains a control, pairing, account, Relay, or Authorization
 credential. A candidate stays off `next` or `latest` until registry setup and
