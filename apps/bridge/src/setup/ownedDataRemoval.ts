@@ -55,6 +55,10 @@ export type OwnedDataDeletionResult = {
   homeDirectoryRemoved: boolean;
 };
 
+export type FinalizedOwnedDataDeletionResult = OwnedDataDeletionResult & {
+  runtimeDirectoryRemoved: boolean;
+};
+
 export class OwnedDataSafetyError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -114,10 +118,26 @@ export async function planOwnedDataDeletion(input: {
 
 export async function executeOwnedDataDeletion(
   plan: OwnedDataDeletionPlan,
-  fileSystem: OwnedDataFileSystem = defaultOwnedDataFileSystem
+  fileSystem: OwnedDataFileSystem = defaultOwnedDataFileSystem,
+  options: { preservePaths?: readonly string[] } = {}
 ): Promise<OwnedDataDeletionResult> {
+  const preservedPaths = new Set(
+    (options.preservePaths ?? []).map(path => {
+      assertLexicalContainment(plan.canonicalHome, path);
+      return resolve(path);
+    })
+  );
+  const removedEntries = new Set<HunsuOwnedHomeEntry>();
   for (const name of plan.entries) {
-    await removeOwnedEntry(fileSystem, plan.canonicalHome, join(plan.canonicalHome, name), ENTRY_TYPES[name]);
+    if (await removeOwnedEntry(
+      fileSystem,
+      plan.canonicalHome,
+      join(plan.canonicalHome, name),
+      ENTRY_TYPES[name],
+      preservedPaths
+    )) {
+      removedEntries.add(name);
+    }
   }
 
   const remaining = await safeReadDirectory(fileSystem, plan.canonicalHome);
@@ -134,9 +154,38 @@ export async function executeOwnedDataDeletion(
     }
   }
   return {
-    deleted: plan.existingEntries.filter(name => name !== ".hunsu-bridge-home.json"),
+    deleted: plan.existingEntries.filter(name => name !== ".hunsu-bridge-home.json" && removedEntries.has(name)),
     preservedUnknownEntries: unknownEntries(remaining),
     homeDirectoryRemoved
+  };
+}
+
+export async function finalizeOwnedDataDeletion(
+  plan: OwnedDataDeletionPlan,
+  fileSystem: OwnedDataFileSystem = defaultOwnedDataFileSystem
+): Promise<FinalizedOwnedDataDeletionResult> {
+  for (const name of plan.entries) {
+    if (ENTRY_TYPES[name] !== "directory") continue;
+    await removeOwnedDirectoryIfEmpty(fileSystem, plan.canonicalHome, join(plan.canonicalHome, name));
+  }
+
+  const remainingBeforeHomeRemoval = await safeReadDirectory(fileSystem, plan.canonicalHome);
+  let homeDirectoryRemoved = false;
+  if (remainingBeforeHomeRemoval.length === 0) {
+    homeDirectoryRemoved = await removeCanonicalHomeIfEmpty(fileSystem, plan.canonicalHome);
+  }
+
+  const remaining = homeDirectoryRemoved ? [] : await safeReadDirectory(fileSystem, plan.canonicalHome);
+  const deleted: string[] = [];
+  for (const name of plan.existingEntries) {
+    if (name === ".hunsu-bridge-home.json") continue;
+    if (!await safeLstat(fileSystem, join(plan.canonicalHome, name))) deleted.push(name);
+  }
+  return {
+    deleted,
+    preservedUnknownEntries: unknownEntries(remaining),
+    homeDirectoryRemoved,
+    runtimeDirectoryRemoved: !await safeLstat(fileSystem, join(plan.canonicalHome, "runtime"))
   };
 }
 
@@ -197,30 +246,91 @@ async function removeOwnedEntry(
   fileSystem: OwnedDataFileSystem,
   canonicalHome: string,
   path: string,
-  expectedType: ExpectedEntryType
-): Promise<void> {
+  expectedType: ExpectedEntryType,
+  preservedPaths: ReadonlySet<string>
+): Promise<boolean> {
   assertLexicalContainment(canonicalHome, path);
+  if (preservedPaths.has(resolve(path))) return false;
   const stats = await safeLstat(fileSystem, path);
-  if (!stats) return;
+  if (!stats) return true;
   if (stats.isSymbolicLink()) {
     await fileSystem.unlink(path);
-    return;
+    return true;
   }
   if (stats.isFile()) {
     if (expectedType === "directory") throw unexpectedType();
     await assertCanonicalContainment(fileSystem, canonicalHome, path);
     await fileSystem.unlink(path);
-    return;
+    return true;
   }
   if (!stats.isDirectory() || expectedType === "file") throw unexpectedType();
   await assertCanonicalContainment(fileSystem, canonicalHome, path);
+  let allChildrenRemoved = true;
   for (const child of await safeReadDirectory(fileSystem, path)) {
     assertSafeBasename(child);
     await assertDirectoryStillContained(fileSystem, canonicalHome, path);
-    await removeOwnedEntry(fileSystem, canonicalHome, join(path, child), "any");
+    if (!await removeOwnedEntry(fileSystem, canonicalHome, join(path, child), "any", preservedPaths)) {
+      allChildrenRemoved = false;
+    }
   }
   await assertDirectoryStillContained(fileSystem, canonicalHome, path);
-  await fileSystem.rmdir(path);
+  if (!allChildrenRemoved) return false;
+  try {
+    await fileSystem.rmdir(path);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return true;
+    if (isNodeError(error) && (error.code === "ENOTEMPTY" || error.code === "EEXIST")) return false;
+    throw error;
+  }
+}
+
+async function removeOwnedDirectoryIfEmpty(
+  fileSystem: OwnedDataFileSystem,
+  canonicalHome: string,
+  path: string
+): Promise<boolean> {
+  assertLexicalContainment(canonicalHome, path);
+  const stats = await safeLstat(fileSystem, path);
+  if (!stats) return true;
+  if (stats.isSymbolicLink() || !stats.isDirectory()) throw unexpectedType();
+  await assertCanonicalContainment(fileSystem, canonicalHome, path);
+  if ((await safeReadDirectory(fileSystem, path)).length > 0) return false;
+  try {
+    await fileSystem.rmdir(path);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return true;
+    if (isNodeError(error) && (error.code === "ENOTEMPTY" || error.code === "EEXIST")) return false;
+    throw error;
+  }
+}
+
+async function removeCanonicalHomeIfEmpty(
+  fileSystem: OwnedDataFileSystem,
+  canonicalHome: string
+): Promise<boolean> {
+  const stats = await safeLstat(fileSystem, canonicalHome);
+  if (!stats) return true;
+  if (stats.isSymbolicLink() || !stats.isDirectory()) throw unexpectedType();
+  let currentCanonicalHome: string;
+  try {
+    currentCanonicalHome = resolve(await fileSystem.realpath(canonicalHome));
+  } catch (error) {
+    throw new OwnedDataSafetyError("Canonical containment could not be re-established for the Hunsu home.", { cause: error });
+  }
+  if (!samePath(canonicalHome, currentCanonicalHome)) {
+    throw new OwnedDataSafetyError("The canonical Hunsu home changed during removal.");
+  }
+  if ((await safeReadDirectory(fileSystem, canonicalHome)).length > 0) return false;
+  try {
+    await fileSystem.rmdir(canonicalHome);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return true;
+    if (isNodeError(error) && (error.code === "ENOTEMPTY" || error.code === "EEXIST")) return false;
+    throw error;
+  }
 }
 
 async function assertDirectoryStillContained(

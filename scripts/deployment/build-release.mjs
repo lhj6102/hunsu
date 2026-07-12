@@ -10,6 +10,7 @@ import {
   gitValue,
   verifyRelease
 } from "./release-lib.mjs";
+import { cloudflareResourceAllowlist } from "./resource-allowlist.mjs";
 
 const scriptRoot = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptRoot, "../..");
@@ -89,10 +90,21 @@ cpSync(resolve(repositoryRoot, "apps/connect-api/migrations"), resolve(outputRoo
 
 const bridgePackage = JSON.parse(readFileSync(resolve(repositoryRoot, "apps/bridge/package.json"), "utf8"));
 const pnpmVersion = execFileSync("pnpm", ["--version"], { cwd: repositoryRoot, encoding: "utf8" }).trim();
+const connectTrust = Object.fromEntries(["preview", "production"].map(target => {
+  const resources = cloudflareResourceAllowlist(target);
+  return [target, {
+    apiOrigin: resources.connectApiBaseUrl,
+    accessIssuer: resources.connectAccessIssuer,
+    accessAudience: resources.connectAccessAud,
+    ticketSigningKeyId: resources.connectSigningKeyId,
+    ticketSigningPublicJwk: JSON.parse(resources.connectSigningPublicJwk)
+  }];
+}));
 createReleaseManifest(outputRoot, {
   sourceSha,
   sourceTree: gitValue(["rev-parse", "HEAD^{tree}"], repositoryRoot),
   bridgePackageVersion: bridgePackage.version,
+  connectTrust,
   repository: process.env.GITHUB_REPOSITORY ?? "local/hunsu",
   ref: process.env.GITHUB_REF ?? "local",
   workflowRunId: process.env.GITHUB_RUN_ID,

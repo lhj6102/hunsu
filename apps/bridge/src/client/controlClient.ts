@@ -168,7 +168,7 @@ async function probeHealthAt(fetchImpl: typeof fetch, endpoint: string, timeoutM
   try {
     response = await fetchImpl(new URL("/health", endpoint), {
       method: "GET",
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (_error) {

@@ -43,7 +43,8 @@ scope. Revocation is persisted before a subsequent command is authorized.
 
 ## Remote peer boundary
 
-Cloudflare Access protects only Connect's interactive `/auth/*` routes. Connect
+Cloudflare Access protects only Connect's interactive `/auth/login` and
+`/auth/device-enrollments` routes. Connect
 validates the Access JWT issuer, signature, expiry, and exact environment AUD
 before issuing its own HttpOnly, Secure, SameSite=Lax browser session. Bridge
 device requests use rotating proof-of-possession credentials instead of a

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -382,6 +382,68 @@ test("setup automatically recovers an interrupted first-install transaction befo
     assert.equal(result.ok, true);
     assert.equal(await exists(setupTransactionPath(fixture.paths)), false);
     assert.equal(fixture.service.installed(), true);
+    assert.equal(fixture.service.running(), true);
+    assert.equal(fixture.service.input()?.packageVersion, BRIDGE_PACKAGE_VERSION);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("pending setup recovery runs before corrupt deployment-profile state is validated", async () => {
+  const fixture = await createFixture();
+  try {
+    await fixture.prepareHome();
+    const candidate = await seedRuntime(fixture.paths, BRIDGE_PACKAGE_VERSION, "interrupted-before-corrupt-config");
+    fixture.service.seed(serviceInputForInstallation(candidate, fixture.paths.home), true, true);
+    const timestamp = "2026-07-12T00:00:00.000Z";
+    await createSetupTransactionStore(fixture.paths).write({
+      schema: SETUP_TRANSACTION_SCHEMA,
+      transactionId: "recover-before-corrupt-config",
+      phase: "candidate-started",
+      candidate,
+      previous: null,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    await writeFile(fixture.paths.configFile, "{corrupt", "utf8");
+
+    const result = await setupBridge(fixture.options());
+
+    assert.equal(result.ok, false);
+    assert.equal(fixture.service.installed(), false);
+    assert.equal(fixture.service.running(), false);
+    assert.equal(await exists(candidate.runtimePath), false);
+    assert.equal(await exists(setupTransactionPath(fixture.paths)), false);
+    assert.ok(fixture.events.indexOf("service.uninstall") < fixture.events.indexOf("phase:profile-persistence"));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("interrupted upgrade recovery restores the previous runtime before missing config is recreated", async () => {
+  const fixture = await createFixture();
+  try {
+    const previous = await fixture.seedPreviousRuntime("0.2.0-next.0");
+    const candidate = await seedRuntime(fixture.paths, BRIDGE_PACKAGE_VERSION, "interrupted-upgrade-candidate");
+    fixture.service.seed(serviceInputForInstallation(candidate, fixture.paths.home), true, true);
+    const timestamp = "2026-07-12T00:00:00.000Z";
+    await createSetupTransactionStore(fixture.paths).write({
+      schema: SETUP_TRANSACTION_SCHEMA,
+      transactionId: "recover-upgrade-before-config",
+      phase: "candidate-started",
+      candidate,
+      previous,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    await unlink(fixture.paths.configFile);
+
+    const result = await setupBridge(fixture.options({ transactionId: "setup-after-upgrade-recovery" }));
+
+    assert.equal(result.ok, true);
+    assert.ok(fixture.events.indexOf(`service.install:${previous.current.packageVersion}`)
+      < fixture.events.indexOf("phase:profile-persistence"));
+    assert.equal(await exists(setupTransactionPath(fixture.paths)), false);
     assert.equal(fixture.service.running(), true);
     assert.equal(fixture.service.input()?.packageVersion, BRIDGE_PACKAGE_VERSION);
   } finally {

@@ -42,6 +42,10 @@ assertCloudflareResourceAllowlist(target, {
   connectWorkerName: environment.connectWorkerName,
   connectD1DatabaseName: environment.connectD1DatabaseName,
   connectD1DatabaseId: environment.connectD1DatabaseId,
+  connectAccessIssuer: environment.connectAccessIssuer,
+  connectAccessAud: environment.connectAccessAud,
+  connectSigningPublicJwk: environment.connectSigningPublicJwk,
+  connectSigningKeyId: environment.connectSigningKeyId,
   workerName: environment.workerName,
   originName: environment.originName,
   hubPublicApiUrl,
@@ -50,6 +54,14 @@ assertCloudflareResourceAllowlist(target, {
   r2BucketName: environment.r2BucketName
 });
 const verified = verifyRelease(releaseRoot, { expectedSourceSha: sourceSha });
+const retainedConnectTrust = verified.manifest.connectTrust[target];
+if (retainedConnectTrust.apiOrigin !== connectApiBaseUrl
+  || retainedConnectTrust.accessIssuer !== environment.connectAccessIssuer
+  || retainedConnectTrust.accessAudience !== environment.connectAccessAud
+  || retainedConnectTrust.ticketSigningKeyId !== environment.connectSigningKeyId
+  || JSON.stringify(retainedConnectTrust.ticketSigningPublicJwk) !== environment.connectSigningPublicJwk) {
+  throw new Error("Protected Connect trust does not match the retained release and immutable Bridge candidate.");
+}
 
 rmSync(outputRoot, { recursive: true, force: true });
 mkdirSync(outputRoot, { recursive: true });
@@ -110,7 +122,7 @@ const connectUploadConfig = {
 writeFileSync(resolve(outputRoot, "connect/wrangler.json"), `${JSON.stringify(connectUploadConfig, null, 2)}\n`, "utf8");
 
 const deployment = {
-  schema: "hunsu.deployment-input.v2",
+  schema: "hunsu.deployment-input.v3",
   target,
   sourceSha,
   sourceTree: verified.manifest.source.tree,
@@ -120,6 +132,7 @@ const deployment = {
   hubPublicApiUrl,
   bridgeApiBaseUrl,
   connectApiBaseUrl,
+  connectTrust: retainedConnectTrust,
   resources: {
     pagesProject: environment.pagesProject,
     workerName: environment.workerName,

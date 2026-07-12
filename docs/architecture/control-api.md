@@ -18,8 +18,9 @@ GET /health is unauthenticated and returns only safe service identity:
 {
   "ok": true,
   "service": "hunsu-bridge",
-  "version": "0.2.0-next.7",
-  "protocolVersion": "local-bridge-v1"
+  "version": "0.2.0-next.8",
+  "protocolVersion": "local-bridge-v1",
+  "deploymentProfile": "production"
 }
 ~~~
 

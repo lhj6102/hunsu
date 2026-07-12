@@ -1,4 +1,4 @@
-export const RELEASE_SCHEMA: "hunsu.deployment-release.v3";
+export const RELEASE_SCHEMA: "hunsu.deployment-release.v4";
 export const PREVIEW_EVIDENCE_SCHEMA: "hunsu.preview-deployment-evidence.v1";
 export const WEB_RUNTIME_CONFIG_SCHEMA: "hunsu.web-runtime-config.v2";
 export const RELEASE_MANIFEST_FILE: "release-manifest.json";
@@ -7,6 +7,24 @@ export type ReleaseFile = {
   path: string;
   sha256: string;
   bytes: number;
+};
+
+export type ConnectTrustProfile = {
+  apiOrigin: string;
+  accessIssuer: string;
+  accessAudience: string;
+  ticketSigningKeyId: string;
+  ticketSigningPublicJwk: {
+    kty: "EC";
+    crv: "P-256";
+    x: string;
+    y: string;
+  };
+};
+
+export type ConnectTrust = {
+  preview: ConnectTrustProfile;
+  production: ConnectTrustProfile;
 };
 
 export type ReleaseManifest = {
@@ -18,6 +36,7 @@ export type ReleaseManifest = {
     ref: string;
   };
   bridgePackageVersion: string;
+  connectTrust: ConnectTrust;
   build: {
     workflowRunId: string;
     workflowRunAttempt: string;
@@ -46,6 +65,7 @@ export function createReleaseManifest(root: string, input: {
   sourceSha: string;
   sourceTree: string;
   bridgePackageVersion: string;
+  connectTrust: ConnectTrust;
   repository: string;
   ref: string;
   workflowRunId?: string;
@@ -62,3 +82,4 @@ export function safeReleasePath(root: string, relativePath: string): string;
 export function requireEnv(name: string, env?: Record<string, string | undefined>): string;
 export function validateBaseUrl(value: unknown, label: string, options?: { allowEmpty?: boolean }): string;
 export function relativePosix(from: string, to: string): string;
+export function normalizeConnectTrust(value: unknown): ConnectTrust;

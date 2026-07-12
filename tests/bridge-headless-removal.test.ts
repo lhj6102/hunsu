@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   access,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -35,6 +36,7 @@ import {
 } from "../apps/bridge/src/setup/runtimeInstaller.ts";
 import { removeBridge } from "../apps/bridge/src/setup/uninstall.ts";
 import { acquireSetupOperationLock } from "../apps/bridge/src/setup/setupTransaction.ts";
+import { defaultOwnedDataFileSystem } from "../apps/bridge/src/setup/ownedDataRemoval.ts";
 
 const INSTALLATION_ID = "install_removal_test_0001";
 const OTHER_INSTALLATION_ID = "install_removal_test_0002";
@@ -263,6 +265,152 @@ test("ordinary removal cleans a markerless next.0 runtime while preserving all u
   }
 });
 
+test("ordinary removal of a broad Documents-style home without an install only uninstalls the service", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-owned-documents-no-install-"));
+  const paths = resolveHunsuPaths({ home: join(root, "user", "Documents") });
+  try {
+    await mkdir(join(paths.home, "personal-project", "nested"), { recursive: true });
+    await Promise.all([
+      writeFile(paths.configFile, "user-owned config\n", "utf8"),
+      writeFile(join(paths.home, "user-notes.txt"), "preserve\n", "utf8"),
+      writeFile(join(paths.home, "personal-project", "nested", "keep.txt"), "preserve\n", "utf8")
+    ]);
+    const events: string[] = [];
+    const result = await removeBridge({}, { paths, serviceManager: fakeServiceManager(events) });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.deepEqual(result.value, {
+      removedRuntime: false,
+      deletedData: false,
+      deleted: [],
+      preservedUnknownEntries: ["personal-project", "user-notes.txt"],
+      homeDirectoryRemoved: false,
+      dryRun: false
+    });
+    assert.deepEqual(events, ["service.uninstall"]);
+    assert.equal(await readFile(paths.configFile, "utf8"), "user-owned config\n");
+    assert.equal(await readFile(join(paths.home, "user-notes.txt"), "utf8"), "preserve\n");
+    assert.equal(await readFile(join(paths.home, "personal-project", "nested", "keep.txt"), "utf8"), "preserve\n");
+    assert.equal(await exists(paths.runtimeDirectory), false, "the lock must not leave a new runtime behind");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary removal preserves an unverified existing runtime and reports that it was not removed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-owned-unverified-runtime-"));
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
+  try {
+    await mkdir(paths.runtimeDirectory, { recursive: true });
+    await writeFile(join(paths.runtimeDirectory, "user-owned.txt"), "preserve\n", "utf8");
+    await writeFile(paths.runtimeFile, "preserve\n", "utf8");
+    const events: string[] = [];
+    const result = await removeBridge({}, { paths, serviceManager: fakeServiceManager(events) });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.removedRuntime, false);
+    assert.deepEqual(result.value.deleted, []);
+    assert.deepEqual(events, ["service.uninstall"]);
+    assert.equal(await readFile(join(paths.runtimeDirectory, "user-owned.txt"), "utf8"), "preserve\n");
+    assert.equal(await readFile(paths.runtimeFile, "utf8"), "preserve\n");
+    assert.equal(await exists(paths.setupLockFile), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a valid-looking install record with external runtime paths cannot authorize broad-home deletion", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-owned-external-install-paths-"));
+  const paths = resolveHunsuPaths({ home: join(root, "user", "Documents") });
+  const externalRuntime = join(root, "external-runtime");
+  try {
+    const externalCli = join(externalRuntime, "node_modules", "@hunsu", "bridge", "dist", "cli.js");
+    await mkdir(dirname(externalCli), { recursive: true });
+    await writeFile(externalCli, "external CLI\n", "utf8");
+    await mkdir(paths.runtimeDirectory, { recursive: true });
+    await writeFile(join(paths.runtimeDirectory, "personal-runtime-data.txt"), "preserve\n", "utf8");
+    const current: RuntimeInstallation = {
+      ...runtimeInstallation(paths),
+      runtimePath: externalRuntime,
+      cliPath: externalCli
+    };
+    await createRuntimeInstallStore(paths).write({
+      schema: RUNTIME_INSTALL_SCHEMA,
+      installationId: null,
+      current,
+      previous: null,
+      serviceInput: serviceInputForInstallation(current, paths.home),
+      updatedAt: current.installedAt
+    });
+
+    const events: string[] = [];
+    const result = await removeBridge({}, { paths, serviceManager: fakeServiceManager(events) });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.removedRuntime, false);
+    assert.deepEqual(result.value.deleted, []);
+    assert.deepEqual(events, ["service.uninstall"]);
+    assert.equal(await readFile(join(paths.runtimeDirectory, "personal-runtime-data.txt"), "utf8"), "preserve\n");
+    assert.equal(await exists(paths.runtimeInstallFile), true);
+    assert.equal(await readFile(externalCli, "utf8"), "external CLI\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary runtime deletion keeps the setup lock until recursive deletion is finished", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-owned-runtime-lock-held-"));
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
+  try {
+    await writeCompleteOwnedHome(paths, { installationId: null, writeMarker: false });
+    const unlinked: string[] = [];
+    const fileSystem = {
+      ...defaultOwnedDataFileSystem,
+      async unlink(path: string) {
+        assert.notEqual(path, paths.setupLockFile, "owned-data deletion must not unlink its active operation lock");
+        assert.equal(await exists(paths.setupLockFile), true, "the operation lock must remain held during deletion");
+        unlinked.push(path);
+        await defaultOwnedDataFileSystem.unlink(path);
+      }
+    };
+    const result = await removeBridge({}, {
+      paths,
+      serviceManager: fakeServiceManager([]),
+      fileSystem
+    });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.removedRuntime, true);
+    assert.equal(unlinked.includes(paths.runtimeInstallFile), true);
+    assert.equal(await exists(paths.runtimeDirectory), false);
+    assert.equal(await exists(paths.setupLockFile), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a linked runtime causes ordinary removal to fail before service mutation or external traversal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-owned-runtime-link-"));
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
+  const external = join(root, "external-runtime");
+  try {
+    await mkdir(paths.home, { recursive: true });
+    await mkdir(external, { recursive: true });
+    await writeFile(join(external, "survives.txt"), "outside\n", "utf8");
+    await symlink(external, paths.runtimeDirectory, process.platform === "win32" ? "junction" : "dir");
+    const events: string[] = [];
+    const result = await removeBridge({}, { paths, serviceManager: fakeServiceManager(events) });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "RUNTIME_INSTALL_FAILED");
+    assert.deepEqual(events, []);
+    assert.equal((await lstat(paths.runtimeDirectory)).isSymbolicLink(), true);
+    assert.equal(await readFile(join(external, "survives.txt"), "utf8"), "outside\n");
+    assert.deepEqual(await readdir(external), ["survives.txt"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("mismatched canonical home and installation identity refuse destructive removal", async t => {
   const root = await mkdtemp(join(tmpdir(), "hunsu-owned-mismatch-"));
   try {
@@ -386,6 +534,8 @@ async function writeCompleteOwnedHome(paths: HunsuPaths, options: {
     writeFile(paths.structuredLogFile, "{}\n", "utf8")
   ]);
   const current = runtimeInstallation(paths);
+  await mkdir(dirname(current.cliPath), { recursive: true });
+  await writeFile(current.cliPath, "fixture CLI\n", "utf8");
   const document: RuntimeInstallDocument = {
     schema: RUNTIME_INSTALL_SCHEMA,
     installationId,

@@ -25,8 +25,8 @@ import {
   verifyConnectTicket
 } from "../apps/bridge/src/remote/peerCrypto.ts";
 import { createWeriftPeerTransportFactory } from "../apps/bridge/src/remote/peerTransport.ts";
-import type { PeerData, PeerDataChannel, PeerTransport } from "../apps/bridge/src/remote/peerTransport.ts";
-import { createRemoteService, type ConnectSocket } from "../apps/bridge/src/remote/remoteService.ts";
+import type { PeerTransport } from "../apps/bridge/src/remote/peerTransport.ts";
+import { createRemoteService } from "../apps/bridge/src/remote/remoteService.ts";
 import { createRemoteCommandRouter } from "../apps/bridge/src/remote/remoteCommandRouter.ts";
 import {
   createConfigStore,
@@ -35,6 +35,19 @@ import {
   resolveHunsuPaths
 } from "../apps/bridge/src/state/index.ts";
 import { createWorkspaceService } from "../apps/bridge/src/workspaces/workspaceService.ts";
+import {
+  FakeConnectSocket,
+  FakePeerDataChannel,
+  browserSignalCipher,
+  decryptDataFrame,
+  decryptSignal,
+  deriveBrowserControlCipher,
+  encryptDataFrame,
+  encryptSignal,
+  signTicket,
+  validSdp,
+  waitFor
+} from "./fixtures/deterministic-connect-p2p.ts";
 
 const subtle = webcrypto.subtle;
 
@@ -510,216 +523,6 @@ test("Remote service persists only Connect enrollment secrets and returns path-f
   }
 });
 
-async function signTicket(privateKey: webcrypto.CryptoKey, kid: string, claims: unknown): Promise<string> {
-  const header = encodeJson({ alg: "ES256", typ: "hunsu-connect-session+jwt", kid });
-  const payload = encodeJson(claims);
-  const signature = await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, new TextEncoder().encode(`${header}.${payload}`));
-  return `${header}.${payload}.${Buffer.from(signature).toString("base64url")}`;
-}
-
-function encodeJson(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
-}
-
-async function browserSignalCipher(privateKey: webcrypto.CryptoKey, devicePublicJwk: JsonWebKey, sessionId: string): Promise<webcrypto.CryptoKey> {
-  const publicKey = await subtle.importKey("jwk", devicePublicJwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
-  const shared = await subtle.deriveBits({ name: "ECDH", public: publicKey }, privateKey, 256);
-  const master = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
-  const bits = await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(sessionId), info: new TextEncoder().encode("hunsu.connect.signal.v1") }, master, 256);
-  return subtle.importKey("raw", bits, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
-}
-
-async function encryptSignal(key: webcrypto.CryptoKey, sessionId: string, sequence: number, role: "browser" | "bridge", value: unknown) {
-  const iv = await roleNonce(role, sequence);
-  const ciphertext = await subtle.encrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`${CONNECT_SIGNAL_FRAME_SCHEMA}:${sessionId}:${sequence}`), tagLength: 128 }, key, new TextEncoder().encode(JSON.stringify(value)));
-  return { schema: CONNECT_SIGNAL_FRAME_SCHEMA, sessionId, sequence, iv: Buffer.from(iv).toString("base64url"), ciphertext: Buffer.from(ciphertext).toString("base64url") };
-}
-
-async function decryptSignal(key: webcrypto.CryptoKey, frame: Awaited<ReturnType<typeof encryptSignal>>, role: "browser" | "bridge") {
-  const iv = await roleNonce(role, frame.sequence);
-  const plaintext = await subtle.decrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`${CONNECT_SIGNAL_FRAME_SCHEMA}:${frame.sessionId}:${frame.sequence}`), tagLength: 128 }, key, Buffer.from(frame.ciphertext, "base64url"));
-  return JSON.parse(Buffer.from(plaintext).toString("utf8")) as unknown;
-}
-
-async function roleNonce(role: "browser" | "bridge", sequence: number): Promise<Uint8Array> {
-  const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(`hunsu.connect.signal.nonce/${role}`)));
-  const nonce = new Uint8Array(12);
-  nonce.set(hash.slice(0, 4));
-  new DataView(nonce.buffer).setBigUint64(4, BigInt(sequence), false);
-  return nonce;
-}
-
-async function encryptDataFrame(key: webcrypto.CryptoKey, sessionId: string, channel: "control" | "stream", role: "browser" | "bridge", sequence: number, value: unknown): Promise<string> {
-  const nonce = await dataNonce(channel, role, sequence);
-  const ciphertext = await subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: new TextEncoder().encode(`hunsu-peer-v1:${sessionId}:${channel}:${sequence}`), tagLength: 128 }, key, new TextEncoder().encode(JSON.stringify(value)));
-  return JSON.stringify({ version: "hunsu-peer-v1", sessionId, channel, sequence, nonce: Buffer.from(nonce).toString("base64url"), ciphertext: Buffer.from(ciphertext).toString("base64url") });
-}
-
-async function decryptDataFrame(key: webcrypto.CryptoKey, encoded: string, role: "browser" | "bridge"): Promise<unknown> {
-  const frame = JSON.parse(encoded) as { sessionId: string; channel: "control" | "stream"; sequence: number; nonce: string; ciphertext: string };
-  const nonce = await dataNonce(frame.channel, role, frame.sequence);
-  assert.equal(frame.nonce, Buffer.from(nonce).toString("base64url"));
-  const plaintext = await subtle.decrypt({ name: "AES-GCM", iv: nonce, additionalData: new TextEncoder().encode(`hunsu-peer-v1:${frame.sessionId}:${frame.channel}:${frame.sequence}`), tagLength: 128 }, key, Buffer.from(frame.ciphertext, "base64url"));
-  return JSON.parse(Buffer.from(plaintext).toString("utf8")) as unknown;
-}
-
-async function dataNonce(channel: "control" | "stream", role: "browser" | "bridge", sequence: number): Promise<Uint8Array> {
-  const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(`hunsu.peer.data.nonce/${channel}/${role}`)));
-  const nonce = new Uint8Array(12);
-  nonce.set(hash.slice(0, 4));
-  new DataView(nonce.buffer).setBigUint64(4, BigInt(sequence), false);
-  return nonce;
-}
-
-async function deriveBrowserControlCipher(input: {
-  browserPrivateKey: webcrypto.CryptoKey;
-  browserAgreementPublicJwk: JsonWebKey;
-  deviceSigningPublicJwk: JsonWebKey;
-  ticket: string;
-  ticketClaims: { sessionId: string; accountId: string; deviceId: string };
-  browserNonce: string;
-  serverHello: {
-    bridgeEphemeralPublicJwk: JsonWebKey;
-    bridgeNonce: string;
-    leaseExpiresAt: string;
-    transcriptHash: string;
-    signature: string;
-  };
-}): Promise<{ sendKey: webcrypto.CryptoKey; receiveKey: webcrypto.CryptoKey; transcriptHash: string }> {
-  const ticketDigest = Buffer.from(await subtle.digest("SHA-256", new TextEncoder().encode(input.ticket))).toString("base64url");
-  const transcript = peerTranscript({
-    sessionId: input.ticketClaims.sessionId,
-    accountId: input.ticketClaims.accountId,
-    deviceId: input.ticketClaims.deviceId,
-    ticketDigest,
-    browserAgreementPublicJwk: input.browserAgreementPublicJwk,
-    bridgeEphemeralPublicJwk: input.serverHello.bridgeEphemeralPublicJwk,
-    browserNonce: input.browserNonce,
-    bridgeNonce: input.serverHello.bridgeNonce,
-    leaseExpiresAt: input.serverHello.leaseExpiresAt
-  });
-  const transcriptHashBytes = new Uint8Array(await subtle.digest("SHA-256", transcript));
-  const transcriptHash = Buffer.from(transcriptHashBytes).toString("base64url");
-  assert.equal(transcriptHash, input.serverHello.transcriptHash);
-  const signingKey = await subtle.importKey("jwk", input.deviceSigningPublicJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-  assert.equal(await subtle.verify(
-    { name: "ECDSA", hash: "SHA-256" },
-    signingKey,
-    Buffer.from(input.serverHello.signature, "base64url"),
-    transcriptHashBytes
-  ), true);
-  const bridgeKey = await subtle.importKey("jwk", input.serverHello.bridgeEphemeralPublicJwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
-  const shared = await subtle.deriveBits({ name: "ECDH", public: bridgeKey }, input.browserPrivateKey, 256);
-  const master = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
-  const directional = new Uint8Array(await subtle.deriveBits({
-    name: "HKDF",
-    hash: "SHA-256",
-    salt: transcriptHashBytes,
-    info: new TextEncoder().encode("hunsu.peer.data.v1")
-  }, master, 1024));
-  return {
-    sendKey: await subtle.importKey("raw", directional.slice(0, 32), { name: "AES-GCM" }, false, ["encrypt"]),
-    receiveKey: await subtle.importKey("raw", directional.slice(32, 64), { name: "AES-GCM" }, false, ["decrypt"]),
-    transcriptHash
-  };
-}
-
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await predicate()) return;
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  assert.fail("Timed out waiting for the deterministic direct-peer fixture.");
-}
-
-class FakeConnectSocket implements ConnectSocket {
-  readyState = 1;
-  readonly sent: string[] = [];
-  private readonly listeners = new Map<string, Set<(event: { data?: unknown }) => void>>();
-
-  send(data: string): void {
-    if (this.readyState !== 1) throw new Error("Fake Connect socket is closed.");
-    this.sent.push(data);
-  }
-
-  close(): void {
-    if (this.readyState === 3) return;
-    this.readyState = 3;
-    this.emit("close", {});
-  }
-
-  addEventListener(type: "open" | "close" | "error" | "message", listener: (event: { data?: unknown }) => void): void {
-    const listeners = this.listeners.get(type) ?? new Set();
-    listeners.add(listener);
-    this.listeners.set(type, listeners);
-  }
-
-  removeEventListener(type: "open" | "close" | "error" | "message", listener: (event: { data?: unknown }) => void): void {
-    this.listeners.get(type)?.delete(listener);
-  }
-
-  receive(value: unknown): void {
-    this.emit("message", { data: JSON.stringify(value) });
-  }
-
-  private emit(type: string, event: { data?: unknown }): void {
-    for (const listener of this.listeners.get(type) ?? []) listener(event);
-  }
-}
-
-class FakePeerDataChannel implements PeerDataChannel {
-  readonly label: string;
-  readonly ordered = true;
-  readonly maxRetransmits = undefined;
-  readonly maxPacketLifeTime = undefined;
-  readyState: PeerDataChannel["readyState"] = "open";
-  bufferedAmount = 0;
-  bufferedAmountLowThreshold = 0;
-  readonly sent: Array<string | Uint8Array> = [];
-  private readonly messageListeners = new Set<(value: PeerData) => void>();
-  private readonly stateListeners = new Set<(state: PeerDataChannel["readyState"]) => void>();
-  private readonly lowListeners = new Set<() => void>();
-
-  constructor(label: string) {
-    this.label = label;
-  }
-
-  send(value: string | Uint8Array): void {
-    if (this.readyState !== "open") throw new Error("Fake peer channel is closed.");
-    this.sent.push(value);
-  }
-
-  close(): void {
-    if (this.readyState === "closed") return;
-    this.readyState = "closed";
-    for (const listener of this.stateListeners) listener("closed");
-  }
-
-  onMessage(listener: (value: PeerData) => void): () => void {
-    this.messageListeners.add(listener);
-    return () => this.messageListeners.delete(listener);
-  }
-
-  onStateChange(listener: (state: PeerDataChannel["readyState"]) => void): () => void {
-    this.stateListeners.add(listener);
-    return () => this.stateListeners.delete(listener);
-  }
-
-  onBufferedAmountLow(listener: () => void): () => void {
-    this.lowListeners.add(listener);
-    return () => this.lowListeners.delete(listener);
-  }
-
-  receive(value: PeerData): void {
-    for (const listener of this.messageListeners) listener(value);
-  }
-
-  canReceive(): boolean {
-    return this.messageListeners.size > 0;
-  }
-}
-
 class FakeEvent<T extends unknown[]> {
   private readonly listeners = new Set<(...args: T) => void>();
   subscribe(listener: (...args: T) => void) {
@@ -762,23 +565,4 @@ function fakePeerConnection(control: ReturnType<typeof fakeChannel>, stream: Ret
     async addIceCandidate() {},
     async close() {}
   };
-}
-
-function validSdp(type: "offer" | "answer"): string {
-  const fingerprint = Array.from({ length: 32 }, () => "AA").join(":");
-  return [
-    "v=0",
-    "o=- 0 0 IN IP4 127.0.0.1",
-    "s=-",
-    "t=0 0",
-    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
-    "c=IN IP4 0.0.0.0",
-    "a=ice-ufrag:abcd",
-    "a=ice-pwd:abcdefghijklmnopqrstuv",
-    `a=fingerprint:sha-256 ${fingerprint}`,
-    type === "offer" ? "a=setup:actpass" : "a=setup:active",
-    "a=candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
-    "a=sctp-port:5000",
-    ""
-  ].join("\r\n");
 }

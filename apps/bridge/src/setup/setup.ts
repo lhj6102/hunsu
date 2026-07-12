@@ -222,16 +222,6 @@ async function setupWhileLocked(
   });
   const now = options.now ?? (() => new Date());
 
-  try {
-    await runPhase(options, "profile-persistence");
-    await (options.configStore ?? createConfigStore(options.paths)).ensureDeploymentProfile(deploymentProfile);
-  } catch (_error) {
-    return failure(
-      "RUNTIME_INSTALL_FAILED",
-      `HUNSU_HOME is already bound to a different Bridge deployment profile; use a clean home for ${deploymentProfile}.`
-    );
-  }
-
   let pending: SetupTransaction | undefined;
   try {
     pending = await transactionStore.read();
@@ -247,6 +237,16 @@ async function setupWhileLocked(
       installationId: pending.previous?.installationId ?? null
     });
     if (!recovered.ok) return rollbackFailure(recovered.failures);
+  }
+
+  try {
+    await runPhase(options, "profile-persistence");
+    await (options.configStore ?? createConfigStore(options.paths)).ensureDeploymentProfile(deploymentProfile);
+  } catch (_error) {
+    return failure(
+      "RUNTIME_INSTALL_FAILED",
+      `HUNSU_HOME is already bound to a different Bridge deployment profile; use a clean home for ${deploymentProfile}.`
+    );
   }
 
   let existing: RuntimeInstallDocument | undefined;

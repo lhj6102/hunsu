@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import test from "node:test";
 import {
   BRIDGE_CONFIG_SCHEMA,
+  BRIDGE_CREDENTIALS_SCHEMA,
   LEGACY_BRIDGE_CONFIG_SCHEMA,
   createConfigStore,
   createCredentialStore,
@@ -14,7 +15,10 @@ import {
   resolveHunsuPaths
 } from "../apps/bridge/src/state/index.ts";
 import { BRIDGE_RUNTIME_SCHEMA } from "../apps/bridge/src/state/runtimeStore.ts";
-import { windowsCredentialAclPowerShellInvocation } from "../apps/bridge/src/state/credentialStore.ts";
+import {
+  windowsCredentialAclPowerShellInvocation,
+  windowsCredentialAclValidationPowerShellInvocation
+} from "../apps/bridge/src/state/credentialStore.ts";
 import { invalidState } from "../apps/bridge/src/state/atomicJsonStore.ts";
 import { bridgeErrorResult } from "../apps/bridge/src/client/cliResult.ts";
 import {
@@ -28,6 +32,7 @@ import {
 } from "../apps/bridge/src/workspaces/workspaceService.ts";
 import { createPairingService } from "../apps/bridge/src/pairing/pairingService.ts";
 import { createStructuredLog } from "../apps/bridge/src/diagnostics/structuredLog.ts";
+import { createDoctorReport } from "../apps/bridge/src/diagnostics/doctor.ts";
 import {
   bridgeDeploymentEndpoints,
   bridgeSetupPackageTag
@@ -96,6 +101,37 @@ test("Windows credential ACL hardening uses one encoded injection-safe PowerShel
   );
 });
 
+test("Windows credential ACL validation is read-only and requires one current-user rule", () => {
+  const credentialPath = "C:\\Users\\O'Brien\\Hunsu Bridge\\credentials.json";
+  const invocation = windowsCredentialAclValidationPowerShellInvocation(credentialPath);
+  assert.equal(invocation.command, "powershell.exe");
+  assert.deepEqual(invocation.args.slice(0, -1), [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand"
+  ]);
+  assert.equal(invocation.args.includes(credentialPath), false);
+  const command = Buffer.from(invocation.args.at(-1) ?? "", "base64").toString("utf16le");
+  assert.match(command, /\$CredentialPath = 'C:\\Users\\O''Brien\\Hunsu Bridge\\credentials\.json'/u);
+  assert.match(command, /FileAttributes\]::ReparsePoint/u);
+  assert.match(command, /WindowsIdentity\]::GetCurrent\(\)\.User/u);
+  assert.match(command, /System\.IO\.File\]::GetAccessControl/u);
+  assert.match(command, /GetOwner\(\[System\.Security\.Principal\.SecurityIdentifier\]\)/u);
+  assert.match(command, /AreAccessRulesProtected/u);
+  assert.match(command, /GetAccessRules\(\$true, \$true, \[System\.Security\.Principal\.SecurityIdentifier\]\)/u);
+  assert.match(command, /rules\.Count -ne 1/u);
+  assert.match(command, /IdentityReference\.Value -ne \$sid\.Value/u);
+  assert.match(command, /AccessControlType\]::Allow/u);
+  assert.match(command, /FileSystemRights\]::FullControl/u);
+  assert.doesNotMatch(command, /SetAccessControl|SetOwner|SetAccessRule|Set-Acl|New-Object|NTAccount/u);
+  assert.throws(
+    () => windowsCredentialAclValidationPowerShellInvocation("C:\\Hunsu\nInjected\\credentials.json"),
+    /control characters/u
+  );
+});
+
 test("Windows PowerShell 5.1 children cannot inherit PowerShell 7 module paths", () => {
   assert.equal(isWindowsPowerShellCommand("powershell.exe"), true);
   assert.equal(isWindowsPowerShellCommand("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE"), true);
@@ -128,6 +164,165 @@ test("Bridge state failures keep the stable code and expose only basename-safe c
     message: "Bridge state file is invalid (credentials.json): credentials ACL could not be restricted to the current Windows user"
   });
   assert.doesNotMatch(JSON.stringify(result), /\/secret\/runtime/u);
+});
+
+test("credential reads reject permissive POSIX modes without reading or repairing the file", {
+  skip: process.platform === "win32"
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-credential-mode-"));
+  const paths = resolveHunsuPaths({ home: join(root, "private-state") });
+  const persisted = `${JSON.stringify({
+    schema: BRIDGE_CREDENTIALS_SCHEMA,
+    controlToken: "hunsu_control_valid_but_exposed",
+    connect: null
+  })}\n`;
+  try {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.credentialsFile, persisted, { encoding: "utf8", mode: 0o600 });
+    await chmod(paths.credentialsFile, 0o644);
+    const store = createCredentialStore(paths, { platform: "linux" });
+
+    for (const operation of [
+      () => store.read(),
+      () => store.ensure(),
+      () => store.rotateControlToken()
+    ]) {
+      await assert.rejects(operation, error => {
+        assert.equal((error as { code?: unknown }).code, "BRIDGE_STATE_INVALID");
+        assert.match((error as Error).message, /credentials\.json/u);
+        assert.match((error as Error).message, /permissions/u);
+        assert.equal((error as Error).message.includes(paths.home), false);
+        return true;
+      });
+    }
+
+    assert.equal((await stat(paths.credentialsFile)).mode & 0o777, 0o644);
+    assert.equal(await readFile(paths.credentialsFile, "utf8"), persisted);
+    const doctor = await createDoctorReport({ paths, online: false });
+    assert.equal(doctor.state.credentialsPresent, true);
+    assert.equal(
+      doctor.issues.some(issue => issue.code === "BRIDGE_STATE_INVALID" && /credentials file/u.test(issue.message)),
+      true
+    );
+    assert.equal(JSON.stringify(doctor.issues).includes(root), false);
+
+    await chmod(paths.credentialsFile, 0o600);
+    const owner = (await stat(paths.credentialsFile)).uid;
+    await assert.rejects(
+      () => createCredentialStore(paths, {
+        platform: "linux",
+        currentUserId: owner + 1
+      }).read(),
+      /owned by the current user/u
+    );
+    assert.equal((await stat(paths.credentialsFile)).mode & 0o777, 0o600);
+    assert.equal(await readFile(paths.credentialsFile, "utf8"), persisted);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("credential operations reject symlinks and non-files without touching a symlink target", {
+  skip: process.platform === "win32"
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-credential-link-"));
+  const paths = resolveHunsuPaths({ home: join(root, "private-state") });
+  const target = join(root, "outside-credentials.json");
+  const persisted = `${JSON.stringify({
+    schema: BRIDGE_CREDENTIALS_SCHEMA,
+    controlToken: "hunsu_control_symlink_target",
+    connect: null
+  })}\n`;
+  const aclCalls: string[] = [];
+  try {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(target, persisted, { encoding: "utf8", mode: 0o600 });
+    await symlink(target, paths.credentialsFile, "file");
+    const store = createCredentialStore(paths, {
+      platform: "win32",
+      windowsAclValidator: async path => { aclCalls.push(`validate:${path}`); },
+      windowsAclHardener: async path => { aclCalls.push(`harden:${path}`); }
+    });
+
+    for (const operation of [
+      () => store.read(),
+      () => store.ensure(),
+      () => store.rotateControlToken()
+    ]) {
+      await assert.rejects(operation, error => {
+        assert.equal((error as { code?: unknown }).code, "BRIDGE_STATE_INVALID");
+        assert.match((error as Error).message, /regular file|symbolic link/u);
+        assert.equal((error as Error).message.includes(root), false);
+        return true;
+      });
+    }
+
+    assert.deepEqual(aclCalls, []);
+    assert.equal((await lstat(paths.credentialsFile)).isSymbolicLink(), true);
+    assert.equal(await readFile(target, "utf8"), persisted);
+    assert.equal((await stat(target)).mode & 0o777, 0o600);
+
+    const doctor = await createDoctorReport({ paths, online: false });
+    assert.equal(doctor.state.credentialsPresent, true);
+    assert.equal(doctor.issues.some(issue => issue.code === "BRIDGE_STATE_INVALID"), true);
+
+    await rm(paths.credentialsFile);
+    await mkdir(paths.credentialsFile);
+    for (const operation of [
+      () => store.read(),
+      () => store.ensure(),
+      () => store.rotateControlToken()
+    ]) {
+      await assert.rejects(operation, /regular file/u);
+    }
+    assert.deepEqual(aclCalls, []);
+    assert.equal(await readFile(target, "utf8"), persisted);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows credential reads reject unsafe ACLs instead of hardening an existing file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-credential-acl-"));
+  const paths = resolveHunsuPaths({ home: join(root, "private-state") });
+  const persisted = `${JSON.stringify({
+    schema: BRIDGE_CREDENTIALS_SCHEMA,
+    controlToken: "hunsu_control_valid_but_acl_exposed",
+    connect: null
+  })}\n`;
+  let validations = 0;
+  let hardenings = 0;
+  try {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.credentialsFile, persisted, { encoding: "utf8", mode: 0o600 });
+    const store = createCredentialStore(paths, {
+      platform: "win32",
+      windowsAclValidator: async () => {
+        validations += 1;
+        throw new Error("injected unsafe ACL");
+      },
+      windowsAclHardener: async () => { hardenings += 1; }
+    });
+
+    for (const operation of [
+      () => store.read(),
+      () => store.ensure(),
+      () => store.rotateControlToken()
+    ]) {
+      await assert.rejects(operation, error => {
+        assert.equal((error as { code?: unknown }).code, "BRIDGE_STATE_INVALID");
+        assert.match((error as Error).message, /credentials\.json/u);
+        assert.match((error as Error).message, /ACL/u);
+        assert.equal((error as Error).message.includes(root), false);
+        return true;
+      });
+    }
+    assert.equal(validations, 3);
+    assert.equal(hardenings, 0);
+    assert.equal(await readFile(paths.credentialsFile, "utf8"), persisted);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("atomic state stores persist config, preserve credentials, and guard runtime identity", async () => {
@@ -183,24 +378,27 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
     await assert.rejects(() => credentialStore.write({
       connect: { ...withAccount.connect!, expiresAt: "not-a-timestamp" }
     }), /valid timestamp/u);
+    const validated: string[] = [];
     const hardened: string[] = [];
     await createCredentialStore(paths, {
       platform: "win32",
+      windowsAclValidator: async path => { validated.push(path); },
       windowsAclHardener: async path => { hardened.push(path); }
     }).ensure();
-    assert.deepEqual(hardened, [paths.credentialsFile]);
+    assert.deepEqual(validated, [paths.credentialsFile]);
+    assert.deepEqual(hardened, []);
 
     const runtimeStore = createRuntimeStore(paths);
     await runtimeStore.write({
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-one",
       daemonPid: 1234,
-      version: "0.2.0-next.7",
+      version: "0.2.0-next.8",
       protocolVersion: "local-bridge-v1",
       deploymentProfile: "preview",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",
-      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.7",
+      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.8",
       serviceManager: "development",
       lastHealthyAt: "2026-07-12T00:00:00.000Z"
     });
@@ -209,7 +407,7 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-invalid",
       daemonPid: 1234,
-      version: "0.2.0-next.7",
+      version: "0.2.0-next.8",
       protocolVersion: "local-bridge-v1",
       deploymentProfile: "preview",
       startedAt: "2026-07-12T00:00:00.000Z",
@@ -289,11 +487,11 @@ test("deployment profiles resolve exact Web, Connect, signing-key, and setup-cha
     connectApiUrl: "https://connect.hunsu.app",
     connectWsUrl: "wss://connect.hunsu.app/v1/connect/device",
     connectTicketIssuer: "https://connect.hunsu.app",
-    connectTicketSigningKeyId: "connect-Ea21pgXVRp5WfId1kXKSeyea",
+    connectTicketSigningKeyId: "connect-enaK6bbNEOky9hUYzzJuN3Qi",
     connectTicketSigningPublicJwk: {
       kty: "EC", crv: "P-256",
-      x: "SekGyUfv_HqJlJ35q9uE4cUzM7jWW6V6B7k4_HGy6ck",
-      y: "zY0W0qv5kHQKxF6aynjmy0kGv1XodPwF4MX4yvTW_C8"
+      x: "LmCMF_gjDJ9HQOmdmk_ylwWFA5r3cwvuMpJ_f6Ud3Cg",
+      y: "wjC2rVxMFzICuC-QH3RKXb5ztR968bg2oVc5PJ1A1gM"
     }
   });
   assert.deepEqual(bridgeDeploymentEndpoints("preview"), {
@@ -301,11 +499,11 @@ test("deployment profiles resolve exact Web, Connect, signing-key, and setup-cha
     connectApiUrl: "https://connect.preview.hunsu.app",
     connectWsUrl: "wss://connect.preview.hunsu.app/v1/connect/device",
     connectTicketIssuer: "https://connect.preview.hunsu.app",
-    connectTicketSigningKeyId: "connect-vd_GiPDTK2lPIDS3Y2dDIEck",
+    connectTicketSigningKeyId: "connect-LPehY8CSnG6Y0rkTzjQB4I77",
     connectTicketSigningPublicJwk: {
       kty: "EC", crv: "P-256",
-      x: "DZDAFyOricZ4dOBOhNrNtAS2X_EdqrE2wQxB23raNcc",
-      y: "qLXw7DinTp-5T0i_MdU9jN15Wpnxu0dXh-Owo5ydL1U"
+      x: "69FCDW0whttjj1IhJjFMQOOl-icup4Dv4MlpgasZcWw",
+      y: "9oGa20XKzFy9LCFn34v3H7ss42sD_9eKhjBbWwwBTa4"
     }
   });
   assert.equal(bridgeSetupPackageTag("production"), "next");
@@ -316,13 +514,13 @@ test("runtime install state migrates v1 without trusting an unversioned digest a
   const home = await mkdtemp(join(tmpdir(), "hunsu-headless-runtime-install-state-"));
   const paths = resolveHunsuPaths({ home });
   const timestamp = "2026-07-12T00:00:00.000Z";
-  const runtimePath = join(paths.runtimeVersionsDirectory, "0.2.0-next.7");
+  const runtimePath = join(paths.runtimeVersionsDirectory, "0.2.0-next.8");
   const cliPath = join(runtimePath, "node_modules", "@hunsu", "bridge", "dist", "cli.js");
   const legacy = {
     schema: LEGACY_RUNTIME_INSTALL_SCHEMA,
     installationId: "install_runtime_state_test",
     current: {
-      packageVersion: "0.2.0-next.7",
+      packageVersion: "0.2.0-next.8",
       runtimePath,
       nodePath: process.execPath,
       cliPath,
@@ -334,7 +532,7 @@ test("runtime install state migrates v1 without trusting an unversioned digest a
       nodePath: process.execPath,
       cliPath,
       hunsuHome: home,
-      packageVersion: "0.2.0-next.7",
+      packageVersion: "0.2.0-next.8",
       runtimePath,
       deploymentProfile: "production"
     },
@@ -382,6 +580,7 @@ test("control-token rotation hardens the temporary file before commit and never 
   const store = createCredentialStore(paths, {
     platform: "win32",
     randomBytes: size => new Uint8Array(size).fill(randomFill++),
+    windowsAclValidator: async () => undefined,
     windowsAclHardener: async path => {
       if (!failHardening) return;
       enteredHardening(path);

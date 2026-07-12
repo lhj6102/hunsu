@@ -1,4 +1,3 @@
-import { access } from "node:fs/promises";
 import type { BridgeDeploymentProfile } from "../deploymentProfile.ts";
 import type { HeadlessProviderService } from "../provider/providerRegistry.ts";
 import {
@@ -56,13 +55,12 @@ export async function createDoctorReport(input: {
     configValid = false;
     issues.push({ code: "BRIDGE_STATE_INVALID", message: "Bridge configuration is invalid." });
   }
-  const credentialsPresent = await fileExists(input.paths.credentialsFile);
-  if (credentialsPresent) {
-    try {
-      await createCredentialStore(input.paths).read();
-    } catch (_error) {
-      issues.push({ code: "BRIDGE_STATE_INVALID", message: "Bridge credentials file is invalid or inaccessible." });
-    }
+  let credentialsPresent = false;
+  try {
+    credentialsPresent = await createCredentialStore(input.paths).read() !== undefined;
+  } catch (_error) {
+    credentialsPresent = true;
+    issues.push({ code: "BRIDGE_STATE_INVALID", message: "Bridge credentials file is invalid or inaccessible." });
   }
   const runtime = await createRuntimeStore(input.paths).read().catch(() => undefined);
   if (runtime && runtime.deploymentProfile !== deploymentProfile) {
@@ -122,13 +120,4 @@ export async function createDoctorReport(input: {
   const safe = sanitizeDiagnostics(report) as BridgeDoctorReport;
   assertDiagnosticsSafe(safe);
   return safe;
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch (_error) {
-    return false;
-  }
 }

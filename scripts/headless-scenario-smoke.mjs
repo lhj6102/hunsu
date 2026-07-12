@@ -13,6 +13,8 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { startBridgeDaemon } from "../apps/bridge/src/daemon/daemon.ts";
+import { createDeterministicConnectP2pFixture } from "../tests/fixtures/deterministic-connect-p2p.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -28,6 +30,7 @@ export async function runHeadlessScenario(options = {}) {
   const workspace = join(root, "workspace");
   let daemon;
   let web;
+  let connectFixture;
   const captured = [];
   let endpoint;
   let webUrl;
@@ -38,6 +41,7 @@ export async function runHeadlessScenario(options = {}) {
     const codexBinary = await createFakeCodexExecutable(root);
     const webPort = await allocateFreePort();
     webUrl = `http://127.0.0.1:${webPort}`;
+    connectFixture = await createDeterministicConnectP2pFixture();
     const environment = {
       ...process.env,
       HUNSU_HOME: home,
@@ -46,6 +50,11 @@ export async function runHeadlessScenario(options = {}) {
       HUNSU_CODEX_APP_SERVER_COMMAND: codexBinary,
       HUNSU_CODEX_APP_SERVER_ARGS: JSON.stringify(["app-server", "--stdio"]),
       HUNSU_FAKE_CODEX_MODE: "ready",
+      HUNSU_CONNECT_API_BASE_URL: connectFixture.apiUrl,
+      HUNSU_CONNECT_WS_URL: connectFixture.wsUrl,
+      HUNSU_DEVELOPMENT_CONNECT_TICKET_ISSUER: connectFixture.ticketIssuer,
+      HUNSU_DEVELOPMENT_CONNECT_TICKET_SIGNING_KEY_ID: connectFixture.ticketSigningKeyId,
+      HUNSU_DEVELOPMENT_CONNECT_TICKET_SIGNING_PUBLIC_JWK: JSON.stringify(connectFixture.ticketSigningPublicJwk),
       NODE_OPTIONS: [
         process.env.NODE_OPTIONS,
         "--no-warnings",
@@ -54,20 +63,20 @@ export async function runHeadlessScenario(options = {}) {
       ].filter(Boolean).join(" ")
     };
 
-    daemon = spawn(process.execPath, [
-      "--experimental-transform-types",
-      "--conditions=development",
-      bridgeCliPath,
-      "dev",
-      "--host", "127.0.0.1",
-      "--port", "0",
-      "--cwd", workspace,
-      "--web-url", `${webUrl}/studio`,
-      "--json"
-    ], childOptions(environment));
-    captureChild(daemon, captured);
-    const ready = await waitForDaemonResult(daemon, captured);
-    endpoint = requiredUrl(ready.value?.endpoint, "foreground daemon endpoint");
+    daemon = await startBridgeDaemon({
+      home,
+      host: "127.0.0.1",
+      port: 0,
+      cwd: workspace,
+      webUrl: `${webUrl}/studio`,
+      deploymentProfile: "preview",
+      development: true,
+      env: environment,
+      socketFactory: connectFixture.socketFactory,
+      peerTransportFactory: connectFixture.peerTransportFactory,
+      openBrowser: async () => undefined
+    });
+    endpoint = requiredUrl(daemon.identity.endpoint, "foreground daemon endpoint");
     const daemonReadyMs = Math.round(performance.now() - startedAt);
 
     const status = await runCli(["status", "--json"], environment, captured);
@@ -109,6 +118,27 @@ export async function runHeadlessScenario(options = {}) {
     await waitForHealth(webUrl, web, captured);
     const webReadyMs = Math.round(performance.now() - startedAt);
 
+    const login = await runCli(["login", "--no-open", "--json"], environment, captured);
+    ensure(login.value?.state === "pending", "Connect login did not start device enrollment");
+    ensure(new URL(requiredString(login.value?.verificationUri, "Connect verification URI")).origin === connectFixture.apiUrl, "Connect login escaped the fixture origin");
+    await connectFixture.completeBrowserEnrollment(requiredString(login.value?.userCode, "Connect user code"));
+    await waitFor(async () => {
+      try {
+        const value = JSON.parse(await readFile(join(home, "credentials.json"), "utf8"));
+        return value?.connect?.state === "registered" ? value.connect : undefined;
+      } catch (_error) {
+        return undefined;
+      }
+    }, 5_000, "Connect device enrollment");
+
+    const enabled = await runCli(["remote", "enable", "--json"], environment, captured);
+    ensure(enabled.value?.enabled === true, "Remote Bridge did not enable after enrollment");
+    await connectFixture.authenticateBridge();
+    await waitFor(async () => {
+      const statusResult = await runCli(["remote", "status", "--json"], environment, captured, { quiet: true });
+      return statusResult.value?.connection === "connected" ? statusResult : undefined;
+    }, 3_000, "authenticated Connect socket");
+
     await runCli([
       "workspace", "grant", workspaceId,
       "--scopes", "remote.access",
@@ -117,11 +147,32 @@ export async function runHeadlessScenario(options = {}) {
     const granted = await runCli(["workspace", "inspect", workspaceId, "--json"], environment, captured);
     ensure(granted.value?.remoteAccess?.enabled === true, "Workspace grant was not persisted");
 
+    const browserSession = await connectFixture.openBrowserSession();
+    ensure(browserSession.evidence.opaqueSignaling, "P2P fixture did not prove opaque signaling");
+    ensure(browserSession.evidence.signedTranscript, "P2P fixture did not verify the Bridge transcript signature");
+    ensure(browserSession.evidence.encryptedDataChannel, "P2P fixture did not use encrypted DataChannel frames");
+    const readyWorkspaces = Array.isArray(browserSession.ready.workspaces) ? browserSession.ready.workspaces : [];
+    ensure(readyWorkspaces.some(candidate => candidate?.workspaceId === workspaceId), "Direct peer did not receive the granted Workspace");
+    ensure(!JSON.stringify(browserSession.ready).includes(workspace), "Direct peer leaked the local Workspace path");
+    const allowed = await browserSession.command({ requestId: "request_allowed", workspaceId });
+    ensure(allowed.type === "command.result" && allowed.ok === true && allowed.status === 200, "Encrypted direct P2P command failed");
+    ensure(!JSON.stringify(allowed).includes(workspace), "Direct peer command leaked the local Workspace path");
+
     await runCli(["workspace", "revoke", workspaceId, "--json"], environment, captured);
     const revoked = await runCli(["workspace", "inspect", workspaceId, "--json"], environment, captured);
     ensure(revoked.value?.remoteAccess?.enabled === false, "Workspace revoke did not persist before shutdown");
+    const denied = await browserSession.command({ requestId: "request_revoked", workspaceId });
+    ensure(denied.type === "command.result" && denied.ok === false && denied.status === 403, "Revoked Workspace command did not fail closed");
+
+    const disabled = await runCli(["remote", "disable", "--json"], environment, captured);
+    ensure(disabled.value?.enabled === false && disabled.value?.connection === "disabled", "Remote Bridge did not disable cleanly");
+    await runCli(["logout", "--json"], environment, captured);
+    const signedOut = await runCli(["remote", "status", "--json"], environment, captured);
+    ensure(signedOut.value?.signedIn === false && signedOut.value?.connection === "signed_out", "Connect logout did not clear device enrollment");
+
     const credentials = JSON.parse(await readFile(join(home, "credentials.json"), "utf8"));
     const controlToken = requiredString(credentials.controlToken, "temporary control token");
+    ensure(credentials.connect === null, "Connect credentials remained after logout");
     const shutdown = await fetch(new URL("/v1/control/shutdown", endpoint), {
       method: "POST",
       headers: { "X-Hunsu-Bridge-Control-Token": controlToken },
@@ -129,12 +180,21 @@ export async function runHeadlessScenario(options = {}) {
     });
     ensure(shutdown.ok, `authenticated shutdown failed with HTTP ${shutdown.status}`);
     authenticatedShutdown = true;
-    await waitForChildExit(daemon, 8_000);
+    await withTimeout(
+      daemon.waitUntilClosed(),
+      8_000,
+      "Foreground daemon did not exit after authenticated shutdown."
+    );
     await assertPortReleased(endpoint);
 
     const persistedLogs = await readTextTree(join(home, "logs"));
     const evidence = `${captured.join("\n")}\n${persistedLogs}`;
-    assertNoCredentialLeak(evidence, [controlToken]);
+    assertNoCredentialLeak(evidence, [controlToken, ...connectFixture.sensitiveValues()]);
+    const fixtureEvidence = connectFixture.evidence();
+    ensure(fixtureEvidence.identityLogins === 1, "Connect identity login was not exercised exactly once");
+    ensure(fixtureEvidence.enrollmentRequests === 1 && fixtureEvidence.enrollmentApprovals === 1 && fixtureEvidence.tokenIssues === 1, "Connect enrollment flow was incomplete");
+    ensure(fixtureEvidence.socketAuthentications === 1 && fixtureEvidence.peerSessions === 1, "Connect/P2P session evidence was incomplete");
+    ensure(fixtureEvidence.externalRequests === 0 && fixtureEvidence.turnRequests === 0 && fixtureEvidence.hostedForwardingRequests === 0, "Scenario used a non-direct network path");
     const totalMs = Math.round(performance.now() - startedAt);
     process.stdout.write(`[headless-scenario] daemon ready: ${formatElapsed(daemonReadyMs)}\n`);
     process.stdout.write(`[headless-scenario] Web ready: ${formatElapsed(webReadyMs)}\n`);
@@ -142,9 +202,9 @@ export async function runHeadlessScenario(options = {}) {
     return { daemonReadyMs, webReadyMs, totalMs };
   } finally {
     if (web) await terminateChildTree(web);
-    if (daemon && !authenticatedShutdown) await terminateChildTree(daemon);
+    if (daemon && !authenticatedShutdown) await daemon.close().catch(() => undefined);
+    await connectFixture?.close().catch(() => undefined);
     releaseChildHandles(web);
-    releaseChildHandles(daemon);
     if (options.keepState !== true) await rm(root, { recursive: true, force: true });
     else process.stdout.write(`[headless-scenario] state preserved at ${root}\n`);
   }
@@ -241,21 +301,6 @@ function captureChild(child, captured) {
   }
 }
 
-async function waitForDaemonResult(child, captured, timeoutMs = 15_000) {
-  return waitFor(() => {
-    assertChildRunning(child, captured, "foreground daemon");
-    for (const line of captured.join("").split(/\r?\n/u)) {
-      try {
-        const value = JSON.parse(line);
-        if (value?.schema === "hunsu.bridge.cli-result.v1" && value.ok === true && value.value?.endpoint) return value;
-      } catch (_error) {
-        // The daemon may have emitted a partial line while it was starting.
-      }
-    }
-    return undefined;
-  }, timeoutMs, "foreground daemon readiness");
-}
-
 async function waitForHealth(baseUrl, child, captured, timeoutMs = 15_000) {
   return waitFor(async () => {
     assertChildRunning(child, captured, "Web development server");
@@ -301,13 +346,6 @@ async function assertPortReleased(endpoint) {
       return true;
     }
   }, 5_000, "Bridge endpoint release");
-}
-
-async function waitForChildExit(child, timeoutMs) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  if (!await waitForExitWithin(child, timeoutMs)) {
-    throw new Error("Foreground daemon did not exit after authenticated shutdown.");
-  }
 }
 
 async function terminateChildTree(child) {
@@ -426,6 +464,19 @@ function ensure(condition, message) {
 
 function delay(milliseconds) {
   return new Promise(resolveDelay => setTimeout(resolveDelay, milliseconds));
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timeout;
+  const expired = new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timeout.unref?.();
+  });
+  try {
+    return await Promise.race([promise, expired]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function parseArguments(argv = process.argv.slice(2)) {
