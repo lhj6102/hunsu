@@ -3,6 +3,7 @@ import { accessSync, constants, existsSync, readdirSync, statSync } from "node:f
 import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { currentProcessEnv, resolveCodexAppServerConfig } from "@hunsu/config";
+import { codexCommandLaunch, type CodexCommandLaunch } from "./windowsCommandShim.ts";
 import { redactDiagnosticText, sanitizeDiagnostics } from "../../diagnostics/redaction.ts";
 import { HUNSU_BRIDGE_VERSION } from "../../version.ts";
 
@@ -169,6 +170,7 @@ export async function getCodexVersion(input: {
       env: processEnvForProbe(env, platform),
       timeout: input.timeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS,
       windowsHide: true,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
       maxBuffer: 64 * 1024
     });
     const output = `${stdout}\n${stderr}`.trim();
@@ -625,27 +627,13 @@ function expandWindowsPathVariables(path: string, env: Record<string, string | u
   });
 }
 
-function codexProbeLaunchCommand(
+export function codexProbeLaunchCommand(
   binaryPath: string,
   args: string[],
   env: Record<string, string | undefined>,
   platform: NodeJS.Platform
-): { command: string; args: string[] } {
-  if (platform === "win32" && /\.(?:cmd|bat)$/i.test(binaryPath)) {
-    return {
-      command: firstEnv(env, "ComSpec", "COMSPEC") ?? "cmd.exe",
-      args: ["/d", "/s", "/c", windowsCmdCommandLine(binaryPath, args)]
-    };
-  }
-  return { command: binaryPath, args };
-}
-
-function windowsCmdCommandLine(binaryPath: string, args: string[]): string {
-  return `"${[binaryPath, ...args].map(quoteWindowsCmdArg).join(" ")}"`;
-}
-
-function quoteWindowsCmdArg(value: string): string {
-  return `"${value.replace(/"/g, "\"\"")}"`;
+): CodexCommandLaunch {
+  return codexCommandLaunch(binaryPath, args, env, platform);
 }
 
 function processEnvForProbe(env: Record<string, string | undefined>, platform: NodeJS.Platform): NodeJS.ProcessEnv {
@@ -696,7 +684,8 @@ export class CodexAppServerProbeClient {
     this.child = spawn(launch.command, launch.args, {
       env: processEnvForProbe(env, platform),
       stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments
     });
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", chunk => this.read(chunk));

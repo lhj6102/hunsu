@@ -90,6 +90,7 @@ import {
 import { connectionExecutePreflightErrorForSelection } from "../apps/bridge/src/executes/executePreflight.ts";
 import { codexRuntimePreflightError } from "../apps/bridge/src/runtimes/codex.ts";
 import { codexInstallerLaunchCommand } from "../apps/bridge/src/runtime-providers/codex/codexInstall.ts";
+import { codexProbeLaunchCommand, getCodexVersion } from "../apps/bridge/src/runtime-providers/codex/codexDetection.ts";
 
 test("Bridge server exposes named modular HTTP boundaries", () => {
   const root = process.cwd();
@@ -213,11 +214,65 @@ test("Bridge Codex npm prerequisite and installer launch Windows command shims t
       args: [
         "/d",
         "/s",
+        "/v:off",
         "/c",
         '""npm.cmd" "install" "-g" "@openai/codex@latest""'
-      ]
+      ],
+      windowsVerbatimArguments: true
     }
   );
+  assert.deepEqual(
+    codexProbeLaunchCommand(
+      "C:\\Program Files\\Codex\\codex.cmd",
+      ["app-server", "--stdio"],
+      { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+      "win32"
+    ),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/v:off",
+        "/c",
+        '""C:\\Program Files\\Codex\\codex.cmd" "app-server" "--stdio""'
+      ],
+      windowsVerbatimArguments: true
+    }
+  );
+  assert.throws(
+    () => codexProbeLaunchCommand("C:\\unsafe%PATH%\\codex.cmd", ["--version"], {}, "win32"),
+    /cannot contain percent/u
+  );
+});
+
+test("Bridge Codex probes a real Windows command shim without Node re-escaping cmd.exe", {
+  skip: process.platform !== "win32"
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu codex command shim "));
+  const codexCmd = join(root, "fake codex.cmd");
+  const fakeCodex = join(process.cwd(), "tests", "fixtures", "fake-codex.mjs");
+  writeFileSync(codexCmd, `@echo off\r\n"${process.execPath}" "${fakeCodex}" %*\r\n`, "utf8");
+  try {
+    assert.equal(await getCodexVersion({
+      binaryPath: codexCmd,
+      env: process.env,
+      platform: "win32",
+      timeoutMs: 5_000
+    }), "codex-cli 0.0.0-fake");
+    const status = await getCodexRuntimeStatus({
+      customBinaryPath: codexCmd,
+      env: process.env,
+      platform: "win32",
+      force: true,
+      timeoutMs: 5_000
+    });
+    assert.equal(status.cli.installed, true);
+    assert.equal(status.appServer.available, true);
+    assert.equal(status.ready, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 import { HUNSU_CURRENT_EXECUTION_PATH, HUNSU_DESTINATIONS_PATH, HUNSU_EXECUTORS_PATH, HUNSU_HARNESS_PATH, HUNSU_HUNSU_DRAFT_PATH, HUNSU_PREVIOUS_EXECUTION_PATH, HUNSU_RESOURCES_PATH, HUNSU_RUNTIME_PATHS, decodeHunsuRuntimeFileText, readHunsuRuntimeStateAtRef, readPreviousExecutionChain, writeCommands, type ArtifactActionCommandRunner } from "../packages/core/src/index.ts";
 import type { ArtifactActionDefinition, BoardProjection, Command, Destination, NodeRecord } from "../packages/protocol/src/index.ts";
