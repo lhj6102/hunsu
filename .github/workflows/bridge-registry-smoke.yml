@@ -1,4 +1,4 @@
-name: Bridge Registry Candidate Smoke (diagnostic shell)
+name: Bridge Registry Candidate Smoke (diagnostic module path)
 
 on:
   workflow_dispatch:
@@ -77,6 +77,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
       - name: Exercise exact registry npx setup through the OS user service
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+          Remove-Item Env:WinPSModulePath -ErrorAction SilentlyContinue
+          node scripts/bridge-service-smoke.mjs --registry-version "${{ needs.identity.outputs.version }}"
+      - name: Exercise exact registry npx setup through the OS user service
+        if: runner.os != 'Windows'
         shell: bash
         run: node scripts/bridge-service-smoke.mjs --registry-version "${{ needs.identity.outputs.version }}"
       - name: Report elapsed time
