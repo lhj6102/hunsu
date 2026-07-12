@@ -29,7 +29,7 @@ Hunsu exists for that human layer.
 ## Public Alpha Quickstart
 
 > [!WARNING]
-> The current headless prerelease is experimental. `0.2.0-next.4` is the next
+> The current headless prerelease is experimental. `0.2.0-next.5` is the next
 > candidate and is published under `candidate-next` first; the `next` tag moves only after exact registry,
 > cross-platform service, and production integration verification succeeds.
 

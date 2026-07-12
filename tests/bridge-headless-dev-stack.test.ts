@@ -52,14 +52,14 @@ test("development scripts have valid Node syntax and safe helper contracts", asy
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.4",
+    version: "0.2.0-next.5",
     protocolVersion: "local-bridge-v1",
     deploymentProfile: "production"
   }), true);
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.4",
+    version: "0.2.0-next.5",
     protocolVersion: "local-bridge-v1",
     deploymentProfile: "production",
     daemonPid: 123
@@ -108,7 +108,7 @@ test("Bridge verification budget and production evidence contracts are explicit 
   const retainedBody = Buffer.from('{"schema":"hunsu.bridge.qa-evidence.v1","result":"passed"}\n', "utf8");
   const retainedDigest = `sha256:${createHash("sha256").update(retainedBody).digest("hex")}`;
   const record = evidence.validateProductionEvidence({
-    npmVersion: "0.2.0-next.4",
+    npmVersion: "0.2.0-next.5",
     npmIntegrity: `sha512-${"a".repeat(86)}==`,
     evidenceUrl: "https://evidence.example.test/bridge-next-1",
     evidenceSha256: retainedDigest,
@@ -155,7 +155,7 @@ test("Bridge verification budget and production evidence contracts are explicit 
     fetchImpl: async () => new Response(unsafeBody, { status: 200 })
   }), /credential or private local path/u);
   assert.throws(() => evidence.validateProductionEvidence({
-    npmVersion: "0.2.0-next.4",
+    npmVersion: "0.2.0-next.5",
     npmIntegrity: "sha512-YQ==",
     evidenceUrl: "https://evidence.example.test/bridge-next-1",
     evidenceSha256: retainedDigest,
@@ -170,7 +170,7 @@ test("Bridge verification budget and production evidence contracts are explicit 
     })
   }));
   assert.throws(() => evidence.validateProductionEvidence({
-    npmVersion: "0.2.0-next.4",
+    npmVersion: "0.2.0-next.5",
     npmIntegrity: "sha512-invalid",
     evidenceUrl: "https://example.test/?token=secret",
     evidenceSha256: retainedDigest,
@@ -186,7 +186,7 @@ test("npm provenance verification binds the signed package subject to the protec
   const provenance = await import(pathToFileURL(npmProvenanceVerifierPath).href) as {
     verifyBridgeNpmProvenanceAudit(input: Record<string, unknown>): Record<string, unknown>;
   };
-  const version = "0.2.0-next.4";
+  const version = "0.2.0-next.5";
   const versionTag = `v${version}`;
   const gitSha = "1".repeat(40);
   const subjectSha512 = "ab".repeat(64);
@@ -357,7 +357,7 @@ test("dev stack launches isolated Bridge and Web processes with all same-origin 
   const expectedHealth = {
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.4",
+    version: "0.2.0-next.5",
     protocolVersion: "local-bridge-v1",
     deploymentProfile: "production"
   };

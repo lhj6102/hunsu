@@ -41,7 +41,7 @@ test("deployment release manifest detects artifact changes", () => {
     createReleaseManifest(root, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.4",
+      bridgePackageVersion: "0.2.0-next.5",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -220,7 +220,7 @@ test("deployment preparation binds exact retained Connect bytes and target confi
     createReleaseManifest(release, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.4",
+      bridgePackageVersion: "0.2.0-next.5",
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -375,7 +375,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
     assert.equal(binding.source.sha, SOURCE_SHA);
     assert.throws(() => verifyBridgeCandidate(root, {
       ...releaseManifest,
-      bridgePackageVersion: "0.2.0-next.4"
+      bridgePackageVersion: "0.2.0-next.5"
     }), /does not match retained release/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -431,7 +431,9 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   assert.match(reusable, /d1 time-travel info/u);
   assert.match(reusable, /--no-bundle/u);
   assert.match(reusable, /exec node --conditions=development scripts\/cloudflare-config\.mjs print/u);
+  assert.match(reusable, /@hunsu\/connect-api exec node --conditions=development scripts\/cloudflare-config\.mjs print/u);
   assert.doesNotMatch(reusable, /config:print\s*>/u);
+  assert.doesNotMatch(reusable, /@hunsu\/connect-api run config:print/u);
   assert.doesNotMatch(reusable, /CLOUDFLARE_ACCOUNT_ID:.*\n\s+CLOUDFLARE_API_TOKEN:/u);
   assert.match(reusable, /name: production-d1-recovery-/u);
   assert.match(reusable, /deployment-failure-/u);
