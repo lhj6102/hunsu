@@ -18,6 +18,7 @@ jobs:
   deploy_preview:
     name: Build once and deploy preview
     uses: ./.github/workflows/deploy-cloudflare.yml
+    secrets: inherit
     with:
       deploy_target: preview
       environment_name: hunsu-preview

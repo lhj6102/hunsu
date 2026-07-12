@@ -144,6 +144,7 @@ jobs:
     name: Deploy approved retained release
     needs: authorize
     uses: ./.github/workflows/deploy-cloudflare.yml
+    secrets: inherit
     with:
       deploy_target: production
       environment_name: hunsu-production

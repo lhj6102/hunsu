@@ -169,6 +169,7 @@ jobs:
     name: Redeploy previous retained Web and Worker
     needs: authorize
     uses: ./.github/workflows/deploy-cloudflare.yml
+    secrets: inherit
     with:
       deploy_target: ${{ inputs.deploy_target }}
       environment_name: ${{ needs.authorize.outputs.environment_name }}
