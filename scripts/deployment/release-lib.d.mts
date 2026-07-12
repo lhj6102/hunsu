@@ -57,6 +57,7 @@ export function verifyRelease(root: string, options?: { expectedSourceSha?: stri
   manifestPath: string;
   manifestSha256: string;
 };
+export function assertRetainedWorkerModule(path: string, label?: string): void;
 export function safeReleasePath(root: string, relativePath: string): string;
 export function requireEnv(name: string, env?: Record<string, string | undefined>): string;
 export function validateBaseUrl(value: unknown, label: string, options?: { allowEmpty?: boolean }): string;

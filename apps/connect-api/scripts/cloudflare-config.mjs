@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -43,7 +43,18 @@ switch (command) {
   case "build": {
     writeConfig();
     const output = resolve(extraArgs[0] ?? join(appRoot, ".generated", "connect", "worker.mjs"));
-    runWrangler(["deploy", "--config", configPath, "--dry-run", "--outfile", output, "--metafile", `${output}.meta.json`]);
+    const bundleDirectory = resolve(`${output}.bundle`);
+    const bundledEntry = join(bundleDirectory, "index.js");
+    const bundledMetadata = join(bundleDirectory, "bundle-meta.json");
+    rmSync(bundleDirectory, { recursive: true, force: true });
+    runWrangler(["deploy", "--config", configPath, "--dry-run", "--outdir", bundleDirectory, "--metafile", bundledMetadata]);
+    if (!existsSync(bundledEntry)) {
+      throw new Error("Wrangler did not emit the Connect Worker index.js bundle.");
+    }
+    mkdirSync(dirname(output), { recursive: true });
+    copyFileSync(bundledEntry, output);
+    if (existsSync(bundledMetadata)) copyFileSync(bundledMetadata, `${output}.meta.json`);
+    rmSync(bundleDirectory, { recursive: true, force: true });
     break;
   }
   case "deploy":
@@ -83,5 +94,5 @@ function runWrangler(args) {
     process.stderr.write(`${result.error.message}\n`);
     process.exit(1);
   }
-  process.exit(result.status ?? 1);
+  if (result.status !== 0) process.exit(result.status ?? 1);
 }

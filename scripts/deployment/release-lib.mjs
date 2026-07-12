@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   lstatSync,
   readFileSync,
@@ -16,6 +16,7 @@ export const RELEASE_MANIFEST_FILE = "release-manifest.json";
 
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 const EXACT_SEMVER_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:[0-9a-z-]+(?:\.[0-9a-z-]+)*))?(?:\+[0-9a-z-]+(?:\.[0-9a-z-]+)*)?$/iu;
+const MULTIPART_WORKER_PATTERN = /^--[^\r\n]+\r?\nContent-Disposition:\s*form-data;/u;
 
 export function assertSourceSha(value, label = "source SHA") {
   const sha = String(value ?? "").trim().toLowerCase();
@@ -97,6 +98,8 @@ export function createReleaseManifest(root, input) {
   if (!files.some(file => file.path === "connect/worker.mjs")) {
     throw new Error("Release is missing the prebuilt Connect Worker module.");
   }
+  assertRetainedWorkerModule(resolve(absoluteRoot, "hub/worker.mjs"), "Hub");
+  assertRetainedWorkerModule(resolve(absoluteRoot, "connect/worker.mjs"), "Connect");
   const migrations = files
     .filter(file => /^(?:hub|connect)\/migrations\/[^/]+\.sql$/u.test(file.path))
     .map(file => ({
@@ -162,6 +165,8 @@ export function verifyRelease(root, options = {}) {
       throw new Error(`Release artifact integrity mismatch: ${file.path}`);
     }
   }
+  assertRetainedWorkerModule(safeReleasePath(absoluteRoot, "hub/worker.mjs"), "Hub");
+  assertRetainedWorkerModule(safeReleasePath(absoluteRoot, "connect/worker.mjs"), "Connect");
   const expectedMigrations = manifest.files
     .filter(file => /^(?:hub|connect)\/migrations\/[^/]+\.sql$/u.test(file.path))
     .map(file => ({
@@ -177,6 +182,26 @@ export function verifyRelease(root, options = {}) {
     manifestPath,
     manifestSha256: sha256File(manifestPath)
   };
+}
+
+export function assertRetainedWorkerModule(path, label = "Retained") {
+  const source = readFileSync(path, "utf8");
+  if (!source.trim()) {
+    throw new Error(`${label} Worker module is empty.`);
+  }
+  if (MULTIPART_WORKER_PATTERN.test(source)) {
+    throw new Error(`${label} Worker module is a multipart upload body, not JavaScript.`);
+  }
+  if (!/\bexport\s+(?:default|\{)/u.test(source)) {
+    throw new Error(`${label} Worker module does not contain an ES module export.`);
+  }
+  const checked = spawnSync(process.execPath, ["--check", path], {
+    encoding: "utf8",
+    stdio: "pipe"
+  });
+  if (checked.error || checked.status !== 0) {
+    throw new Error(`${label} Worker module is not syntactically valid JavaScript.`);
+  }
 }
 
 export function safeReleasePath(root, relativePath) {

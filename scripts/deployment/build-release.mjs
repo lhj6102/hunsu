@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  assertRetainedWorkerModule,
   assertSourceSha,
   createReleaseManifest,
   gitValue,
@@ -45,6 +46,8 @@ if (!existsSync(neutralRuntimeConfig) || !readFileSync(neutralRuntimeConfig, "ut
 cpSync(webDist, resolve(outputRoot, "web"), { recursive: true });
 
 run("pnpm", ["--filter", "@hunsu/hub-api", "config:write"]);
+const hubBundleDirectory = resolve(outputRoot, ".hub-worker-build");
+rmSync(hubBundleDirectory, { recursive: true, force: true });
 run("pnpm", [
   "--filter",
   "@hunsu/hub-api",
@@ -54,12 +57,19 @@ run("pnpm", [
   "--config",
   ".wrangler/generated.toml",
   "--dry-run",
-  "--outfile",
-  resolve(outputRoot, "hub/worker.mjs")
+  "--outdir",
+  hubBundleDirectory,
+  "--metafile",
+  resolve(hubBundleDirectory, "bundle-meta.json")
 ]);
-if (!existsSync(resolve(outputRoot, "hub/worker.mjs"))) {
+const hubBundleEntry = resolve(hubBundleDirectory, "index.js");
+const retainedHubWorker = resolve(outputRoot, "hub/worker.mjs");
+if (!existsSync(hubBundleEntry)) {
   throw new Error("Wrangler dry-run did not produce the retained Hub Worker module.");
 }
+copyFileSync(hubBundleEntry, retainedHubWorker);
+rmSync(hubBundleDirectory, { recursive: true, force: true });
+assertRetainedWorkerModule(retainedHubWorker, "Hub");
 cpSync(resolve(repositoryRoot, "apps/hub-api/migrations"), resolve(outputRoot, "hub/migrations"), { recursive: true });
 
 run("pnpm", [
@@ -74,6 +84,7 @@ if (!existsSync(resolve(outputRoot, "connect/worker.mjs"))) {
   throw new Error("Wrangler dry-run did not produce the retained Connect Worker module.");
 }
 rmSync(resolve(outputRoot, "connect/worker.mjs.meta.json"), { force: true });
+assertRetainedWorkerModule(resolve(outputRoot, "connect/worker.mjs"), "Connect");
 cpSync(resolve(repositoryRoot, "apps/connect-api/migrations"), resolve(outputRoot, "connect/migrations"), { recursive: true });
 
 const bridgePackage = JSON.parse(readFileSync(resolve(repositoryRoot, "apps/bridge/package.json"), "utf8"));
