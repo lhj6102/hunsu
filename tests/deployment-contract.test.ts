@@ -447,7 +447,9 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   assert.match(reusable, /workflow_call:\s*[\s\S]*?secrets:\s*\n\s+CLOUDFLARE_API_TOKEN:[\s\S]*?required: false[\s\S]*?HUNSU_CONNECT_SIGNING_PRIVATE_JWK:[\s\S]*?required: false/u);
   assert.match(reusable, /name: Require protected environment secrets/u);
   assert.match(reusable, /selected protected environment is missing its deployment secrets/u);
-  assert.doesNotMatch(`${preview}\n${production}\n${rollback}`, /secrets: inherit/u);
+  for (const caller of [preview, production, rollback]) {
+    assert.match(caller, /uses: \.\/\.github\/workflows\/deploy-cloudflare\.yml\s*\n\s*secrets: inherit/u);
+  }
   assert.match(headless, /pull_request:\s*\n\s*branches:\s*\n\s*- preview/u);
   assert.doesNotMatch(headless, /name: Promotion candidate ready/u);
   assert.match(preview, /name: Promotion candidate ready/u);
