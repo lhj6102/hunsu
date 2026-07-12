@@ -254,7 +254,7 @@ async function loadAppRenderModule(): Promise<{ render: () => string; close: () 
     },
     define: {
       __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
-      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_CONNECT_API_BASE_URL__: JSON.stringify(""),
       __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
     },
     ssr: {

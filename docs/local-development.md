@@ -7,17 +7,18 @@ pnpm install
 pnpm dev:stack
 ~~~
 
-The stack creates a temporary HUNSU_HOME, allocates random Bridge, Web, and
-Relay ports, starts a deterministic local Relay fixture, starts the foreground
-daemon with fake Codex, waits for health, starts Web, prefixes child output,
-and cleans up processes and state on exit.
+The stack creates a temporary HUNSU_HOME, allocates random Bridge and Web ports,
+starts the foreground daemon with fake Codex, waits for health, starts Web,
+prefixes child output, and cleans up processes and state on exit. Remote peer
+behavior is exercised by deterministic Connect/peer contract tests rather than
+a locally deployed service. No application is deployed from a developer
+machine.
 
 Safe startup output contains only local URLs and the temporary state path:
 
 ~~~text
 [bridge] ready at http://127.0.0.1:43127
 [web]    ready at http://hunsu.localhost:5173
-[relay]  ready at http://127.0.0.1:43128
 [state]  /tmp/hunsu-dev-abc123
 [timing] daemon ready: 420 ms
 [timing] Web ready: 910 ms
@@ -45,8 +46,9 @@ unavailable, use a 127.0.0.1 origin.
 
 ## Deterministic tests
 
-tests/fixtures/fake-codex.mjs and tests/fixtures/fake-relay.mjs provide
-credential-free provider and Relay behavior. Automated tests create disposable
+`tests/fixtures/fake-codex.mjs` and the Connect/peer test adapters provide
+credential-free provider, enrollment, encrypted signaling, and direct command
+behavior. Automated tests create disposable
 Git repositories and never use a developer's real Workspace registry.
 
 Run the complete normal gate with:
@@ -69,7 +71,7 @@ user service:
 pnpm run test:headless:scenario
 ~~~
 
-It starts one daemon and local Relay, exercises status, fake Codex setup/check,
-Workspace add/list/inspect, pairing, Web proxy health, device login, Remote
-enable and command round-trip, Workspace revocation, authenticated shutdown,
-port release, and credential-leak checks.
+It starts one daemon, exercises status, fake Codex setup/check, Workspace
+add/list/inspect, pairing, Web proxy health, the local remote-grant lifecycle,
+authenticated shutdown, port release, and credential-leak checks. Dedicated
+peer tests cover encrypted signaling and direct command round trips.

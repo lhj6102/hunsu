@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,11 +12,17 @@ import type {
 } from "../apps/bridge/src/service/types.ts";
 import { resolveHunsuPaths, type HunsuPaths } from "../apps/bridge/src/state/paths.ts";
 import {
+  BRIDGE_CONFIG_SCHEMA,
+  LEGACY_BRIDGE_CONFIG_SCHEMA,
+  createConfigStore
+} from "../apps/bridge/src/state/configStore.ts";
+import {
   HOME_OWNERSHIP_SCHEMA,
   createHomeOwnershipStore
 } from "../apps/bridge/src/setup/homeOwnership.ts";
 import {
   BRIDGE_PACKAGE_VERSION,
+  LEGACY_RUNTIME_INSTALL_SCHEMA,
   RUNTIME_INSTALL_SCHEMA,
   createRuntimeInstallStore,
   serviceInputForInstallation,
@@ -39,6 +46,8 @@ import {
 } from "../apps/bridge/src/setup/setup.ts";
 
 const INSTALLATION_ID = "install_setup_transaction_test";
+const INSTALLED_CLI = "#!/usr/bin/env node\n";
+const INSTALLED_CLI_SHA256 = createHash("sha256").update(INSTALLED_CLI).digest("hex");
 
 test("setup rejects unsupported Node and dry-run has no filesystem or service side effects", async () => {
   assert.equal(nodeVersionIsSupported("v24.17.99"), false);
@@ -80,12 +89,12 @@ test("initial setup stages, verifies, activates, journals, starts, and atomicall
     assert.equal(await exists(setupLockPath(fixture.paths)), false);
     assert.equal(await exists(join(fixture.paths.runtimeDirectory, "staging", "setup-test")), false);
     assert.deepEqual(fixture.events.slice(0, 6), [
+      "phase:profile-persistence",
       "phase:ownership-marker",
       "phase:credential-ensure",
       "credentials.ensure",
       "phase:npm-install",
-      "npm.install",
-      "phase:candidate-verification"
+      "npm.install"
     ]);
     assert.ok(fixture.events.indexOf("credentials.ensure") < fixture.events.indexOf("npm.install"));
     assert.equal(fixture.service.installed(), true);
@@ -95,7 +104,14 @@ test("initial setup stages, verifies, activates, journals, starts, and atomicall
     assert.equal(install?.installationId, INSTALLATION_ID);
     assert.equal(install?.current.packageVersion, BRIDGE_PACKAGE_VERSION);
     assert.equal(install?.current.runtimePath, result.value.runtimePath);
+    assert.equal(install?.current.cliSha256, INSTALLED_CLI_SHA256);
     assert.equal(install?.previous, null);
+    const rawInstall = JSON.parse(await readFile(fixture.paths.runtimeInstallFile, "utf8")) as {
+      schema?: string;
+      current?: { cliSha256?: string };
+    };
+    assert.equal(rawInstall.schema, RUNTIME_INSTALL_SCHEMA);
+    assert.equal(rawInstall.current?.cliSha256, INSTALLED_CLI_SHA256);
     const marker = JSON.parse(await readFile(fixture.paths.homeOwnershipFile, "utf8")) as { schema?: string; installationId?: string };
     assert.equal(marker.schema, HOME_OWNERSHIP_SCHEMA);
     assert.equal(marker.installationId, INSTALLATION_ID);
@@ -123,6 +139,83 @@ test("same-version setup verifies and reuses the exact CLI without npm or a seco
   }
 });
 
+test("same-version setup replaces a CLI whose bytes no longer match the trusted install record", async () => {
+  const fixture = await createFixture();
+  try {
+    assert.equal((await setupBridge(fixture.options())).ok, true);
+    const install = await createRuntimeInstallStore(fixture.paths).read();
+    assert.ok(install);
+    await writeFile(install.current.cliPath, "#!/usr/bin/env node\nmalicious();\n", "utf8");
+    fixture.events.length = 0;
+
+    const repaired = await setupBridge(fixture.options({ transactionId: "setup-repair" }));
+    assert.equal(repaired.ok, true);
+    if (!repaired.ok) return;
+    assert.equal(repaired.value.idempotent, false);
+    assert.equal(repaired.value.started, true);
+    assert.equal(fixture.events.includes("npm.install"), true);
+    assert.equal(fixture.events.includes("service.restart"), true);
+    assert.equal(await readFile(install.current.cliPath, "utf8"), INSTALLED_CLI);
+    assert.equal((await createRuntimeInstallStore(fixture.paths).read())?.current.cliSha256, INSTALLED_CLI_SHA256);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("legacy install state cannot authorize same-version reuse until exact package bytes re-establish trust", async () => {
+  const fixture = await createFixture();
+  try {
+    assert.equal((await setupBridge(fixture.options())).ok, true);
+    const raw = JSON.parse(await readFile(fixture.paths.runtimeInstallFile, "utf8")) as {
+      schema: string;
+      current: Record<string, unknown>;
+      previous: Record<string, unknown> | null;
+    };
+    raw.schema = LEGACY_RUNTIME_INSTALL_SCHEMA;
+    delete raw.current.cliSha256;
+    if (raw.previous) delete raw.previous.cliSha256;
+    await writeFile(fixture.paths.runtimeInstallFile, `${JSON.stringify(raw)}\n`, "utf8");
+    fixture.events.length = 0;
+
+    const migrated = await setupBridge(fixture.options({ transactionId: "setup-migrate" }));
+    assert.equal(migrated.ok, true);
+    assert.equal(fixture.events.includes("npm.install"), true);
+    const persisted = await createRuntimeInstallStore(fixture.paths).read();
+    assert.equal(persisted?.schema, RUNTIME_INSTALL_SCHEMA);
+    assert.equal(persisted?.current.cliSha256, INSTALLED_CLI_SHA256);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("preview setup persists and verifies one profile and emits preview-aware follow-up commands", async () => {
+  const fixture = await createFixture();
+  try {
+    const preview = await setupBridge(fixture.options({ deploymentProfile: "preview" }));
+    assert.equal(preview.ok, true);
+    if (!preview.ok) return;
+    assert.equal(preview.value.deploymentProfile, "preview");
+    assert.equal(fixture.service.input()?.deploymentProfile, "preview");
+    assert.equal((await createConfigStore(fixture.paths).read()).deploymentProfile, "preview");
+    assert.deepEqual(preview.value.commands, {
+      status: "npx @hunsu/bridge@candidate-next status --profile preview",
+      doctor: "npx @hunsu/bridge@candidate-next doctor --profile preview",
+      remove: "npx @hunsu/bridge@candidate-next remove --profile preview"
+    });
+
+    const installEvents = fixture.events.length;
+    const switched = await setupBridge(fixture.options({
+      deploymentProfile: "production",
+      transactionId: "setup-switch"
+    }));
+    assert.equal(switched.ok, false);
+    assert.equal(fixture.service.input()?.deploymentProfile, "preview");
+    assert.equal(fixture.events.slice(installEvents).some(event => event.startsWith("service.")), false);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("upgrade switches side-by-side and records the previous verified runtime", async () => {
   const fixture = await createFixture();
   try {
@@ -142,6 +235,7 @@ test("upgrade switches side-by-side and records the previous verified runtime", 
 });
 
 const FIRST_INSTALL_FAILURES: SetupFailurePhase[] = [
+  "profile-persistence",
   "ownership-marker",
   "credential-ensure",
   "npm-install",
@@ -153,6 +247,7 @@ const FIRST_INSTALL_FAILURES: SetupFailurePhase[] = [
   "health-verification",
   "authentication-verification",
   "version-verification",
+  "profile-verification",
   "install-record-commit"
 ];
 
@@ -168,7 +263,16 @@ test("every first-install phase failure compensates to no daemon, definition, ca
         assert.equal(await exists(join(fixture.paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION)), false, phase);
         assert.equal(await exists(fixture.paths.runtimeInstallFile), false, phase);
         assert.equal(await exists(setupTransactionPath(fixture.paths)), false, phase);
-        assert.equal(await readFile(fixture.paths.configFile, "utf8"), "config-preserved\n", phase);
+        const config = JSON.parse(await readFile(fixture.paths.configFile, "utf8")) as {
+          schema?: string;
+          deploymentProfile?: string;
+        };
+        assert.equal(
+          config.schema === LEGACY_BRIDGE_CONFIG_SCHEMA || config.schema === BRIDGE_CONFIG_SCHEMA,
+          true,
+          phase
+        );
+        if (config.schema === BRIDGE_CONFIG_SCHEMA) assert.equal(config.deploymentProfile, "production", phase);
         assert.equal(await readFile(fixture.paths.workspacesFile, "utf8"), "workspaces-preserved\n", phase);
         assert.equal(await readFile(fixture.paths.credentialsFile, "utf8"), "credentials-preserved\n", phase);
       } finally {
@@ -186,6 +290,7 @@ test("upgrade failures restore the previous service, install record, and runtime
     "health-verification",
     "authentication-verification",
     "version-verification",
+    "profile-verification",
     "install-record-commit"
   ];
   for (const phase of phases) {
@@ -293,12 +398,19 @@ async function createFixture() {
   const service = fakeServiceManager(events);
   let prepared = false;
 
-  const prepareHome = async (): Promise<void> => {
+  const prepareHome = async (deploymentProfile: "production" | "preview" = "production"): Promise<void> => {
     if (prepared) return;
     prepared = true;
     await mkdir(paths.home, { recursive: true });
     await Promise.all([
-      writeFile(paths.configFile, "config-preserved\n", "utf8"),
+      writeFile(paths.configFile, `${JSON.stringify({
+        schema: BRIDGE_CONFIG_SCHEMA,
+        deploymentProfile,
+        host: "127.0.0.1",
+        port: 19687,
+        provider: { kind: "unconfigured" },
+        remote: { enabled: false }
+      })}\n`, "utf8"),
       writeFile(paths.workspacesFile, "workspaces-preserved\n", "utf8"),
       writeFile(paths.credentialsFile, "credentials-preserved\n", { encoding: "utf8", mode: 0o600 })
     ]);
@@ -307,19 +419,20 @@ async function createFixture() {
   const options = (input: {
     failPhases?: SetupFailurePhase[];
     transactionId?: string;
+    deploymentProfile?: "production" | "preview";
   } = {}): BridgeSetupOptions => {
     const remaining = new Set(input.failPhases ?? []);
     return {
       paths,
+      ...(input.deploymentProfile ? { deploymentProfile: input.deploymentProfile } : {}),
       credentialStore: {
         async ensure() {
-          await prepareHome();
+          await prepareHome(input.deploymentProfile);
           events.push("credentials.ensure");
           return {
-            schema: "hunsu.bridge.credentials.v1",
+            schema: "hunsu.bridge.credentials.v2",
             controlToken: "hunsu_control_fixture",
-            account: null,
-            relay: null
+            connect: null
           };
         }
       },
@@ -332,7 +445,7 @@ async function createFixture() {
       createInstallationId: () => INSTALLATION_ID,
       createTransactionId: () => input.transactionId ?? "setup-test",
       onPhase: async phase => {
-        await prepareHome();
+        await prepareHome(input.deploymentProfile);
         events.push(`phase:${phase}`);
         if (remaining.delete(phase)) throw new Error(`injected ${phase}`);
       }
@@ -386,7 +499,7 @@ function packageRunner(events: string[]): StagedRuntimeCommandRunner {
       version: BRIDGE_PACKAGE_VERSION,
       engines: { node: ">=24.18" }
     })}\n`, "utf8");
-    await writeFile(join(packageRoot, "dist", "cli.js"), "#!/usr/bin/env node\n", "utf8");
+    await writeFile(join(packageRoot, "dist", "cli.js"), INSTALLED_CLI, "utf8");
     return { exitCode: 0, stdout: "", stderr: "" };
   };
 }
@@ -467,7 +580,8 @@ function fakeServiceManager(events: string[]): BridgeServiceManager & {
         health: running,
         authenticated: running,
         version: currentInput?.packageVersion ?? "unavailable",
-        runtimePath: currentInput?.runtimePath ?? installation.runtimePath
+        runtimePath: currentInput?.runtimePath ?? installation.runtimePath,
+        deploymentProfile: currentInput?.deploymentProfile ?? "production"
       };
     }
   };
@@ -489,6 +603,7 @@ async function seedRuntime(paths: HunsuPaths, version: string, cliText: string):
     runtimePath,
     nodePath: process.execPath,
     cliPath,
+    cliSha256: createHash("sha256").update(`${cliText}\n`).digest("hex"),
     installedAt: "2026-07-12T00:00:00.000Z"
   };
 }

@@ -107,7 +107,9 @@ function windowsTaskActionArguments(input: ServiceInstallInput): string {
     "--runtime-path",
     windowsArgument(input.runtimePath),
     "--home",
-    windowsArgument(input.hunsuHome)
+    windowsArgument(input.hunsuHome),
+    "--profile",
+    input.deploymentProfile
   ].join(" ");
 }
 

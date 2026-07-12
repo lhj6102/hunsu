@@ -2,6 +2,10 @@ import {
   createBridgeControlStateReader,
   type BridgeControlStateReader
 } from "../state/controlStateReader.ts";
+import {
+  isBridgeDeploymentProfile,
+  type BridgeDeploymentProfile
+} from "../deploymentProfile.ts";
 import { resolveHunsuPaths, type HunsuPathInput, type HunsuPaths } from "../state/paths.ts";
 import {
   BRIDGE_CLI_RESULT_SCHEMA,
@@ -34,6 +38,7 @@ export type BridgeHealth = {
   service: "hunsu-bridge";
   version: string;
   protocolVersion: "local-bridge-v1";
+  deploymentProfile: BridgeDeploymentProfile;
 };
 
 export type ControlEndpointProbe =
@@ -175,7 +180,8 @@ async function probeHealthAt(fetchImpl: typeof fetch, endpoint: string, timeoutM
     && value?.ok === true
     && value.service === "hunsu-bridge"
     && typeof value.version === "string"
-    && value.protocolVersion === "local-bridge-v1") {
+    && value.protocolVersion === "local-bridge-v1"
+    && isBridgeDeploymentProfile(value.deploymentProfile)) {
     return {
       probe: { state: "hunsu-healthy" },
       health: value as BridgeHealth

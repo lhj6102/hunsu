@@ -16,7 +16,7 @@ export type HunsuConfigError = {
   allowed?: readonly string[];
 };
 
-export type HunsuPortName = "bridgeApi" | "studioWeb" | "agentPreview" | "relay";
+export type HunsuPortName = "bridgeApi" | "studioWeb" | "agentPreview";
 
 export type HunsuEndpoint = {
   name: HunsuPortName;
@@ -55,7 +55,7 @@ export type StudioWebServerConfig = {
   apiProxyTarget: string;
   browserBridgeUrl?: string;
   browserHubApiUrl?: string;
-  browserRelayApiUrl?: string;
+  browserConnectApiUrl?: string;
 };
 
 export type StudioLauncherConfig = {
@@ -95,19 +95,9 @@ export type BridgeRuntimeConfig = {
   codexThreadOptions: CodexThreadOptionsConfig;
 };
 
-export type RelayServerConfig = {
-  relay: HunsuEndpoint;
-  publicApiUrl: string;
-  publicWsUrl: string;
-  issuer: string;
-  storagePath: string;
-  processEnv: Record<string, string>;
-};
-
-export type RelayClientConfig = {
-  authBaseUrl: string;
-  relayApiUrl?: string;
-  relayWsUrl?: string;
+export type ConnectClientConfig = {
+  connectApiUrl: string;
+  connectWsUrl: string;
 };
 
 export type BridgeRuntimeConfigOptions = {
@@ -163,20 +153,10 @@ export const HUNSU_PORT_SPECS: Record<HunsuPortName, PortSpec> = {
     reserved: true,
     allowPortZero: false
   },
-  relay: {
-    name: "relay",
-    defaultHost: DEFAULT_HOST,
-    hostEnv: ["HUNSU_RELAY_HOST"],
-    defaultPort: 19690,
-    portEnv: ["HUNSU_RELAY_PORT"],
-    reserved: false,
-    allowPortZero: true
-  }
 };
 
 export const HUNSU_ACTIVE_SERVICE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
 export const HUNSU_STUDIO_WEB_ACTIVE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
-export const HUNSU_RELAY_ACTIVE_PORTS = ["relay"] as const satisfies readonly HunsuPortName[];
 const CODEX_SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
 const CODEX_APPROVAL_POLICIES = ["never", "on-request", "on-failure", "untrusted"] as const;
 const CODEX_APPROVALS_REVIEWERS = ["user", "auto_review"] as const;
@@ -221,16 +201,10 @@ export function resolveHunsuPorts(env: Env, options: HunsuPortResolveOptions = {
     return agentPreview;
   }
 
-  const relay = resolveEndpoint(HUNSU_PORT_SPECS.relay, env, options.overrides?.relay);
-  if (!relay.ok) {
-    return relay;
-  }
-
   return ok({
     bridgeApi: bridgeApi.value,
     studioWeb: studioWeb.value,
-    agentPreview: agentPreview.value,
-    relay: relay.value
+    agentPreview: agentPreview.value
   });
 }
 
@@ -244,7 +218,7 @@ export function resolveStudioWebServerConfig(env: Env): ConfigResult<StudioWebSe
     ports => flatMapConfigResult(readConfigBoolean(env, "HUNSU_WEB_STRICT_PORT", true), strictPort =>
       flatMapConfigResult(readOptionalUrl(env, "VITE_HUNSU_BRIDGE_URL"), browserBridgeUrl =>
         flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_HUB_API_URL", "HUNSU_HUB_PUBLIC_API_URL"], defaultBrowserHubApiUrl(env)), browserHubApiUrl =>
-          flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_RELAY_API_URL", "HUNSU_RELAY_PUBLIC_API_URL"]), browserRelayApiUrl =>
+          flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_CONNECT_API_URL", "HUNSU_CONNECT_API_BASE_URL"]), browserConnectApiUrl =>
             mapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_API_PROXY_TARGET"], browserBridgeUrl ?? endpointUrl(ports.bridgeApi)), apiProxyTarget => ({
               web: ports.studioWeb,
               bridgeApi: ports.bridgeApi,
@@ -252,7 +226,7 @@ export function resolveStudioWebServerConfig(env: Env): ConfigResult<StudioWebSe
               apiProxyTarget,
               browserBridgeUrl,
               browserHubApiUrl,
-              browserRelayApiUrl
+              browserConnectApiUrl
             }))
           )
         )
@@ -316,39 +290,19 @@ export function resolveBridgeRuntimeConfig(env: Env, options: BridgeRuntimeConfi
   );
 }
 
-export function resolveRelayServerConfig(env: Env, options: { storagePath?: string; homeDir?: string } = {}): ConfigResult<RelayServerConfig> {
-  const processEnv = filterEnv(env);
-  return flatMapConfigResult(resolveValidatedHunsuPorts(env, { activePortNames: HUNSU_RELAY_ACTIVE_PORTS }), ports =>
-    flatMapConfigResult(readFirstOptionalUrl(env, ["HUNSU_RELAY_PUBLIC_API_URL", "HUNSU_RELAY_API_URL"], endpointUrl(ports.relay)), publicApiUrl =>
-      flatMapConfigResult(readFirstOptionalWebSocketUrl(env, ["HUNSU_RELAY_PUBLIC_WS_URL", "HUNSU_RELAY_WS_URL"], httpUrlToWebSocketUrl(`${publicApiUrl ?? endpointUrl(ports.relay)}/v1/device/connect`)), publicWsUrl =>
-        flatMapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_AUTH_BASE_URL"], publicApiUrl ?? endpointUrl(ports.relay)), issuer =>
-          mapConfigResult(resolveRequiredConfiguredPath(
-            options.storagePath,
-            env,
-            "HUNSU_RELAY_STORAGE_PATH",
-            join(options.homeDir ?? homedir(), ".config", "hunsu", "relay-service.json")
-          ), storagePath => ({
-            relay: ports.relay,
-            publicApiUrl: publicApiUrl ?? endpointUrl(ports.relay),
-            publicWsUrl: publicWsUrl ?? httpUrlToWebSocketUrl(`${publicApiUrl ?? endpointUrl(ports.relay)}/v1/device/connect`),
-            issuer,
-            storagePath,
-            processEnv
-          }))
-        )
-      )
-    )
-  );
-}
-
-export function resolveRelayClientConfig(env: Env): ConfigResult<RelayClientConfig> {
-  return flatMapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_AUTH_BASE_URL"], "https://hunsu.app"), authBaseUrl =>
-    flatMapConfigResult(readFirstOptionalUrl(env, ["HUNSU_RELAY_PUBLIC_API_URL", "HUNSU_RELAY_API_URL"]), relayApiUrl =>
-      mapConfigResult(readFirstOptionalWebSocketUrl(env, ["HUNSU_RELAY_PUBLIC_WS_URL", "HUNSU_RELAY_WS_URL"], relayApiUrl ? httpUrlToWebSocketUrl(`${relayApiUrl}/v1/device/connect`) : undefined), relayWsUrl => ({
-        authBaseUrl,
-        relayApiUrl,
-        relayWsUrl
-      }))
+export function resolveConnectClientConfig(env: Env): ConfigResult<ConnectClientConfig> {
+  return flatMapConfigResult(
+    readFirstUrl(env, ["HUNSU_CONNECT_API_BASE_URL"], "https://connect.hunsu.app"),
+    connectApiUrl => mapConfigResult(
+      readFirstOptionalWebSocketUrl(
+        env,
+        ["HUNSU_CONNECT_WS_URL"],
+        httpUrlToWebSocketUrl(`${connectApiUrl}/v1/connect/device`)
+      ),
+      connectWsUrl => ({
+        connectApiUrl,
+        connectWsUrl: connectWsUrl ?? httpUrlToWebSocketUrl(`${connectApiUrl}/v1/connect/device`)
+      })
     )
   );
 }

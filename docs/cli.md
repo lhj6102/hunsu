@@ -100,7 +100,10 @@ stages the exact runtime under `runtime/staging/<transaction-id>`. Only a
 complete package with the expected name, version, Node engine, and CLI is moved
 to `runtime/versions/<version>` and installed into the OS user-service
 definition. Health, control authentication, version, and runtime path are
-verified before `runtime/install.json` commits.
+verified before `runtime/install.json` commits the CLI SHA-256. A same-version
+rerun skips package staging only when the installed CLI still matches that
+trusted digest; legacy records without a digest must re-establish trust from the
+exact package source.
 
 On a failed first install, setup removes the candidate service definition and
 runtime while preserving config, Workspaces, and credentials. On a failed

@@ -101,7 +101,7 @@ export type RuntimeProviderCapabilities = {
   supportsSubscriptionAuth: boolean;
   supportsDeviceAuth: boolean;
   supportsApiKeyAuth: boolean;
-  supportsRemoteRelay: boolean;
+  supportsRemoteAccess: boolean;
   supportsAcp: boolean;
 };
 
@@ -269,6 +269,6 @@ export const unavailableProviderCapabilities: RuntimeProviderCapabilities = {
   supportsSubscriptionAuth: false,
   supportsDeviceAuth: false,
   supportsApiKeyAuth: false,
-  supportsRemoteRelay: false,
+  supportsRemoteAccess: false,
   supportsAcp: false
 };

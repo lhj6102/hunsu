@@ -10,6 +10,7 @@ const WORKFLOW_PATH = ".github/workflows/publish-bridge.yml";
 const SLSA_PREDICATE = "https://slsa.dev/provenance/v1";
 const GITHUB_ACTIONS_BUILD_TYPE = "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1";
 const GITHUB_HOSTED_BUILDER = "https://github.com/actions/runner/github-hosted";
+const PREVIEW_PUBLICATION_REF = "refs/heads/preview";
 
 export function verifyBridgeNpmProvenanceAudit(input) {
   const version = exactVersion(input.version);
@@ -50,14 +51,13 @@ export function verifyBridgeNpmProvenanceAudit(input) {
   const buildDefinition = requiredObject(statement.predicate?.buildDefinition, "SLSA build definition");
   ensure(buildDefinition.buildType === GITHUB_ACTIONS_BUILD_TYPE, "The candidate was not built by the GitHub Actions SLSA workflow build type.");
   const workflow = requiredObject(buildDefinition.externalParameters?.workflow, "SLSA workflow identity");
-  const expectedRef = `refs/tags/${versionTag}`;
   ensure(workflow.repository === REPOSITORY_URL, "The provenance repository did not match Hunsu.");
   ensure(workflow.path === WORKFLOW_PATH, "The provenance workflow did not match publish-bridge.yml.");
-  ensure(workflow.ref === expectedRef, "The provenance workflow ref did not match the immutable candidate tag.");
-  ensure(buildDefinition.internalParameters?.github?.event_name === "workflow_dispatch", "The candidate was not published by the protected dispatch workflow.");
+  ensure(workflow.ref === PREVIEW_PUBLICATION_REF, "The provenance workflow ref did not match the protected preview branch.");
+  ensure(buildDefinition.internalParameters?.github?.event_name === "push", "The candidate was not published by the protected preview push workflow.");
 
   ensure(Array.isArray(buildDefinition.resolvedDependencies), "The provenance omitted resolved source dependencies.");
-  const expectedSourceUri = `git+${REPOSITORY_URL}@${expectedRef}`;
+  const expectedSourceUri = `git+${REPOSITORY_URL}@${PREVIEW_PUBLICATION_REF}`;
   const source = buildDefinition.resolvedDependencies.find(value => value?.uri === expectedSourceUri);
   ensure(source?.digest?.gitCommit === gitSha, "The signed provenance source commit did not match the candidate Git SHA.");
   ensure(statement.predicate?.runDetails?.builder?.id === GITHUB_HOSTED_BUILDER, "The candidate was not published from a GitHub-hosted runner.");
@@ -75,7 +75,7 @@ export function verifyBridgeNpmProvenanceAudit(input) {
     source: {
       repository: REPOSITORY_URL,
       workflow: WORKFLOW_PATH,
-      ref: expectedRef,
+      ref: PREVIEW_PUBLICATION_REF,
       gitSha,
       builder: GITHUB_HOSTED_BUILDER,
       invocationId

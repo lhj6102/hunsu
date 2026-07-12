@@ -1,0 +1,155 @@
+name: Promote Preview To Production
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: cloudflare-production
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Verify preview merge and QA approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      preview_sha: ${{ steps.gate.outputs.preview_sha }}
+      artifact_run_id: ${{ steps.gate.outputs.artifact_run_id }}
+      pull_request_number: ${{ steps.gate.outputs.pull_request_number }}
+      qa_leader: ${{ steps.gate.outputs.qa_leader }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Require one exact preview PR and QA leader approval
+        id: gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          QA_LEADERS: ${{ vars.HUNSU_QA_LEADERS }}
+        with:
+          script: |
+            const path = require("node:path");
+            const { pathToFileURL } = require("node:url");
+            const gateModule = await import(pathToFileURL(path.join(
+              process.env.GITHUB_WORKSPACE,
+              "scripts/deployment/promotion-gate.mjs"
+            )).href);
+            const pullRequests = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                per_page: 100
+              }
+            );
+            const reviewsByPullRequest = {};
+            for (const pullRequest of pullRequests) {
+              reviewsByPullRequest[pullRequest.number] = await github.paginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pullRequest.number,
+                  per_page: 100
+                }
+              );
+            }
+            const promotion = gateModule.selectPromotionPullRequest({
+              pullRequests,
+              reviewsByPullRequest,
+              currentSha: context.sha,
+              qaLeaders: process.env.QA_LEADERS
+            });
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: "deploy-preview.yml",
+                head_sha: promotion.previewSha,
+                status: "completed",
+                per_page: 100
+              }
+            );
+            const previewRun = runs.find(run =>
+              run.conclusion === "success"
+              && run.event === "push"
+              && run.head_branch === "preview"
+            );
+            if (!previewRun) {
+              core.setFailed(`No successful preview deployment exists for ${promotion.previewSha}.`);
+              return;
+            }
+            const approvalTime = Date.parse(promotion.qaApprovedAt);
+            const previewCompletedTime = Date.parse(previewRun.updated_at);
+            if (!Number.isFinite(approvalTime) || !Number.isFinite(previewCompletedTime) || approvalTime <= previewCompletedTime) {
+              core.setFailed(`QA leader approval must be submitted after preview run ${previewRun.id} completes successfully.`);
+              return;
+            }
+            const artifactResponse = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: previewRun.id,
+              per_page: 100
+            });
+            const requiredArtifacts = [
+              `deployment-release-${promotion.previewSha}`,
+              `preview-deployment-evidence-${promotion.previewSha}`
+            ];
+            for (const artifactName of requiredArtifacts) {
+              const artifact = artifactResponse.data.artifacts.find(item => item.name === artifactName && !item.expired);
+              if (!artifact) {
+                core.setFailed(`Preview run ${previewRun.id} is missing retained artifact ${artifactName}.`);
+                return;
+              }
+            }
+            core.setOutput("preview_sha", promotion.previewSha);
+            core.setOutput("artifact_run_id", String(previewRun.id));
+            core.setOutput("pull_request_number", String(promotion.pullRequestNumber));
+            core.setOutput("qa_leader", promotion.qaLeader);
+            core.summary
+              .addHeading("Production promotion authorized")
+              .addRaw(`PR #${promotion.pullRequestNumber}; QA leader @${promotion.qaLeader} approved after preview run ${previewRun.html_url}`)
+              .write();
+      - name: Require production tree to equal the approved preview tree
+        env:
+          PREVIEW_SHA: ${{ steps.gate.outputs.preview_sha }}
+          PULL_REQUEST_NUMBER: ${{ steps.gate.outputs.pull_request_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/pull/${PULL_REQUEST_NUMBER}/head:refs/remotes/origin/approved-preview"
+          fetched_preview_sha=$(git rev-parse refs/remotes/origin/approved-preview)
+          if [[ "$fetched_preview_sha" != "$PREVIEW_SHA" ]]; then
+            echo "The preview PR head moved after QA approval." >&2
+            exit 1
+          fi
+          preview_tree=$(git rev-parse "$PREVIEW_SHA^{tree}")
+          production_tree=$(git rev-parse "$GITHUB_SHA^{tree}")
+          if [[ "$preview_tree" != "$production_tree" ]]; then
+            echo "main does not have the exact tree deployed and approved on preview." >&2
+            echo "Merge main into preview, redeploy, re-QA, and merge the refreshed preview PR." >&2
+            exit 1
+          fi
+
+  deploy_production:
+    name: Deploy approved retained release
+    needs: authorize
+    uses: ./.github/workflows/deploy-cloudflare.yml
+    with:
+      deploy_target: production
+      environment_name: hunsu-production
+      source_sha: ${{ needs.authorize.outputs.preview_sha }}
+      tooling_ref: ${{ github.sha }}
+      artifact_run_id: ${{ needs.authorize.outputs.artifact_run_id }}
+      build_release: false
+      require_preview_evidence: true
+      apply_migrations: true

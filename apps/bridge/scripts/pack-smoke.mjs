@@ -161,6 +161,7 @@ export async function runBridgePackSmoke(options = {}) {
     assertCliSuccess(ready);
     assert.equal(ready.value?.version, manifest.version);
     assert.equal(ready.value?.protocolVersion, "local-bridge-v1");
+    assert.equal(ready.value?.deploymentProfile, "production");
     const endpoint = new URL(String(ready.value?.endpoint));
     assert.equal(endpoint.hostname, "127.0.0.1");
     assert.ok(Number(endpoint.port) > 0);
@@ -199,6 +200,7 @@ export async function runBridgePackSmoke(options = {}) {
     assert.equal(statusResult.value?.endpoint, endpoint.toString().replace(/\/$/u, ""));
     assert.equal(statusResult.value?.version, manifest.version);
     assert.equal(statusResult.value?.runtimePath, installDirectory);
+    assert.equal(statusResult.value?.deploymentProfile, "production");
 
     const credentialRotationRun = await run(command("npx"), [
       "--no-install",
@@ -269,7 +271,7 @@ export async function runBridgePackSmoke(options = {}) {
 
 function auditManifest(manifest) {
   assert.equal(manifest.name, "@hunsu/bridge");
-  assert.equal(manifest.version, "0.2.0-next.2");
+  assert.equal(manifest.version, "0.2.0-next.3");
   assert.equal(manifest.private, false);
   assert.equal(manifest.type, "module");
   assert.deepEqual(manifest.repository, {
@@ -318,6 +320,7 @@ function auditRuntimeImports(contents, file) {
   assert.equal(contents.includes(repositoryRoot), false, `${file} must not embed the repository path`);
   assert.doesNotMatch(contents, /sourceMappingURL=/u);
   assert.doesNotMatch(contents, /\/packages\/[^/]+\/src\/|\/apps\/bridge\/src\//u);
+  assert.doesNotMatch(contents, /(?:from|import\()["'](?:ip|werift|ws)["']/u, `${file} must bundle the peer networking stack and audited IP codec`);
   const imports = [
     ...Array.from(contents.matchAll(/\bfrom["']([^"']+)["']/gu), match => match[1]),
     ...Array.from(contents.matchAll(/\bimport\(["']([^"']+)["']\)/gu), match => match[1])
@@ -375,9 +378,13 @@ async function assertPublicApiContract(installDirectory, environment) {
   assert.equal(runtime.stderr.trim(), "");
   assert.deepEqual(JSON.parse(runtime.stdout), [
     "BRIDGE_CLI_RESULT_SCHEMA",
+    "BRIDGE_DEPLOYMENT_PROFILES",
     "HUNSU_BRIDGE_PROTOCOL_VERSION",
     "HUNSU_BRIDGE_VERSION",
+    "bridgeDeploymentEndpoints",
+    "bridgeSetupPackageTag",
     "createBridgeControlClient",
+    "isBridgeDeploymentProfile",
     "resolveHunsuHome",
     "resolveHunsuPaths",
     "runBridgeCli",
@@ -387,9 +394,13 @@ async function assertPublicApiContract(installDirectory, environment) {
   const consumer = `
     import {
       BRIDGE_CLI_RESULT_SCHEMA,
+      BRIDGE_DEPLOYMENT_PROFILES,
       HUNSU_BRIDGE_PROTOCOL_VERSION,
       HUNSU_BRIDGE_VERSION,
+      bridgeDeploymentEndpoints,
+      bridgeSetupPackageTag,
       createBridgeControlClient,
+      isBridgeDeploymentProfile,
       resolveHunsuHome,
       resolveHunsuPaths,
       runBridgeCli,
@@ -398,10 +409,13 @@ async function assertPublicApiContract(installDirectory, environment) {
       type BridgeControlClient,
       type BridgeControlRequest,
       type BridgeDaemonOptions,
+      type BridgeDeploymentEndpoints,
+      type BridgeDeploymentProfile,
       type BridgeHealth,
       type BridgeRuntimeIdentity,
       type HunsuPaths,
-      type RelaySocket,
+      type ConnectSocket,
+      type ConnectSocketFactory,
       type RunningBridgeDaemon
     } from "@hunsu/bridge";
 
@@ -409,13 +423,30 @@ async function assertPublicApiContract(installDirectory, environment) {
     const paths: HunsuPaths = resolveHunsuPaths({ home });
     const client: BridgeControlClient = createBridgeControlClient({ paths, timeoutMs: 10 });
     const request: BridgeControlRequest = { method: "GET", timeoutMs: 10 };
-    const options: BridgeDaemonOptions = { home, host: "127.0.0.1", port: 0, development: true };
+    const profile: BridgeDeploymentProfile = "preview";
+    const endpoints: BridgeDeploymentEndpoints = bridgeDeploymentEndpoints(profile);
+    const options: BridgeDaemonOptions = { home, host: "127.0.0.1", port: 0, deploymentProfile: profile, development: true };
     const health: Promise<BridgeHealth | undefined> = client.health();
     const status: Promise<BridgeCliResult<BridgeRuntimeIdentity>> = client.request("/v1/control/status", request);
     const daemon: Promise<RunningBridgeDaemon> = startBridgeDaemon(options);
-    const socket: RelaySocket | undefined = undefined;
+    const socket: ConnectSocket | undefined = undefined;
+    const socketFactory: ConnectSocketFactory | undefined = undefined;
     const exitCode: Promise<number> = runBridgeCli(["--version", "--json"]);
-    void [BRIDGE_CLI_RESULT_SCHEMA, HUNSU_BRIDGE_PROTOCOL_VERSION, HUNSU_BRIDGE_VERSION, health, status, daemon, socket, exitCode];
+    void [
+      BRIDGE_CLI_RESULT_SCHEMA,
+      BRIDGE_DEPLOYMENT_PROFILES,
+      HUNSU_BRIDGE_PROTOCOL_VERSION,
+      HUNSU_BRIDGE_VERSION,
+      endpoints,
+      bridgeSetupPackageTag(profile),
+      isBridgeDeploymentProfile(profile),
+      health,
+      status,
+      daemon,
+      socket,
+      socketFactory,
+      exitCode
+    ];
   `;
   const consumerPath = join(installDirectory, "bridge-consumer.ts");
   await writeFile(consumerPath, consumer, "utf8");

@@ -1,4 +1,5 @@
 import { copyFile, mkdir, readFile, rm } from "node:fs/promises";
+import { builtinModules } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
@@ -6,6 +7,9 @@ import { build } from "esbuild";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = resolve(packageRoot, "dist");
 const cliSource = resolve(packageRoot, "src", "cli.ts");
+const bareNodeBuiltins = new Set(builtinModules
+  .filter(name => !name.startsWith("node:"))
+  .map(name => name.replace(/^node:/u, "")));
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 
@@ -20,6 +24,15 @@ const common = {
   sourcemap: false,
   treeShaking: true,
   logLevel: "info"
+};
+
+const canonicalNodeBuiltinsPlugin = {
+  name: "canonical-node-builtins",
+  setup(context) {
+    context.onResolve({ filter: /^[a-z][a-z0-9_/-]*$/ }, args => bareNodeBuiltins.has(args.path)
+      ? { path: `node:${args.path}`, external: true }
+      : undefined);
+  }
 };
 
 const packagedCliPlugin = {
@@ -42,7 +55,8 @@ await Promise.all([
   build({
     ...common,
     entryPoints: [resolve(packageRoot, "src", "package-api.ts")],
-    outfile: resolve(dist, "index.js")
+    outfile: resolve(dist, "index.js"),
+    plugins: [canonicalNodeBuiltinsPlugin]
   }),
   build({
     ...common,
@@ -61,7 +75,7 @@ await Promise.all([
     },
     outfile: resolve(dist, "cli.js"),
     banner: { js: "#!/usr/bin/env node" },
-    plugins: [packagedCliPlugin]
+    plugins: [canonicalNodeBuiltinsPlugin, packagedCliPlugin]
   })
 ]);
 

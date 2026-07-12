@@ -5,8 +5,7 @@ import { join } from "node:path";
 import {
   endpointUrl,
   resolveCodexAppServerConfig,
-  resolveRelayClientConfig,
-  resolveRelayServerConfig,
+  resolveConnectClientConfig,
   resolveHunsuPorts,
   resolveBridgeApiServerConfig,
   resolveBridgeRuntimeConfig,
@@ -17,13 +16,16 @@ import {
   validateNoPortConflicts
 } from "../packages/config/src/index.ts";
 import {
+  renderConnectWranglerJson,
   renderHubWranglerToml,
+  resolveConnectCloudflareConfig,
   resolveHubApiWorkerRuntimeConfig,
   resolveHubCloudflareConfig,
   type ConfigResult
 } from "../packages/config/src/cloudflare.ts";
 
 const ROOT = new URL("..", import.meta.url).pathname;
+const RELEASE_SHA = "0123456789abcdef0123456789abcdef01234567";
 
 test("Hunsu config resolves canonical Bridge ports", () => {
   const ports = unwrapConfigResult(resolveHunsuPorts({}));
@@ -31,7 +33,6 @@ test("Hunsu config resolves canonical Bridge ports", () => {
   assert.equal(ports.bridgeApi.port, 19687);
   assert.equal(ports.studioWeb.port, 19688);
   assert.equal(ports.agentPreview.port, 19673);
-  assert.equal(ports.relay.port, 19690);
   assert.equal(ports.agentPreview.reserved, true);
 });
 
@@ -64,12 +65,12 @@ test("Studio web config validates browser URL and exposes it for Vite define", (
   const config = unwrapConfigResult(resolveStudioWebServerConfig({
     VITE_HUNSU_BRIDGE_URL: "http://127.0.0.1:19687/",
     VITE_HUNSU_HUB_API_URL: "https://hub.example.test/",
-    VITE_HUNSU_RELAY_API_URL: "https://relay.example.test/"
+    VITE_HUNSU_CONNECT_API_URL: "https://connect.example.test/"
   }));
 
   assert.equal(config.browserBridgeUrl, "http://127.0.0.1:19687");
   assert.equal(config.browserHubApiUrl, "https://hub.example.test");
-  assert.equal(config.browserRelayApiUrl, "https://relay.example.test");
+  assert.equal(config.browserConnectApiUrl, "https://connect.example.test");
   assert.equal(config.apiProxyTarget, "http://127.0.0.1:19687");
 
   const publicHub = unwrapConfigResult(resolveStudioWebServerConfig({
@@ -88,10 +89,10 @@ test("Studio web config validates browser URL and exposes it for Vite define", (
     assert.equal(invalid.error.code, "invalid_url");
   }
 
-  const invalidRelay = resolveStudioWebServerConfig({ VITE_HUNSU_RELAY_API_URL: "not a url" });
-  assert.equal(invalidRelay.ok, false);
-  if (!invalidRelay.ok) {
-    assert.equal(invalidRelay.error.code, "invalid_url");
+  const invalidConnect = resolveStudioWebServerConfig({ VITE_HUNSU_CONNECT_API_URL: "not a url" });
+  assert.equal(invalidConnect.ok, false);
+  if (!invalidConnect.ok) {
+    assert.equal(invalidConnect.error.code, "invalid_url");
   }
 });
 
@@ -214,35 +215,48 @@ test("Bridge runtime config keeps process env separate from Codex app-server env
   assert.equal(config.codexAppServer.environment.CODEX_HOME, "/codex/only");
 });
 
-test("Relay config resolves hosted auth and WebSocket endpoints explicitly", () => {
-  const server = unwrapConfigResult(resolveRelayServerConfig({
-    HUNSU_RELAY_PORT: "0",
-    HUNSU_RELAY_PUBLIC_API_URL: "https://relay.example.test/",
-    HUNSU_RELAY_PUBLIC_WS_URL: "wss://relay.example.test/v1/device/connect/",
-    HUNSU_BRIDGE_AUTH_BASE_URL: "https://auth.example.test/",
-    HUNSU_RELAY_STORAGE_PATH: "relay-state.json"
-  }, {
-    homeDir: "/tmp/hunsu-home"
+test("Connect config resolves the hosted API and device WebSocket explicitly", () => {
+  const client = unwrapConfigResult(resolveConnectClientConfig({
+    HUNSU_CONNECT_API_BASE_URL: "https://connect.example.test/",
+    HUNSU_CONNECT_WS_URL: "wss://connect.example.test/v1/connect/device/"
   }));
+  assert.equal(client.connectApiUrl, "https://connect.example.test");
+  assert.equal(client.connectWsUrl, "wss://connect.example.test/v1/connect/device");
 
-  assert.equal(server.relay.port, 0);
-  assert.equal(server.publicApiUrl, "https://relay.example.test");
-  assert.equal(server.publicWsUrl, "wss://relay.example.test/v1/device/connect");
-  assert.equal(server.issuer, "https://auth.example.test");
-  assert.equal(server.storagePath, join(ROOT, "relay-state.json"));
+  const defaults = unwrapConfigResult(resolveConnectClientConfig({}));
+  assert.equal(defaults.connectApiUrl, "https://connect.hunsu.app");
+  assert.equal(defaults.connectWsUrl, "wss://connect.hunsu.app/v1/connect/device");
 
-  const client = unwrapConfigResult(resolveRelayClientConfig({
-    HUNSU_BRIDGE_AUTH_BASE_URL: "https://auth.example.test/",
-    HUNSU_RELAY_PUBLIC_API_URL: "https://relay.example.test/",
-    HUNSU_RELAY_PUBLIC_WS_URL: "wss://relay.example.test/v1/device/connect/"
-  }));
-  assert.equal(client.authBaseUrl, "https://auth.example.test");
-  assert.equal(client.relayApiUrl, "https://relay.example.test");
-  assert.equal(client.relayWsUrl, "wss://relay.example.test/v1/device/connect");
-
-  const invalidWs = resolveRelayClientConfig({ HUNSU_RELAY_PUBLIC_WS_URL: "https://relay.example.test/ws" });
+  const invalidWs = resolveConnectClientConfig({ HUNSU_CONNECT_WS_URL: "https://connect.example.test/ws" });
   assert.equal(invalidWs.ok, false);
   if (!invalidWs.ok) assert.equal(invalidWs.error.code, "invalid_url");
+});
+
+test("Connect Cloudflare config renders exact hosted bindings without private signing material", () => {
+  const config = unwrapCloudflareConfig(resolveConnectCloudflareConfig({
+    HUNSU_DEPLOY_TARGET: "preview",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
+    HUNSU_CONNECT_WORKER_NAME: "hunsu-connect-preview",
+    HUNSU_CONNECT_API_BASE_URL: "https://connect.preview.hunsu.app",
+    HUNSU_WEB_PUBLIC_URL: "https://preview.hunsu.app",
+    HUNSU_CONNECT_ACCESS_ISSUER: "https://hunsu.cloudflareaccess.com",
+    HUNSU_CONNECT_ACCESS_AUD: "previewConnectAudience1234",
+    HUNSU_CONNECT_D1_DATABASE_NAME: "hunsu_connect_preview",
+    HUNSU_CONNECT_D1_DATABASE_ID: "38cc819b-2405-47a6-925e-0d5d7de731c4",
+    HUNSU_CONNECT_SIGNING_PUBLIC_JWK: JSON.stringify({
+      kty: "EC",
+      crv: "P-256",
+      x: "DZDAFyOricZ4dOBOhNrNtAS2X_EdqrE2wQxB23raNcc",
+      y: "qLXw7DinTp-5T0i_MdU9jN15Wpnxu0dXh-Owo5ydL1U"
+    }),
+    HUNSU_CONNECT_SIGNING_KEY_ID: "connect-vd_GiPDTK2lPIDS3Y2dDIEck"
+  }));
+  const rendered = JSON.parse(renderConnectWranglerJson(config));
+  assert.equal(rendered.name, "hunsu-connect-preview");
+  assert.equal(rendered.d1_databases[0].binding, "CONNECT_DB");
+  assert.equal(rendered.durable_objects.bindings[0].class_name, "DeviceSignalDO");
+  assert.deepEqual(rendered.routes, [{ pattern: "connect.preview.hunsu.app", custom_domain: true }]);
+  assert.equal(rendered.vars.HUNSU_CONNECT_SIGNING_PRIVATE_JWK, undefined);
 });
 
 test("Hub Cloudflare config resolves local defaults and deterministic dev config", () => {
@@ -254,6 +268,7 @@ test("Hub Cloudflare config resolves local defaults and deterministic dev config
 
   const dev = unwrapCloudflareConfig(resolveHubCloudflareConfig({
     HUNSU_DEPLOY_TARGET: "dev",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
     HUNSU_HUB_WORKER_NAME: "hunsu-hub-api-dev",
     HUNSU_HUB_ORIGIN_NAME: "motorhome-dev",
     HUNSU_HUB_PUBLIC_API_URL: "https://hub-dev.example.test/",
@@ -267,11 +282,25 @@ test("Hub Cloudflare config resolves local defaults and deterministic dev config
   assert.equal(dev.publicHubApiUrl, "https://hub-dev.example.test");
   assert.deepEqual(dev.compatibilityFlags, ["nodejs_compat"]);
   assert.equal(dev.publishQueueName, "hunsu-hub-publish-dev");
+
+  const preview = unwrapCloudflareConfig(resolveHubCloudflareConfig({
+    HUNSU_DEPLOY_TARGET: "preview",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
+    HUNSU_HUB_WORKER_NAME: "hunsu-hub-api-preview",
+    HUNSU_HUB_ORIGIN_NAME: "hunsu",
+    HUNSU_HUB_PUBLIC_API_URL: "https://api.preview.hunsu.app",
+    HUNSU_HUB_D1_DATABASE_NAME: "hunsu_hub_preview",
+    HUNSU_HUB_D1_DATABASE_ID: "preview-db-id",
+    HUNSU_HUB_R2_BUCKET_NAME: "hunsu-hub-packages-preview"
+  }));
+  assert.equal(preview.target, "preview");
+  assert.equal(preview.releaseSha, RELEASE_SHA);
 });
 
 test("Hub Cloudflare config rejects missing or invalid deployment environment", () => {
   const missingId = resolveHubCloudflareConfig({
     HUNSU_DEPLOY_TARGET: "production",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
     HUNSU_HUB_WORKER_NAME: "hunsu-hub-api",
     HUNSU_HUB_ORIGIN_NAME: "motorhome",
     HUNSU_HUB_PUBLIC_API_URL: "https://hub.example.test",
@@ -281,6 +310,7 @@ test("Hub Cloudflare config rejects missing or invalid deployment environment", 
   const invalidTarget = resolveHubCloudflareConfig({ HUNSU_DEPLOY_TARGET: "staging" });
   const invalidUrl = resolveHubCloudflareConfig({
     HUNSU_DEPLOY_TARGET: "dev",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
     HUNSU_HUB_WORKER_NAME: "hunsu-hub-api-dev",
     HUNSU_HUB_ORIGIN_NAME: "motorhome-dev",
     HUNSU_HUB_PUBLIC_API_URL: "ftp://hub-dev.example.test",
@@ -295,11 +325,24 @@ test("Hub Cloudflare config rejects missing or invalid deployment environment", 
   if (!missingId.ok) assert.equal(missingId.error.code, "missing_required_env");
   if (!invalidTarget.ok) assert.equal(invalidTarget.error.code, "invalid_enum");
   if (!invalidUrl.ok) assert.equal(invalidUrl.error.code, "invalid_url");
+
+  const missingRelease = resolveHubCloudflareConfig({
+    HUNSU_DEPLOY_TARGET: "preview",
+    HUNSU_HUB_WORKER_NAME: "hunsu-hub-api-preview",
+    HUNSU_HUB_ORIGIN_NAME: "hunsu",
+    HUNSU_HUB_PUBLIC_API_URL: "https://api.preview.hunsu.app",
+    HUNSU_HUB_D1_DATABASE_NAME: "hunsu_hub_preview",
+    HUNSU_HUB_D1_DATABASE_ID: "preview-db-id",
+    HUNSU_HUB_R2_BUCKET_NAME: "hunsu-hub-packages-preview"
+  });
+  assert.equal(missingRelease.ok, false);
+  if (!missingRelease.ok) assert.equal(missingRelease.error.env, "HUNSU_RELEASE_SHA");
 });
 
 test("Hub generated Wrangler TOML omits secrets and placeholders", () => {
   const config = unwrapCloudflareConfig(resolveHubCloudflareConfig({
     HUNSU_DEPLOY_TARGET: "production",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
     HUNSU_HUB_WORKER_NAME: "hunsu-hub-api",
     HUNSU_HUB_ORIGIN_NAME: "motorhome",
     HUNSU_HUB_PUBLIC_API_URL: "https://hub.example.test",
@@ -312,20 +355,27 @@ test("Hub generated Wrangler TOML omits secrets and placeholders", () => {
 
   assert.match(toml, /name = "hunsu-hub-api"/);
   assert.match(toml, /database_id = "prod-db-id"/);
+  assert.match(toml, /HUNSU_DEPLOY_TARGET = "production"/);
+  assert.match(toml, new RegExp(`HUNSU_RELEASE_SHA = "${RELEASE_SHA}"`));
+  assert.match(toml, /\[\[routes\]\][\s\S]*pattern = "hub\.example\.test"[\s\S]*custom_domain = true/);
   assert.doesNotMatch(toml, /replace-with|placeholder|HUNSU_HUB_ADMIN_TOKEN|must-not-render/);
 });
 
 test("Hub API Worker runtime config fails closed without an origin", () => {
   const missing = resolveHubApiWorkerRuntimeConfig({});
   const valid = unwrapCloudflareConfig(resolveHubApiWorkerRuntimeConfig({
+    HUNSU_DEPLOY_TARGET: "production",
     HUNSU_HUB_ORIGIN_NAME: "motorhome",
     HUNSU_HUB_PUBLIC_API_URL: "https://hub.example.test",
+    HUNSU_RELEASE_SHA: RELEASE_SHA,
     HUNSU_HUB_ADMIN_TOKEN: "token"
   }));
 
   assert.equal(missing.ok, false);
   if (!missing.ok) assert.equal(missing.error.code, "missing_required_env");
   assert.equal(valid.originName, "motorhome");
+  assert.equal(valid.target, "production");
+  assert.equal(valid.releaseSha, RELEASE_SHA);
   assert.equal(valid.publicHubApiUrl, "https://hub.example.test");
   assert.equal(valid.adminToken, "token");
 });
@@ -338,6 +388,7 @@ test("Hub API scripts use generated Wrangler config instead of a tracked Wrangle
   assert.equal(existsSync(join(ROOT, "apps/hub-api/wrangler.toml")), false);
   for (const scriptName of ["config:print", "config:write", "dev", "deploy", "db:migrate:local", "db:migrate:remote"]) {
     assert.match(hubPackage.scripts[scriptName], /scripts\/cloudflare-config\.mjs/);
+    assert.match(hubPackage.scripts[scriptName], /--conditions=development/);
     assert.doesNotMatch(hubPackage.scripts[scriptName], /wrangler\.toml/);
   }
   assert.match(hubPackage.scripts["seed:local"], /scripts\/seed-local\.mjs/);

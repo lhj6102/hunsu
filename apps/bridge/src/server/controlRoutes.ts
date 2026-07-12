@@ -311,8 +311,8 @@ function parseRemoteWorkspaceScopes(value: unknown): BridgeRemoteWorkspaceScope[
     }
     return scope as BridgeRemoteWorkspaceScope;
   });
-  if (!scopes.includes("remoteRelay.access")) {
-    throw new BridgeError("BRIDGE_STATE_INVALID", "Workspace Remote access requires the remoteRelay.access scope.");
+  if (!scopes.includes("remote.access")) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Workspace Remote access requires the remote.access scope.");
   }
   return [...new Set(scopes)];
 }

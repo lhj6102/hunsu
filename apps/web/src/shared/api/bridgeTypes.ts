@@ -461,7 +461,7 @@ export type RoadmapRegistryEntry = {
   localAccess?: { enabled: boolean };
   remoteAccess?: {
     enabled: boolean;
-    scopes: Array<"remoteRelay.access" | "execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose">;
+    scopes: Array<"remote.access" | "execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose">;
   };
   codex?: {
     readyForExecute: boolean;
@@ -530,7 +530,7 @@ export type RuntimeProviderStatus = {
     supportsSubscriptionAuth: boolean;
     supportsDeviceAuth: boolean;
     supportsApiKeyAuth: boolean;
-    supportsRemoteRelay: boolean;
+    supportsRemoteAccess: boolean;
     supportsAcp: boolean;
   };
   modelInventory:
@@ -581,7 +581,7 @@ export type BridgeBackendStatus = {
     | { state: "connected" }
     | { state: "not_running" }
     | { state: "login_required" }
-    | { state: "relay_offline" }
+    | { state: "signaling_offline" }
     | { state: "error"; error: string };
   workspaces: ConnectedWorkspaceSummary[];
 };
@@ -745,7 +745,7 @@ export type StudioBridgeRequirement = {
 
 export type StudioConnectionStatus = {
   mode: "none" | "local" | "remote";
-  transport: "direct" | "relay" | "unreachable";
+  transport: "direct" | "p2p" | "unreachable";
   health: "checking" | "connected" | "disconnected" | "error";
   auth: "paired" | "missing_token" | "expired" | "invalid" | "account_mismatch" | "unknown";
   projectAccess: "granted" | "needs_grant" | "denied" | "not_applicable";
@@ -759,7 +759,7 @@ export type StudioConnectionStatus = {
   };
   endpoint?: {
     apiUrl?: string;
-    relayLabel?: string;
+    connectLabel?: string;
   };
   account?: {
     webUserId?: string;
@@ -775,7 +775,7 @@ export type StudioConnectionStatus = {
     | "public_bind"
     | "version_mismatch"
     | "origin_not_allowed"
-    | "relay_unavailable"
+    | "signaling_unavailable"
     | "project_missing"
   >;
   error?: string;
@@ -792,22 +792,13 @@ export type BridgeCompatibility =
 export type RemoteBridgeDevice = {
   deviceId: string;
   deviceName: string;
-  userId: string;
-  registeredAt: string;
   lastSeenAt?: string;
   status: "online" | "offline";
-  remoteAccess?: "enabled" | "disabled";
-  provider?: RuntimeProviderStatus;
+  signingPublicKeyJwk: JsonWebKey;
+  agreementPublicKeyJwk: JsonWebKey;
   workspaces?: ConnectedWorkspaceSummary[];
-  projectGrants?: Array<{
-    path: string;
-    grantedAt?: string;
-    scopes: Array<"execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose" | "remoteRelay.access">;
-    active?: boolean;
-  }>;
-  lastSnapshotAt?: string;
   bridgeVersion?: string;
-  protocolVersion?: string;
+  protocolVersion: string;
 };
 
 export type RemoteBridgeDeviceListResult = {
@@ -816,8 +807,8 @@ export type RemoteBridgeDeviceListResult = {
 
 export type RemoteBridgeConnectRequest = {
   deviceId: string;
-  webUserId?: string;
-  projectPath?: string;
+  workspaceId: string;
+  workspaceLabel?: string;
   minBridgeVersion?: string;
   requiredProtocolVersion?: string;
   requiredFeatures?: string[];
@@ -827,14 +818,6 @@ export type RemoteBridgeConnectResult = {
   connection: StudioConnectionStatus;
   device?: RemoteBridgeDevice;
   compatibility: BridgeCompatibility;
-};
-
-export type RemoteProjectGrantStatus = "granted" | "needs_grant" | "denied";
-
-export type RemoteProjectGrantStatusResult = {
-  projectAccess: RemoteProjectGrantStatus;
-  missingScopes?: Array<"execute.start" | "artifactAction.run" | "env.read" | "hostAlias.expose" | "remoteRelay.access">;
-  message?: string;
 };
 
 export type BrowseRootId = string & { readonly __brand: "BrowseRootId" };

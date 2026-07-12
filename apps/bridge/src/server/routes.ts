@@ -1,14 +1,4 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { BridgeRuntimeConfig } from "@hunsu/config";
-import {
-  connectRemoteBridgeForRequest,
-  listRemoteBridgeDevicesForRequest,
-  remoteBridgeCommandFromEventUrl,
-  routeRemoteBridgeCommand,
-  streamRemoteBridgeCommand,
-  type RemoteBridgeCommandRequest,
-  type RemoteBridgeConnectRequest
-} from "../connections/remoteConnection.ts";
 
 type StudioResourceRouteContext = {
   readJson: <T>(request: IncomingMessage) => Promise<T>;
@@ -74,59 +64,6 @@ export function isBridgeControlRoute(pathname: string): boolean {
     || pathname === "/api/bridge/pairing/rotate"
     || pathname === "/api/bridge/pairing/revoke"
     || pathname === "/api/bridge/control/shutdown";
-}
-
-export async function handleRemoteBridgeRoute(
-  request: IncomingMessage,
-  response: ServerResponse,
-  pathname: string,
-  url: URL,
-  context: {
-    runtimeConfig: BridgeRuntimeConfig;
-    readJson: <T>(request: IncomingMessage) => Promise<T>;
-    sendJson: (response: ServerResponse, status: number, body: unknown) => void;
-    responseHeaders?: (response: ServerResponse) => Record<string, string>;
-  }
-): Promise<boolean> {
-  if (request.method === "GET" && pathname === "/api/remote/devices") {
-    context.sendJson(response, 200, {
-      devices: await listRemoteBridgeDevicesForRequest(request, context.runtimeConfig, {
-        relayRegistryPath: context.runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH,
-        userId: url.searchParams.get("userId") ?? undefined
-      })
-    });
-    return true;
-  }
-
-  if (request.method === "POST" && pathname === "/api/remote/connect") {
-    const body = await context.readJson<RemoteBridgeConnectRequest>(request);
-    context.sendJson(response, 202, await connectRemoteBridgeForRequest(body, request, context.runtimeConfig, {
-      relayRegistryPath: context.runtimeConfig.processEnv.HUNSU_RELAY_REGISTRY_PATH
-    }));
-    return true;
-  }
-
-  if (request.method === "POST" && pathname === "/api/remote/commands") {
-    const body = await context.readJson<RemoteBridgeCommandRequest>(request);
-    const result = await routeRemoteBridgeCommand(body, request, context.runtimeConfig);
-    context.sendJson(response, result.ok ? result.status : result.status ?? 502, result);
-    return true;
-  }
-
-  if (request.method === "GET" && pathname === "/api/remote/commands/events") {
-    const command = remoteBridgeCommandFromEventUrl(url);
-    if (!command) {
-      context.sendJson(response, 400, { ok: false, error: "Remote event stream command payload is invalid." });
-      return true;
-    }
-    await streamRemoteBridgeCommand(command, request, response, context.runtimeConfig, {
-      sendJson: context.sendJson,
-      responseHeaders: context.responseHeaders
-    });
-    return true;
-  }
-
-  return false;
 }
 
 export async function handleStudioResourceRoute(

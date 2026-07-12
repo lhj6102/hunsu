@@ -5,11 +5,12 @@ import { cn } from "@/lib/utils";
 import { bridgeApiHttpUrl } from "@/shared/api/bridgeApiBase";
 import { useBridgeConnection, type BridgeConnectionState } from "@/shared/api/bridgeConnection";
 import { isUsableLocalStudioConnectionStatus } from "@/shared/api/studioConnectionStatus";
+import { bridgeSetupCommands, HUNSU_WEB_RUNTIME_CONFIG } from "@/shared/config/runtimeConfig";
 import { Button } from "@/shared/ui/button";
 
 export function SetupScreen({ next = "/studio" }: { next?: string }) {
   const safeNext = safeStudioNext(next);
-  const command = useMemo(bridgeSetupCommands, []);
+  const command = useMemo(() => bridgeSetupCommands(), []);
   const healthEndpoint = useMemo(() => bridgeApiHttpUrl("/health"), []);
   const connection = useBridgeConnection({ enabled: true, intervalMs: 1800 });
   const [copied, setCopied] = useState(false);
@@ -71,7 +72,11 @@ export function SetupScreen({ next = "/studio" }: { next?: string }) {
             </div>
 
             <div className="mt-7 grid gap-3 sm:grid-cols-3">
-              <SetupStep number="1" title="Setup" body="Run npx @hunsu/bridge@next setup once." />
+              <SetupStep
+                number="1"
+                title="Setup"
+                body={`Install Bridge ${HUNSU_WEB_RUNTIME_CONFIG.bridgePackageVersion || "from the recommended channel"} for the ${HUNSU_WEB_RUNTIME_CONFIG.target === "preview" ? "preview" : "production"} profile once.`}
+              />
               <SetupStep number="2" title="Pair" body="Run hunsu-bridge open for a fresh browser session." />
               <SetupStep number="3" title="Continue" body="Choose or create a Workspace in Studio." />
             </div>
@@ -190,12 +195,4 @@ function canContinueToStudio(connection: BridgeConnectionState): boolean {
   return connection.status === "online"
     && connection.tokenPresent
     && isUsableLocalStudioConnectionStatus(connection.connection);
-}
-
-function bridgeSetupCommands(): string {
-  return [
-    "npx @hunsu/bridge@next setup",
-    "hunsu-bridge status",
-    "hunsu-bridge open"
-  ].join("\n");
 }

@@ -1,7 +1,13 @@
+import { access } from "node:fs/promises";
+import {
+  isBridgeDeploymentProfile,
+  type BridgeDeploymentProfile
+} from "../deploymentProfile.ts";
 import type { HunsuPaths } from "./paths.ts";
-import { invalidState, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
+import { invalidState, isNodeError, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
 
-export const BRIDGE_CONFIG_SCHEMA = "hunsu.bridge.config.v1" as const;
+export const LEGACY_BRIDGE_CONFIG_SCHEMA = "hunsu.bridge.config.v1" as const;
+export const BRIDGE_CONFIG_SCHEMA = "hunsu.bridge.config.v2" as const;
 
 export type BridgeProviderConfig =
   | { kind: "unconfigured" }
@@ -17,6 +23,7 @@ export type BridgeProviderConfig =
 
 export type BridgeConfig = {
   schema: typeof BRIDGE_CONFIG_SCHEMA;
+  deploymentProfile: BridgeDeploymentProfile;
   host: string;
   port: number;
   provider: BridgeProviderConfig;
@@ -25,6 +32,7 @@ export type BridgeConfig = {
 
 export const DEFAULT_BRIDGE_CONFIG: Readonly<BridgeConfig> = Object.freeze({
   schema: BRIDGE_CONFIG_SCHEMA,
+  deploymentProfile: "production",
   host: "127.0.0.1",
   port: 19687,
   provider: Object.freeze({ kind: "unconfigured" }),
@@ -35,13 +43,14 @@ export type ConfigStore = {
   read(): Promise<BridgeConfig>;
   write(config: BridgeConfig): Promise<void>;
   update(change: (config: BridgeConfig) => BridgeConfig): Promise<BridgeConfig>;
+  ensureDeploymentProfile(profile: BridgeDeploymentProfile): Promise<BridgeConfig>;
 };
 
 export function createConfigStore(paths: HunsuPaths): ConfigStore {
   let writeQueue = Promise.resolve();
   const readCurrent = async (): Promise<BridgeConfig> => {
     const value = await readJsonState(paths.configFile);
-    return value === undefined ? cloneConfig(DEFAULT_BRIDGE_CONFIG) : decodeConfig(paths.configFile, value);
+    return value === undefined ? cloneConfig(DEFAULT_BRIDGE_CONFIG) : decodeBridgeConfig(paths.configFile, value);
   };
   const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
     const task = writeQueue.then(operation, operation);
@@ -55,23 +64,54 @@ export function createConfigStore(paths: HunsuPaths): ConfigStore {
     },
     async write(config) {
       await serialize(async () => {
-        await writeJsonStateAtomic(paths.configFile, decodeConfig(paths.configFile, config));
+        await writeJsonStateAtomic(paths.configFile, decodeBridgeConfig(paths.configFile, config));
       });
     },
     async update(change) {
       return serialize(async () => {
-        const next = decodeConfig(paths.configFile, change(await readCurrent()));
+        const next = decodeBridgeConfig(paths.configFile, change(await readCurrent()));
         await writeJsonStateAtomic(paths.configFile, next);
         return next;
+      });
+    },
+    async ensureDeploymentProfile(profile) {
+      return serialize(async () => {
+        const persisted = await readJsonState(paths.configFile);
+        if (persisted === undefined) {
+          if (profile !== "production" && await hasDurableBridgeState(paths)) {
+            throw invalidState(
+              paths.configFile,
+              "a populated HUNSU_HOME without an explicit profile is treated as production and cannot switch to preview"
+            );
+          }
+          const initialized = { ...cloneConfig(DEFAULT_BRIDGE_CONFIG), deploymentProfile: profile };
+          await writeJsonStateAtomic(paths.configFile, initialized);
+          return initialized;
+        }
+        const current = decodeBridgeConfig(paths.configFile, persisted);
+        if (current.deploymentProfile !== profile) {
+          throw invalidState(
+            paths.configFile,
+            `deploymentProfile is ${current.deploymentProfile} and cannot switch to ${profile} in a populated HUNSU_HOME`
+          );
+        }
+        if (isLegacyConfig(persisted)) {
+          await writeJsonStateAtomic(paths.configFile, current);
+        }
+        return current;
       });
     }
   };
 }
 
-function decodeConfig(file: string, value: unknown): BridgeConfig {
-  if (!isRecord(value) || value.schema !== BRIDGE_CONFIG_SCHEMA) {
-    throw invalidState(file, `expected schema ${BRIDGE_CONFIG_SCHEMA}`);
+export function decodeBridgeConfig(file: string, value: unknown): BridgeConfig {
+  if (!isRecord(value)
+    || (value.schema !== BRIDGE_CONFIG_SCHEMA && value.schema !== LEGACY_BRIDGE_CONFIG_SCHEMA)) {
+    throw invalidState(file, `expected schema ${BRIDGE_CONFIG_SCHEMA} or ${LEGACY_BRIDGE_CONFIG_SCHEMA}`);
   }
+  const deploymentProfile = value.schema === LEGACY_BRIDGE_CONFIG_SCHEMA
+    ? "production"
+    : decodeDeploymentProfile(file, value.deploymentProfile);
   if (typeof value.host !== "string" || value.host.trim() === "") {
     throw invalidState(file, "host must be a non-empty string");
   }
@@ -84,11 +124,19 @@ function decodeConfig(file: string, value: unknown): BridgeConfig {
   const provider = decodeProvider(file, value.provider);
   return {
     schema: BRIDGE_CONFIG_SCHEMA,
+    deploymentProfile,
     host: value.host.trim(),
     port: value.port as number,
     provider,
     remote: { enabled: value.remote.enabled }
   };
+}
+
+function decodeDeploymentProfile(file: string, value: unknown): BridgeDeploymentProfile {
+  if (!isBridgeDeploymentProfile(value)) {
+    throw invalidState(file, "deploymentProfile must be production or preview");
+  }
+  return value;
 }
 
 function decodeProvider(file: string, value: unknown): BridgeProviderConfig {
@@ -150,6 +198,31 @@ function cloneConfig(config: Readonly<BridgeConfig>): BridgeConfig {
     provider: { ...config.provider },
     remote: { ...config.remote }
   };
+}
+
+async function hasDurableBridgeState(paths: HunsuPaths): Promise<boolean> {
+  const durableFiles = [
+    paths.homeOwnershipFile,
+    paths.credentialsFile,
+    paths.workspacesFile,
+    paths.runtimeFile,
+    paths.runtimeInstallFile,
+    paths.setupTransactionFile
+  ];
+  const present = await Promise.all(durableFiles.map(async file => {
+    try {
+      await access(file);
+      return true;
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return false;
+      throw invalidState(file, "durable Bridge state could not be inspected safely");
+    }
+  }));
+  return present.some(Boolean);
+}
+
+function isLegacyConfig(value: unknown): boolean {
+  return isRecord(value) && value.schema === LEGACY_BRIDGE_CONFIG_SCHEMA;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

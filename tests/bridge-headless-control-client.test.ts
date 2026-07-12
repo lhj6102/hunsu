@@ -168,7 +168,8 @@ function healthResponse(): Response {
     ok: true,
     service: "hunsu-bridge",
     version: "0.2.0-test",
-    protocolVersion: "local-bridge-v1"
+    protocolVersion: "local-bridge-v1",
+    deploymentProfile: "production"
   });
 }
 

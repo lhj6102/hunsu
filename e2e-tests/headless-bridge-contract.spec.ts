@@ -4,8 +4,9 @@ import { startHeadlessBrowserHarness, type HeadlessBrowserHarness, type Headless
 const EXPECTED_HEALTH = {
   ok: true,
   service: "hunsu-bridge",
-  version: "0.2.0-next.2",
-  protocolVersion: "local-bridge-v1"
+  version: "0.2.0-next.3",
+  protocolVersion: "local-bridge-v1",
+  deploymentProfile: "production"
 };
 
 test.describe.serial("headless Bridge browser contract", () => {
@@ -34,11 +35,11 @@ test.describe.serial("headless Bridge browser contract", () => {
           health: "connected",
           auth: "paired",
           version: {
-            bridgeVersion: "0.2.0-next.2",
+            bridgeVersion: "0.2.0-next.3",
             protocolVersion: "local-bridge-v1"
           }
         });
-        expect(JSON.stringify(connection.body)).not.toMatch(/hunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+/iu);
+        expect(JSON.stringify(connection.body)).not.toMatch(/hunsu_(?:bridge|control|pairing|connect)_[A-Za-z0-9_-]+/iu);
 
         const preflight = await request.fetch(`${harness.bridgeUrl}/api/bridge/status`, {
           method: "OPTIONS",

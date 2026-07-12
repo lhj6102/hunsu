@@ -182,7 +182,9 @@ function decodeSetupTransaction(file: string, value: unknown): SetupTransaction 
     schema: SETUP_TRANSACTION_SCHEMA,
     transactionId: requiredSafeString(file, "transactionId", value.transactionId),
     phase: value.phase,
-    candidate: decodeRuntimeInstallation(file, "candidate", value.candidate),
+    // v1 journals predate persisted CLI integrity. An unverified candidate is
+    // accepted only so setup can compensate and clear that interrupted journal.
+    candidate: decodeRuntimeInstallation(file, "candidate", value.candidate, { allowUnverified: true }),
     previous: value.previous === null ? null : decodeRuntimeInstallDocument(file, value.previous),
     createdAt: requiredIsoTimestamp(file, "createdAt", value.createdAt),
     updatedAt: requiredIsoTimestamp(file, "updatedAt", value.updatedAt)

@@ -14,7 +14,10 @@ import {
 import { isAbsolute, posix, relative, resolve, win32 } from "node:path";
 import { isWindowsPowerShellCommand, windowsPowerShellEnvironment } from "../windowsPowerShell.ts";
 import type { HunsuPaths } from "../state/paths.ts";
-import type { RuntimeInstallation } from "./runtimeInstaller.ts";
+import type {
+  RuntimeInstallation,
+  VerifiedRuntimeInstallation
+} from "./runtimeInstaller.ts";
 import {
   executingBridgeRuntimeSource,
   runtimePackageName,
@@ -69,10 +72,6 @@ export type StagedRuntimePlan = {
   manifestPath: string;
   nodePath: string;
   npmCommand: StagedRuntimeCommand;
-};
-
-export type VerifiedRuntimeInstallation = RuntimeInstallation & {
-  cliSha256: string;
 };
 
 export type StagedRuntimeInstallResult = {

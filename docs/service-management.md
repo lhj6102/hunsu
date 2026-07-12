@@ -11,7 +11,9 @@ Linux    -> ~/.config/systemd/user/hunsu-bridge.service
 
 Service definitions use absolute paths to the selected Node executable and the
 versioned stable @hunsu/bridge runtime. They never execute code from an npm
-cache or a relative path.
+cache or a relative path. The same fixed service identity and port `19687` are
+used for both deployment profiles; each definition carries
+`--profile production|preview` so a restart cannot silently change targets.
 
 ## Lifecycle
 
@@ -26,7 +28,7 @@ hunsu-bridge service uninstall --json
 
 service status works while the daemon is offline. It combines manager state,
 health, authenticated status when available, installed version, and configured
-runtime path.
+runtime path and deployment profile.
 
 Stop first requests authenticated /v1/control/shutdown and waits for health to
 disappear. If the daemon is unresponsive, the adapter stops only its exact
@@ -54,16 +56,37 @@ HUNSU_HOME/runtime/versions, installs or repairs the service definition, starts
 it, and verifies health plus authenticated status. Re-running setup is
 idempotent and cannot create a second daemon.
 
+Preview QA installs the canonical candidate with:
+
+~~~sh
+npx @hunsu/bridge@candidate-next setup --profile preview
+~~~
+
+The selected profile is written to `config.json`, `runtime/install.json`, the
+OS service arguments, runtime identity, health, and authenticated control
+status. Legacy v1 configuration migrates explicitly to `production`. Setup
+fails before credential or service mutation if a populated home is already
+bound to the other profile.
+
 Setup is a serialized side-by-side transaction:
 
 1. acquire `HUNSU_HOME/runtime/setup.lock`;
-2. recover any incomplete `setup-transaction.json`;
-3. verify the home ownership marker and ensure control credentials;
-4. install into `runtime/staging/<transaction-id>` and verify the exact package;
-5. atomically move the candidate to `runtime/versions/<version>`;
-6. switch the service definition to stable absolute Node and CLI paths;
-7. start and verify health, authentication, version, and runtime path;
-8. atomically commit `runtime/install.json`, then clear the journal and lock.
+2. bind and verify the durable deployment profile;
+3. recover any incomplete `setup-transaction.json`;
+4. verify the home ownership marker and ensure control credentials;
+5. install into `runtime/staging/<transaction-id>` and verify the exact package;
+6. atomically move the candidate to `runtime/versions/<version>`;
+7. switch the service definition to stable absolute Node and CLI paths;
+8. start and verify health, authentication, version, runtime path, and profile;
+9. atomically commit `runtime/install.json` with the verified CLI SHA-256, then
+   clear the journal and lock.
+
+Same-version setup reuses the stable runtime only when the current CLI bytes
+match that persisted digest. A mismatch stages the exact package again,
+atomically repairs the version directory, and restarts the daemon before health
+verification. Legacy `runtime-install.v1` records migrate as untrusted rather
+than deriving trust from whatever CLI bytes happen to be present; the next
+successful exact-package setup commits `runtime-install.v2`.
 
 An initial-install failure stops and uninstalls the service and removes only
 the failed candidate runtime. Config, Workspaces, and credentials remain. An

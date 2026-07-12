@@ -7,6 +7,7 @@ dist/
 .playwright-cli/
 handoffs/*
 **/.wrangler/
+apps/connect-api/.generated/
 playwright-report/
 test-results/
 ops/hub/env/*.env

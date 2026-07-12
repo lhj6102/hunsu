@@ -101,6 +101,8 @@ const CORS_HEADERS = {
   "access-control-allow-headers": "authorization,content-type,x-hunsu-admin-token"
 };
 
+const HUB_API_SERVICE = "hunsu-hub-api";
+
 export default {
   async fetch(request: Request, env: HubApiEnv): Promise<Response> {
     if (request.method === "OPTIONS") {
@@ -125,6 +127,17 @@ async function handleHubRequest(request: Request, env: HubApiEnv): Promise<Respo
   requireHubBindings(env);
   const runtimeConfig = requireRuntimeConfig(env);
   const url = new URL(request.url);
+  if (request.method === "GET" && url.pathname === "/health") {
+    return json({
+      status: "ok",
+      service: HUB_API_SERVICE,
+      target: runtimeConfig.target,
+      origin: runtimeConfig.originName,
+      release: runtimeConfig.releaseSha
+    }, 200, {
+      "cache-control": "no-store"
+    });
+  }
   if (request.method === "GET" && url.pathname === "/api/hub/packages") {
     return json({ packages: await listPackages(env, runtimeConfig.originName) });
   }

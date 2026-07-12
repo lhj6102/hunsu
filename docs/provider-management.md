@@ -43,7 +43,7 @@ with guidance to use `--codex-home`.
 
 Codex Home and binary overrides are explicit settings. The daemon applies the
 same effective provider configuration to status checks, login, local Execute,
-and outbound Remote Relay commands.
+and authenticated direct Remote Bridge commands.
 
 The provider interface remains extensible, but additional providers and
 speculative provider-selection UI are outside the first prerelease.

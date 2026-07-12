@@ -256,7 +256,7 @@ async function loadWebModule<T>(path: string): Promise<{ module: T; close: () =>
     },
     define: {
       __HUNSU_BRIDGE_API_BASE_URL__: JSON.stringify(""),
-      __HUNSU_RELAY_API_BASE_URL__: JSON.stringify(""),
+      __HUNSU_CONNECT_API_BASE_URL__: JSON.stringify(""),
       __HUNSU_HUB_API_BASE_URL__: JSON.stringify("")
     },
     server: {

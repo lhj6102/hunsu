@@ -1,5 +1,5 @@
 export const BRIDGE_REMOTE_WORKSPACE_SCOPES = [
-  "remoteRelay.access",
+  "remote.access",
   "execute.start",
   "artifactAction.run",
   "env.read",

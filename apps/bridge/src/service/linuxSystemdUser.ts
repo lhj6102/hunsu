@@ -75,7 +75,15 @@ export function linuxSystemdUserUnit(input: ServiceInstallInput): string {
     "",
     "[Service]",
     "Type=simple",
-    `ExecStart=${[input.nodePath, input.cliPath, "daemon", "--runtime-path", input.runtimePath].map(systemdQuote).join(" ")}`,
+    `ExecStart=${[
+      input.nodePath,
+      input.cliPath,
+      "daemon",
+      "--runtime-path",
+      input.runtimePath,
+      "--profile",
+      input.deploymentProfile
+    ].map(systemdQuote).join(" ")}`,
     `Environment=${systemdQuote(`HUNSU_HOME=${input.hunsuHome}`)}`,
     "Restart=on-failure",
     "RestartSec=2",

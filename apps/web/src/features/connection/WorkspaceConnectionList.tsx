@@ -48,7 +48,7 @@ export function WorkspaceConnectionList({
 
 function remoteConnectionLabel(state: BridgeBackendStatus["connection"]["state"]): string {
   if (state === "login_required") return "Sign in to connect remote workspaces";
-  if (state === "relay_offline") return "Remote Bridge offline";
+  if (state === "signaling_offline") return "Remote Bridge offline";
   if (state === "not_running") return "Remote Bridge not running";
   return "Remote Bridge unavailable";
 }

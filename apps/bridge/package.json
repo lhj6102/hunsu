@@ -1,6 +1,6 @@
 {
   "name": "@hunsu/bridge",
-  "version": "0.2.0-next.2",
+  "version": "0.2.0-next.3",
   "private": false,
   "description": "Headless Hunsu Bridge daemon, authenticated CLI, and local Web API.",
   "license": "Apache-2.0",
@@ -53,6 +53,9 @@
     "@hunsu/core": "workspace:*",
     "@hunsu/protocol": "workspace:*",
     "@hunsu/protocol-registry": "workspace:*",
-    "esbuild": "0.27.7"
+    "esbuild": "0.27.7",
+    "ipaddr.js": "2.4.0",
+    "werift": "0.23.0",
+    "ws": "8.21.0"
   }
 }

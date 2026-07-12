@@ -1,18 +1,33 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createHunsuRelayServer } from "../apps/relay/src/index.ts";
-import type { RelayServerConfig } from "../packages/config/src/index.ts";
-import { BridgeError } from "../apps/bridge/src/client/cliResult.ts";
-import { createBridgeControlClient } from "../apps/bridge/src/client/controlClient.ts";
-import { startBridgeDaemon, type RunningBridgeDaemon } from "../apps/bridge/src/daemon/daemon.ts";
 import {
-  createRemoteService,
-  type RelaySocket,
-  type RelaySocketFactory
-} from "../apps/bridge/src/remote/remoteService.ts";
+  CONNECT_SIGNAL_FRAME_SCHEMA,
+  connectEnrollmentProofMessage
+} from "../packages/protocol/src/connect.ts";
+import {
+  REMOTE_PEER_CONTROL_CHANNEL,
+  REMOTE_PEER_STREAM_CHANNEL,
+  REMOTE_PEER_STUN_URL,
+  decodeRemotePeerClientHello
+} from "../packages/protocol/src/remote-peer.ts";
+import {
+  canonicalPublicJwk,
+  createPeerDataCryptoContext,
+  createSignalCryptoContext,
+  generateDeviceKeySet,
+  peerTranscript,
+  signEnrollmentProof,
+  validateRemoteSdp,
+  verifyConnectTicket
+} from "../apps/bridge/src/remote/peerCrypto.ts";
+import { createWeriftPeerTransportFactory } from "../apps/bridge/src/remote/peerTransport.ts";
+import type { PeerData, PeerDataChannel, PeerTransport } from "../apps/bridge/src/remote/peerTransport.ts";
+import { createRemoteService, type ConnectSocket } from "../apps/bridge/src/remote/remoteService.ts";
+import { createRemoteCommandRouter } from "../apps/bridge/src/remote/remoteCommandRouter.ts";
 import {
   createConfigStore,
   createCredentialStore,
@@ -21,460 +36,749 @@ import {
 } from "../apps/bridge/src/state/index.ts";
 import { createWorkspaceService } from "../apps/bridge/src/workspaces/workspaceService.ts";
 
-test("Remote Bridge completes device login, safe registration, outbound auth, commands, reconnect, and disable in one daemon service", { timeout: 10_000 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-remote-"));
-  const home = join(root, "state");
-  const repository = join(root, "private-repository-path");
-  const ungrantedRepository = join(root, "ungranted-repository-path");
+const subtle = webcrypto.subtle;
+
+test("device enrollment proof uses the exact P-256 canonical transcript", async () => {
+  const keys = await generateDeviceKeySet();
+  const input = {
+    deviceName: "QA workstation",
+    signingPublicJwk: canonicalPublicJwk(keys.signingPublicKey),
+    agreementPublicJwk: canonicalPublicJwk(keys.agreementPublicKey),
+    issuedAt: "2026-07-12T00:00:00.000Z",
+    nonce: "nonce_012345678901234567890123"
+  };
+  const proof = await signEnrollmentProof({ ...input, signingPrivateKey: keys.signingPrivateKey });
+  assert.equal(Buffer.from(proof, "base64url").byteLength, 64);
+  const publicKey = await subtle.importKey("jwk", keys.signingPublicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  assert.equal(await subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    publicKey,
+    Buffer.from(proof, "base64url"),
+    new TextEncoder().encode(connectEnrollmentProofMessage(input))
+  ), true);
+});
+
+test("Connect tickets are exact-profile, browser-key-bound, short lived, and one use", async () => {
+  const signing = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const browser = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const signingPublicKey = await subtle.exportKey("jwk", signing.publicKey);
+  const browserAgreementPublicJwk = canonicalPublicJwk(await subtle.exportKey("jwk", browser.publicKey));
+  const claims = {
+    iss: "https://connect.preview.hunsu.app",
+    aud: "hunsu-bridge",
+    sub: "device_123",
+    jti: "ticket_123",
+    environment: "preview",
+    sessionId: "cs_12345678901234567890",
+    accountId: "account_123",
+    deviceId: "device_123",
+    browserAgreementPublicJwk,
+    iat: 1_783_814_400,
+    exp: 1_783_814_490
+  } as const;
+  const ticket = await signTicket(signing.privateKey, "preview-key", claims);
+  const consumed = new Set<string>();
+  const verify = () => verifyConnectTicket({
+    ticket,
+    signingPublicKey,
+    expectedKeyId: "preview-key",
+    expectedIssuer: claims.iss,
+    expectedEnvironment: "preview",
+    expectedSessionId: claims.sessionId,
+    expectedDeviceId: claims.deviceId,
+    expectedBrowserAgreementPublicJwk: browserAgreementPublicJwk,
+    now: new Date("2026-07-12T00:00:30.000Z"),
+    consume: id => !consumed.has(id) && Boolean(consumed.add(id))
+  });
+  assert.deepEqual(await verify(), claims);
+  await assert.rejects(verify, /already used/u);
+  await assert.rejects(() => verifyConnectTicket({
+    ticket,
+    signingPublicKey,
+    expectedKeyId: "preview-key",
+    expectedIssuer: claims.iss,
+    expectedEnvironment: "production",
+    expectedSessionId: claims.sessionId,
+    expectedDeviceId: claims.deviceId,
+    now: new Date("2026-07-12T00:00:30.000Z"),
+    consume: () => true
+  }), /binding/u);
+});
+
+test("opaque signaling uses the enrolled device agreement key and strict directional sequences", async () => {
+  const device = await generateDeviceKeySet();
+  const browser = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const browserPublic = await subtle.exportKey("jwk", browser.publicKey);
+  const sessionId = "cs_12345678901234567890";
+  const bridge = await createSignalCryptoContext({
+    sessionId,
+    browserAgreementPublicJwk: browserPublic,
+    deviceAgreementPrivateKey: device.agreementPrivateKey
+  });
+  const browserCipher = await browserSignalCipher(browser.privateKey, device.agreementPublicKey, sessionId);
+  const browserFrame = await encryptSignal(browserCipher, sessionId, 1, "browser", { type: "peer.close", reason: "complete" });
+  assert.deepEqual(await bridge.decrypt(browserFrame), { type: "peer.close", reason: "complete" });
+  await assert.rejects(() => bridge.decrypt(browserFrame), /sequence/u);
+  const response = await bridge.encrypt({ type: "peer.answer", sdp: "encrypted-only" });
+  assert.equal(response.schema, CONNECT_SIGNAL_FRAME_SCHEMA);
+  assert.deepEqual(await decryptSignal(browserCipher, response, "bridge"), { type: "peer.answer", sdp: "encrypted-only" });
+});
+
+test("signed DataChannel transcript derives four interoperable directional keys", async () => {
+  const device = await generateDeviceKeySet();
+  const browser = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const browserPublic = canonicalPublicJwk(await subtle.exportKey("jwk", browser.publicKey));
+  const ticketClaims = {
+    iss: "https://connect.preview.hunsu.app",
+    aud: "hunsu-bridge",
+    sub: "device_123",
+    jti: "ticket_123",
+    environment: "preview",
+    sessionId: "cs_12345678901234567890",
+    accountId: "account_123",
+    deviceId: "device_123",
+    browserAgreementPublicJwk: browserPublic,
+    iat: 1_783_814_400,
+    exp: 1_783_814_490
+  } as const;
+  const ticket = "signed.ticket.value";
+  const browserNonce = Buffer.alloc(24, 4).toString("base64url");
+  const bridge = await createPeerDataCryptoContext({
+    sessionId: ticketClaims.sessionId,
+    ticket,
+    ticketClaims,
+    browserNonce,
+    deviceSigningPrivateKey: device.signingPrivateKey,
+    now: () => new Date("2026-07-12T00:00:30.000Z"),
+    randomBytes: size => new Uint8Array(size).fill(8)
+  });
+  const ticketDigest = Buffer.from(await subtle.digest("SHA-256", new TextEncoder().encode(ticket))).toString("base64url");
+  const transcript = peerTranscript({
+    sessionId: ticketClaims.sessionId,
+    accountId: ticketClaims.accountId,
+    deviceId: ticketClaims.deviceId,
+    ticketDigest,
+    browserAgreementPublicJwk: browserPublic,
+    bridgeEphemeralPublicJwk: bridge.serverHello.bridgeEphemeralPublicJwk,
+    browserNonce,
+    bridgeNonce: bridge.serverHello.bridgeNonce,
+    leaseExpiresAt: bridge.serverHello.leaseExpiresAt
+  });
+  const transcriptHash = new Uint8Array(await subtle.digest("SHA-256", transcript));
+  assert.equal(Buffer.from(transcriptHash).toString("base64url"), bridge.transcriptHash);
+  const signingPublic = await subtle.importKey("jwk", device.signingPublicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  assert.equal(await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, signingPublic, Buffer.from(bridge.serverHello.signature, "base64url"), transcriptHash), true);
+
+  const bridgePublic = await subtle.importKey("jwk", bridge.serverHello.bridgeEphemeralPublicJwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const shared = await subtle.deriveBits({ name: "ECDH", public: bridgePublic }, browser.privateKey, 256);
+  const master = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  const directional = new Uint8Array(await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: transcriptHash, info: new TextEncoder().encode("hunsu.peer.data.v1") }, master, 1024));
+  const browserControl = await subtle.importKey("raw", directional.slice(0, 32), { name: "AES-GCM" }, false, ["encrypt"]);
+  const bridgeControl = await subtle.importKey("raw", directional.slice(32, 64), { name: "AES-GCM" }, false, ["decrypt"]);
+  const confirm = { type: "session.confirm", sessionId: ticketClaims.sessionId, transcriptHash: bridge.transcriptHash };
+  const inbound = await encryptDataFrame(browserControl, ticketClaims.sessionId, "control", "browser", 1, confirm);
+  assert.deepEqual(await bridge.decrypt("control", inbound), confirm);
+  const ready = { type: "session.ready", value: true };
+  const outbound = await bridge.encrypt("control", ready);
+  assert.deepEqual(await decryptDataFrame(bridgeControl, outbound, "bridge"), ready);
+});
+
+test("peer transport configures only Cloudflare STUN and requires the two reliable ordered channels", async () => {
+  const seen: unknown[] = [];
+  const control = fakeChannel(REMOTE_PEER_CONTROL_CHANNEL);
+  const stream = fakeChannel(REMOTE_PEER_STREAM_CHANNEL);
+  const connection = fakePeerConnection(control, stream);
+  const factory = createWeriftPeerTransportFactory({
+    loadWerift: async () => ({
+      RTCPeerConnection: class {
+        constructor(configuration: unknown) {
+          seen.push(configuration);
+          return connection;
+        }
+      } as never
+    })
+  });
+  const transport = await factory();
+  await transport.acceptOffer(validSdp("offer"));
+  const result = await transport.waitForChannels();
+  assert.equal(result.control.label, REMOTE_PEER_CONTROL_CHANNEL);
+  assert.equal(result.stream.label, REMOTE_PEER_STREAM_CHANNEL);
+  assert.deepEqual(seen, [{
+    iceServers: [{ urls: REMOTE_PEER_STUN_URL }],
+    iceTransportPolicy: "all",
+    maxMessageSize: 128 * 1024
+  }]);
+  await transport.close();
+});
+
+test("hostile SDP and unencrypted local-path hello fields fail closed", () => {
+  const forbiddenCandidateType = `typ ${["re", "lay"].join("")}`;
+  assert.throws(() => validateRemoteSdp("offer", validSdp("offer").replace("typ host", forbiddenCandidateType)), /invalid ICE candidates/u);
+  assert.throws(() => validateRemoteSdp("offer", `${validSdp("offer")}m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n`), /DataChannel section/u);
+  const hello = decodeRemotePeerClientHello({
+    type: "peer.client-hello",
+    protocolVersion: "hunsu-peer-v1",
+    sessionId: "cs_12345678901234567890",
+    ticket: "ticket",
+    browserAgreementPublicJwk: { kty: "EC", crv: "P-256", x: "x", y: "y" },
+    browserNonce: Buffer.alloc(24).toString("base64url"),
+    repositoryPath: "/private/repository"
+  });
+  assert.equal(hello.ok, false);
+});
+
+test("direct peer session rechecks the real Workspace grant for every encrypted command", { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-direct-peer-"));
+  const repository = join(root, "private-repository");
   await mkdir(repository);
-  await mkdir(ungrantedRepository);
-  const paths = resolveHunsuPaths({ home });
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
   const configStore = createConfigStore(paths);
-  const credentialStore = createCredentialStore(paths, { randomBytes: size => new Uint8Array(size).fill(9) });
+  const credentialStore = createCredentialStore(paths);
   const workspaceService = createWorkspaceService({ store: createWorkspaceStore(paths) });
-  const added = await workspaceService.add(repository, { displayName: "Remote Workspace" });
+  const added = await workspaceService.add(repository, { displayName: "Direct peer fixture" });
   assert.equal(added.ok, true);
   if (!added.ok) return;
-  const ungranted = await workspaceService.add(ungrantedRepository, { displayName: "Ungrantable by default" });
-  assert.equal(ungranted.ok, true);
-  const granted = await workspaceService.setRemoteAccess(added.value.workspaceId, {
+  const workspaceId = added.value.workspaceId;
+  const granted = await workspaceService.setRemoteAccess(workspaceId, {
     enabled: true,
-    scopes: ["remoteRelay.access", "execute.start", "artifactAction.run", "env.read", "hostAlias.expose"]
+    scopes: ["remote.access"]
   });
   assert.equal(granted.ok, true);
 
-  const accountToken = "account_access_token_must_stay_out_of_urls";
-  const deviceCode = "private-device-code";
-  const requests: Array<{ url: string; init?: RequestInit }> = [];
-  const sockets: FakeRelaySocket[] = [];
-  const socketFactory: RelaySocketFactory = url => {
-    const socket = new FakeRelaySocket(url);
-    sockets.push(socket);
-    return socket;
-  };
-  const fetchImpl: typeof fetch = async (resource, init) => {
-    const url = resource instanceof URL ? resource : new URL(typeof resource === "string" ? resource : resource.url);
-    requests.push({ url: url.toString(), init });
-    if (url.pathname === "/oauth/device/code") {
-      return jsonResponse(200, {
-        device_code: deviceCode,
-        user_code: "ABCD-EFGH",
-        verification_uri: "https://hunsu.app/activate",
-        verification_uri_complete: "https://hunsu.app/activate?user_code=ABCD-EFGH",
-        expires_in: 900,
-        interval: 1
-      });
+  const device = await generateDeviceKeySet();
+  const deviceId = "device_direct_123";
+  const accountId = "account_direct_123";
+  const accessToken = "direct-access-token";
+  await credentialStore.ensure();
+  await credentialStore.write({
+    connect: {
+      ...device,
+      state: "registered",
+      deviceId,
+      accountId,
+      accessToken,
+      refreshToken: "direct-refresh-token",
+      expiresAt: "2026-07-12T01:00:00.000Z",
+      connectWsUrl: "wss://connect.preview.hunsu.app/v1/connect/device"
     }
-    if (url.pathname === "/oauth/token") {
-      return jsonResponse(200, {
-        access_token: accountToken,
-        refresh_token: "private-refresh-token",
-        account_id: "account-123",
-        expires_in: 3_600
-      });
-    }
-    if (url.pathname === "/v1/devices") {
-      const registration = JSON.parse(String(init?.body)) as { device: Record<string, unknown> };
-      return jsonResponse(202, { device: { ...registration.device, status: "offline" } });
-    }
-    return jsonResponse(404, { error: "not_found" });
-  };
+  });
 
+  const socket = new FakeConnectSocket();
+  const control = new FakePeerDataChannel(REMOTE_PEER_CONTROL_CHANNEL);
+  const stream = new FakePeerDataChannel(REMOTE_PEER_STREAM_CHANNEL);
+  const offered: string[] = [];
+  const peerTransport: PeerTransport = {
+    async acceptOffer(sdp) {
+      offered.push(sdp);
+      return { answerSdp: validSdp("answer") };
+    },
+    async waitForChannels() { return { control, stream }; },
+    async addIceCandidate() {},
+    async close() {}
+  };
+  const loopbackRequests: Array<{ url: string; init?: RequestInit }> = [];
+  const loopbackFetch: typeof fetch = async (resource, init) => {
+    const url = resource instanceof URL ? resource : new URL(typeof resource === "string" ? resource : resource.url);
+    loopbackRequests.push({ url: url.toString(), init });
+    assert.equal(url.origin, "http://127.0.0.1:19687");
+    assert.equal(url.pathname, `/api/roadmaps/${encodeURIComponent(workspaceId)}/board`);
+    assert.equal(new Headers(init?.headers).get("x-hunsu-bridge-control-token"), "fixture-control-token");
+    return new Response(JSON.stringify({
+      roadmapId: workspaceId,
+      accepted: true,
+      repositoryPath: repository
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const router = createRemoteCommandRouter({
+    workspaceService,
+    endpoint: () => "http://127.0.0.1:19687",
+    controlToken: () => "fixture-control-token",
+    fetchImpl: loopbackFetch
+  });
+  const ticketSigner = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const ticketSigningPublicKey = await subtle.exportKey("jwk", ticketSigner.publicKey);
+  const now = new Date("2026-07-12T00:00:30.000Z");
   const service = createRemoteService({
     configStore,
     credentialStore,
     workspaceService,
-    authBaseUrl: "https://auth.example.test",
-    relayApiUrl: "https://relay.example.test",
-    relayWsUrl: "wss://relay.example.test/v1/bridge",
-    fetchImpl,
-    socketFactory,
-    openBrowser: async () => undefined,
-    deviceName: "Test Device",
-    now: () => new Date("2026-07-12T00:00:00.000Z"),
-    onCommand: async command => {
-      if (command.command === "health") throw new Error("hunsu_control_must-not-leak /private/path");
-      return { ok: true, status: 200, body: { echoed: command } };
-    }
+    deploymentProfile: "preview",
+    connectApiUrl: "https://connect.preview.hunsu.app",
+    connectWsUrl: "wss://connect.preview.hunsu.app/v1/connect/device",
+    connectTicketIssuer: "https://connect.preview.hunsu.app",
+    connectTicketSigningKeyId: "preview-direct-key",
+    connectTicketSigningPublicJwk: ticketSigningPublicKey,
+    fetchImpl: loopbackFetch,
+    socketFactory: async request => {
+      assert.equal(request.url, "wss://connect.preview.hunsu.app/v1/connect/device");
+      assert.equal(request.headers.authorization, `DPoP ${accessToken}`);
+      assert.equal(request.headers.dpop.includes(accessToken), false);
+      return socket;
+    },
+    peerTransportFactory: async () => peerTransport,
+    sleep: () => new Promise(() => undefined),
+    now: () => now,
+    randomBytes: size => new Uint8Array(size).fill(11),
+    onCommand: router
   });
 
   try {
-    await assert.rejects(
-      () => service.enable(),
-      error => error instanceof BridgeError && error.code === "ACCOUNT_LOGIN_REQUIRED"
-    );
+    await service.enable();
+    socket.receive({
+      schema: "hunsu.connect.control-frame.v1",
+      type: "connect.authenticated",
+      deviceId,
+      accountId,
+      expiresAt: "2026-07-12T01:00:00.000Z"
+    });
+    await waitFor(() => service.status().then(status => status.connection === "connected"));
 
-    const login = await service.login({ openBrowser: false });
-    assert.equal(login.state, "pending");
-    assert.equal(login.userCode, "ABCD-EFGH");
-    assert.equal(login.browserOpened, false);
-    const safeLogin = JSON.stringify(login);
-    assert.equal(safeLogin.includes(deviceCode), false);
-    assert.equal(safeLogin.includes(accountToken), false);
-    assert.equal(safeLogin.includes("private-refresh-token"), false);
+    const browser = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const browserAgreementPublicJwk = canonicalPublicJwk(await subtle.exportKey("jwk", browser.publicKey));
+    const sessionId = "cs_12345678901234567890";
+    const ticketClaims = {
+      iss: "https://connect.preview.hunsu.app",
+      aud: "hunsu-bridge",
+      sub: deviceId,
+      jti: "ticket_direct_123",
+      environment: "preview",
+      sessionId,
+      accountId,
+      deviceId,
+      browserAgreementPublicJwk,
+      iat: 1_783_814_400,
+      exp: 1_783_814_490
+    } as const;
+    const ticket = await signTicket(ticketSigner.privateKey, "preview-direct-key", ticketClaims);
+    socket.receive({
+      schema: "hunsu.connect.control-frame.v1",
+      type: "connect.session",
+      sessionId,
+      ticket,
+      expiresAt: "2026-07-12T00:01:30.000Z"
+    });
+    await waitFor(() => service.status().then(status => status.peerSessionId === sessionId));
 
-    await waitFor(async () => (await credentialStore.read())?.account?.accessToken === accountToken);
-    const tokenRequest = requests.find(request => new URL(request.url).pathname === "/oauth/token");
-    assert.ok(tokenRequest);
-    assert.equal(tokenRequest.url.includes(deviceCode), false);
+    const signalCipher = await browserSignalCipher(browser.privateKey, device.agreementPublicKey, sessionId);
+    socket.receive(await encryptSignal(signalCipher, sessionId, 1, "browser", { type: "peer.offer", sdp: validSdp("offer") }));
+    await waitFor(() => socket.sent.length === 1 && control.canReceive());
+    assert.deepEqual(offered, [validSdp("offer")]);
+    const answerFrame = JSON.parse(socket.sent[0]!) as Awaited<ReturnType<typeof encryptSignal>>;
+    assert.deepEqual(await decryptSignal(signalCipher, answerFrame, "bridge"), { type: "peer.answer", sdp: validSdp("answer") });
 
-    const enabled = await service.enable();
-    assert.equal(enabled.enabled, true);
-    assert.equal(enabled.signedIn, true);
-    assert.deepEqual(enabled.grantedWorkspaceIds, [added.value.workspaceId]);
-    assert.equal(sockets.length, 1);
-    assert.equal(new URL(sockets[0]!.url).search, "");
-    assert.equal(sockets[0]!.url.includes(accountToken), false);
-
-    const registration = requests.find(request => new URL(request.url).pathname === "/v1/devices");
-    assert.ok(registration);
-    assert.equal(new URL(registration.url).search, "");
-    assert.equal(registration.url.includes(accountToken), false);
-    assert.equal(registration.url.includes(accountToken), false);
-    assert.equal(registration.init?.headers && (registration.init.headers as Record<string, string>).authorization, `Bearer ${accountToken}`);
-    const registrationBody = JSON.parse(String(registration.init?.body)) as {
-      device: { deviceId: string; deviceName: string; protocolVersion: string };
-      workspaces: Array<{ workspaceId: string; displayName: string; pathRedacted: boolean }>;
-      projectGrants: Array<{ path: string; scopes: string[] }>;
+    const browserNonce = Buffer.alloc(24, 12).toString("base64url");
+    control.receive(JSON.stringify({
+      type: "peer.client-hello",
+      protocolVersion: "hunsu-peer-v1",
+      sessionId,
+      ticket,
+      browserAgreementPublicJwk,
+      browserNonce
+    }));
+    await waitFor(() => control.sent.length === 1);
+    const serverHello = JSON.parse(String(control.sent[0])) as {
+      bridgeEphemeralPublicJwk: JsonWebKey;
+      bridgeNonce: string;
+      leaseExpiresAt: string;
+      transcriptHash: string;
+      signature: string;
     };
-    assert.match(registrationBody.device.deviceId, /^device_/u);
-    assert.equal(registrationBody.device.deviceName, "Test Device");
-    assert.equal(registrationBody.device.protocolVersion, "local-bridge-v1");
-    assert.equal(registrationBody.workspaces.length, 1);
-    assert.equal(registrationBody.workspaces[0]?.workspaceId, added.value.workspaceId);
-    assert.equal(registrationBody.workspaces[0]?.pathRedacted, true);
-    assert.deepEqual(registrationBody.projectGrants.map(grant => grant.path), [repository]);
-    assert.equal(JSON.stringify(registrationBody).includes(ungrantedRepository), false);
-    assert.equal(JSON.stringify(registrationBody).includes(accountToken), false);
+    const browserData = await deriveBrowserControlCipher({
+      browserPrivateKey: browser.privateKey,
+      browserAgreementPublicJwk,
+      deviceSigningPublicJwk: device.signingPublicKey,
+      ticket,
+      ticketClaims,
+      browserNonce,
+      serverHello
+    });
+    control.receive(await encryptDataFrame(browserData.sendKey, sessionId, "control", "browser", 1, {
+      type: "session.confirm",
+      sessionId,
+      transcriptHash: browserData.transcriptHash
+    }));
+    await waitFor(() => control.sent.length === 2);
+    const ready = await decryptDataFrame(browserData.receiveKey, String(control.sent[1]), "bridge") as {
+      type: string;
+      workspaces: Array<Record<string, unknown>>;
+    };
+    assert.equal(ready.type, "session.ready");
+    assert.deepEqual(ready.workspaces, [{
+      workspaceId,
+      displayName: "Direct peer fixture",
+      scopes: ["remote.access"]
+    }]);
+    assert.equal(JSON.stringify(ready).includes(repository), false);
+    assert.equal(JSON.stringify(ready).includes("repositoryPath"), false);
 
-    sockets[0]!.emit("open");
-    assert.equal((await service.status()).connection, "connected");
-    const authenticate = sockets[0]!.messages().find(message => message.type === "authenticate");
-    assert.deepEqual(authenticate, {
-      type: "authenticate",
-      protocolVersion: "local-bridge-v1",
-      deviceId: registrationBody.device.deviceId,
-      token: accountToken
-    });
-    const registered = sockets[0]!.messages().find(message => message.type === "device.register");
-    assert.ok(registered);
-    assert.equal(JSON.stringify(registered).includes(ungrantedRepository), false);
+    const deadline = "2026-07-12T00:01:00.000Z";
+    control.receive(await encryptDataFrame(browserData.sendKey, sessionId, "control", "browser", 2, {
+      type: "command.request",
+      sessionId,
+      requestId: "request_allowed",
+      workspaceId,
+      deadline,
+      command: "roadmap.board"
+    }));
+    await waitFor(() => control.sent.length === 3);
+    const allowed = await decryptDataFrame(browserData.receiveKey, String(control.sent[2]), "bridge") as {
+      type: string;
+      ok: boolean;
+      status: number;
+      body: Record<string, unknown>;
+    };
+    assert.equal(allowed.type, "command.result");
+    assert.equal(allowed.ok, true);
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.body.accepted, true);
+    assert.equal(allowed.body.repositoryPath, undefined);
+    assert.equal(allowed.body.pathRedacted, true);
+    assert.equal(loopbackRequests.length, 1);
 
-    sockets[0]!.emit("message", {
-      data: JSON.stringify({
-        type: "command",
-        commandId: "request-1",
-        userId: "account-123",
-        command: { deviceId: registrationBody.device.deviceId, command: "bridge.status" }
-      })
-    });
-    await waitFor(() => sockets[0]!.messages().some(message => message.type === "command.result"));
-    assert.deepEqual(sockets[0]!.messages().find(message => message.type === "command.result"), {
-      type: "command.result",
-      commandId: "request-1",
-      result: {
-        ok: true,
-        status: 200,
-        body: { echoed: { deviceId: registrationBody.device.deviceId, command: "bridge.status" } }
-      }
-    });
-
-    sockets[0]!.emit("message", {
-      data: JSON.stringify({
-        type: "command",
-        commandId: "request-denied",
-        userId: "account-123",
-        command: {
-          deviceId: registrationBody.device.deviceId,
-          command: "roadmap.board",
-          projectPath: ungrantedRepository,
-          payload: { roadmapId: ungranted.ok ? ungranted.value.workspaceId : "missing" }
-        }
-      })
-    });
-    await waitFor(() => sockets[0]!.messages().some(message => message.commandId === "request-denied"));
-    assert.deepEqual(sockets[0]!.messages().find(message => message.commandId === "request-denied"), {
-      type: "command.result",
-      commandId: "request-denied",
-      result: { ok: false, status: 403, error: "Remote command Workspace is not granted." }
-    });
-    sockets[0]!.emit("message", {
-      data: JSON.stringify({
-        type: "command",
-        commandId: "request-error",
-        userId: "account-123",
-        command: { deviceId: registrationBody.device.deviceId, command: "health", projectPath: repository }
-      })
-    });
-    await waitFor(() => sockets[0]!.messages().some(message => message.commandId === "request-error"));
-    assert.deepEqual(sockets[0]!.messages().find(message => message.commandId === "request-error"), {
-      type: "command.result",
-      commandId: "request-error",
-      result: { ok: false, status: 500, error: "Remote command failed." }
-    });
-    sockets[0]!.emit("message", { data: "{malformed" });
-
-    sockets[0]!.emit("close");
-    assert.equal((await service.status()).connection, "offline");
-    await waitFor(() => sockets.length === 2, 2_000);
-    sockets[1]!.emit("open");
-    assert.equal((await service.status()).connection, "connected");
-    sockets[0]!.emit("close");
-    await new Promise(resolve => setTimeout(resolve, 350));
-    assert.equal(sockets.length, 2);
-
-    const disabled = await service.disable();
-    assert.equal(disabled.enabled, false);
-    assert.equal(disabled.connection, "disabled");
-    assert.equal(sockets[1]!.closed, true);
-    assert.equal((await configStore.read()).remote.enabled, false);
+    const revoked = await workspaceService.setRemoteAccess(workspaceId, { enabled: false, scopes: [] });
+    assert.equal(revoked.ok, true);
+    control.receive(await encryptDataFrame(browserData.sendKey, sessionId, "control", "browser", 3, {
+      type: "command.request",
+      sessionId,
+      requestId: "request_revoked",
+      workspaceId,
+      deadline,
+      command: "roadmap.board"
+    }));
+    await waitFor(() => control.sent.length === 4);
+    const denied = await decryptDataFrame(browserData.receiveKey, String(control.sent[3]), "bridge") as {
+      type: string;
+      ok: boolean;
+      status: number;
+      error: string;
+    };
+    assert.equal(denied.type, "command.result");
+    assert.equal(denied.ok, false);
+    assert.equal(denied.status, 403);
+    assert.match(denied.error, /not granted/u);
+    assert.equal(loopbackRequests.length, 1);
   } finally {
     service.stop();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("headless daemon registers with the real Relay and routes only explicitly granted Workspace commands", { timeout: 15_000 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-real-relay-"));
-  const repository = join(root, "granted-workspace");
-  const deniedRepository = join(root, "denied-workspace");
+test("Remote service persists only Connect enrollment secrets and returns path-free login data", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-connect-login-"));
+  const repository = join(root, "private-repository");
   await mkdir(repository);
-  await mkdir(deniedRepository);
-  const relay = createHunsuRelayServer({
-    config: relayConfig(join(root, "relay-state.json")),
-    commandTimeoutMs: 3_000
-  });
-  const urls = await relay.listen();
-  let daemon: RunningBridgeDaemon | undefined;
-  let pairingUrl = "";
-  try {
-    daemon = await startBridgeDaemon({
-      home: join(root, "state"),
-      port: 0,
-      cwd: repository,
-      development: true,
-      env: {
-        HUNSU_BRIDGE_AUTH_BASE_URL: urls.apiUrl,
-        HUNSU_RELAY_API_URL: urls.apiUrl,
-        HUNSU_RELAY_WS_URL: urls.wsUrl
-      },
-      openBrowser: async url => { pairingUrl = url; }
-    });
-    const client = createBridgeControlClient({ paths: daemon.paths });
-    const added = await client.request<{ workspaceId: string }>("/v1/control/workspaces", {
-      method: "POST",
-      body: { path: repository, displayName: "Granted Workspace" }
-    });
-    assert.equal(added.ok, true);
-    if (!added.ok || !added.value) return;
-    const login = await client.request<{ verificationUriComplete?: string }>("/v1/control/login", {
-      method: "POST",
-      body: { openBrowser: false }
-    });
-    assert.equal(login.ok, true);
-    if (!login.ok || !login.value?.verificationUriComplete) return;
-    assert.equal((await fetch(login.value.verificationUriComplete)).status, 200);
-    await waitFor(async () => Boolean((await createCredentialStore(daemon!.paths).read())?.account), 3_000);
-
-    const granted = await client.request(`/v1/control/workspaces/${encodeURIComponent(added.value.workspaceId)}/remote-access`, {
-      method: "PUT",
-      body: { enabled: true, scopes: ["remoteRelay.access"] }
-    });
-    assert.equal(granted.ok, true);
-
-    const paired = await client.request("/v1/control/pair", { method: "POST", body: { openBrowser: true } });
-    assert.equal(paired.ok, true);
-    const pairingToken = new URL(pairingUrl).searchParams.get("hunsuBridgeToken");
-    assert.ok(pairingToken);
-    const enabled = await fetch(`${daemon.identity.endpoint}/api/connections/remote/enable`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${pairingToken}` }
-    });
-    assert.equal(enabled.status, 202);
-    await waitFor(async () => {
-      const status = await client.request<{ connection?: string }>("/v1/control/remote");
-      return status.ok && status.value?.connection === "connected";
-    }, 3_000);
-    const denied = await client.request<{ workspaceId: string }>("/v1/control/workspaces", {
-      method: "POST",
-      body: { path: deniedRepository, displayName: "Denied Workspace" }
-    });
-    assert.equal(denied.ok, true);
-    const credentials = await createCredentialStore(daemon.paths).read();
-    assert.ok(credentials?.account?.accessToken);
-    assert.ok(credentials?.relay?.deviceId);
-    const relayToken = credentials.account.accessToken;
-    const deviceId = credentials.relay.deviceId;
-
-    const devices = await relayRequest(`${urls.apiUrl}/v1/devices`, relayToken);
-    assert.equal((devices as { devices?: Array<{ deviceId: string; status: string; workspaces?: unknown[] }> }).devices?.[0]?.deviceId, deviceId);
-    assert.equal((devices as { devices?: Array<{ status: string }> }).devices?.[0]?.status, "online");
-
-    const statusCommand = await relayRequest(`${urls.apiUrl}/v1/commands`, relayToken, {
-      deviceId,
-      command: "bridge.status"
-    });
-    assert.equal((statusCommand as { ok?: boolean }).ok, true);
-    assert.equal(JSON.stringify(statusCommand).includes(repository), false);
-    assert.equal(JSON.stringify(statusCommand).includes(deniedRepository), false);
-
-    const grantedHealth = await relayRequest(`${urls.apiUrl}/v1/commands`, relayToken, {
-      deviceId,
-      command: "health",
-      projectPath: repository
-    });
-    assert.equal((grantedHealth as { ok?: boolean; status?: number }).ok, true);
-
-    const rejected = await relayRequest(`${urls.apiUrl}/v1/commands`, relayToken, {
-      deviceId,
-      command: "roadmap.board",
-      projectPath: deniedRepository,
-      payload: { roadmapId: denied.ok ? denied.value?.workspaceId : "missing" }
-    }, 403);
-    assert.equal((rejected as { ok?: boolean; reason?: string }).ok, false);
-    assert.equal((rejected as { reason?: string }).reason, "project_grant_denied");
-
-    const disabled = await fetch(`${daemon.identity.endpoint}/api/connections/remote/disable`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${pairingToken}` }
-    });
-    assert.equal(disabled.status, 202);
-    const inspected = await client.request<{ remoteAccess?: { enabled?: boolean } }>(
-      `/v1/control/workspaces/${encodeURIComponent(added.value.workspaceId)}`
-    );
-    assert.equal(inspected.ok, true);
-    if (inspected.ok) assert.equal(inspected.value?.remoteAccess?.enabled, true);
-
-    const revoked = await client.request(`/v1/control/workspaces/${encodeURIComponent(added.value.workspaceId)}/remote-access`, {
-      method: "PUT",
-      body: { enabled: false, scopes: [] }
-    });
-    assert.equal(revoked.ok, true);
-    const revokedWorkspace = await client.request<{ remoteAccess?: { enabled?: boolean; scopes?: unknown[] } }>(
-      `/v1/control/workspaces/${encodeURIComponent(added.value.workspaceId)}`
-    );
-    assert.equal(revokedWorkspace.ok, true);
-    if (revokedWorkspace.ok) assert.deepEqual(revokedWorkspace.value?.remoteAccess, { enabled: false, scopes: [] });
-  } finally {
-    await daemon?.close().catch(() => undefined);
-    await relay.close().catch(() => undefined);
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("logout cancels an in-flight device-code completion before credentials can be restored", async () => {
-  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-login-cancel-"));
   const paths = resolveHunsuPaths({ home: join(root, "state") });
-  let resolveToken: ((response: Response) => void) | undefined;
-  const tokenResponse = new Promise<Response>(resolve => { resolveToken = resolve; });
+  const credentialStore = createCredentialStore(paths);
+  const workspaceService = createWorkspaceService({ store: createWorkspaceStore(paths) });
+  await workspaceService.add(repository);
+  const signing = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
   const service = createRemoteService({
     configStore: createConfigStore(paths),
-    credentialStore: createCredentialStore(paths),
-    workspaceService: createWorkspaceService({ store: createWorkspaceStore(paths) }),
-    authBaseUrl: "https://auth.example.test",
-    relayApiUrl: "https://relay.example.test",
-    fetchImpl: async resource => {
-      const url = resource instanceof URL ? resource : new URL(typeof resource === "string" ? resource : resource.url);
-      if (url.pathname === "/oauth/device/code") {
-        return jsonResponse(200, {
-          device_code: "private-device-code",
-          user_code: "ABCD-EFGH",
-          verification_uri: "https://auth.example.test/activate",
-          expires_in: 900,
-          interval: 1
-        });
-      }
-      if (url.pathname === "/oauth/token") return tokenResponse;
-      return jsonResponse(404, {});
-    },
+    credentialStore,
+    workspaceService,
+    deploymentProfile: "preview",
+    connectApiUrl: "https://connect.preview.hunsu.app",
+    connectWsUrl: "wss://connect.preview.hunsu.app/v1/connect/device",
+    connectTicketIssuer: "https://connect.preview.hunsu.app",
+    connectTicketSigningKeyId: "preview-key",
+    connectTicketSigningPublicJwk: await subtle.exportKey("jwk", signing.publicKey),
+    fetchImpl: async () => new Response(JSON.stringify({
+      schema: "hunsu.connect.enrollment-created.v1",
+      enrollmentId: "enrollment_123",
+      deviceCode: "private_device_code",
+      userCode: "ABCD-EFGH",
+      verificationUri: "https://connect.preview.hunsu.app/auth/device-enrollments",
+      verificationUriComplete: "https://connect.preview.hunsu.app/auth/device-enrollments?user_code=ABCD-EFGH",
+      expiresIn: 600,
+      interval: 5
+    }), { status: 201, headers: { "content-type": "application/json" } }),
+    sleep: () => new Promise(() => undefined),
+    now: () => new Date("2026-07-12T00:00:00.000Z"),
     openBrowser: async () => undefined
   });
   try {
-    await service.login({ openBrowser: false });
-    await waitFor(() => resolveToken !== undefined);
-    await service.logout();
-    resolveToken?.(jsonResponse(200, {
-      access_token: "late-account-token",
-      account_id: "late-account",
-      expires_in: 3_600
-    }));
-    await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal((await createCredentialStore(paths).read())?.account, null);
+    const login = await service.login({ openBrowser: false });
+    assert.equal(login.userCode, "ABCD-EFGH");
+    assert.equal(JSON.stringify(login).includes("private_device_code"), false);
+    assert.equal(JSON.stringify(login).includes(repository), false);
+    const stored = await credentialStore.read();
+    assert.equal(stored?.connect?.state, "enrolling");
+    assert.equal(stored?.connect?.state === "enrolling" ? stored.connect.deviceCode : undefined, "private_device_code");
   } finally {
     service.stop();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-class FakeRelaySocket implements RelaySocket {
-  readonly url: string;
-  readyState = 0;
-  closed = false;
-  private readonly sent: string[] = [];
-  private readonly listeners = new Map<string, Array<(event: { data?: unknown }) => void>>();
+async function signTicket(privateKey: webcrypto.CryptoKey, kid: string, claims: unknown): Promise<string> {
+  const header = encodeJson({ alg: "ES256", typ: "hunsu-connect-session+jwt", kid });
+  const payload = encodeJson(claims);
+  const signature = await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, new TextEncoder().encode(`${header}.${payload}`));
+  return `${header}.${payload}.${Buffer.from(signature).toString("base64url")}`;
+}
 
-  constructor(url: string) {
-    this.url = url;
+function encodeJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+async function browserSignalCipher(privateKey: webcrypto.CryptoKey, devicePublicJwk: JsonWebKey, sessionId: string): Promise<webcrypto.CryptoKey> {
+  const publicKey = await subtle.importKey("jwk", devicePublicJwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const shared = await subtle.deriveBits({ name: "ECDH", public: publicKey }, privateKey, 256);
+  const master = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  const bits = await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(sessionId), info: new TextEncoder().encode("hunsu.connect.signal.v1") }, master, 256);
+  return subtle.importKey("raw", bits, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptSignal(key: webcrypto.CryptoKey, sessionId: string, sequence: number, role: "browser" | "bridge", value: unknown) {
+  const iv = await roleNonce(role, sequence);
+  const ciphertext = await subtle.encrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`${CONNECT_SIGNAL_FRAME_SCHEMA}:${sessionId}:${sequence}`), tagLength: 128 }, key, new TextEncoder().encode(JSON.stringify(value)));
+  return { schema: CONNECT_SIGNAL_FRAME_SCHEMA, sessionId, sequence, iv: Buffer.from(iv).toString("base64url"), ciphertext: Buffer.from(ciphertext).toString("base64url") };
+}
+
+async function decryptSignal(key: webcrypto.CryptoKey, frame: Awaited<ReturnType<typeof encryptSignal>>, role: "browser" | "bridge") {
+  const iv = await roleNonce(role, frame.sequence);
+  const plaintext = await subtle.decrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`${CONNECT_SIGNAL_FRAME_SCHEMA}:${frame.sessionId}:${frame.sequence}`), tagLength: 128 }, key, Buffer.from(frame.ciphertext, "base64url"));
+  return JSON.parse(Buffer.from(plaintext).toString("utf8")) as unknown;
+}
+
+async function roleNonce(role: "browser" | "bridge", sequence: number): Promise<Uint8Array> {
+  const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(`hunsu.connect.signal.nonce/${role}`)));
+  const nonce = new Uint8Array(12);
+  nonce.set(hash.slice(0, 4));
+  new DataView(nonce.buffer).setBigUint64(4, BigInt(sequence), false);
+  return nonce;
+}
+
+async function encryptDataFrame(key: webcrypto.CryptoKey, sessionId: string, channel: "control" | "stream", role: "browser" | "bridge", sequence: number, value: unknown): Promise<string> {
+  const nonce = await dataNonce(channel, role, sequence);
+  const ciphertext = await subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: new TextEncoder().encode(`hunsu-peer-v1:${sessionId}:${channel}:${sequence}`), tagLength: 128 }, key, new TextEncoder().encode(JSON.stringify(value)));
+  return JSON.stringify({ version: "hunsu-peer-v1", sessionId, channel, sequence, nonce: Buffer.from(nonce).toString("base64url"), ciphertext: Buffer.from(ciphertext).toString("base64url") });
+}
+
+async function decryptDataFrame(key: webcrypto.CryptoKey, encoded: string, role: "browser" | "bridge"): Promise<unknown> {
+  const frame = JSON.parse(encoded) as { sessionId: string; channel: "control" | "stream"; sequence: number; nonce: string; ciphertext: string };
+  const nonce = await dataNonce(frame.channel, role, frame.sequence);
+  assert.equal(frame.nonce, Buffer.from(nonce).toString("base64url"));
+  const plaintext = await subtle.decrypt({ name: "AES-GCM", iv: nonce, additionalData: new TextEncoder().encode(`hunsu-peer-v1:${frame.sessionId}:${frame.channel}:${frame.sequence}`), tagLength: 128 }, key, Buffer.from(frame.ciphertext, "base64url"));
+  return JSON.parse(Buffer.from(plaintext).toString("utf8")) as unknown;
+}
+
+async function dataNonce(channel: "control" | "stream", role: "browser" | "bridge", sequence: number): Promise<Uint8Array> {
+  const hash = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(`hunsu.peer.data.nonce/${channel}/${role}`)));
+  const nonce = new Uint8Array(12);
+  nonce.set(hash.slice(0, 4));
+  new DataView(nonce.buffer).setBigUint64(4, BigInt(sequence), false);
+  return nonce;
+}
+
+async function deriveBrowserControlCipher(input: {
+  browserPrivateKey: webcrypto.CryptoKey;
+  browserAgreementPublicJwk: JsonWebKey;
+  deviceSigningPublicJwk: JsonWebKey;
+  ticket: string;
+  ticketClaims: { sessionId: string; accountId: string; deviceId: string };
+  browserNonce: string;
+  serverHello: {
+    bridgeEphemeralPublicJwk: JsonWebKey;
+    bridgeNonce: string;
+    leaseExpiresAt: string;
+    transcriptHash: string;
+    signature: string;
+  };
+}): Promise<{ sendKey: webcrypto.CryptoKey; receiveKey: webcrypto.CryptoKey; transcriptHash: string }> {
+  const ticketDigest = Buffer.from(await subtle.digest("SHA-256", new TextEncoder().encode(input.ticket))).toString("base64url");
+  const transcript = peerTranscript({
+    sessionId: input.ticketClaims.sessionId,
+    accountId: input.ticketClaims.accountId,
+    deviceId: input.ticketClaims.deviceId,
+    ticketDigest,
+    browserAgreementPublicJwk: input.browserAgreementPublicJwk,
+    bridgeEphemeralPublicJwk: input.serverHello.bridgeEphemeralPublicJwk,
+    browserNonce: input.browserNonce,
+    bridgeNonce: input.serverHello.bridgeNonce,
+    leaseExpiresAt: input.serverHello.leaseExpiresAt
+  });
+  const transcriptHashBytes = new Uint8Array(await subtle.digest("SHA-256", transcript));
+  const transcriptHash = Buffer.from(transcriptHashBytes).toString("base64url");
+  assert.equal(transcriptHash, input.serverHello.transcriptHash);
+  const signingKey = await subtle.importKey("jwk", input.deviceSigningPublicJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  assert.equal(await subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    signingKey,
+    Buffer.from(input.serverHello.signature, "base64url"),
+    transcriptHashBytes
+  ), true);
+  const bridgeKey = await subtle.importKey("jwk", input.serverHello.bridgeEphemeralPublicJwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const shared = await subtle.deriveBits({ name: "ECDH", public: bridgeKey }, input.browserPrivateKey, 256);
+  const master = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  const directional = new Uint8Array(await subtle.deriveBits({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: transcriptHashBytes,
+    info: new TextEncoder().encode("hunsu.peer.data.v1")
+  }, master, 1024));
+  return {
+    sendKey: await subtle.importKey("raw", directional.slice(0, 32), { name: "AES-GCM" }, false, ["encrypt"]),
+    receiveKey: await subtle.importKey("raw", directional.slice(32, 64), { name: "AES-GCM" }, false, ["decrypt"]),
+    transcriptHash
+  };
+}
+
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
   }
+  assert.fail("Timed out waiting for the deterministic direct-peer fixture.");
+}
+
+class FakeConnectSocket implements ConnectSocket {
+  readyState = 1;
+  readonly sent: string[] = [];
+  private readonly listeners = new Map<string, Set<(event: { data?: unknown }) => void>>();
 
   send(data: string): void {
+    if (this.readyState !== 1) throw new Error("Fake Connect socket is closed.");
     this.sent.push(data);
   }
 
   close(): void {
-    this.closed = true;
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.emit("close", {});
   }
 
   addEventListener(type: "open" | "close" | "error" | "message", listener: (event: { data?: unknown }) => void): void {
-    const current = this.listeners.get(type) ?? [];
-    current.push(listener);
-    this.listeners.set(type, current);
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
   }
 
-  emit(type: "open" | "close" | "error" | "message", event: { data?: unknown } = {}): void {
+  removeEventListener(type: "open" | "close" | "error" | "message", listener: (event: { data?: unknown }) => void): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  receive(value: unknown): void {
+    this.emit("message", { data: JSON.stringify(value) });
+  }
+
+  private emit(type: string, event: { data?: unknown }): void {
     for (const listener of this.listeners.get(type) ?? []) listener(event);
   }
+}
 
-  messages(): Array<Record<string, unknown>> {
-    return this.sent.map(value => JSON.parse(value) as Record<string, unknown>);
+class FakePeerDataChannel implements PeerDataChannel {
+  readonly label: string;
+  readonly ordered = true;
+  readonly maxRetransmits = undefined;
+  readonly maxPacketLifeTime = undefined;
+  readyState: PeerDataChannel["readyState"] = "open";
+  bufferedAmount = 0;
+  bufferedAmountLowThreshold = 0;
+  readonly sent: Array<string | Uint8Array> = [];
+  private readonly messageListeners = new Set<(value: PeerData) => void>();
+  private readonly stateListeners = new Set<(state: PeerDataChannel["readyState"]) => void>();
+  private readonly lowListeners = new Set<() => void>();
+
+  constructor(label: string) {
+    this.label = label;
+  }
+
+  send(value: string | Uint8Array): void {
+    if (this.readyState !== "open") throw new Error("Fake peer channel is closed.");
+    this.sent.push(value);
+  }
+
+  close(): void {
+    if (this.readyState === "closed") return;
+    this.readyState = "closed";
+    for (const listener of this.stateListeners) listener("closed");
+  }
+
+  onMessage(listener: (value: PeerData) => void): () => void {
+    this.messageListeners.add(listener);
+    return () => this.messageListeners.delete(listener);
+  }
+
+  onStateChange(listener: (state: PeerDataChannel["readyState"]) => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  onBufferedAmountLow(listener: () => void): () => void {
+    this.lowListeners.add(listener);
+    return () => this.lowListeners.delete(listener);
+  }
+
+  receive(value: PeerData): void {
+    for (const listener of this.messageListeners) listener(value);
+  }
+
+  canReceive(): boolean {
+    return this.messageListeners.size > 0;
   }
 }
 
-function jsonResponse(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" }
-  });
-}
-
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!await predicate()) {
-    if (Date.now() >= deadline) throw new Error("Timed out waiting for asynchronous Remote Bridge state.");
-    await new Promise(resolve => setTimeout(resolve, 10));
+class FakeEvent<T extends unknown[]> {
+  private readonly listeners = new Set<(...args: T) => void>();
+  subscribe(listener: (...args: T) => void) {
+    this.listeners.add(listener);
+    return { unSubscribe: () => this.listeners.delete(listener) };
   }
+  emit(...args: T): void { for (const listener of this.listeners) listener(...args); }
 }
 
-function relayConfig(storagePath: string): RelayServerConfig {
+function fakeChannel(label: string) {
   return {
-    relay: { name: "relay", host: "127.0.0.1", hostSource: "override", port: 0, portSource: "override", reserved: false },
-    publicApiUrl: "http://127.0.0.1:0",
-    publicWsUrl: "ws://127.0.0.1:0/v1/device/connect",
-    issuer: "http://127.0.0.1:0",
-    storagePath,
-    processEnv: {}
+    label,
+    ordered: true,
+    maxRetransmits: undefined,
+    maxPacketLifeTime: undefined,
+    isCreatedByRemote: true,
+    readyState: "open" as const,
+    bufferedAmount: 0,
+    bufferedAmountLowThreshold: 0,
+    onMessage: new FakeEvent<[string | Buffer]>(),
+    stateChange: new FakeEvent<["connecting" | "open" | "closing" | "closed"]>(),
+    bufferedAmountLow: new FakeEvent<[]>(),
+    send() {},
+    close() {}
   };
 }
 
-async function relayRequest(url: string, accessToken: string, body?: unknown, expectedStatus = 200): Promise<unknown> {
-  const response = await fetch(url, {
-    method: body === undefined ? "GET" : "POST",
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      ...(body === undefined ? {} : { "content-type": "application/json" })
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) })
-  });
-  if (response.status !== expectedStatus) assert.fail(await response.text().catch(() => ""));
-  return response.json();
+function fakePeerConnection(control: ReturnType<typeof fakeChannel>, stream: ReturnType<typeof fakeChannel>) {
+  const onDataChannel = new FakeEvent<[ReturnType<typeof fakeChannel>]>();
+  const iceGatheringStateChange = new FakeEvent<["new" | "gathering" | "complete"]>();
+  return {
+    onDataChannel,
+    connectionStateChange: new FakeEvent<[string]>(),
+    iceGatheringState: "complete" as const,
+    iceGatheringStateChange,
+    localDescription: { sdp: validSdp("answer") },
+    async setRemoteDescription() { onDataChannel.emit(control); onDataChannel.emit(stream); },
+    async createAnswer() { return { type: "answer" as const, sdp: validSdp("answer") }; },
+    async setLocalDescription() {},
+    async addIceCandidate() {},
+    async close() {}
+  };
+}
+
+function validSdp(type: "offer" | "answer"): string {
+  const fingerprint = Array.from({ length: 32 }, () => "AA").join(":");
+  return [
+    "v=0",
+    "o=- 0 0 IN IP4 127.0.0.1",
+    "s=-",
+    "t=0 0",
+    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
+    "c=IN IP4 0.0.0.0",
+    "a=ice-ufrag:abcd",
+    "a=ice-pwd:abcdefghijklmnopqrstuv",
+    `a=fingerprint:sha-256 ${fingerprint}`,
+    type === "offer" ? "a=setup:actpass" : "a=setup:active",
+    "a=candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
+    "a=sctp-port:5000",
+    ""
+  ].join("\r\n");
 }

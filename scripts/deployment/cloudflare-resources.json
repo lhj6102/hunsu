@@ -1,0 +1,35 @@
+{
+  "schema": "hunsu.cloudflare-resource-allowlist.v2",
+  "preview": {
+    "accountId": "a5e99f3b23c16ac20da1d55d34504e28",
+    "pagesProject": "hunsu-web-preview",
+    "webPublicUrl": "https://preview.hunsu.app",
+    "bridgeApiBaseUrl": "http://127.0.0.1:19687",
+    "connectApiBaseUrl": "https://connect.preview.hunsu.app",
+    "connectWorkerName": "hunsu-connect-preview",
+    "connectD1DatabaseName": "hunsu_connect_preview",
+    "connectD1DatabaseId": "38cc819b-2405-47a6-925e-0d5d7de731c4",
+    "workerName": "hunsu-hub-api-preview",
+    "originName": "hunsu",
+    "hubPublicApiUrl": "https://api.preview.hunsu.app",
+    "d1DatabaseName": "hunsu_hub_preview",
+    "d1DatabaseId": "348e2174-ddf2-4126-be51-603e6e986f08",
+    "r2BucketName": "hunsu-hub-packages-preview"
+  },
+  "production": {
+    "accountId": "a5e99f3b23c16ac20da1d55d34504e28",
+    "pagesProject": "hunsu-web",
+    "webPublicUrl": "https://hunsu.app",
+    "bridgeApiBaseUrl": "http://127.0.0.1:19687",
+    "connectApiBaseUrl": "https://connect.hunsu.app",
+    "connectWorkerName": "hunsu-connect",
+    "connectD1DatabaseName": "hunsu_connect",
+    "connectD1DatabaseId": "c71aed30-29ff-48aa-ba76-866add7f8198",
+    "workerName": "hunsu-hub-api",
+    "originName": "hunsu",
+    "hubPublicApiUrl": "https://api.hunsu.app",
+    "d1DatabaseName": "hunsu_hub",
+    "d1DatabaseId": "4523fd88-b827-4015-9aa4-e05c0499ece7",
+    "r2BucketName": "hunsu-hub-packages"
+  }
+}

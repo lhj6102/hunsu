@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 import { pathToFileURL } from "node:url";
 import { assertDiagnosticsSafe, sanitizeDiagnostics } from "./diagnostics/redaction.ts";
+import {
+  bridgeSetupPackageTag,
+  isBridgeDeploymentProfile,
+  type BridgeDeploymentProfile
+} from "./deploymentProfile.ts";
 import { startBridgeDaemon, type RunningBridgeDaemon } from "./daemon/daemon.ts";
 import {
   bridgeCliJsonRequested,
@@ -19,7 +24,7 @@ import {
 } from "./client/cliResult.ts";
 import { createBridgeControlClient } from "./client/controlClient.ts";
 import { createDefaultBridgeServiceManager } from "./service/defaultServiceManager.ts";
-import { createCredentialStore, resolveHunsuPaths } from "./state/index.ts";
+import { createConfigStore, createCredentialStore, resolveHunsuPaths } from "./state/index.ts";
 import { createRuntimeInstallStore } from "./setup/runtimeInstaller.ts";
 import { localBridgeTarballSource } from "./setup/runtimePackageSource.ts";
 import { removeBridge } from "./setup/uninstall.ts";
@@ -59,7 +64,12 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
     const paths = resolveHunsuPaths({ home, env: processEnv });
     const client = createBridgeControlClient({ paths });
 
+    if (command === "status" || command === "doctor" || command === "remove") {
+      await assertDeploymentProfile(paths, getFlag(parsed, "profile"));
+    }
+
     if (command === "dev" || command === "daemon") {
+      const deploymentProfile = parseDeploymentProfile(getFlag(parsed, "profile"));
       const daemon = await startBridgeDaemon({
         home,
         host: getFlag(parsed, "host"),
@@ -67,12 +77,18 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
         cwd: getFlag(parsed, "cwd"),
         runtimePath: getFlag(parsed, "runtime-path"),
         webUrl: getFlag(parsed, "web-url"),
+        deploymentProfile,
         development: command === "dev",
         env: processEnv
       });
       const result = cliSuccess(
         command === "dev" ? "Hunsu Bridge development daemon is ready." : "Hunsu Bridge daemon is ready.",
-        { endpoint: daemon.identity.endpoint, version: daemon.identity.version, protocolVersion: daemon.identity.protocolVersion }
+        {
+          endpoint: daemon.identity.endpoint,
+          version: daemon.identity.version,
+          protocolVersion: daemon.identity.protocolVersion,
+          deploymentProfile: daemon.identity.deploymentProfile
+        }
       );
       printResult(result, json, io);
       await waitForDaemon(daemon);
@@ -81,10 +97,18 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
 
     const serviceManager = createDefaultBridgeServiceManager({ paths, controlClient: client, processEnv });
     if (command === "setup") {
-      const channel = getFlag(parsed, "channel") ?? "next";
-      if (channel !== "next") throw new BridgeError("RUNTIME_INSTALL_FAILED", "The initial headless prerelease supports only the next channel.");
+      const deploymentProfile = parseDeploymentProfile(getFlag(parsed, "profile"));
+      const expectedChannel = bridgeSetupPackageTag(deploymentProfile);
+      const channel = getFlag(parsed, "channel") ?? expectedChannel;
+      if (channel !== expectedChannel) {
+        throw new BridgeError(
+          "RUNTIME_INSTALL_FAILED",
+          `The ${deploymentProfile} profile requires the ${expectedChannel} channel.`
+        );
+      }
       const result = await setupBridge({
         paths,
+        deploymentProfile,
         credentialStore: createCredentialStore(paths, { processEnv }),
         serviceManager,
         processEnv,
@@ -95,7 +119,8 @@ export async function runBridgeCli(argv = process.argv.slice(2), io: CliIo = def
         verifyRuntime: installation => verifyInstalledRuntime(
           client,
           installation.packageVersion,
-          installation.runtimePath
+          installation.runtimePath,
+          deploymentProfile
         )
       });
       return printResult(result.ok ? cliSuccess(result.message, result.value) : cliFailure(result.code, result.message), json, io);
@@ -182,19 +207,33 @@ function serviceResult(result: Awaited<ReturnType<ReturnType<typeof createDefaul
 async function verifyInstalledRuntime(
   client: ReturnType<typeof createBridgeControlClient>,
   expectedVersion: string,
-  expectedRuntimePath: string
-): Promise<{ health: boolean; authenticated: boolean; version: string; runtimePath: string }> {
+  expectedRuntimePath: string,
+  expectedDeploymentProfile: BridgeDeploymentProfile
+): Promise<{
+  health: boolean;
+  authenticated: boolean;
+  version: string;
+  runtimePath: string;
+  deploymentProfile: BridgeDeploymentProfile;
+}> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const health = await client.health();
     if (health) {
-      const status = await client.request<{ version?: string; runtimePath?: string }>("/v1/control/status");
+      const status = await client.request<{
+        version?: string;
+        runtimePath?: string;
+        deploymentProfile?: BridgeDeploymentProfile;
+      }>("/v1/control/status");
       return {
         health: true,
         authenticated: status.ok,
         version: status.ok && typeof status.value?.version === "string" ? status.value.version : health.version,
         runtimePath: status.ok && typeof status.value?.runtimePath === "string"
           ? status.value.runtimePath
-          : "unavailable"
+          : "unavailable",
+        deploymentProfile: status.ok && isBridgeDeploymentProfile(status.value?.deploymentProfile)
+          ? status.value.deploymentProfile
+          : health.deploymentProfile
       };
     }
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -203,7 +242,8 @@ async function verifyInstalledRuntime(
     health: false,
     authenticated: false,
     version: expectedVersion,
-    runtimePath: expectedRuntimePath
+    runtimePath: expectedRuntimePath,
+    deploymentProfile: expectedDeploymentProfile
   };
 }
 
@@ -250,15 +290,39 @@ function parseOptionalPort(value: string | undefined): number | undefined {
   return port;
 }
 
+function parseDeploymentProfile(value: string | undefined): BridgeDeploymentProfile {
+  const deploymentProfile = value ?? "production";
+  if (!isBridgeDeploymentProfile(deploymentProfile)) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "--profile must be production or preview.");
+  }
+  return deploymentProfile;
+}
+
+async function assertDeploymentProfile(
+  paths: ReturnType<typeof resolveHunsuPaths>,
+  value: string | undefined
+): Promise<void> {
+  if (value === undefined) return;
+  const expected = parseDeploymentProfile(value);
+  const actual = (await createConfigStore(paths).read()).deploymentProfile;
+  if (actual !== expected) {
+    throw new BridgeError(
+      "BRIDGE_STATE_INVALID",
+      `This HUNSU_HOME uses the ${actual} deployment profile, not ${expected}.`
+    );
+  }
+}
+
 function helpText(): string {
   return `Usage: hunsu-bridge <command> [options]
 
 Lifecycle:
-  setup [--channel next]              Install an exact stable runtime and user service.
+  setup [--profile production|preview] [--channel next|candidate-next]
+                                      Install an exact stable runtime and user service.
   remove [--delete-data --confirm-delete-data]
   service install|uninstall|start|stop|restart|status
-  dev [--host 127.0.0.1] [--port 0] [--home <path>]
-  daemon
+  dev [--host 127.0.0.1] [--port 0] [--home <path>] [--profile production|preview]
+  daemon [--profile production|preview]
 
 Client commands (never start a daemon):
   status | doctor | logs [--follow]

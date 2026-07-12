@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rm,
   stat,
@@ -11,7 +12,7 @@ import {
   writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, parse } from "node:path";
+import { basename, dirname, join, parse } from "node:path";
 import test from "node:test";
 import type {
   BridgeServiceManager,
@@ -21,7 +22,8 @@ import { resolveHunsuPaths, type HunsuPaths } from "../apps/bridge/src/state/pat
 import {
   HOME_OWNERSHIP_SCHEMA,
   createHomeOwnershipStore,
-  ensureHomeOwnership
+  ensureHomeOwnership,
+  windowsHomeOwnershipAclPowerShellInvocation
 } from "../apps/bridge/src/setup/homeOwnership.ts";
 import {
   BRIDGE_PACKAGE_VERSION,
@@ -57,6 +59,76 @@ test("ownership marker records canonical home with user-only permissions", async
     if (process.platform !== "win32") {
       assert.equal((await stat(paths.homeOwnershipFile)).mode & 0o777, 0o600);
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows ownership marker ACL hardening uses one encoded injection-safe current-user-only command", () => {
+  const markerPath = "C:\\Users\\O'Brien\\Hunsu Bridge\\.hunsu-bridge-home.json";
+  const invocation = windowsHomeOwnershipAclPowerShellInvocation(markerPath);
+  assert.equal(invocation.command, "powershell.exe");
+  assert.deepEqual(invocation.args.slice(0, -1), [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand"
+  ]);
+  assert.equal(invocation.args.includes(markerPath), false);
+
+  const command = Buffer.from(invocation.args.at(-1) ?? "", "base64").toString("utf16le");
+  assert.match(command, /\$OwnershipMarkerPath = 'C:\\Users\\O''Brien\\Hunsu Bridge\\\.hunsu-bridge-home\.json'/u);
+  assert.match(command, /WindowsIdentity\]::GetCurrent\(\)\.User/u);
+  assert.match(command, /FileSecurity\]::new\(\)/u);
+  assert.match(command, /SetOwner\(\$sid\)/u);
+  assert.match(command, /SetAccessRuleProtection\(\$true, \$false\)/u);
+  assert.match(command, /FileSystemAccessRule\]::new\(\$sid/u);
+  assert.match(command, /FileSystemRights\]::FullControl/u);
+  assert.match(command, /AccessControlType\]::Allow/u);
+  assert.match(command, /System\.IO\.File\]::SetAccessControl\(\$OwnershipMarkerPath, \$acl\)/u);
+  assert.doesNotMatch(command, /param\(|Get-Acl|Set-Acl|New-Object|NTAccount/u);
+  assert.throws(
+    () => windowsHomeOwnershipAclPowerShellInvocation("C:\\Hunsu\nInjected\\.hunsu-bridge-home.json"),
+    /control characters/u
+  );
+});
+
+test("Windows ownership markers are ACL-hardened before atomic commit and failed hardening preserves the marker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-windows-ownership-marker-"));
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
+  const hardened: string[] = [];
+  const store = createHomeOwnershipStore(paths, {
+    platform: "win32",
+    windowsAclHardener: async temporaryFile => {
+      assert.notEqual(temporaryFile, paths.homeOwnershipFile);
+      assert.match(basename(temporaryFile), /^\.\.hunsu-bridge-home\.json\..+\.tmp$/u);
+      assert.equal(JSON.parse(await readFile(temporaryFile, "utf8")).schema, HOME_OWNERSHIP_SCHEMA);
+      hardened.push(temporaryFile);
+    }
+  });
+  try {
+    const marker = await ensureHomeOwnership({
+      store,
+      expectedInstallationId: INSTALLATION_ID,
+      now: () => new Date("2026-07-12T01:02:03.000Z")
+    });
+    assert.equal(hardened.length, 1);
+
+    await ensureHomeOwnership({ store, expectedInstallationId: INSTALLATION_ID });
+    assert.equal(hardened.length, 2, "an existing marker must be re-hardened during setup verification");
+
+    const original = await readFile(paths.homeOwnershipFile, "utf8");
+    const failingStore = createHomeOwnershipStore(paths, {
+      platform: "win32",
+      windowsAclHardener: async () => { throw new Error("injected ACL failure"); }
+    });
+    await assert.rejects(
+      () => failingStore.write({ ...marker, createdAt: "2026-07-12T02:03:04.000Z" }),
+      /Unable to persist Bridge state file/u
+    );
+    assert.equal(await readFile(paths.homeOwnershipFile, "utf8"), original);
+    assert.deepEqual((await readdir(paths.home)).filter(entry => entry.endsWith(".tmp")), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -339,6 +411,7 @@ function runtimeInstallation(paths: HunsuPaths): RuntimeInstallation {
     runtimePath: join(paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION),
     nodePath: process.execPath,
     cliPath: join(paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION, "node_modules", "@hunsu", "bridge", "dist", "cli.js"),
+    cliSha256: "0".repeat(64),
     installedAt: "2026-07-12T00:00:00.000Z"
   };
 }

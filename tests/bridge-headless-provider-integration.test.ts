@@ -65,6 +65,7 @@ test("provider control updates immediately drive browser inventory and Execute",
 
     const configured = await client.request("/v1/control/provider", {
       method: "PUT",
+      timeoutMs: 20_000,
       body: { providerId: "codex", binaryPath: configuredCodexPath }
     });
     assert.equal(configured.ok, true, JSON.stringify(configured));
@@ -138,6 +139,7 @@ test("persisted provider configuration drives Execute immediately after daemon r
     assert.equal(added.ok, true, JSON.stringify(added));
     const configured = await firstClient.request("/v1/control/provider", {
       method: "PUT",
+      timeoutMs: 20_000,
       body: { providerId: "codex", binaryPath: configuredCodexPath }
     });
     assert.equal(configured.ok, true, JSON.stringify(configured));

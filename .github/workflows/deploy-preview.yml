@@ -1,0 +1,97 @@
+name: Deploy Preview
+
+on:
+  push:
+    branches:
+      - preview
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: cloudflare-preview
+  cancel-in-progress: false
+
+jobs:
+  deploy_preview:
+    name: Build once and deploy preview
+    uses: ./.github/workflows/deploy-cloudflare.yml
+    with:
+      deploy_target: preview
+      environment_name: hunsu-preview
+      source_sha: ${{ github.sha }}
+      tooling_ref: ${{ github.sha }}
+      build_release: true
+      require_preview_evidence: false
+      apply_migrations: true
+  promotion_candidate:
+    name: Promotion candidate ready
+    if: always()
+    needs: deploy_preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Bind the required promotion check to a successful exact preview deployment
+        env:
+          DEPLOY_RESULT: ${{ needs.deploy_preview.result }}
+          PREVIEW_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          if [[ "$DEPLOY_RESULT" != "success" ]]; then
+            echo "Exact preview deployment and candidate evidence did not complete for $PREVIEW_SHA." >&2
+            exit 1
+          fi
+          echo "Exact preview deployment and candidate evidence passed for $PREVIEW_SHA." >> "$GITHUB_STEP_SUMMARY"
+  open_promotion_pr:
+    name: Open preview to main promotion PR
+    needs:
+      - deploy_preview
+      - promotion_candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create or retain the QA promotion PR
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const head = `${context.repo.owner}:preview`;
+            const openPullRequests = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              base: "main",
+              head,
+              per_page: 100
+            });
+            if (openPullRequests.length > 1) {
+              core.setFailed(`Expected at most one open preview-to-main pull request; found ${openPullRequests.length}.`);
+              return;
+            }
+            if (openPullRequests.length === 1) {
+              core.summary
+                .addHeading("QA promotion PR ready")
+                .addLink(`#${openPullRequests[0].number}`, openPullRequests[0].html_url)
+                .addRaw(" tracks the latest preview branch head. Review and approve only after QA passes.")
+                .write();
+              return;
+            }
+            const created = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              base: "main",
+              head: "preview",
+              title: "Promote verified preview to production",
+              body: [
+                "This PR is opened automatically after a successful preview deployment.",
+                "",
+                "All required checks are bound to this exact preview head by the protected preview push workflows.",
+                "QA leader: test the retained preview release, then approve this exact head SHA.",
+                "Merging deploys the same retained artifacts to production without rebuilding them."
+              ].join("\n")
+            });
+            core.summary
+              .addHeading("QA promotion PR opened")
+              .addLink(`#${created.data.number}`, created.data.html_url)
+              .write();

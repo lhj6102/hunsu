@@ -1,0 +1,180 @@
+name: Roll Back Cloudflare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: Target to roll back
+        required: true
+        type: choice
+        options:
+          - preview
+          - production
+      source_sha:
+        description: Exact previously previewed source SHA
+        required: true
+        type: string
+      artifact_run_id:
+        description: Successful preview workflow run retaining this release
+        required: true
+        type: string
+      confirmation:
+        description: Type ROLLBACK followed by the target and source SHA
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: cloudflare-${{ inputs.deploy_target }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Confirm explicit code-only rollback
+    runs-on: ubuntu-latest
+    outputs:
+      environment_name: ${{ steps.confirm.outputs.environment_name }}
+      tooling_sha: ${{ steps.release.outputs.tooling_sha }}
+    steps:
+      - name: Validate dispatch branch and confirmation
+        id: confirm
+        env:
+          DEPLOY_TARGET: ${{ inputs.deploy_target }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_ref="$DEPLOY_TARGET"
+          environment_name="hunsu-preview"
+          if [[ "$DEPLOY_TARGET" == "production" ]]; then
+            expected_ref="main"
+            environment_name="hunsu-production"
+          fi
+          if [[ "$GITHUB_REF_NAME" != "$expected_ref" ]]; then
+            echo "Dispatch $DEPLOY_TARGET rollback from branch $expected_ref." >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ || ! "$ARTIFACT_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "Rollback requires a full source SHA and numeric preview run ID." >&2
+            exit 1
+          fi
+          if [[ "$CONFIRMATION" != "ROLLBACK $DEPLOY_TARGET $SOURCE_SHA" ]]; then
+            echo "Confirmation must exactly match: ROLLBACK $DEPLOY_TARGET $SOURCE_SHA" >&2
+            exit 1
+          fi
+          echo "environment_name=$environment_name" >> "$GITHUB_OUTPUT"
+          echo "This rollback will not reverse or restore D1 migrations." >> "$GITHUB_STEP_SUMMARY"
+      - name: Require a successful exact-SHA preview deployment and retained artifacts
+        id: release
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          DEPLOY_TARGET: ${{ inputs.deploy_target }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+        with:
+          script: |
+            const runId = Number(process.env.ARTIFACT_RUN_ID);
+            const previewRunResponse = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId
+            });
+            const previewRun = previewRunResponse.data;
+            if (
+              previewRun.path !== ".github/workflows/deploy-preview.yml"
+              || previewRun.event !== "push"
+              || previewRun.head_branch !== "preview"
+              || previewRun.head_sha !== process.env.SOURCE_SHA
+              || previewRun.conclusion !== "success"
+            ) {
+              core.setFailed("Rollback artifact_run_id must be a successful exact-SHA deploy-preview.yml push run.");
+              return;
+            }
+            const previewArtifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId,
+                per_page: 100
+              }
+            );
+            for (const name of [
+              `deployment-release-${process.env.SOURCE_SHA}`,
+              `preview-deployment-evidence-${process.env.SOURCE_SHA}`
+            ]) {
+              if (!previewArtifacts.some(artifact => artifact.name === name && !artifact.expired)) {
+                core.setFailed(`Rollback preview run is missing unexpired artifact ${name}.`);
+                return;
+              }
+            }
+            if (process.env.DEPLOY_TARGET === "production") {
+              const evidenceName = `production-deployment-evidence-${process.env.SOURCE_SHA}`;
+              const productionArtifacts = await github.paginate(
+                github.rest.actions.listArtifactsForRepo,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: evidenceName,
+                  per_page: 100
+                }
+              );
+              let priorProductionRun;
+              for (const artifact of productionArtifacts.filter(item => item.name === evidenceName && !item.expired)) {
+                if (!artifact.workflow_run?.id) continue;
+                const response = await github.rest.actions.getWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: artifact.workflow_run.id
+                });
+                const candidate = response.data;
+                if (
+                  candidate.conclusion === "success"
+                  && (
+                    (
+                      candidate.path === ".github/workflows/deploy-production.yml"
+                      && candidate.event === "push"
+                      && candidate.head_branch === "main"
+                    )
+                    || (
+                      candidate.path === ".github/workflows/rollback-cloudflare.yml"
+                      && candidate.event === "workflow_dispatch"
+                      && candidate.head_branch === "main"
+                    )
+                  )
+                ) {
+                  priorProductionRun = candidate;
+                  break;
+                }
+              }
+              if (!priorProductionRun) {
+                core.setFailed(`Production rollback requires unexpired prior production evidence for ${process.env.SOURCE_SHA}.`);
+                return;
+              }
+              core.info(`Using prior production deployment ${priorProductionRun.html_url}.`);
+            }
+            const mainBranch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: "main"
+            });
+            core.setOutput("tooling_sha", mainBranch.data.commit.sha);
+
+  deploy_previous_release:
+    name: Redeploy previous retained Web and Worker
+    needs: authorize
+    uses: ./.github/workflows/deploy-cloudflare.yml
+    with:
+      deploy_target: ${{ inputs.deploy_target }}
+      environment_name: ${{ needs.authorize.outputs.environment_name }}
+      source_sha: ${{ inputs.source_sha }}
+      tooling_ref: ${{ needs.authorize.outputs.tooling_sha }}
+      artifact_run_id: ${{ inputs.artifact_run_id }}
+      build_release: false
+      require_preview_evidence: true
+      apply_migrations: false

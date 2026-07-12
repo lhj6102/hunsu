@@ -2,7 +2,11 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname } from "node:path";
 import { currentProcessEnv } from "@hunsu/config";
 import { resolveHunsuPaths } from "../state/paths.ts";
-import { BRIDGE_CONFIG_SCHEMA, type BridgeConfig } from "../state/configStore.ts";
+import {
+  BRIDGE_CONFIG_SCHEMA,
+  decodeBridgeConfig,
+  type BridgeConfig
+} from "../state/configStore.ts";
 import { codexSettingsFromRecord, type BridgeCodexSettings } from "./codex/codexConfig.ts";
 
 export type BridgeRuntimeProviderState = {
@@ -83,6 +87,7 @@ export function createBridgeRuntimeProviderStore(
     write(state) {
       const existing = readHeadlessConfig(path) ?? {
         schema: BRIDGE_CONFIG_SCHEMA,
+        deploymentProfile: "production",
         host: "127.0.0.1",
         port: 19687,
         provider: { kind: "unconfigured" },
@@ -112,17 +117,7 @@ function readHeadlessConfig(path: string): BridgeConfig | undefined {
   if (!existsSync(path)) return undefined;
   try {
     const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    if (!isRecord(value)
-      || value.schema !== BRIDGE_CONFIG_SCHEMA
-      || typeof value.host !== "string"
-      || typeof value.port !== "number"
-      || !isRecord(value.remote)
-      || typeof value.remote.enabled !== "boolean"
-      || !isRecord(value.provider)
-      || (value.provider.kind !== "unconfigured" && value.provider.kind !== "codex")) {
-      return undefined;
-    }
-    return value as BridgeConfig;
+    return decodeBridgeConfig(path, value);
   } catch (_error) {
     return undefined;
   }

@@ -3,6 +3,12 @@ import type { Server } from "node:http";
 import { mkdir } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { resolveBridgeRuntimeConfig, unwrapConfigResult } from "@hunsu/config";
+import {
+  bridgeDeploymentEndpoints,
+  isBridgeDeploymentProfile,
+  type BridgeDeploymentEndpoints,
+  type BridgeDeploymentProfile
+} from "../deploymentProfile.ts";
 import { createStudioServer, openStudioInBrowser } from "../index.ts";
 import { endpointFromHostPort } from "../client/controlClient.ts";
 import { BridgeError } from "../client/cliResult.ts";
@@ -10,8 +16,9 @@ import { createDoctorReport } from "../diagnostics/doctor.ts";
 import { createStructuredLog } from "../diagnostics/structuredLog.ts";
 import { createPairingService } from "../pairing/pairingService.ts";
 import { createHeadlessProviderService } from "../provider/providerRegistry.ts";
-import { createRemoteService, type RelaySocket, type RelaySocketFactory } from "../remote/remoteService.ts";
-import { createRemoteCommandRouter } from "../remote/remoteCommandRouter.ts";
+import { createRemoteService, type ConnectSocketFactory } from "../remote/remoteService.ts";
+import { createRemoteCommandRouter, createRemoteCommandStreamRouter } from "../remote/remoteCommandRouter.ts";
+import type { PeerTransportFactory } from "../remote/peerTransport.ts";
 import { createHeadlessControlRouteHandler } from "../server/controlRoutes.ts";
 import {
   BRIDGE_RUNTIME_SCHEMA,
@@ -37,11 +44,13 @@ export type BridgeDaemonOptions = HunsuPathInput & {
   cwd?: string;
   runtimePath?: string;
   webUrl?: string;
+  deploymentProfile?: BridgeDeploymentProfile;
   development?: boolean;
   serviceManager?: BridgeServiceManagerKind;
   fetchImpl?: typeof fetch;
   openBrowser?: (url: string) => Promise<void>;
-  socketFactory?: RelaySocketFactory;
+  socketFactory?: ConnectSocketFactory;
+  peerTransportFactory?: PeerTransportFactory;
 };
 
 export type RunningBridgeDaemon = {
@@ -80,7 +89,17 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
   const configStore = createConfigStore(paths);
   const credentialStore = createCredentialStore(paths, { processEnv: environment });
   const runtimeStore = createRuntimeStore(paths);
-  const config = await configStore.read();
+  const requestedDeploymentProfile = options.deploymentProfile ?? "production";
+  if (!isBridgeDeploymentProfile(requestedDeploymentProfile)) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Bridge deployment profile must be production or preview.");
+  }
+  const config = await configStore.ensureDeploymentProfile(requestedDeploymentProfile);
+  const deploymentEndpoints = daemonDeploymentEndpoints({
+    profile: config.deploymentProfile,
+    development: options.development === true,
+    environment,
+    webUrl: options.webUrl
+  });
   const requestedHost = options.host ?? config.host;
   const requestedPort = options.port ?? config.port;
   assertLoopbackHost(requestedHost);
@@ -126,9 +145,14 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
     env: { ...environment, HUNSU_HOME: paths.home }
   });
   const pairingService = createPairingService({ controlToken: credentials.controlToken });
-  const socketFactory = options.socketFactory ?? defaultRelaySocketFactory();
   let identity: BridgeRuntimeIdentity | undefined;
   const remoteCommandRouter = createRemoteCommandRouter({
+    workspaceService,
+    endpoint: () => identity?.endpoint,
+    controlToken: () => controlToken,
+    fetchImpl: options.fetchImpl
+  });
+  const remoteCommandStreamRouter = createRemoteCommandStreamRouter({
     workspaceService,
     endpoint: () => identity?.endpoint,
     controlToken: () => controlToken,
@@ -138,13 +162,18 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
     configStore,
     credentialStore,
     workspaceService,
-    authBaseUrl: environment.HUNSU_BRIDGE_AUTH_BASE_URL,
-    relayApiUrl: environment.HUNSU_RELAY_API_URL,
-    relayWsUrl: environment.HUNSU_RELAY_WS_URL,
+    deploymentProfile: config.deploymentProfile,
+    connectApiUrl: deploymentEndpoints.connectApiUrl,
+    connectWsUrl: deploymentEndpoints.connectWsUrl,
+    connectTicketIssuer: deploymentEndpoints.connectTicketIssuer,
+    connectTicketSigningKeyId: deploymentEndpoints.connectTicketSigningKeyId,
+    connectTicketSigningPublicJwk: deploymentEndpoints.connectTicketSigningPublicJwk,
     fetchImpl: options.fetchImpl,
-    socketFactory,
+    socketFactory: options.socketFactory,
+    peerTransportFactory: options.peerTransportFactory,
     openBrowser: options.openBrowser ?? openStudioInBrowser,
-    onCommand: remoteCommandRouter
+    onCommand: remoteCommandRouter,
+    onCommandStream: remoteCommandStreamRouter
   });
   const startedAt = new Date().toISOString();
   const serviceManager = options.serviceManager ?? serviceManagerForPlatform(options.development === true, options.platform ?? process.platform);
@@ -185,14 +214,16 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
       HUNSU_BRIDGE_HOST: requestedHost,
       HUNSU_BRIDGE_PORT: String(requestedPort),
       HUNSU_ROADMAP_REGISTRY_PATH: paths.workspacesFile,
-      ...(options.webUrl ? { HUNSU_WEB_URL: options.webUrl } : {})
+      HUNSU_WEB_URL: deploymentEndpoints.webUrl,
+      HUNSU_CONNECT_API_BASE_URL: deploymentEndpoints.connectApiUrl,
+      HUNSU_CONNECT_WS_URL: deploymentEndpoints.connectWsUrl
     };
     const runtimeConfig = unwrapConfigResult(resolveBridgeRuntimeConfig(processEnv, {
       cwd: options.cwd ?? process.cwd(),
       roadmapRegistryPath: paths.workspacesFile,
       processEnv
     }));
-    const webUrl = options.webUrl ?? processEnv.HUNSU_WEB_URL ?? "https://hunsu.app/studio";
+    const webUrl = deploymentEndpoints.webUrl;
     const allowedOrigin = new URL(webUrl).origin;
     const controlRouteHandler = createHeadlessControlRouteHandler({
       controlToken: () => controlToken,
@@ -225,6 +256,8 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
       cwd: options.cwd ?? process.cwd(),
       roadmapRegistryPath: paths.workspacesFile,
       runtimeConfig,
+      deploymentProfile: config.deploymentProfile,
+      controlStatus: { deploymentProfile: config.deploymentProfile },
       security: {
         controlToken: () => controlToken,
         allowedOrigins: [allowedOrigin],
@@ -250,6 +283,7 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
       daemonPid: process.pid,
       version: HUNSU_BRIDGE_VERSION,
       protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
+      deploymentProfile: config.deploymentProfile,
       startedAt,
       endpoint,
       runtimePath,
@@ -265,7 +299,13 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
       level: "info",
       event: "daemon.started",
       message: "Hunsu Bridge is ready.",
-      data: { instanceId, endpoint, version: HUNSU_BRIDGE_VERSION, serviceManager }
+      data: {
+        instanceId,
+        endpoint,
+        version: HUNSU_BRIDGE_VERSION,
+        serviceManager,
+        deploymentProfile: config.deploymentProfile
+      }
     });
     heartbeat = setInterval(() => {
       if (!identity) return;
@@ -302,6 +342,32 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
     }
     throw error;
   }
+}
+
+function daemonDeploymentEndpoints(input: {
+  profile: BridgeDeploymentProfile;
+  development: boolean;
+  environment: Readonly<Record<string, string | undefined>>;
+  webUrl?: string;
+}): BridgeDeploymentEndpoints {
+  const allowlisted = bridgeDeploymentEndpoints(input.profile);
+  if (!input.development) {
+    if (input.webUrl !== undefined && input.webUrl !== allowlisted.webUrl) {
+      throw new BridgeError(
+        "BRIDGE_STATE_INVALID",
+        `Installed ${input.profile} Bridge daemons use the allowlisted Web URL for that profile.`
+      );
+    }
+    return allowlisted;
+  }
+  return {
+    webUrl: input.webUrl ?? input.environment.HUNSU_WEB_URL ?? allowlisted.webUrl,
+    connectApiUrl: input.environment.HUNSU_CONNECT_API_BASE_URL ?? allowlisted.connectApiUrl,
+    connectWsUrl: input.environment.HUNSU_CONNECT_WS_URL ?? allowlisted.connectWsUrl,
+    connectTicketIssuer: allowlisted.connectTicketIssuer,
+    connectTicketSigningKeyId: allowlisted.connectTicketSigningKeyId,
+    connectTicketSigningPublicJwk: allowlisted.connectTicketSigningPublicJwk
+  };
 }
 
 export async function runBridgeDaemon(options: BridgeDaemonOptions = {}): Promise<RunningBridgeDaemon> {
@@ -344,12 +410,6 @@ function serviceManagerForPlatform(development: boolean, platform: NodeJS.Platfo
   if (platform === "win32") return "windows-task-scheduler";
   if (platform === "darwin") return "macos-launch-agent";
   return "linux-systemd-user";
-}
-
-function defaultRelaySocketFactory(): RelaySocketFactory | undefined {
-  const WebSocketConstructor = globalThis.WebSocket;
-  if (!WebSocketConstructor) return undefined;
-  return url => new WebSocketConstructor(url) as unknown as RelaySocket;
 }
 
 function isErrno(error: unknown, code: string): boolean {

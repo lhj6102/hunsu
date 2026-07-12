@@ -15,5 +15,6 @@
     "allowImportingTsExtensions": true,
     "skipLibCheck": true
   },
-  "include": ["apps/**/*.ts", "apps/**/*.tsx", "packages/**/*.ts", "tests/**/*.ts"]
+  "include": ["apps/**/*.ts", "apps/**/*.tsx", "packages/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["apps/connect-api/**", "tests/connect-api.test.ts"]
 }

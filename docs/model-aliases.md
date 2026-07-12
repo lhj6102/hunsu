@@ -86,7 +86,7 @@ Failures return `{ ok: false, backendId, error, message, actions }`, where
 `REASONING_UNSUPPORTED`, or `SERVICE_TIER_UNSUPPORTED`, plus actions.
 
 Codex owns its catalog at the runtime-provider adapter boundary. Local status
-and daemon Remote publication serialize that same catalog. Remote Relay
+and the authenticated Bridge peer serialize that same catalog. Direct peer
 transport maps `remote:<deviceId>` to that device's local backend for the
 request and restores the remote backend id on the response.
 

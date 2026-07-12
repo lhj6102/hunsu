@@ -2,35 +2,53 @@ import { chmod } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
-import { windowsPowerShellEnvironment } from "../windowsPowerShell.ts";
+import {
+  windowsCurrentUserOnlyFileAclPowerShellInvocation,
+  windowsPowerShellEnvironment
+} from "../windowsPowerShell.ts";
 import type { HunsuPaths } from "./paths.ts";
 import { invalidState, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
 
-export const BRIDGE_CREDENTIALS_SCHEMA = "hunsu.bridge.credentials.v1" as const;
+export const BRIDGE_CREDENTIALS_SCHEMA = "hunsu.bridge.credentials.v2" as const;
 
-export type StoredAccountCredential = {
-  accountId: string;
-  accessToken: string;
-  refreshToken: string | null;
-  expiresAt: string | null;
+type StoredDeviceKeys = {
+  signingPrivateKey: JsonWebKey;
+  signingPublicKey: JsonWebKey;
+  agreementPrivateKey: JsonWebKey;
+  agreementPublicKey: JsonWebKey;
 };
 
-export type StoredRelayCredential = {
-  deviceId: string;
-  token: string;
-};
+export type StoredConnectCredential = StoredDeviceKeys & (
+  | {
+      state: "enrolling";
+      enrollmentId: string;
+      deviceCode: string;
+      userCode: string;
+      verificationUri: string;
+      verificationUriComplete: string;
+      interval: number;
+      expiresAt: string;
+    }
+  | {
+      state: "registered";
+      deviceId: string;
+      accountId: string;
+      refreshToken: string;
+      accessToken: string;
+      expiresAt: string;
+      connectWsUrl: string;
+    }
+);
 
 export type BridgeCredentials = {
   schema: typeof BRIDGE_CREDENTIALS_SCHEMA;
   controlToken: string;
-  account: StoredAccountCredential | null;
-  relay: StoredRelayCredential | null;
+  connect: StoredConnectCredential | null;
 };
 
 export type CredentialWriteInput = {
   controlToken?: string;
-  account?: StoredAccountCredential | null;
-  relay?: StoredRelayCredential | null;
+  connect?: StoredConnectCredential | null;
 };
 
 export type ControlTokenRotation = {
@@ -85,8 +103,7 @@ export function createCredentialStore(
           "controlToken",
           input.controlToken ?? current?.controlToken ?? createControlToken(secureRandomBytes)
         ),
-        account: input.account === undefined ? current?.account ?? null : decodeAccount(paths.credentialsFile, input.account),
-        relay: input.relay === undefined ? current?.relay ?? null : decodeRelay(paths.credentialsFile, input.relay)
+        connect: input.connect === undefined ? current?.connect ?? null : decodeConnect(paths.credentialsFile, input.connect)
       };
       await writeJsonStateAtomic(paths.credentialsFile, credentials, {
         mode: 0o600,
@@ -121,8 +138,7 @@ export function createCredentialStore(
         const credentials: BridgeCredentials = {
           schema: BRIDGE_CREDENTIALS_SCHEMA,
           controlToken,
-          account: current?.account ?? null,
-          relay: current?.relay ?? null
+          connect: current?.connect ?? null
         };
         await writeJsonStateAtomic(paths.credentialsFile, credentials, {
           mode: 0o600,
@@ -159,32 +175,7 @@ export function windowsCredentialAclPowerShellInvocation(path: string): {
   if (/[\u0000-\u001f\u007f]/u.test(path)) {
     throw invalidState(path, "credentials path cannot contain control characters");
   }
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    `$CredentialPath = ${powerShellStringLiteral(path)}`,
-    "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
-    "$acl = [System.Security.AccessControl.FileSecurity]::new()",
-    "$acl.SetOwner($sid)",
-    "$acl.SetAccessRuleProtection($true, $false)",
-    "$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)",
-    "$acl.SetAccessRule($rule)",
-    "[System.IO.File]::SetAccessControl($CredentialPath, $acl)"
-  ].join("; ");
-  return {
-    command: "powershell.exe",
-    args: [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-EncodedCommand",
-      Buffer.from(script, "utf16le").toString("base64")
-    ]
-  };
-}
-
-function powerShellStringLiteral(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
+  return windowsCurrentUserOnlyFileAclPowerShellInvocation(path, "CredentialPath");
 }
 
 function createControlToken(randomBytes: (size: number) => Uint8Array): string {
@@ -198,37 +189,47 @@ function decodeCredentials(file: string, value: unknown): BridgeCredentials {
   return {
     schema: BRIDGE_CREDENTIALS_SCHEMA,
     controlToken: requiredSecret(file, "controlToken", value.controlToken),
-    account: decodeAccount(file, value.account),
-    relay: decodeRelay(file, value.relay)
+    connect: decodeConnect(file, value.connect)
   };
 }
 
-function decodeAccount(file: string, value: unknown): StoredAccountCredential | null {
+function decodeConnect(file: string, value: unknown): StoredConnectCredential | null {
   if (value === null) return null;
-  if (!isRecord(value)) throw invalidState(file, "account must be null or an account credential");
-  return {
-    accountId: requiredString(file, "account.accountId", value.accountId),
-    accessToken: requiredSecret(file, "account.accessToken", value.accessToken),
-    refreshToken: nullableSecret(file, "account.refreshToken", value.refreshToken),
-    expiresAt: nullableTimestamp(file, "account.expiresAt", value.expiresAt)
+  if (!isRecord(value)) throw invalidState(file, "connect must be null or a Connect credential");
+  const keys: StoredDeviceKeys = {
+    signingPrivateKey: requiredP256Jwk(file, "connect.signingPrivateKey", value.signingPrivateKey, true),
+    signingPublicKey: requiredP256Jwk(file, "connect.signingPublicKey", value.signingPublicKey, false),
+    agreementPrivateKey: requiredP256Jwk(file, "connect.agreementPrivateKey", value.agreementPrivateKey, true),
+    agreementPublicKey: requiredP256Jwk(file, "connect.agreementPublicKey", value.agreementPublicKey, false)
   };
-}
-
-function decodeRelay(file: string, value: unknown): StoredRelayCredential | null {
-  if (value === null) return null;
-  if (!isRecord(value)) throw invalidState(file, "relay must be null or a Relay credential");
+  if (value.state === "enrolling") {
+    return {
+      ...keys,
+      state: "enrolling",
+      enrollmentId: requiredString(file, "connect.enrollmentId", value.enrollmentId),
+      deviceCode: requiredSecret(file, "connect.deviceCode", value.deviceCode),
+      userCode: requiredString(file, "connect.userCode", value.userCode),
+      verificationUri: requiredSecureHttpUrl(file, "connect.verificationUri", value.verificationUri),
+      verificationUriComplete: requiredSecureHttpUrl(file, "connect.verificationUriComplete", value.verificationUriComplete),
+      interval: requiredPollingInterval(file, "connect.interval", value.interval),
+      expiresAt: requiredTimestamp(file, "connect.expiresAt", value.expiresAt)
+    };
+  }
+  if (value.state !== "registered") throw invalidState(file, "connect.state must be enrolling or registered");
   return {
-    deviceId: requiredString(file, "relay.deviceId", value.deviceId),
-    token: requiredSecret(file, "relay.token", value.token)
+    ...keys,
+    state: "registered",
+    deviceId: requiredString(file, "connect.deviceId", value.deviceId),
+    accountId: requiredString(file, "connect.accountId", value.accountId),
+    refreshToken: requiredSecret(file, "connect.refreshToken", value.refreshToken),
+    accessToken: requiredSecret(file, "connect.accessToken", value.accessToken),
+    expiresAt: requiredTimestamp(file, "connect.expiresAt", value.expiresAt),
+    connectWsUrl: requiredSecureWebSocketUrl(file, "connect.connectWsUrl", value.connectWsUrl)
   };
 }
 
 function requiredSecret(file: string, field: string, value: unknown): string {
   return requiredString(file, field, value);
-}
-
-function nullableSecret(file: string, field: string, value: unknown): string | null {
-  return nullableString(file, field, value);
 }
 
 function requiredString(file: string, field: string, value: unknown): string {
@@ -238,17 +239,73 @@ function requiredString(file: string, field: string, value: unknown): string {
   return value;
 }
 
-function nullableString(file: string, field: string, value: unknown): string | null {
-  if (value === null) return null;
-  return requiredString(file, field, value);
-}
-
-function nullableTimestamp(file: string, field: string, value: unknown): string | null {
-  const timestamp = nullableString(file, field, value);
-  if (timestamp !== null && !Number.isFinite(Date.parse(timestamp))) {
-    throw invalidState(file, `${field} must be a valid timestamp or null`);
+function requiredTimestamp(file: string, field: string, value: unknown): string {
+  const timestamp = requiredString(file, field, value);
+  if (!Number.isFinite(Date.parse(timestamp))) {
+    throw invalidState(file, `${field} must be a valid timestamp`);
   }
   return timestamp;
+}
+
+function requiredSecureWebSocketUrl(file: string, field: string, value: unknown): string {
+  const raw = requiredString(file, field, value);
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch (_error) {
+    throw invalidState(file, `${field} must be a valid WebSocket URL`);
+  }
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
+  if (url.protocol !== "wss:" && !(url.protocol === "ws:" && loopback)) {
+    throw invalidState(file, `${field} must use WSS except for loopback fixtures`);
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw invalidState(file, `${field} must not contain credentials`);
+  }
+  return url.toString();
+}
+
+function requiredSecureHttpUrl(file: string, field: string, value: unknown): string {
+  const raw = requiredString(file, field, value);
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch (_error) {
+    throw invalidState(file, `${field} must be a valid URL`);
+  }
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw invalidState(file, `${field} must use HTTPS except for loopback fixtures`);
+  }
+  if (url.username || url.password || url.hash) throw invalidState(file, `${field} must not contain credentials`);
+  return url.toString();
+}
+
+function requiredPollingInterval(file: string, field: string, value: unknown): number {
+  if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > 30) {
+    throw invalidState(file, `${field} must be an integer from 1 through 30`);
+  }
+  return Number(value);
+}
+
+function requiredP256Jwk(file: string, field: string, value: unknown, requirePrivate: boolean): JsonWebKey {
+  if (!isRecord(value)
+    || value.kty !== "EC"
+    || value.crv !== "P-256"
+    || typeof value.x !== "string"
+    || typeof value.y !== "string"
+    || (requirePrivate && typeof value.d !== "string")
+    || (!requirePrivate && value.d !== undefined)) {
+    throw invalidState(file, `${field} must be a ${requirePrivate ? "private" : "public"} P-256 JWK`);
+  }
+  return {
+    kty: "EC",
+    crv: "P-256",
+    x: value.x,
+    y: value.y,
+    ...(requirePrivate ? { d: value.d as string } : {}),
+    ext: true
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

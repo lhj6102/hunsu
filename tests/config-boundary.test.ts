@@ -6,6 +6,7 @@ import { join, relative } from "node:path";
 const ROOT = new URL("..", import.meta.url).pathname;
 const SCAN_ROOTS = ["apps", "packages"];
 const ALLOWED_ENV_READ_FILES = new Set([
+  "apps/connect-api/scripts/cloudflare-config.mjs",
   "apps/hub-api/scripts/cloudflare-config.mjs",
   "apps/hub-api/scripts/seed-local.mjs",
   "apps/bridge/scripts/pack-smoke.mjs",

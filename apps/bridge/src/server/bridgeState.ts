@@ -1,21 +1,28 @@
 import { existsSync, readFileSync } from "node:fs";
 import { codexProviderEnv, codexSettingsFromRecord, type BridgeCodexSettings } from "../runtime-providers/codex.ts";
-import type { BridgeCommandScope, RemoteWorkspaceProjectGrant } from "../connections/remoteConnection.ts";
 import type { BridgeStatusAccount } from "./bridgeStatus.ts";
-import { BRIDGE_CONFIG_SCHEMA, type BridgeConfig } from "../state/configStore.ts";
+import { decodeBridgeConfig, type BridgeConfig } from "../state/configStore.ts";
 import { BRIDGE_CREDENTIALS_SCHEMA, type BridgeCredentials } from "../state/credentialStore.ts";
 import { WORKSPACE_STORE_SCHEMA, type WorkspaceStoreDocument } from "../state/workspaceStore.ts";
 import { resolveHunsuPaths } from "../state/paths.ts";
+import type { BridgeRemoteWorkspaceScope } from "../workspaces/remoteScopes.ts";
+
+export type BridgeCommandScope = BridgeRemoteWorkspaceScope;
+
+export type RemoteWorkspaceProjectGrant = {
+  workspaceId: string;
+  scopes: BridgeCommandScope[];
+  active?: boolean;
+};
 
 export type BridgeAccountEvidence = BridgeStatusAccount & { available: boolean };
 
 export function bridgeStatusAccountEvidenceFromState(env: Record<string, string | undefined>): BridgeAccountEvidence {
   const credentials = readCredentials(env);
-  if (!credentials?.account) return { available: credentials !== undefined, signedIn: false };
-  const expired = credentials.account.expiresAt !== null && Date.parse(credentials.account.expiresAt) <= Date.now();
-  return expired
-    ? { available: true, signedIn: false }
-    : { available: true, signedIn: true, userId: credentials.account.accountId };
+  if (!credentials?.connect || credentials.connect.state !== "registered") return { available: credentials !== undefined, signedIn: false };
+  return credentials.connect.refreshToken
+    ? { available: true, signedIn: true, userId: credentials.connect.accountId }
+    : { available: true, signedIn: false };
 }
 
 export function bridgeStatusProjectGrantsFromState(env: Record<string, string | undefined>): RemoteWorkspaceProjectGrant[] {
@@ -27,10 +34,10 @@ export function bridgeStatusProjectGrantsFromState(env: Record<string, string | 
   return workspaces.workspaces
     .filter(workspace => workspace.lifecycle === "active"
       && workspace.remoteAccess?.enabled === true
-      && workspace.remoteAccess.scopes.includes("remoteRelay.access"))
+      && workspace.remoteAccess.scopes.includes("remote.access"))
     .map(workspace => ({
-      path: normalizeRepositoryPath(workspace.repositoryPath),
-      scopes: workspace.remoteAccess?.scopes.filter(isBridgeCommandScope) ?? ["remoteRelay.access"]
+      workspaceId: workspace.workspaceId,
+      scopes: workspace.remoteAccess?.scopes.filter(isBridgeCommandScope) ?? ["remote.access"]
     }));
 }
 
@@ -60,9 +67,9 @@ export function parseBridgeStatusProjectGrants(value: string | undefined): Remot
     const parsed = JSON.parse(value) as unknown;
     if (!Array.isArray(parsed)) return [];
     return parsed.flatMap(item => {
-      if (!isRecord(item) || typeof item.path !== "string" || !item.path.trim() || !Array.isArray(item.scopes)) return [];
+      if (!isRecord(item) || typeof item.workspaceId !== "string" || !item.workspaceId.trim() || !Array.isArray(item.scopes)) return [];
       return [{
-        path: normalizeRepositoryPath(item.path),
+        workspaceId: item.workspaceId.trim(),
         scopes: item.scopes.filter(isBridgeCommandScope),
         active: item.active === false ? false : undefined
       }];
@@ -73,22 +80,29 @@ export function parseBridgeStatusProjectGrants(value: string | undefined): Remot
 }
 
 export function mergeBridgeStatusProjectGrants(projectGrants: RemoteWorkspaceProjectGrant[]): RemoteWorkspaceProjectGrant[] {
-  const byPath = new Map<string, RemoteWorkspaceProjectGrant>();
+  const byWorkspaceId = new Map<string, RemoteWorkspaceProjectGrant>();
   for (const grant of projectGrants) {
-    const path = normalizeRepositoryPath(grant.path);
-    const existing = byPath.get(path);
-    byPath.set(path, {
-      path,
+    const workspaceId = grant.workspaceId.trim();
+    if (!workspaceId) continue;
+    const existing = byWorkspaceId.get(workspaceId);
+    byWorkspaceId.set(workspaceId, {
+      workspaceId,
       scopes: [...new Set([...(existing?.scopes ?? []), ...grant.scopes])],
       active: existing?.active === false || grant.active === false ? false : undefined
     });
   }
-  return [...byPath.values()];
+  return [...byWorkspaceId.values()];
 }
 
 function readConfig(env: Record<string, string | undefined>): BridgeConfig | undefined {
-  const config = readJson<BridgeConfig>(resolveHunsuPaths({ env }).configFile);
-  return config?.schema === BRIDGE_CONFIG_SCHEMA ? config : undefined;
+  const file = resolveHunsuPaths({ env }).configFile;
+  const config = readJson<unknown>(file);
+  if (config === undefined) return undefined;
+  try {
+    return decodeBridgeConfig(file, config);
+  } catch (_error) {
+    return undefined;
+  }
 }
 
 function readCredentials(env: Record<string, string | undefined>): BridgeCredentials | undefined {
@@ -110,11 +124,7 @@ function isBridgeCommandScope(value: unknown): value is BridgeCommandScope {
     || value === "artifactAction.run"
     || value === "env.read"
     || value === "hostAlias.expose"
-    || value === "remoteRelay.access";
-}
-
-function normalizeRepositoryPath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/\/+$/, "");
+    || value === "remote.access";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

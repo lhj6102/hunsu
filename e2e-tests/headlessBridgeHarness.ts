@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 export type HeadlessBrowserMode = "proxy" | "direct";
 
@@ -18,23 +18,17 @@ export type HeadlessBrowserHarness = {
   stop(): Promise<void>;
 };
 
-type FakeRelay = {
-  url: string;
-  port: number;
-  close(): Promise<void>;
-};
-
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const bridgeCliPath = join(repositoryRoot, "apps", "bridge", "src", "cli.ts");
 const vitePath = join(repositoryRoot, "apps", "web", "node_modules", "vite", "bin", "vite.js");
 const webRoot = join(repositoryRoot, "apps", "web");
 const fakeCodexPath = join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs");
-const fakeRelayPath = join(repositoryRoot, "tests", "fixtures", "fake-relay.mjs");
 const EXPECTED_HEALTH = {
   ok: true,
   service: "hunsu-bridge",
-  version: "0.2.0-next.2",
-  protocolVersion: "local-bridge-v1"
+  version: "0.2.0-next.3",
+  protocolVersion: "local-bridge-v1",
+  deploymentProfile: "production"
 };
 
 export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Promise<HeadlessBrowserHarness> {
@@ -47,10 +41,6 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
   const webUrl = mode === "proxy"
     ? `http://hunsu.localhost:${webPort}`
     : `http://127.0.0.1:${webPort}`;
-  const relayModule = await import(pathToFileURL(fakeRelayPath).href) as {
-    startFakeRelay(options?: { host?: string; port?: number }): Promise<FakeRelay>;
-  };
-  const relay = await relayModule.startFakeRelay({ host: "127.0.0.1", port: 0 });
   const children: ChildProcess[] = [];
   const childOutput = new Map<ChildProcess, string>();
   let stopped = false;
@@ -73,10 +63,6 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
     HUNSU_CODEX_APP_SERVER_COMMAND: process.execPath,
     HUNSU_CODEX_APP_SERVER_ARGS: JSON.stringify([fakeCodexPath, "app-server", "--stdio"]),
     HUNSU_FAKE_CODEX_MODE: "ready",
-    HUNSU_BRIDGE_AUTH_BASE_URL: relay.url,
-    HUNSU_RELAY_API_URL: relay.url,
-    HUNSU_RELAY_PUBLIC_API_URL: relay.url,
-    HUNSU_RELAY_WS_URL: `ws://127.0.0.1:${relay.port}/v1/device/connect`,
     HUNSU_E2E_BROWSER_CAPTURE_PATH: browserCapture.urlFile,
     PATH: [browserCapture.binDirectory, process.env.PATH].filter(Boolean).join(delimiter),
     NODE_OPTIONS: [
@@ -90,7 +76,6 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
     if (stopped) return;
     stopped = true;
     await Promise.all(children.map(terminateChildTree));
-    await relay.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   };
 
@@ -170,7 +155,7 @@ export async function startHeadlessBrowserHarness(mode: HeadlessBrowserMode): Pr
         if (evidence.includes(controlToken) || evidence.includes(pairingToken)) {
           throw new Error("Bridge diagnostics contained a browser or control credential.");
         }
-        if (/\bhunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+\b/iu.test(evidence)
+        if (/\bhunsu_(?:bridge|control|pairing|connect)_[A-Za-z0-9_-]+\b/iu.test(evidence)
           || /authorization\s*[=:]\s*Bearer\s+(?!\[redacted\])/iu.test(evidence)) {
           throw new Error("Bridge diagnostics contained unsanitized credential material.");
         }
@@ -346,7 +331,10 @@ function assertChildRunning(child: ChildProcess, output: Map<ChildProcess, strin
 }
 
 async function terminateChildTree(child: ChildProcess): Promise<void> {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
+    releaseChildHandles(child);
+    return;
+  }
   if (process.platform === "win32") {
     await new Promise<void>(resolveKill => {
       const killer = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
@@ -356,11 +344,23 @@ async function terminateChildTree(child: ChildProcess): Promise<void> {
       killer.once("error", () => resolveKill());
       killer.once("exit", () => resolveKill());
     });
+    releaseChildHandles(child);
     return;
   }
   signalGroup(child.pid, "SIGTERM");
-  await Promise.race([childExit(child), delay(2_000)]);
-  if (child.exitCode === null && child.signalCode === null) signalGroup(child.pid, "SIGKILL");
+  await waitForExitWithin(child, 2_000);
+  if (child.exitCode === null && child.signalCode === null) {
+    signalGroup(child.pid, "SIGKILL");
+    await waitForExitWithin(child, 500);
+  }
+  releaseChildHandles(child);
+}
+
+function releaseChildHandles(child: ChildProcess): void {
+  child.stdin?.destroy();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  child.unref();
 }
 
 function signalGroup(pid: number, signal: NodeJS.Signals): void {
@@ -371,15 +371,24 @@ function signalGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-function childExit(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise(resolveExit => child.once("exit", () => resolveExit()));
+function waitForExitWithin(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise(resolveExit => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timeout);
+      child.removeListener("exit", onExit);
+      resolveExit(exited);
+    };
+    const onExit = () => finish(true);
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
 }
 
 function sanitizeOutput(value: string): string {
   return value
     .replace(/([?&](?:hunsuBridgeToken|token|authorization)=)[^&#\s]+/giu, "$1[redacted]")
-    .replace(/\bhunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+\b/giu, "[redacted]")
+    .replace(/\bhunsu_(?:bridge|control|pairing|connect)_[A-Za-z0-9_-]+\b/giu, "[redacted]")
     .replace(/(Bearer\s+)[^\s,"']+/giu, "$1[redacted]");
 }
 

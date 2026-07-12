@@ -18,7 +18,6 @@ const verifyBridgePath = join(repositoryRoot, "scripts", "verify-bridge.mjs");
 const evidenceValidatorPath = join(repositoryRoot, "scripts", "validate-bridge-production-evidence.mjs");
 const npmProvenanceVerifierPath = join(repositoryRoot, "scripts", "verify-bridge-npm-provenance.mjs");
 const fakeCodexPath = join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs");
-const fakeRelayPath = join(repositoryRoot, "tests", "fixtures", "fake-relay.mjs");
 
 test("development scripts have valid Node syntax and safe helper contracts", async () => {
   await Promise.all([
@@ -28,8 +27,7 @@ test("development scripts have valid Node syntax and safe helper contracts", asy
     verifyBridgePath,
     evidenceValidatorPath,
     npmProvenanceVerifierPath,
-    fakeCodexPath,
-    fakeRelayPath
+    fakeCodexPath
   ].map(path =>
     execFileAsync(process.execPath, ["--check", path])
   ));
@@ -54,14 +52,16 @@ test("development scripts have valid Node syntax and safe helper contracts", asy
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.2",
-    protocolVersion: "local-bridge-v1"
+    version: "0.2.0-next.3",
+    protocolVersion: "local-bridge-v1",
+    deploymentProfile: "production"
   }), true);
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.2",
+    version: "0.2.0-next.3",
     protocolVersion: "local-bridge-v1",
+    deploymentProfile: "production",
     daemonPid: 123
   }), false);
   assert.equal(
@@ -108,13 +108,13 @@ test("Bridge verification budget and production evidence contracts are explicit 
   const retainedBody = Buffer.from('{"schema":"hunsu.bridge.qa-evidence.v1","result":"passed"}\n', "utf8");
   const retainedDigest = `sha256:${createHash("sha256").update(retainedBody).digest("hex")}`;
   const record = evidence.validateProductionEvidence({
-    npmVersion: "0.2.0-next.2",
+    npmVersion: "0.2.0-next.3",
     npmIntegrity: `sha512-${"a".repeat(86)}==`,
     evidenceUrl: "https://evidence.example.test/bridge-next-1",
     evidenceSha256: retainedDigest,
     hunsuAppDeployment: "https://hunsu.app/deployments/bridge-next-1",
     codexVersion: "codex-cli 1.2.3",
-    relayEnvironment: "production-qa",
+    connectEnvironment: "production-qa",
     workspaceFixtureId: "ws_disposable_001",
     platformEvidence: JSON.stringify({
       windows: { os: "windows-latest", node: "24.18.0", serviceManager: "Task Scheduler" },
@@ -122,7 +122,7 @@ test("Bridge verification budget and production evidence contracts are explicit 
       linux: { os: "ubuntu-latest", node: "24.18.0", serviceManager: "systemd --user" }
     })
   });
-  assert.equal(record.schema, "hunsu.bridge.production-evidence.v1");
+  assert.equal(record.schema, "hunsu.bridge.production-evidence.v2");
   assert.deepEqual(record.evidence, {
     url: "https://evidence.example.test/bridge-next-1",
     sha256: retainedDigest
@@ -155,13 +155,13 @@ test("Bridge verification budget and production evidence contracts are explicit 
     fetchImpl: async () => new Response(unsafeBody, { status: 200 })
   }), /credential or private local path/u);
   assert.throws(() => evidence.validateProductionEvidence({
-    npmVersion: "0.2.0-next.2",
+    npmVersion: "0.2.0-next.3",
     npmIntegrity: "sha512-YQ==",
     evidenceUrl: "https://evidence.example.test/bridge-next-1",
     evidenceSha256: retainedDigest,
     hunsuAppDeployment: "https://hunsu.app/deployments/bridge-next-1",
     codexVersion: "codex-cli 1.2.3",
-    relayEnvironment: "production-qa",
+    connectEnvironment: "production-qa",
     workspaceFixtureId: "ws_disposable_001",
     platformEvidence: JSON.stringify({
       windows: { os: "windows-latest", node: "24.18.0", serviceManager: "Task Scheduler" },
@@ -170,23 +170,23 @@ test("Bridge verification budget and production evidence contracts are explicit 
     })
   }));
   assert.throws(() => evidence.validateProductionEvidence({
-    npmVersion: "0.2.0-next.2",
+    npmVersion: "0.2.0-next.3",
     npmIntegrity: "sha512-invalid",
     evidenceUrl: "https://example.test/?token=secret",
     evidenceSha256: retainedDigest,
     hunsuAppDeployment: "https://hunsu.app",
     codexVersion: "codex-cli 1.2.3",
-    relayEnvironment: "production-qa",
+    connectEnvironment: "production-qa",
     workspaceFixtureId: "ws_disposable_001",
     platformEvidence: "{}"
   }));
 });
 
-test("npm provenance verification binds the signed package subject to the exact tag, workflow, and Git SHA", async () => {
+test("npm provenance verification binds the signed package subject to the protected preview publisher and exact Git SHA", async () => {
   const provenance = await import(pathToFileURL(npmProvenanceVerifierPath).href) as {
     verifyBridgeNpmProvenanceAudit(input: Record<string, unknown>): Record<string, unknown>;
   };
-  const version = "0.2.0-next.2";
+  const version = "0.2.0-next.3";
   const versionTag = `v${version}`;
   const gitSha = "1".repeat(40);
   const subjectSha512 = "ab".repeat(64);
@@ -200,14 +200,14 @@ test("npm provenance verification binds the signed package subject to the exact 
         buildType: "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1",
         externalParameters: {
           workflow: {
-            ref: `refs/tags/${versionTag}`,
+            ref: "refs/heads/preview",
             repository: "https://github.com/lhj6102/hunsu",
             path: ".github/workflows/publish-bridge.yml"
           }
         },
-        internalParameters: { github: { event_name: "workflow_dispatch" } },
+        internalParameters: { github: { event_name: "push" } },
         resolvedDependencies: [{
-          uri: `git+https://github.com/lhj6102/hunsu@refs/tags/${versionTag}`,
+          uri: "git+https://github.com/lhj6102/hunsu@refs/heads/preview",
           digest: { gitCommit: gitSha }
         }]
       },
@@ -246,7 +246,7 @@ test("npm provenance verification binds the signed package subject to the exact 
   assert.deepEqual((verified.source as { gitSha: string; ref: string }), {
     repository: "https://github.com/lhj6102/hunsu",
     workflow: ".github/workflows/publish-bridge.yml",
-    ref: `refs/tags/${versionTag}`,
+    ref: "refs/heads/preview",
     gitSha,
     builder: "https://github.com/actions/runner/github-hosted",
     invocationId: "https://github.com/lhj6102/hunsu/actions/runs/123/attempts/1"
@@ -258,6 +258,21 @@ test("npm provenance verification binds the signed package subject to the exact 
     gitSha: "2".repeat(40),
     integrity
   }), /source commit/u);
+  const tagStatement = structuredClone(statement);
+  tagStatement.predicate.buildDefinition.externalParameters.workflow.ref = `refs/tags/${versionTag}`;
+  tagStatement.predicate.buildDefinition.internalParameters.github.event_name = "workflow_dispatch";
+  tagStatement.predicate.buildDefinition.resolvedDependencies[0].uri = `git+https://github.com/lhj6102/hunsu@refs/tags/${versionTag}`;
+  const tagAudit = structuredClone(audit);
+  tagAudit.verified[0].attestationBundles[0].bundle.dsseEnvelope.payload = Buffer
+    .from(JSON.stringify(tagStatement), "utf8")
+    .toString("base64");
+  assert.throws(() => provenance.verifyBridgeNpmProvenanceAudit({
+    audit: tagAudit,
+    version,
+    versionTag,
+    gitSha,
+    integrity
+  }), /protected preview branch/u);
 });
 
 test("fake Codex provides version, readiness, login-required, unsupported-model, and controlled app-server responses", async () => {
@@ -300,85 +315,6 @@ test("fake Codex provides version, readiness, login-required, unsupported-model,
   }
 });
 
-test("fake Relay supports deterministic device login, registration, commands, disconnect, and reconnect", { timeout: 15_000 }, async t => {
-  const relay = spawn(process.execPath, [fakeRelayPath, "--port", "0", "--json"], {
-    cwd: repositoryRoot,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  t.after(async () => {
-    if (relay.exitCode === null && relay.signalCode === null) relay.kill("SIGTERM");
-    await waitForExit(relay).catch(() => undefined);
-  });
-  const readyLine = await readFirstLine(relay.stdout);
-  assert.equal(/token|credential|authorization/iu.test(readyLine), false);
-  const ready = JSON.parse(readyLine) as { ready: boolean; url: string };
-  assert.equal(ready.ready, true);
-
-  const deviceCodeResponse = await fetch(`${ready.url}/oauth/device/code`, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: "hunsu-bridge", device_id: "fixture-device" })
-  });
-  const deviceCode = await deviceCodeResponse.json() as {
-    device_code: string;
-    user_code: string;
-    verification_uri: string;
-  };
-  assert.match(deviceCode.user_code, /^HUNSU-/u);
-  assert.match(deviceCode.verification_uri, /^http:\/\/127\.0\.0\.1:/u);
-
-  const pending = await requestDeviceToken(ready.url, deviceCode.device_code);
-  assert.equal(pending.response.status, 400);
-  assert.equal(pending.body.error, "authorization_pending");
-
-  const approval = await fetch(`${ready.url}/__fixture/device/approve`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ deviceCode: deviceCode.device_code })
-  });
-  assert.equal(approval.status, 200);
-  const authorized = await requestDeviceToken(ready.url, deviceCode.device_code);
-  assert.equal(authorized.response.status, 200);
-  assert.match(authorized.body.access_token, /^fake-account-access-/u);
-
-  const registration = await fetch(`${ready.url}/v1/devices`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${authorized.body.access_token}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      device: {
-        deviceId: "fixture-device",
-        deviceName: "Fixture Bridge",
-        userId: "fixture-user",
-        protocolVersion: "local-bridge-v1"
-      },
-      workspaces: [{ workspaceId: "ws_fixture", displayName: "Fixture" }],
-      projectGrants: []
-    })
-  });
-  assert.equal(registration.status, 202);
-
-  const command = { name: "bridge.status", payload: { fixture: true } };
-  const firstRoundTrip = await postJson(`${ready.url}/v1/commands`, {
-    deviceId: "fixture-device",
-    command
-  });
-  assert.equal(firstRoundTrip.response.status, 200);
-  assert.deepEqual(firstRoundTrip.body.result.echoed, command);
-
-  await fetch(`${ready.url}/__fixture/disconnect`, { method: "POST" });
-  const disconnected = await fetch(`${ready.url}/v1/remote/status`).then(response => response.json()) as { connected: boolean };
-  assert.equal(disconnected.connected, false);
-  const failedRoundTrip = await postJson(`${ready.url}/v1/commands`, { deviceId: "fixture-device", command });
-  assert.equal(failedRoundTrip.response.status, 503);
-
-  await fetch(`${ready.url}/__fixture/reconnect`, { method: "POST" });
-  const secondRoundTrip = await postJson(`${ready.url}/v1/commands`, { deviceId: "fixture-device", command });
-  assert.equal(secondRoundTrip.response.status, 200);
-});
-
 test("dev stack launches isolated Bridge and Web processes with all same-origin proxy paths", { timeout: 35_000 }, async t => {
   const stack = spawn(process.execPath, [
     "--no-warnings",
@@ -403,35 +339,28 @@ test("dev stack launches isolated Bridge and Web processes with all same-origin 
   await waitForOutput(stack, () => output, /^\[state\] .+$/mu, 25_000);
   const bridgeUrl = output.match(/^\[bridge\] ready at (http:\/\/\S+)$/mu)?.[1];
   const webUrl = output.match(/^\[web\] ready at (http:\/\/\S+)$/mu)?.[1];
-  const relayUrl = output.match(/^\[relay\] ready at (http:\/\/\S+)$/mu)?.[1];
   const stateHome = output.match(/^\[state\] (.+)$/mu)?.[1];
   assert.ok(bridgeUrl);
   assert.ok(webUrl);
-  assert.ok(relayUrl);
   assert.ok(stateHome);
   await access(stateHome);
 
   const expectedHealth = {
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.2",
-    protocolVersion: "local-bridge-v1"
+    version: "0.2.0-next.3",
+    protocolVersion: "local-bridge-v1",
+    deploymentProfile: "production"
   };
   assert.deepEqual(await fetch(`${bridgeUrl}/health`).then(response => response.json()), expectedHealth);
   assert.deepEqual(await fetch(`${webUrl}/health`).then(response => response.json()), expectedHealth);
   assert.deepEqual(await fetch(`${webUrl}/__bridge/health`).then(response => response.json()), expectedHealth);
-  assert.deepEqual(await fetch(`${relayUrl}/health`).then(response => response.json()), {
-    ok: true,
-    service: "hunsu-relay",
-    issuer: relayUrl
-  });
   const apiResponse = await fetch(`${webUrl}/api/roadmaps/recent`);
   assert.notEqual(apiResponse.status, 404);
 
-  assert.equal(/hunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+/iu.test(output), false);
+  assert.equal(/hunsu_(?:bridge|control|pairing|connect)_[A-Za-z0-9_-]+/iu.test(output), false);
   assert.match(output, /^\[bridge\] /mu);
   assert.match(output, /^\[web\] /mu);
-  assert.match(output, /^\[relay\] /mu);
   assert.match(output, /^\[timing\] daemon ready: \d+ ms$/mu);
   assert.match(output, /^\[timing\] Web ready: \d+ ms$/mu);
 

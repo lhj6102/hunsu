@@ -1,4 +1,5 @@
 import { access } from "node:fs/promises";
+import type { BridgeDeploymentProfile } from "../deploymentProfile.ts";
 import type { HeadlessProviderService } from "../provider/providerRegistry.ts";
 import {
   createConfigStore,
@@ -20,6 +21,7 @@ export type BridgeDoctorReport = {
   mode: "online" | "offline";
   version: string;
   protocolVersion: string;
+  deploymentProfile: BridgeDeploymentProfile;
   home: string;
   state: {
     config: "valid" | "invalid";
@@ -47,8 +49,9 @@ export async function createDoctorReport(input: {
 }): Promise<BridgeDoctorReport> {
   const issues: Array<{ code: string; message: string }> = [];
   let configValid = true;
+  let deploymentProfile: BridgeDeploymentProfile = "production";
   try {
-    await createConfigStore(input.paths).read();
+    deploymentProfile = (await createConfigStore(input.paths).read()).deploymentProfile;
   } catch (_error) {
     configValid = false;
     issues.push({ code: "BRIDGE_STATE_INVALID", message: "Bridge configuration is invalid." });
@@ -62,6 +65,12 @@ export async function createDoctorReport(input: {
     }
   }
   const runtime = await createRuntimeStore(input.paths).read().catch(() => undefined);
+  if (runtime && runtime.deploymentProfile !== deploymentProfile) {
+    issues.push({
+      code: "BRIDGE_PROFILE_MISMATCH",
+      message: "The running Bridge deployment profile does not match its durable configuration."
+    });
+  }
   let setupTransactionPhase: SetupTransactionPhase | undefined;
   try {
     setupTransactionPhase = (await createSetupTransactionStore(input.paths).read())?.phase;
@@ -88,6 +97,7 @@ export async function createDoctorReport(input: {
     mode: input.online === false ? "offline" : "online",
     version: HUNSU_BRIDGE_VERSION,
     protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
+    deploymentProfile,
     home: input.paths.home,
     state: {
       config: configValid ? "valid" : "invalid",

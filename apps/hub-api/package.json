@@ -7,21 +7,21 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "config:print": "node scripts/cloudflare-config.mjs print",
-    "config:write": "node scripts/cloudflare-config.mjs write",
-    "dev": "node scripts/cloudflare-config.mjs dev",
+    "config:print": "node --conditions=development scripts/cloudflare-config.mjs print",
+    "config:write": "node --conditions=development scripts/cloudflare-config.mjs write",
+    "dev": "node --conditions=development scripts/cloudflare-config.mjs dev",
     "seed:local": "node scripts/seed-local.mjs",
     "build": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "deploy": "node scripts/cloudflare-config.mjs deploy",
-    "db:migrate:local": "node scripts/cloudflare-config.mjs db:migrate:local",
-    "db:migrate:remote": "node scripts/cloudflare-config.mjs db:migrate:remote"
+    "deploy": "node --conditions=development scripts/cloudflare-config.mjs deploy",
+    "db:migrate:local": "node --conditions=development scripts/cloudflare-config.mjs db:migrate:local",
+    "db:migrate:remote": "node --conditions=development scripts/cloudflare-config.mjs db:migrate:remote"
   },
   "dependencies": {
     "@hunsu/config": "workspace:*",
     "@hunsu/protocol-registry": "workspace:*"
   },
   "devDependencies": {
-    "wrangler": "4.104.0"
+    "wrangler": "4.110.0"
   }
 }

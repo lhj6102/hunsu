@@ -29,7 +29,7 @@ session.
 ## Remote grants
 
 A Workspace is never remotely accessible merely because it is registered.
-Remote access requires an explicit grant. Relay summaries redact local paths
+Remote access requires an explicit grant. Peer summaries redact local paths
 unless that grant separately authorizes path visibility, and Remote payloads
 cannot replace the granted path.
 

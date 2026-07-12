@@ -19,7 +19,7 @@ export type BridgeBackendStatus = {
     | { state: "connected" }
     | { state: "not_running" }
     | { state: "login_required" }
-    | { state: "relay_offline" }
+    | { state: "remote_offline" }
     | { state: "error"; error: string };
   workspaces: ConnectedWorkspaceSummary[];
 };
