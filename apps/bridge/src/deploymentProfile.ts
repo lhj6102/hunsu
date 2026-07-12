@@ -22,12 +22,12 @@ const PROFILE_ENDPOINTS: Readonly<Record<BridgeDeploymentProfile, BridgeDeployme
     connectApiUrl: "https://connect.hunsu.app",
     connectWsUrl: "wss://connect.hunsu.app/v1/connect/device",
     connectTicketIssuer: "https://connect.hunsu.app",
-    connectTicketSigningKeyId: "connect-Ea21pgXVRp5WfId1kXKSeyea",
+    connectTicketSigningKeyId: "connect-enaK6bbNEOky9hUYzzJuN3Qi",
     connectTicketSigningPublicJwk: Object.freeze({
       kty: "EC",
       crv: "P-256",
-      x: "SekGyUfv_HqJlJ35q9uE4cUzM7jWW6V6B7k4_HGy6ck",
-      y: "zY0W0qv5kHQKxF6aynjmy0kGv1XodPwF4MX4yvTW_C8"
+      x: "LmCMF_gjDJ9HQOmdmk_ylwWFA5r3cwvuMpJ_f6Ud3Cg",
+      y: "wjC2rVxMFzICuC-QH3RKXb5ztR968bg2oVc5PJ1A1gM"
     })
   }),
   preview: Object.freeze({
@@ -35,12 +35,12 @@ const PROFILE_ENDPOINTS: Readonly<Record<BridgeDeploymentProfile, BridgeDeployme
     connectApiUrl: "https://connect.preview.hunsu.app",
     connectWsUrl: "wss://connect.preview.hunsu.app/v1/connect/device",
     connectTicketIssuer: "https://connect.preview.hunsu.app",
-    connectTicketSigningKeyId: "connect-vd_GiPDTK2lPIDS3Y2dDIEck",
+    connectTicketSigningKeyId: "connect-LPehY8CSnG6Y0rkTzjQB4I77",
     connectTicketSigningPublicJwk: Object.freeze({
       kty: "EC",
       crv: "P-256",
-      x: "DZDAFyOricZ4dOBOhNrNtAS2X_EdqrE2wQxB23raNcc",
-      y: "qLXw7DinTp-5T0i_MdU9jN15Wpnxu0dXh-Owo5ydL1U"
+      x: "69FCDW0whttjj1IhJjFMQOOl-icup4Dv4MlpgasZcWw",
+      y: "9oGa20XKzFy9LCFn34v3H7ss42sD_9eKhjBbWwwBTa4"
     })
   })
 });

@@ -13,19 +13,45 @@ import {
 } from "../scripts/deployment/release-lib.mjs";
 import { selectPromotionPullRequest } from "../scripts/deployment/promotion-gate.mjs";
 import { verifyBridgeCandidate } from "../scripts/deployment/bridge-candidate-lib.mjs";
-import { assertCloudflareResourceAllowlist } from "../scripts/deployment/resource-allowlist.mjs";
+import {
+  assertCloudflareResourceAllowlist,
+  cloudflareResourceAllowlist
+} from "../scripts/deployment/resource-allowlist.mjs";
 import { validateEnvironmentContract } from "../scripts/deployment/environment-contract.mjs";
 import { writeConnectSecretsFile } from "../scripts/deployment/write-connect-secrets-file.mjs";
+import {
+  activateConnectSigningKeyRotation,
+  generateConnectSigningKeyRotation,
+  readRotationBundle,
+  windowsAtomicPrivateBundlePowerShellInvocation,
+  type ConnectSigningRotationMetadata
+} from "../scripts/deployment/provision-connect-signing-key.mjs";
+import { bridgeDeploymentEndpoints } from "../apps/bridge/src/deploymentProfile.ts";
 
 const SOURCE_SHA = "a".repeat(40);
 const MERGE_SHA = "b".repeat(40);
 const CONNECT_PUBLIC_JWK = JSON.stringify({
   kty: "EC",
   crv: "P-256",
-  x: "DZDAFyOricZ4dOBOhNrNtAS2X_EdqrE2wQxB23raNcc",
-  y: "qLXw7DinTp-5T0i_MdU9jN15Wpnxu0dXh-Owo5ydL1U"
+  x: "69FCDW0whttjj1IhJjFMQOOl-icup4Dv4MlpgasZcWw",
+  y: "9oGa20XKzFy9LCFn34v3H7ss42sD_9eKhjBbWwwBTa4"
 });
-const CONNECT_KEY_ID = "connect-vd_GiPDTK2lPIDS3Y2dDIEck";
+const CONNECT_KEY_ID = "connect-LPehY8CSnG6Y0rkTzjQB4I77";
+const CONNECT_TRUST: ReleaseManifest["connectTrust"] = {
+  preview: connectTrustProfile("preview"),
+  production: connectTrustProfile("production")
+};
+
+function connectTrustProfile(target: "preview" | "production"): ReleaseManifest["connectTrust"][typeof target] {
+  const resources = cloudflareResourceAllowlist(target);
+  return {
+    apiOrigin: resources.connectApiBaseUrl,
+    accessIssuer: resources.connectAccessIssuer,
+    accessAudience: resources.connectAccessAud,
+    ticketSigningKeyId: resources.connectSigningKeyId,
+    ticketSigningPublicJwk: JSON.parse(resources.connectSigningPublicJwk) as ReleaseManifest["connectTrust"][typeof target]["ticketSigningPublicJwk"]
+  };
+}
 
 test("deployment release manifest detects artifact changes", () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-release-"));
@@ -42,7 +68,8 @@ test("deployment release manifest detects artifact changes", () => {
     createReleaseManifest(root, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.7",
+      bridgePackageVersion: "0.2.0-next.8",
+      connectTrust: CONNECT_TRUST,
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -122,6 +149,15 @@ test("Cloudflare environment values must match the committed exact resource allo
     connectWorkerName: "hunsu-connect",
     connectD1DatabaseName: "hunsu_connect",
     connectD1DatabaseId: "c71aed30-29ff-48aa-ba76-866add7f8198",
+    connectAccessIssuer: "https://long-cell-c9f1.cloudflareaccess.com",
+    connectAccessAud: "4f50097a41fb8cfa589e85e63c0e37a38f25f6fa1de6f3635f06231f3cb285de",
+    connectSigningPublicJwk: JSON.stringify({
+      kty: "EC",
+      crv: "P-256",
+      x: "LmCMF_gjDJ9HQOmdmk_ylwWFA5r3cwvuMpJ_f6Ud3Cg",
+      y: "wjC2rVxMFzICuC-QH3RKXb5ztR968bg2oVc5PJ1A1gM"
+    }),
+    connectSigningKeyId: "connect-enaK6bbNEOky9hUYzzJuN3Qi",
     workerName: "hunsu-hub-api",
     originName: "hunsu",
     hubPublicApiUrl: "https://api.hunsu.app",
@@ -134,6 +170,18 @@ test("Cloudflare environment values must match the committed exact resource allo
     ...production,
     d1DatabaseId: "348e2174-ddf2-4126-be51-603e6e986f08"
   }), /committed allowlist/u);
+});
+
+test("committed Connect signing identities match the immutable Bridge profiles", () => {
+  for (const target of ["preview", "production"] as const) {
+    const resources = cloudflareResourceAllowlist(target);
+    const profile = bridgeDeploymentEndpoints(target);
+    assert.equal(profile.connectApiUrl, resources.connectApiBaseUrl);
+    assert.equal(profile.connectWsUrl, `${resources.connectApiBaseUrl.replace(/^http/u, "ws")}/v1/connect/device`);
+    assert.equal(profile.connectTicketIssuer, resources.connectApiBaseUrl);
+    assert.equal(profile.connectTicketSigningKeyId, resources.connectSigningKeyId);
+    assert.deepEqual(profile.connectTicketSigningPublicJwk, JSON.parse(resources.connectSigningPublicJwk));
+  }
 });
 
 test("preview and production environment contracts isolate both Hub and Connect resources", () => {
@@ -221,6 +269,266 @@ test("Connect secret materialization rejects mismatched keys and writes a curren
   }
 });
 
+test("Connect signing-key rotation stages private material before any GitHub mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-connect-key-stage-"));
+  const bundlePath = join(root, "preview-rotation.json");
+  try {
+    const metadata = generateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      repository: "lhj6102/hunsu",
+      bundlePath,
+      now: new Date("2026-07-13T00:00:00.000Z")
+    });
+    assert.equal(metadata.state, "staged");
+    assert.equal(metadata.bundleFile, "preview-rotation.json");
+    assert.equal("privateJwk" in metadata, false);
+    assert.equal("d" in JSON.parse(metadata.publicJwk), false);
+    assert.equal(readRotationBundle(bundlePath).keyId, metadata.keyId);
+    if (process.platform !== "win32") assert.equal(statSync(bundlePath).mode & 0o777, 0o600);
+    assert.throws(() => generateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath
+    }), /EEXIST/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Connect signing-key activation is ordered, resumable, and reports public reconciliation data before mutation", () => {
+  const protectedSha = "f".repeat(40);
+  for (const failingMutation of [2, 3]) {
+    const root = mkdtempSync(join(tmpdir(), `hunsu-connect-key-activate-${failingMutation}-`));
+    const bundlePath = join(root, "preview-rotation.json");
+    try {
+      const staged = generateConnectSigningKeyRotation({
+        environment: "hunsu-preview",
+        repository: "lhj6102/hunsu",
+        bundlePath
+      });
+      const calls: Array<{ args: string[]; input?: string }> = [];
+      const reports: ConnectSigningRotationMetadata[] = [];
+      let mutationCount = 0;
+      assert.throws(() => activateConnectSigningKeyRotation({
+        environment: "hunsu-preview",
+        repository: "lhj6102/hunsu",
+        bundlePath
+      }, {
+        resourceAllowlist: target => {
+          assert.equal(target, "preview");
+          return {
+            connectSigningPublicJwk: staged.publicJwk,
+            connectSigningKeyId: staged.keyId
+          };
+        },
+        runGit: args => args[0] === "status" ? "" : `${protectedSha}\n`,
+        report: metadata => reports.push(metadata),
+        runGh: (args, input) => {
+          calls.push({ args, input });
+          if (args[0] === "api" && args[1]?.includes("/git/ref/heads/")) {
+            return JSON.stringify({ object: { sha: protectedSha } });
+          }
+          if (args[0] === "variable" || args[0] === "secret") {
+            mutationCount += 1;
+            if (mutationCount === failingMutation) throw new Error("injected gh failure");
+          }
+          return "";
+        }
+      }), /may be partially updated.*Re-run activate with the same staged bundle/u);
+      assert.equal(reports.length, 1);
+      assert.equal(reports[0]?.state, "activating");
+      assert.equal(reports[0]?.publicJwk, staged.publicJwk);
+      assert.equal("privateJwk" in (reports[0] ?? {}), false);
+      assert.deepEqual(calls.slice(0, 3).map(call => call.args.slice(0, 2)), [
+        ["auth", "status"],
+        ["api", "repos/lhj6102/hunsu/environments/hunsu-preview"],
+        ["api", "repos/lhj6102/hunsu/git/ref/heads/preview"]
+      ]);
+      assert.equal(calls[3]?.args[2], "HUNSU_CONNECT_SIGNING_PUBLIC_JWK");
+      assert.equal(calls[4]?.args[2], "HUNSU_CONNECT_SIGNING_KEY_ID");
+      if (failingMutation === 3) {
+        assert.equal(calls[5]?.args[2], "HUNSU_CONNECT_SIGNING_PRIVATE_JWK");
+        assert.equal(typeof calls[5]?.input, "string");
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Connect signing-key activation requires a clean checkout at the exact protected branch SHA", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-connect-key-landed-"));
+  const bundlePath = join(root, "preview-rotation.json");
+  try {
+    const staged = generateConnectSigningKeyRotation({ environment: "hunsu-preview", bundlePath });
+    const allowlist = () => ({
+      connectSigningPublicJwk: staged.publicJwk,
+      connectSigningKeyId: staged.keyId
+    });
+    let ghCalls = 0;
+    assert.throws(() => activateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath
+    }, {
+      resourceAllowlist: allowlist,
+      runGit: args => args[0] === "status" ? " M scripts/deployment/cloudflare-resources.json\n" : `${"a".repeat(40)}\n`,
+      runGh: () => { ghCalls += 1; return ""; }
+    }), /requires a clean source checkout/u);
+    assert.equal(ghCalls, 0);
+
+    assert.throws(() => activateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath
+    }, {
+      resourceAllowlist: allowlist,
+      runGit: args => args[0] === "status" ? "" : `${"a".repeat(40)}\n`,
+      runGh: args => {
+        ghCalls += 1;
+        return args[1]?.includes("/git/ref/heads/")
+          ? JSON.stringify({ object: { sha: "b".repeat(40) } })
+          : "";
+      }
+    }), /HEAD to equal the protected preview branch SHA/u);
+    assert.equal(ghCalls, 3);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Connect signing-key bundles apply and validate a current-user-only Windows ACL", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-connect-key-windows-acl-"));
+  const bundlePath = join(root, "preview-rotation.json");
+  const aclEvents: string[] = [];
+  try {
+    generateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath,
+      platform: "win32",
+      windowsSecureWriter: (path, content) => {
+        aclEvents.push(`atomic-write:${path}`);
+        assert.throws(() => statSync(path), /ENOENT/u, "the Windows writer must own atomic secure creation");
+        assert.match(content, /"privateJwk"/u);
+        writeFileSync(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      },
+      windowsAclValidator: path => {
+        aclEvents.push(`validate:${path}`);
+        assert.ok(statSync(path).size > 0);
+      }
+    });
+    assert.deepEqual(aclEvents, [
+      `atomic-write:${bundlePath}`,
+      `validate:${bundlePath}`,
+      `validate:${bundlePath}`
+    ]);
+    readRotationBundle(bundlePath, {
+      platform: "win32",
+      windowsAclValidator: path => aclEvents.push(`read:${path}`)
+    });
+    assert.deepEqual(aclEvents.slice(-2), [`read:${bundlePath}`, `read:${bundlePath}`]);
+
+    let ghCalled = false;
+    assert.throws(() => activateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath
+    }, {
+      platform: "win32",
+      windowsAclValidator: () => { throw new Error("unsafe inherited ACL"); },
+      runGh: () => { ghCalled = true; return ""; }
+    }), /unsafe inherited ACL/u);
+    assert.equal(ghCalled, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  const failedRoot = mkdtempSync(join(tmpdir(), "hunsu-connect-key-windows-acl-fail-"));
+  const failedPath = join(failedRoot, "preview-rotation.json");
+  let failedWriterSawNoFile = false;
+  try {
+    assert.throws(() => generateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath: failedPath,
+      platform: "win32",
+      windowsSecureWriter: path => {
+        assert.throws(() => statSync(path), /ENOENT/u);
+        failedWriterSawNoFile = true;
+        throw new Error("injected atomic creation failure");
+      }
+    }), /could not be created atomically for the current Windows user/u);
+    assert.equal(failedWriterSawNoFile, true);
+    assert.throws(() => statSync(failedPath), /ENOENT/u);
+  } finally {
+    rmSync(failedRoot, { recursive: true, force: true });
+  }
+
+  const rejectedRoot = mkdtempSync(join(tmpdir(), "hunsu-connect-key-windows-verify-fail-"));
+  const rejectedPath = join(rejectedRoot, "preview-rotation.json");
+  try {
+    assert.throws(() => generateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath: rejectedPath,
+      platform: "win32",
+      windowsSecureWriter: (path, content) => {
+        writeFileSync(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      },
+      windowsAclValidator: () => { throw new Error("injected post-write ACL rejection"); }
+    }), /could not be created atomically for the current Windows user/u);
+    assert.throws(() => statSync(rejectedPath), /ENOENT/u);
+  } finally {
+    rmSync(rejectedRoot, { recursive: true, force: true });
+  }
+});
+
+test("Windows Connect bundles are created with a protected ACL atomically before stdin bytes are written", () => {
+  const path = "C:\\Users\\O'Brien\\Private\\connect-rotation.json";
+  const invocation = windowsAtomicPrivateBundlePowerShellInvocation(path);
+  assert.equal(invocation.command, "powershell.exe");
+  assert.deepEqual(invocation.args.slice(0, -1), [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand"
+  ]);
+  assert.equal(invocation.args.includes(path), false);
+  const script = Buffer.from(invocation.args.at(-1) ?? "", "base64").toString("utf16le");
+  assert.match(script, /\$PrivateFile = 'C:\\Users\\O''Brien\\Private\\connect-rotation\.json'/u);
+  assert.match(script, /FileSecurity\]::new\(\)/u);
+  assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/u);
+  assert.match(script, /Console\]::In\.ReadToEnd\(\)/u);
+  assert.match(script, /FileMode\]::CreateNew/u);
+  assert.match(script, /FileShare\]::None/u);
+  assert.match(script, /FileStream\]::new\([^;]+, \$acl\)/u);
+  assert.match(script, /\$created = \$true/u);
+  assert.match(script, /\$stream\.GetAccessControl\(\)/u);
+  assert.match(script, /AreAccessRulesProtected/u);
+  assert.match(script, /GetAccessRules\(\$true, \$true/u);
+  assert.match(script, /\$stream\.Write\(\$bytes/u);
+  assert.ok(script.indexOf("$stream.GetAccessControl()") < script.indexOf("$stream.Write($bytes"));
+  assert.match(script, /\$created -and -not \$complete/u);
+  assert.doesNotMatch(script, /SetAccessControl/u);
+});
+
+test("Connect signing-key activation refuses a key not yet committed to the target allowlist", () => {
+  const root = mkdtempSync(join(tmpdir(), "hunsu-connect-key-uncommitted-"));
+  const bundlePath = join(root, "preview-rotation.json");
+  try {
+    generateConnectSigningKeyRotation({ environment: "hunsu-preview", bundlePath });
+    let ghCalled = false;
+    assert.throws(() => activateConnectSigningKeyRotation({
+      environment: "hunsu-preview",
+      bundlePath
+    }, {
+      resourceAllowlist: () => ({
+        connectSigningPublicJwk: CONNECT_PUBLIC_JWK,
+        connectSigningKeyId: CONNECT_KEY_ID
+      }),
+      runGh: () => { ghCalled = true; return ""; }
+    }), /not present in the committed Cloudflare allowlist/u);
+    assert.equal(ghCalled, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("deployment preparation binds exact retained Connect bytes and target configuration", () => {
   const root = mkdtempSync(join(tmpdir(), "hunsu-prepare-"));
   const release = join(root, "release");
@@ -238,7 +546,8 @@ test("deployment preparation binds exact retained Connect bytes and target confi
     createReleaseManifest(release, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.7",
+      bridgePackageVersion: "0.2.0-next.8",
+      connectTrust: CONNECT_TRUST,
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
       workflowRunId: "1",
@@ -277,8 +586,8 @@ test("deployment preparation binds exact retained Connect bytes and target confi
         HUNSU_DEPLOY_TARGET: "preview",
         HUNSU_RELEASE_SHA: SOURCE_SHA,
         HUNSU_CONNECT_API_BASE_URL: "https://connect.preview.hunsu.app",
-        HUNSU_CONNECT_ACCESS_ISSUER: "https://hunsu.cloudflareaccess.com",
-        HUNSU_CONNECT_ACCESS_AUD: "a".repeat(64),
+        HUNSU_CONNECT_ACCESS_ISSUER: "https://long-cell-c9f1.cloudflareaccess.com",
+        HUNSU_CONNECT_ACCESS_AUD: "3e3bb57d75e2f332abe29f87c72a4517be115cb912b41385b3cca025d5d00131",
         HUNSU_CONNECT_SIGNING_PUBLIC_JWK: CONNECT_PUBLIC_JWK,
         HUNSU_CONNECT_SIGNING_KEY_ID: CONNECT_KEY_ID,
         HUNSU_WEB_PUBLIC_URL: "https://preview.hunsu.app"
@@ -294,36 +603,38 @@ test("deployment preparation binds exact retained Connect bytes and target confi
       routes: [{ pattern: "connect.preview.hunsu.app", custom_domain: true }]
     }, null, 2)}\n`);
 
-    execFileSync(process.execPath, [
+    const prepareArgs = [
       resolve(import.meta.dirname, "../scripts/deployment/prepare-deployment.mjs"),
       release,
       output,
       hubConfig,
       connectConfig
-    ], {
-      env: {
-        ...process.env,
-        CLOUDFLARE_ACCOUNT_ID: "a5e99f3b23c16ac20da1d55d34504e28",
-        HUNSU_DEPLOY_TARGET: "preview",
-        HUNSU_RELEASE_SHA: SOURCE_SHA,
-        HUNSU_WEB_PAGES_PROJECT: "hunsu-web-preview",
-        HUNSU_WEB_PUBLIC_URL: "https://preview.hunsu.app",
-        HUNSU_BRIDGE_API_BASE_URL: "http://127.0.0.1:19687",
-        HUNSU_CONNECT_API_BASE_URL: "https://connect.preview.hunsu.app",
-        HUNSU_CONNECT_WORKER_NAME: "hunsu-connect-preview",
-        HUNSU_CONNECT_D1_DATABASE_NAME: "hunsu_connect_preview",
-        HUNSU_CONNECT_D1_DATABASE_ID: "38cc819b-2405-47a6-925e-0d5d7de731c4",
-        HUNSU_CONNECT_ACCESS_ISSUER: "https://hunsu.cloudflareaccess.com",
-        HUNSU_CONNECT_ACCESS_AUD: "a".repeat(64),
-        HUNSU_CONNECT_SIGNING_PUBLIC_JWK: CONNECT_PUBLIC_JWK,
-        HUNSU_CONNECT_SIGNING_KEY_ID: CONNECT_KEY_ID,
-        HUNSU_HUB_WORKER_NAME: "hunsu-hub-api-preview",
-        HUNSU_HUB_ORIGIN_NAME: "hunsu",
-        HUNSU_HUB_PUBLIC_API_URL: "https://api.preview.hunsu.app",
-        HUNSU_HUB_D1_DATABASE_NAME: "hunsu_hub_preview",
-        HUNSU_HUB_D1_DATABASE_ID: "348e2174-ddf2-4126-be51-603e6e986f08",
-        HUNSU_HUB_R2_BUCKET_NAME: "hunsu-hub-packages-preview"
-      },
+    ];
+    const prepareEnv = {
+      ...process.env,
+      CLOUDFLARE_ACCOUNT_ID: "a5e99f3b23c16ac20da1d55d34504e28",
+      HUNSU_DEPLOY_TARGET: "preview",
+      HUNSU_RELEASE_SHA: SOURCE_SHA,
+      HUNSU_WEB_PAGES_PROJECT: "hunsu-web-preview",
+      HUNSU_WEB_PUBLIC_URL: "https://preview.hunsu.app",
+      HUNSU_BRIDGE_API_BASE_URL: "http://127.0.0.1:19687",
+      HUNSU_CONNECT_API_BASE_URL: "https://connect.preview.hunsu.app",
+      HUNSU_CONNECT_WORKER_NAME: "hunsu-connect-preview",
+      HUNSU_CONNECT_D1_DATABASE_NAME: "hunsu_connect_preview",
+      HUNSU_CONNECT_D1_DATABASE_ID: "38cc819b-2405-47a6-925e-0d5d7de731c4",
+      HUNSU_CONNECT_ACCESS_ISSUER: "https://long-cell-c9f1.cloudflareaccess.com",
+      HUNSU_CONNECT_ACCESS_AUD: "3e3bb57d75e2f332abe29f87c72a4517be115cb912b41385b3cca025d5d00131",
+      HUNSU_CONNECT_SIGNING_PUBLIC_JWK: CONNECT_PUBLIC_JWK,
+      HUNSU_CONNECT_SIGNING_KEY_ID: CONNECT_KEY_ID,
+      HUNSU_HUB_WORKER_NAME: "hunsu-hub-api-preview",
+      HUNSU_HUB_ORIGIN_NAME: "hunsu",
+      HUNSU_HUB_PUBLIC_API_URL: "https://api.preview.hunsu.app",
+      HUNSU_HUB_D1_DATABASE_NAME: "hunsu_hub_preview",
+      HUNSU_HUB_D1_DATABASE_ID: "348e2174-ddf2-4126-be51-603e6e986f08",
+      HUNSU_HUB_R2_BUCKET_NAME: "hunsu-hub-packages-preview"
+    };
+    execFileSync(process.execPath, prepareArgs, {
+      env: prepareEnv,
       stdio: "pipe"
     });
     assert.equal(readFileSync(join(output, "connect/worker.mjs"), "utf8"), "export default { fetch() {} };\n");
@@ -335,7 +646,26 @@ test("deployment preparation binds exact retained Connect bytes and target confi
     assert.equal(retainedConnectConfig.d1_databases[0].migrations_dir, "./migrations");
     const deployment = JSON.parse(readFileSync(join(output, "deployment-input.json"), "utf8"));
     assert.equal(deployment.resources.connectWorkerName, "hunsu-connect-preview");
+    assert.equal(deployment.connectTrust.ticketSigningKeyId, CONNECT_KEY_ID);
     assert.deepEqual(deployment.migrations.map((migration: { component: string }) => migration.component), ["connect", "hub"]);
+
+    const manifestPath = join(release, "release-manifest.json");
+    const mismatched = JSON.parse(readFileSync(manifestPath, "utf8"));
+    mismatched.connectTrust.preview.ticketSigningKeyId = "connect-enaK6bbNEOky9hUYzzJuN3Qi";
+    writeFileSync(manifestPath, `${JSON.stringify(mismatched, null, 2)}\n`);
+    try {
+      execFileSync(process.execPath, [
+        prepareArgs[0],
+        release,
+        join(root, "mismatch-output"),
+        hubConfig,
+        connectConfig
+      ], { env: prepareEnv, stdio: "pipe" });
+      assert.fail("Mismatched retained Connect trust must stop deployment preparation.");
+    } catch (error) {
+      const stderr = (error as { stderr?: Buffer | string }).stderr;
+      assert.match(String(stderr), /Protected Connect trust does not match the retained release/u);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -363,7 +693,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
       workflow: { runId: "9", runAttempt: "1" }
     }));
     const releaseManifest: ReleaseManifest = {
-      schema: "hunsu.deployment-release.v3",
+      schema: "hunsu.deployment-release.v4",
       source: {
         repository: "lhj6102/hunsu",
         sha: SOURCE_SHA,
@@ -371,6 +701,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
         ref: "refs/heads/preview"
       },
       bridgePackageVersion: "0.2.0-next.2",
+      connectTrust: CONNECT_TRUST,
       build: {
         workflowRunId: "1",
         workflowRunAttempt: "1",
@@ -393,7 +724,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
     assert.equal(binding.source.sha, SOURCE_SHA);
     assert.throws(() => verifyBridgeCandidate(root, {
       ...releaseManifest,
-      bridgePackageVersion: "0.2.0-next.7"
+      bridgePackageVersion: "0.2.0-next.8"
     }), /does not match retained release/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -477,6 +808,8 @@ test("deployment workflows retain preview artifacts and forbid production rebuil
   assert.match(preview, /if \[\[ "\$DEPLOY_RESULT" != "success" \]\]/u);
   assert.match(smoke, /5 \* 60 \* 1000/u);
   assert.match(smoke, /service !== "hunsu-connect"/u);
+  assert.match(smoke, /Connect session status must bypass Access/u);
+  assert.match(smoke, /Connect session preflight must reach the Worker CORS policy/u);
   assert.match(buildRelease, /"@hunsu\/web\.\.\."/u);
   assert.match(buildRelease, /"@hunsu\/hub-api\.\.\."/u);
   assert.match(buildRelease, /"@hunsu\/connect-api\.\.\."/u);

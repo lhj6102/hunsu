@@ -60,7 +60,7 @@ added to bypass that proof-of-presence boundary.
 
 Before merging a change that affects packed Bridge bytes into `preview`, bump
 `apps/bridge/package.json` to a new explicit prerelease such as
-`0.2.0-next.7`. npm versions are immutable. CI never invents or rewrites a
+`0.2.0-next.8`. npm versions are immutable. CI never invents or rewrites a
 version.
 
 A push to protected `preview` starts both `bridge-headless.yml` and
@@ -103,7 +103,7 @@ Preview devices install the exact version recorded in candidate evidence, for
 example:
 
 ~~~sh
-npx @hunsu/bridge@0.2.0-next.7 setup --profile preview
+npx @hunsu/bridge@0.2.0-next.8 setup --profile preview
 ~~~
 
 Do not use only the movable `candidate-next` name in a QA record. Record the
@@ -114,9 +114,9 @@ manually on the recorded preview SHA and push it. Never move or reuse a release
 tag:
 
 ~~~sh
-git tag -a v0.2.0-next.7 <approved-preview-sha> \
-  -m "Release @hunsu/bridge 0.2.0-next.7 candidate"
-git push origin v0.2.0-next.7
+git tag -a v0.2.0-next.8 <approved-preview-sha> \
+  -m "Release @hunsu/bridge 0.2.0-next.8 candidate"
+git push origin v0.2.0-next.8
 ~~~
 
 The tag starts the cross-platform local-tarball service workflow. Dispatch the
@@ -124,8 +124,8 @@ exact registry setup from the same tag:
 
 ~~~sh
 gh workflow run bridge-registry-smoke.yml \
-  --ref v0.2.0-next.7 \
-  -f version_tag=v0.2.0-next.7
+  --ref v0.2.0-next.8 \
+  -f version_tag=v0.2.0-next.8
 ~~~
 
 The registry workflow proves that the tag, source SHA, exact version,
@@ -136,8 +136,9 @@ stop/port release, removal, and service uninstallation.
 
 ## Main and production gates
 
-The QA leader opens the promotion PR from `preview` to `main`. Do not add new
-Bridge changes to that PR. The exact tagged preview tree must occur in `main`;
+The successful preview deployment opens the promotion PR from `preview` to
+`main`; the QA leader reviews and approves that exact head only after QA. Do not
+add new Bridge changes to that PR. The exact tagged preview tree must occur in `main`;
 normal merge commits retain the SHA directly, while squash or rebase promotion
 retains the same reviewed tree identity.
 
@@ -172,8 +173,8 @@ gates pass, authorize promotion from the immutable candidate tag:
 
 ~~~sh
 gh workflow run publish-bridge.yml \
-  --ref v0.2.0-next.7 \
-  -f version_tag=v0.2.0-next.7 \
+  --ref v0.2.0-next.8 \
+  -f version_tag=v0.2.0-next.8 \
   -f operation=promote-next \
   -f confirm_promotion=true
 ~~~
@@ -184,7 +185,7 @@ that `candidate-next` still identifies the attested version. It records—but
 does not execute—the proof-of-presence command. An npm owner then runs:
 
 ~~~sh
-npm dist-tag add @hunsu/bridge@0.2.0-next.7 next
+npm dist-tag add @hunsu/bridge@0.2.0-next.8 next
 npm dist-tag rm @hunsu/bridge candidate-next
 ~~~
 

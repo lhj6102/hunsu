@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 
-export const RELEASE_SCHEMA = "hunsu.deployment-release.v3";
+export const RELEASE_SCHEMA = "hunsu.deployment-release.v4";
 export const PREVIEW_EVIDENCE_SCHEMA = "hunsu.preview-deployment-evidence.v1";
 export const WEB_RUNTIME_CONFIG_SCHEMA = "hunsu.web-runtime-config.v2";
 export const RELEASE_MANIFEST_FILE = "release-manifest.json";
@@ -81,6 +81,7 @@ export function createReleaseManifest(root, input) {
   const sourceSha = assertSourceSha(input.sourceSha);
   const sourceTree = assertSourceSha(input.sourceTree, "source tree SHA");
   const bridgePackageVersion = assertExactSemver(input.bridgePackageVersion, "Bridge package version");
+  const connectTrust = normalizeConnectTrust(input.connectTrust);
   const files = listReleaseFiles(absoluteRoot).map(path => {
     const absolutePath = safeReleasePath(absoluteRoot, path);
     return {
@@ -116,6 +117,7 @@ export function createReleaseManifest(root, input) {
       ref: input.ref
     },
     bridgePackageVersion,
+    connectTrust,
     build: {
       workflowRunId: String(input.workflowRunId ?? "local"),
       workflowRunAttempt: String(input.workflowRunAttempt ?? "1"),
@@ -143,6 +145,7 @@ export function verifyRelease(root, options = {}) {
   const sourceSha = assertSourceSha(manifest.source?.sha);
   assertSourceSha(manifest.source?.tree, "source tree SHA");
   assertExactSemver(manifest.bridgePackageVersion, "Bridge package version");
+  normalizeConnectTrust(manifest.connectTrust);
   if (options.expectedSourceSha && sourceSha !== assertSourceSha(options.expectedSourceSha, "expected source SHA")) {
     throw new Error(`Release source ${sourceSha} does not match expected source ${options.expectedSourceSha}.`);
   }
@@ -182,6 +185,83 @@ export function verifyRelease(root, options = {}) {
     manifestPath,
     manifestSha256: sha256File(manifestPath)
   };
+}
+
+export function normalizeConnectTrust(value) {
+  const input = requireRecord(value, "Connect trust");
+  requireExactKeys(input, ["preview", "production"], "Connect trust");
+  return {
+    preview: normalizeConnectTrustProfile("preview", input.preview),
+    production: normalizeConnectTrustProfile("production", input.production)
+  };
+}
+
+function normalizeConnectTrustProfile(target, value) {
+  const label = `${target} Connect trust`;
+  const input = requireRecord(value, label);
+  requireExactKeys(input, [
+    "apiOrigin",
+    "accessIssuer",
+    "accessAudience",
+    "ticketSigningKeyId",
+    "ticketSigningPublicJwk"
+  ], label);
+  const apiOrigin = validateBaseUrl(input.apiOrigin, `${label} API origin`);
+  const expectedOrigin = target === "preview"
+    ? "https://connect.preview.hunsu.app"
+    : "https://connect.hunsu.app";
+  if (apiOrigin !== expectedOrigin) {
+    throw new Error(`${label} must use ${expectedOrigin}.`);
+  }
+  const accessIssuer = validateBaseUrl(input.accessIssuer, `${label} Access issuer`);
+  if (!new URL(accessIssuer).hostname.endsWith(".cloudflareaccess.com")) {
+    throw new Error(`${label} Access issuer must be a Cloudflare Access team issuer.`);
+  }
+  const accessAudience = String(input.accessAudience ?? "").trim();
+  if (!/^[A-Za-z0-9_-]{16,128}$/u.test(accessAudience)) {
+    throw new Error(`${label} Access audience is invalid.`);
+  }
+  const ticketSigningKeyId = String(input.ticketSigningKeyId ?? "").trim();
+  if (!/^connect-[A-Za-z0-9_-]{16,64}$/u.test(ticketSigningKeyId)) {
+    throw new Error(`${label} ticket signing key id is invalid.`);
+  }
+  const jwk = requireRecord(input.ticketSigningPublicJwk, `${label} ticket signing public JWK`);
+  requireExactKeys(jwk, ["kty", "crv", "x", "y"], `${label} ticket signing public JWK`);
+  if (jwk.kty !== "EC"
+    || jwk.crv !== "P-256"
+    || typeof jwk.x !== "string"
+    || typeof jwk.y !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(jwk.x)
+    || !/^[A-Za-z0-9_-]{43}$/u.test(jwk.y)) {
+    throw new Error(`${label} ticket signing public JWK is invalid.`);
+  }
+  return {
+    apiOrigin,
+    accessIssuer,
+    accessAudience,
+    ticketSigningKeyId,
+    ticketSigningPublicJwk: {
+      kty: "EC",
+      crv: "P-256",
+      x: jwk.x,
+      y: jwk.y
+    }
+  };
+}
+
+function requireRecord(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  return value;
+}
+
+function requireExactKeys(value, expected, label) {
+  const actual = Object.keys(value).sort((left, right) => left.localeCompare(right));
+  const required = [...expected].sort((left, right) => left.localeCompare(right));
+  if (JSON.stringify(actual) !== JSON.stringify(required)) {
+    throw new Error(`${label} has an invalid field set.`);
+  }
 }
 
 export function assertRetainedWorkerModule(path, label = "Retained") {

@@ -37,7 +37,8 @@ token-bearing URL.
 ## Commands
 
 ~~~text
-hunsu-bridge setup [--channel next] [--runtime-package <absolute.tgz>] [--json]
+hunsu-bridge setup [--profile production] [--channel next] [--runtime-package <absolute.tgz>] [--json]
+hunsu-bridge setup --profile preview [--channel candidate-next] [--runtime-package <absolute.tgz>] [--json]
 hunsu-bridge remove [--json]
 hunsu-bridge remove --delete-data --confirm-delete-data [--json]
 
@@ -75,6 +76,8 @@ accepted consistently regardless of position. `--home` always selects
 valid only for `provider set codex`; both options may be used together.
 Duplicate singleton options and unknown options are rejected. The prerelease
 does not keep the old ambiguous provider `--home` meaning as an alias.
+Production setup uses the `next` channel; preview setup requires
+`--profile preview` and the `candidate-next` channel.
 
 status, doctor, provider, workspace, credential, pair, open, login, logout, remote, and
 logs never start a daemon. Offline client commands return:

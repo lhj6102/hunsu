@@ -259,7 +259,7 @@ test("Windows runtime plan invokes npm.cmd through an encoded non-interactive Po
   const script = Buffer.from(encoded, "base64").toString("utf16le");
   assert.match(script, /npm\.cmd/u);
   assert.match(script, /--prefix/u);
-  assert.match(script, /0\.2\.0-next\.7/u);
+  assert.match(script, /0\.2\.0-next\.8/u);
 });
 
 test("local tarball setup keeps the local file URL internal and still targets the exact stable version directory", async () => {

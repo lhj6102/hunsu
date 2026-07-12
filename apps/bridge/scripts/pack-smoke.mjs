@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:net";
 import {
+  chmod,
   copyFile,
   mkdir,
   mkdtemp,
@@ -62,6 +63,7 @@ export async function runBridgePackSmoke(options = {}) {
   const extractDirectory = join(temporaryRoot, "extract");
   const installDirectory = join(temporaryRoot, "install");
   const hunsuHome = join(temporaryRoot, "home");
+  const codexHome = join(temporaryRoot, "codex-home");
   let daemon;
 
   try {
@@ -127,6 +129,7 @@ export async function runBridgePackSmoke(options = {}) {
     assert.deepEqual((await walkFiles(installedRoot)).sort(), expectedFiles);
 
     await assertPublicApiContract(installDirectory, npmEnvironment);
+    const fakeCodexBinary = await prepareFakeCodex(temporaryRoot);
 
     const versionRun = await run(command("npx"), [
       "--no-install",
@@ -174,6 +177,66 @@ export async function runBridgePackSmoke(options = {}) {
       "The generated control credential has an invalid format."
     );
     auditCapturedOutput(readiness, [controlToken]);
+
+    const positionedStatusRun = await run(command("npx"), [
+      "--no-install",
+      "hunsu-bridge",
+      "--json",
+      "--home",
+      hunsuHome,
+      "status"
+    ], { cwd: installDirectory, env: npmEnvironment, timeout: 30_000 });
+    const positionedStatusResult = parseStrictCliJson(positionedStatusRun, [controlToken]);
+    assertCliSuccess(positionedStatusResult);
+    assert.equal(positionedStatusResult.value?.endpoint, endpoint.toString().replace(/\/$/u, ""));
+
+    for (const invalid of [
+      {
+        args: ["status", "--home", hunsuHome, "--home", hunsuHome, "--json"],
+        message: /Duplicate option: --home/u
+      },
+      {
+        args: ["--json", "status", "--home", hunsuHome, "--json"],
+        message: /Duplicate option: --json/u
+      },
+      {
+        args: ["status", "--unknown-pack-smoke-option", "--json"],
+        message: /Unknown option: --unknown-pack-smoke-option/u
+      }
+    ]) {
+      const invalidRun = await runWithExit(command("npx"), [
+        "--no-install",
+        "hunsu-bridge",
+        ...invalid.args
+      ], { cwd: installDirectory, env: npmEnvironment, timeout: 30_000 });
+      assert.equal(invalidRun.exitCode, 1, `${invalid.args.join(" ")} must fail with the CLI usage exit code`);
+      const invalidResult = parseStrictCliJson(invalidRun, [controlToken]);
+      assertCliFailure(invalidResult, "BRIDGE_STATE_INVALID");
+      assert.match(invalidResult.message, invalid.message);
+    }
+
+    const providerRun = await run(command("npx"), [
+      "--no-install",
+      "hunsu-bridge",
+      "--json",
+      "--codex-home",
+      codexHome,
+      "provider",
+      "set",
+      "codex",
+      "--home",
+      hunsuHome,
+      "--binary",
+      fakeCodexBinary
+    ], { cwd: installDirectory, env: npmEnvironment, timeout: 30_000 });
+    const providerResult = parseStrictCliJson(providerRun, [controlToken]);
+    assertCliSuccess(providerResult);
+    const configured = JSON.parse(await readFile(join(hunsuHome, "config.json"), "utf8"));
+    assert.deepEqual(configured.provider, {
+      kind: "codex",
+      binaryPath: fakeCodexBinary,
+      home: codexHome
+    });
 
     const pairingRun = await run(command("npx"), [
       "--no-install",
@@ -243,6 +306,26 @@ export async function runBridgePackSmoke(options = {}) {
     daemon = undefined;
     await assertPortReleased(endpoint.hostname, Number(endpoint.port));
 
+    const ambiguousProviderRun = await runWithExit(command("npx"), [
+      "--no-install",
+      "hunsu-bridge",
+      "provider",
+      "set",
+      "codex",
+      "--home",
+      hunsuHome,
+      "--json"
+    ], { cwd: installDirectory, env: npmEnvironment, timeout: 30_000 });
+    assert.equal(ambiguousProviderRun.exitCode, 1, "the old provider --home form must not be accepted as Codex Home");
+    const ambiguousProviderResult = parseStrictCliJson(ambiguousProviderRun, [controlToken, rotatedControlToken]);
+    assertCliFailure(ambiguousProviderResult, "BRIDGE_NOT_RUNNING");
+    assert.match(
+      ambiguousProviderResult.message,
+      /--home selects HUNSU_HOME; use --codex-home to configure Codex Home/u
+    );
+    assert.equal(ambiguousProviderResult.message.includes(hunsuHome), false);
+    assert.equal(ambiguousProviderResult.message.includes(codexHome), false);
+
     if (options.outputDirectory) {
       const outputDirectory = resolve(options.outputDirectory);
       await mkdir(outputDirectory, { recursive: true });
@@ -271,7 +354,7 @@ export async function runBridgePackSmoke(options = {}) {
 
 function auditManifest(manifest) {
   assert.equal(manifest.name, "@hunsu/bridge");
-  assert.equal(manifest.version, "0.2.0-next.7");
+  assert.equal(manifest.version, "0.2.0-next.8");
   assert.equal(manifest.private, false);
   assert.equal(manifest.type, "module");
   assert.deepEqual(manifest.repository, {
@@ -339,6 +422,13 @@ function assertCliSuccess(result, expectedCode = "OK") {
   assert.equal(result.schema, "hunsu.bridge.cli-result.v1");
   assert.equal(result.ok, true, result.message ?? "Bridge CLI command failed");
   assert.equal(result.code, expectedCode);
+}
+
+function assertCliFailure(result, expectedCode) {
+  assert.equal(result.schema, "hunsu.bridge.cli-result.v1");
+  assert.equal(result.ok, false, "Bridge CLI command unexpectedly succeeded");
+  assert.equal(result.code, expectedCode);
+  assert.equal(typeof result.message, "string");
 }
 
 function parseStrictCliJson(output, secrets = []) {
@@ -472,7 +562,27 @@ async function walkFiles(root, current = root) {
   return files;
 }
 
+async function prepareFakeCodex(root) {
+  const script = join(root, "fake-codex.mjs");
+  await copyFile(join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs"), script);
+  if (process.platform !== "win32") {
+    await chmod(script, 0o700);
+    return script;
+  }
+  const wrapper = join(root, "fake-codex.cmd");
+  await writeFile(wrapper, `@echo off\r\n"${process.execPath}" "%~dp0fake-codex.mjs" %*\r\n`, "utf8");
+  return wrapper;
+}
+
 async function run(executable, args, options = {}) {
+  const result = await runWithExit(executable, args, options);
+  if (result.exitCode !== 0) {
+    throw new Error(`Package-smoke subprocess failed with exit code ${result.exitCode}.`);
+  }
+  return { stdout: result.stdout, stderr: result.stderr };
+}
+
+async function runWithExit(executable, args, options = {}) {
   try {
     const result = await execFileAsync(executable, args, {
       ...options,
@@ -480,10 +590,14 @@ async function run(executable, args, options = {}) {
       maxBuffer: 20 * 1_024 * 1_024,
       windowsHide: true
     });
-    return { stdout: result.stdout, stderr: result.stderr };
+    return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (error) {
     const exitCode = typeof error?.code === "number" ? error.code : "unknown";
-    throw new Error(`Package-smoke subprocess failed with exit code ${exitCode}.`);
+    return {
+      stdout: exitCode === "unknown" || typeof error.stdout !== "string" ? "" : error.stdout,
+      stderr: exitCode === "unknown" || typeof error.stderr !== "string" ? "" : error.stderr,
+      exitCode
+    };
   }
 }
 

@@ -246,10 +246,10 @@ test("Connect Cloudflare config renders exact hosted bindings without private si
     HUNSU_CONNECT_SIGNING_PUBLIC_JWK: JSON.stringify({
       kty: "EC",
       crv: "P-256",
-      x: "DZDAFyOricZ4dOBOhNrNtAS2X_EdqrE2wQxB23raNcc",
-      y: "qLXw7DinTp-5T0i_MdU9jN15Wpnxu0dXh-Owo5ydL1U"
+      x: "69FCDW0whttjj1IhJjFMQOOl-icup4Dv4MlpgasZcWw",
+      y: "9oGa20XKzFy9LCFn34v3H7ss42sD_9eKhjBbWwwBTa4"
     }),
-    HUNSU_CONNECT_SIGNING_KEY_ID: "connect-vd_GiPDTK2lPIDS3Y2dDIEck"
+    HUNSU_CONNECT_SIGNING_KEY_ID: "connect-LPehY8CSnG6Y0rkTzjQB4I77"
   }));
   const rendered = JSON.parse(renderConnectWranglerJson(config));
   assert.equal(rendered.name, "hunsu-connect-preview");

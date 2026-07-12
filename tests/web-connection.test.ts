@@ -63,6 +63,12 @@ test("Connection Center card labels cover required Studio connection states", as
   }
 });
 
+test("Connection Center presents the configured Google identity provider", () => {
+  const source = readFileSync(join(WEB_ROOT, "src/features/connection/ConnectionCenter.tsx"), "utf8");
+  assert.match(source, /Sign in with Google to connect a Remote Bridge\./u);
+  assert.doesNotMatch(source, /Sign in through Cloudflare Access/u);
+});
+
 test("Roadmap workspace preflight actions map to same-origin Studio destinations", async () => {
   const { module, close } = await loadPreflightActionsModule();
   try {

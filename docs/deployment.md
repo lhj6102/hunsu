@@ -56,9 +56,11 @@ stored under the same secret name. Each token needs Account-level Edit for
 Cloudflare Pages, Workers Scripts, D1, and Workers R2 Storage. Do not register
 the broad local deployment token or an npm token.
 
-The reusable deployment job selects the protected environment itself, so these
-remain environment secrets and are not inherited or passed by the caller
-workflow. This keeps preview callers unable to receive production credentials.
+The caller uses GitHub's `secrets: inherit` syntax because reusable workflows
+cannot otherwise resolve protected secrets. The called deployment job selects
+the exact protected environment itself, and GitHub exposes only that selected
+environment's secrets to the job. A preview invocation therefore cannot select
+or receive production credentials.
 
 Add these non-secret variables to both environments. The names are identical;
 the values select isolated resources:
@@ -99,7 +101,7 @@ Required exact values:
 | `HUNSU_CONNECT_ACCESS_ISSUER` | exact `https://<team>.cloudflareaccess.com` issuer | same exact team issuer |
 | `HUNSU_CONNECT_ACCESS_AUD` | preview Access application AUD | production Access application AUD |
 | `HUNSU_CONNECT_SIGNING_PUBLIC_JWK` | preview public P-256 JWK | production public P-256 JWK |
-| `HUNSU_CONNECT_SIGNING_KEY_ID` | `connect-vd_GiPDTK2lPIDS3Y2dDIEck` | `connect-Ea21pgXVRp5WfId1kXKSeyea` |
+| `HUNSU_CONNECT_SIGNING_KEY_ID` | `connect-LPehY8CSnG6Y0rkTzjQB4I77` | `connect-enaK6bbNEOky9hUYzzJuN3Qi` |
 | `HUNSU_HUB_WORKER_NAME` | `hunsu-hub-api-preview` | `hunsu-hub-api` |
 | `HUNSU_HUB_ORIGIN_NAME` | `hunsu` | `hunsu` |
 | `HUNSU_HUB_PUBLIC_API_URL` | `https://api.preview.hunsu.app` | `https://api.hunsu.app` |
@@ -114,6 +116,51 @@ environments; resource isolation does not require a second Origin identity.
 Every value, including account and D1 IDs, must also equal the committed
 [`cloudflare-resources.json`](../scripts/deployment/cloudflare-resources.json)
 allowlist before a credentialed mutation can run.
+
+### Connect signing-key rotation
+
+Rotate each environment independently with the two-phase helper. The generate
+phase makes no GitHub or Cloudflare changes and writes the private material only
+to a new absolute `0600` JSON bundle:
+
+~~~sh
+node scripts/deployment/provision-connect-signing-key.mjs generate \
+  hunsu-preview /absolute/private/path/connect-preview-rotation.json
+~~~
+
+Its stdout contains only the public JWK and key id. Update the committed
+resource allowlist, immutable Bridge deployment profile, exact-key tests, and a
+new immutable Bridge candidate version with those public values. Review and
+land that source change before activation; deployment remains fail-closed while
+the protected environment and retained release disagree.
+
+Activate from a clean checkout whose `HEAD` exactly equals the protected remote
+branch (`preview` for `hunsu-preview`, `main` for `hunsu-production`) with the
+same staged bundle:
+
+~~~sh
+node scripts/deployment/provision-connect-signing-key.mjs activate \
+  hunsu-preview /absolute/private/path/connect-preview-rotation.json
+~~~
+
+Activation rejects dirty, local-only, or wrong-SHA source, preflights GitHub
+access, prints reconciliation-safe public metadata before mutation, updates the
+two public variables, and sets the private secret last. Every update is
+idempotent. If any update fails, do not generate another key: re-run `activate`
+with the same bundle until all three values reconcile, then re-run the blocked
+deployment. The helper enforces `0600` plus current UID on POSIX; on Windows it
+creates the file atomically with a protected current-user-only ACL before
+writing private bytes. Keep the bundle private until the new Worker,
+exact Bridge candidate, and retained release are verified; remove it with the
+host's secure credential-file procedure afterward. Repeat the same procedure
+with `hunsu-production` only when the reviewed source has reached `main`.
+
+Trust is part of release identity. Once an environment activates a new key,
+retained releases bound to its old key are intentionally ineligible for normal
+rollback. Routine rotation is not complete until a new known-good retained
+release succeeds. An emergency compromised-key rotation intentionally revokes
+those old rollback candidates; recover with a forward release rather than
+weakening the exact-key gate.
 
 Create the Pages projects, both D1 databases, and R2 buckets before the first
 deployment. The workflow idempotently associates the exact
@@ -143,20 +190,26 @@ those headless clients.
 
 Create two **Self-hosted** Access applications:
 
-| Environment | Application domain | Path | Audience |
+| Environment | Application domain | Protected path | Audience |
 | --- | --- | --- | --- |
-| Preview | `connect.preview.hunsu.app` | `/auth/*` | distinct preview AUD |
-| Production | `connect.hunsu.app` | `/auth/*` | distinct production AUD |
+| Preview | `connect.preview.hunsu.app` | `/auth/login` | preview AUD |
+| Preview | `connect.preview.hunsu.app` | `/auth/device-enrollments` | preview AUD |
+| Production | `connect.hunsu.app` | `/auth/login` | production AUD |
+| Production | `connect.hunsu.app` | `/auth/device-enrollments` | production AUD |
 
-For each application, add an Allow policy whose Include rule is **Cloudflare
-Account Member**. Use Cloudflare as the identity provider with account-member
-restriction enabled. This initially limits login/approval to members of the
-Cloudflare account, including `lhj6102`; a broader QA identity policy can be
-introduced later as a separately reviewed change.
+For each application, select only the configured **Google** identity provider,
+turn off "Accept all available identity providers", and enable instant
+authentication. Scope the Allow policy to the intended Google users, groups, or
+email domains. Do not use Cloudflare account-member authentication for the
+Bridge login flow.
 
 Enable the binding cookie and HttpOnly cookie attributes, keep SameSite=Lax,
 disable the app launcher entry, and leave preflight bypass off. Create separate
 applications rather than combining both hostnames in one Access application.
+Do not protect `/auth/session` with Access: Connect owns that HttpOnly session
+endpoint and its exact-origin CORS checks. The deployment smoke requires an
+unauthenticated session probe and its DELETE preflight to reach Connect rather
+than an Access redirect or `403`.
 
 Copy the Zero Trust team issuer into `HUNSU_CONNECT_ACCESS_ISSUER` in both
 GitHub environments, and copy each application's distinct AUD into its matching
@@ -225,11 +278,14 @@ that deploy fails instead of becoming a skipped required job.
 ## Artifact Identity
 
 `scripts/deployment/build-release.mjs` writes
-`hunsu.deployment-release.v3`. It binds the source commit and tree, exact Bridge
-package version, build tool versions, every Web/Worker/migration file hash, and
-the neutral runtime-config contract. A valid release must contain both prebuilt
-Worker modules and both retained migration inventories. Production verifies
-the whole file set and every digest before deployment.
+`hunsu.deployment-release.v4`. It binds the source commit and tree, exact Bridge
+package version, build tool versions, every Web/Worker/migration file hash, the
+neutral runtime-config contract, and both preview and production Connect trust
+profiles (API origin, Access issuer/AUD, and ticket verification key). A valid
+release must contain both prebuilt Worker modules and both retained migration
+inventories. Production and rollback verify the whole file set, every digest,
+and the selected environment's exact Connect trust before deployment. Older
+artifacts without this trust contract are intentionally ineligible for rollback.
 
 Preview also waits for the successful `publish-bridge.yml` push run for the
 same SHA. It downloads `bridge-candidate-<sha>`, recomputes the tarball SHA-256

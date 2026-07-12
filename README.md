@@ -29,7 +29,7 @@ Hunsu exists for that human layer.
 ## Public Alpha Quickstart
 
 > [!WARNING]
-> The current headless prerelease is experimental. `0.2.0-next.7` is the next
+> The current headless prerelease is experimental. `0.2.0-next.8` is the next
 > candidate and is published under `candidate-next` first; the `next` tag moves only after exact registry,
 > cross-platform service, and production integration verification succeeds.
 
@@ -70,8 +70,9 @@ pnpm dev:stack
 ```
 
 The local stack uses an isolated temporary HUNSU_HOME, random ports, a
-hunsu.localhost Web origin, deterministic provider and Connect/P2P fixtures, and a
-same-origin development proxy. See
+hunsu.localhost Web origin, a deterministic provider fixture, and a same-origin
+development proxy. Deterministic Connect cryptography, signaling, and peer
+behavior run in the headless contract suite. See
 [Local Development](docs/local-development.md).
 
 Hunsu Bridge must not be exposed directly to a public network. Remote commands,

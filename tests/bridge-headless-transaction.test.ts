@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -71,6 +71,69 @@ test("setup operation lock recovers an invalid partial file that the atomic link
     await recovered.release();
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("setup, removal, and service-mutation locks fail closed for linked homes and runtimes", async t => {
+  for (const operation of ["setup", "remove", "service-mutation"] as const) {
+    await t.test(`${operation} rejects a linked HUNSU_HOME`, async () => {
+      const root = await mkdtemp(join(tmpdir(), `hunsu-${operation}-linked-home-`));
+      const target = join(root, "external-home");
+      const linkedHome = join(root, "linked-home");
+      try {
+        await mkdir(join(target, "runtime"), { recursive: true });
+        await writeFile(join(target, "runtime", "survives.txt"), "outside\n", "utf8");
+        await symlink(target, linkedHome, process.platform === "win32" ? "junction" : "dir");
+        await assert.rejects(
+          acquireSetupOperationLock(resolveHunsuPaths({ home: linkedHome }), operation),
+          /unsafe filesystem type|symbolic link|junction|reparse/u
+        );
+        assert.equal(await readFile(join(target, "runtime", "survives.txt"), "utf8"), "outside\n");
+        assert.deepEqual(await readdir(join(target, "runtime")), ["survives.txt"]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    await t.test(`${operation} rejects a linked runtime directory`, async () => {
+      const root = await mkdtemp(join(tmpdir(), `hunsu-${operation}-linked-runtime-`));
+      const paths = resolveHunsuPaths({ home: join(root, "home") });
+      const target = join(root, "external-runtime");
+      try {
+        await mkdir(paths.home, { recursive: true });
+        await mkdir(target, { recursive: true });
+        await writeFile(join(target, "survives.txt"), "outside\n", "utf8");
+        await symlink(target, paths.runtimeDirectory, process.platform === "win32" ? "junction" : "dir");
+        await assert.rejects(
+          acquireSetupOperationLock(paths, operation),
+          /unsafe filesystem type|symbolic link|junction|reparse/u
+        );
+        assert.equal(await readFile(join(target, "survives.txt"), "utf8"), "outside\n");
+        assert.deepEqual(await readdir(target), ["survives.txt"]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("an unsafe linked setup lock is preserved instead of read through or unlinked", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-linked-setup-lock-"));
+  const paths = resolveHunsuPaths({ home: join(root, "home") });
+  const target = join(root, "external-lock.json");
+  try {
+    await mkdir(paths.runtimeDirectory, { recursive: true });
+    await writeFile(target, "external sentinel\n", "utf8");
+    await symlink(target, paths.setupLockFile, "file");
+    await assert.rejects(
+      acquireSetupOperationLock(paths, "setup", { isProcessAlive: () => false }),
+      /unsafe linked or non-file filesystem type/u
+    );
+    assert.equal((await lstat(paths.setupLockFile)).isSymbolicLink(), true);
+    assert.equal(await readFile(target, "utf8"), "external sentinel\n");
+    assert.deepEqual(await readdir(paths.runtimeDirectory), ["setup.lock"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

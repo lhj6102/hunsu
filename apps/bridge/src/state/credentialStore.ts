@@ -1,13 +1,20 @@
-import { chmod } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
+import { basename } from "node:path";
 import {
   windowsCurrentUserOnlyFileAclPowerShellInvocation,
   windowsPowerShellEnvironment
 } from "../windowsPowerShell.ts";
 import type { HunsuPaths } from "./paths.ts";
-import { invalidState, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
+import {
+  BridgeStateError,
+  invalidState,
+  isNodeError,
+  writeJsonStateAtomic
+} from "./atomicJsonStore.ts";
 
 export const BRIDGE_CREDENTIALS_SCHEMA = "hunsu.bridge.credentials.v2" as const;
 
@@ -68,17 +75,28 @@ export function createCredentialStore(
     randomBytes?: (size: number) => Uint8Array;
     platform?: NodeJS.Platform;
     processEnv?: Readonly<Record<string, string | undefined>>;
+    currentUserId?: number;
     windowsAclHardener?: (path: string) => Promise<void>;
+    windowsAclValidator?: (path: string) => Promise<void>;
   } = {}
 ): CredentialStore {
   const secureRandomBytes = options.randomBytes ?? nodeRandomBytes;
   const platform = options.platform ?? process.platform;
+  const currentUserId = options.currentUserId
+    ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
   const windowsAclHardener = options.windowsAclHardener
     ?? (path => hardenWindowsCredentialAcl(path, options.processEnv ?? {}));
+  const windowsAclValidator = options.windowsAclValidator
+    ?? (path => validateWindowsCredentialAcl(path, options.processEnv ?? {}));
   let writeQueue = Promise.resolve();
 
   const readCurrent = async (): Promise<BridgeCredentials | undefined> => {
-    const value = await readJsonState(paths.credentialsFile);
+    const value = await readCredentialJsonState(
+      paths.credentialsFile,
+      platform,
+      currentUserId,
+      windowsAclValidator
+    );
     if (value === undefined) return undefined;
     return decodeCredentials(paths.credentialsFile, value);
   };
@@ -117,11 +135,7 @@ export function createCredentialStore(
     read,
     async ensure() {
       const existing = await read();
-      if (existing) {
-        if (platform === "win32") await windowsAclHardener(paths.credentialsFile);
-        else await chmod(paths.credentialsFile, 0o600);
-        return existing;
-      }
+      if (existing) return existing;
       return write({});
     },
     write,
@@ -153,6 +167,78 @@ export function createCredentialStore(
 
 const execFileAsync = promisify(execFile);
 
+async function readCredentialJsonState(
+  file: string,
+  platform: NodeJS.Platform,
+  currentUserId: number | undefined,
+  windowsAclValidator: (path: string) => Promise<void>
+): Promise<unknown | undefined> {
+  let pathStats: Stats;
+  try {
+    pathStats = await lstat(file);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw new BridgeStateError(file, `Unable to read Bridge state file: ${basename(file)}.`, { cause: error });
+  }
+
+  assertCredentialFileSecurity(file, pathStats, platform, currentUserId);
+  if (platform === "win32") {
+    try {
+      await windowsAclValidator(file);
+    } catch (error) {
+      if (error instanceof BridgeStateError) throw error;
+      throw invalidState(file, "credentials ACL is not restricted to the current Windows user");
+    }
+  }
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    const noFollow = process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0);
+    handle = await open(file, constants.O_RDONLY | noFollow);
+    const openedStats = await handle.stat();
+    assertCredentialFileSecurity(file, openedStats, platform, currentUserId);
+    const currentPathStats = await lstat(file);
+    assertCredentialFileSecurity(file, currentPathStats, platform, currentUserId);
+    if (!sameFile(pathStats, openedStats) || !sameFile(currentPathStats, openedStats)) {
+      throw invalidState(file, "credentials file changed while it was being validated");
+    }
+    const raw = await handle.readFile("utf8");
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch (error) {
+      throw new BridgeStateError(file, `Bridge state file is not valid JSON: ${basename(file)}.`, { cause: error });
+    }
+  } catch (error) {
+    if (error instanceof BridgeStateError) throw error;
+    throw new BridgeStateError(file, `Unable to read Bridge state file: ${basename(file)}.`, { cause: error });
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function assertCredentialFileSecurity(
+  file: string,
+  stats: Stats,
+  platform: NodeJS.Platform,
+  currentUserId: number | undefined
+): void {
+  if (!stats.isFile()) {
+    throw invalidState(file, "credentials path must be a regular file and cannot be a symbolic link");
+  }
+  if (platform !== "win32") {
+    if ((stats.mode & 0o077) !== 0) {
+      throw invalidState(file, "credentials permissions must grant access only to the current user");
+    }
+    if (currentUserId !== undefined && stats.uid !== currentUserId) {
+      throw invalidState(file, "credentials file must be owned by the current user");
+    }
+  }
+}
+
+function sameFile(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
 async function hardenWindowsCredentialAcl(
   path: string,
   processEnv: Readonly<Record<string, string | undefined>>
@@ -168,6 +254,21 @@ async function hardenWindowsCredentialAcl(
   }
 }
 
+async function validateWindowsCredentialAcl(
+  path: string,
+  processEnv: Readonly<Record<string, string | undefined>>
+): Promise<void> {
+  const invocation = windowsCredentialAclValidationPowerShellInvocation(path);
+  try {
+    await execFileAsync(invocation.command, invocation.args, {
+      env: windowsPowerShellEnvironment(processEnv),
+      windowsHide: true
+    });
+  } catch (_error) {
+    throw invalidState(path, "credentials ACL is not restricted to the current Windows user");
+  }
+}
+
 export function windowsCredentialAclPowerShellInvocation(path: string): {
   command: "powershell.exe";
   args: string[];
@@ -176,6 +277,41 @@ export function windowsCredentialAclPowerShellInvocation(path: string): {
     throw invalidState(path, "credentials path cannot contain control characters");
   }
   return windowsCurrentUserOnlyFileAclPowerShellInvocation(path, "CredentialPath");
+}
+
+export function windowsCredentialAclValidationPowerShellInvocation(path: string): {
+  command: "powershell.exe";
+  args: string[];
+} {
+  if (/[\u0000-\u001f\u007f]/u.test(path)) {
+    throw invalidState(path, "credentials path cannot contain control characters");
+  }
+  const credentialPath = `'${path.replace(/'/g, "''")}'`;
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$CredentialPath = ${credentialPath}`,
+    "$attributes = [System.IO.File]::GetAttributes($CredentialPath)",
+    "if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or ($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { throw 'Credential path is not a regular file.' }",
+    "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+    "$acl = [System.IO.File]::GetAccessControl($CredentialPath, ([System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access))",
+    "$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])",
+    "if ($owner.Value -ne $sid.Value -or -not $acl.AreAccessRulesProtected) { throw 'Credential ACL owner or inheritance is unsafe.' }",
+    "$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))",
+    "if ($rules.Count -ne 1) { throw 'Credential ACL must contain exactly one rule.' }",
+    "$rule = $rules[0]",
+    "if ($rule.IsInherited -or $rule.IdentityReference.Value -ne $sid.Value -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or $rule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { throw 'Credential ACL rule is unsafe.' }"
+  ].join("; ");
+  return {
+    command: "powershell.exe",
+    args: [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64")
+    ]
+  };
 }
 
 function createControlToken(randomBytes: (size: number) => Uint8Array): string {

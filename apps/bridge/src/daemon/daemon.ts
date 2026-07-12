@@ -3,6 +3,7 @@ import type { Server } from "node:http";
 import { mkdir } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { resolveBridgeRuntimeConfig, unwrapConfigResult } from "@hunsu/config";
+import { decodeConnectP256PublicJwk } from "@hunsu/protocol";
 import {
   bridgeDeploymentEndpoints,
   isBridgeDeploymentProfile,
@@ -351,7 +352,14 @@ function daemonDeploymentEndpoints(input: {
   webUrl?: string;
 }): BridgeDeploymentEndpoints {
   const allowlisted = bridgeDeploymentEndpoints(input.profile);
+  const developmentTrust = readDevelopmentConnectTrust(input.environment);
   if (!input.development) {
+    if (developmentTrust.present) {
+      throw new BridgeError(
+        "BRIDGE_STATE_INVALID",
+        "Installed Bridge daemons reject development Connect signing-trust overrides."
+      );
+    }
     if (input.webUrl !== undefined && input.webUrl !== allowlisted.webUrl) {
       throw new BridgeError(
         "BRIDGE_STATE_INVALID",
@@ -360,14 +368,102 @@ function daemonDeploymentEndpoints(input: {
     }
     return allowlisted;
   }
+  const connectApiUrl = input.environment.HUNSU_CONNECT_API_BASE_URL ?? allowlisted.connectApiUrl;
+  const connectWsUrl = input.environment.HUNSU_CONNECT_WS_URL ?? allowlisted.connectWsUrl;
+  const trust = developmentTrust.present
+    ? parseDevelopmentConnectTrust(developmentTrust, connectApiUrl, connectWsUrl)
+    : {
+        connectTicketIssuer: allowlisted.connectTicketIssuer,
+        connectTicketSigningKeyId: allowlisted.connectTicketSigningKeyId,
+        connectTicketSigningPublicJwk: allowlisted.connectTicketSigningPublicJwk
+      };
   return {
     webUrl: input.webUrl ?? input.environment.HUNSU_WEB_URL ?? allowlisted.webUrl,
-    connectApiUrl: input.environment.HUNSU_CONNECT_API_BASE_URL ?? allowlisted.connectApiUrl,
-    connectWsUrl: input.environment.HUNSU_CONNECT_WS_URL ?? allowlisted.connectWsUrl,
-    connectTicketIssuer: allowlisted.connectTicketIssuer,
-    connectTicketSigningKeyId: allowlisted.connectTicketSigningKeyId,
-    connectTicketSigningPublicJwk: allowlisted.connectTicketSigningPublicJwk
+    connectApiUrl,
+    connectWsUrl,
+    ...trust
   };
+}
+
+type DevelopmentConnectTrust = {
+  present: boolean;
+  issuer?: string;
+  keyId?: string;
+  publicJwk?: string;
+};
+
+function readDevelopmentConnectTrust(environment: Readonly<Record<string, string | undefined>>): DevelopmentConnectTrust {
+  const rawIssuer = environment.HUNSU_DEVELOPMENT_CONNECT_TICKET_ISSUER;
+  const rawKeyId = environment.HUNSU_DEVELOPMENT_CONNECT_TICKET_SIGNING_KEY_ID;
+  const rawPublicJwk = environment.HUNSU_DEVELOPMENT_CONNECT_TICKET_SIGNING_PUBLIC_JWK;
+  const issuer = rawIssuer?.trim() || undefined;
+  const keyId = rawKeyId?.trim() || undefined;
+  const publicJwk = rawPublicJwk?.trim() || undefined;
+  return {
+    present: rawIssuer !== undefined || rawKeyId !== undefined || rawPublicJwk !== undefined,
+    issuer,
+    keyId,
+    publicJwk
+  };
+}
+
+function parseDevelopmentConnectTrust(
+  trust: DevelopmentConnectTrust,
+  connectApiUrl: string,
+  connectWsUrl: string
+): Pick<BridgeDeploymentEndpoints, "connectTicketIssuer" | "connectTicketSigningKeyId" | "connectTicketSigningPublicJwk"> {
+  if (!trust.issuer || !trust.keyId || !trust.publicJwk) {
+    throw new BridgeError(
+      "BRIDGE_STATE_INVALID",
+      "Development Connect signing trust requires issuer, key id, and public JWK together."
+    );
+  }
+  let api: URL;
+  let socket: URL;
+  let issuer: URL;
+  try {
+    api = new URL(connectApiUrl);
+    socket = new URL(connectWsUrl);
+    issuer = new URL(trust.issuer);
+  } catch (error) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Development Connect fixture URLs are invalid.", { cause: error });
+  }
+  const socketHttpOrigin = new URL(socket.toString());
+  socketHttpOrigin.protocol = "http:";
+  if (api.protocol !== "http:" || socket.protocol !== "ws:"
+    || !isLoopbackHostname(api.hostname) || !isLoopbackHostname(socket.hostname)
+    || api.pathname !== "/" || api.search || api.hash
+    || socket.pathname !== "/v1/connect/device"
+    || socket.search || socket.hash || socketHttpOrigin.origin !== api.origin
+    || issuer.origin !== api.origin || issuer.pathname !== "/" || issuer.search || issuer.hash
+    || api.username || api.password || socket.username || socket.password || issuer.username || issuer.password) {
+    throw new BridgeError(
+      "BRIDGE_STATE_INVALID",
+      "Development Connect signing trust is limited to an exact loopback HTTP/WS fixture."
+    );
+  }
+  if (!/^connect-[A-Za-z0-9_-]{16,64}$/u.test(trust.keyId)) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Development Connect signing key id is invalid.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trust.publicJwk) as unknown;
+  } catch (error) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Development Connect signing public JWK is invalid.", { cause: error });
+  }
+  const publicJwk = decodeConnectP256PublicJwk(parsed, "developmentConnectTicketSigningPublicJwk");
+  if (!publicJwk.ok) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Development Connect signing public JWK must be a public P-256 key.");
+  }
+  return {
+    connectTicketIssuer: issuer.origin,
+    connectTicketSigningKeyId: trust.keyId,
+    connectTicketSigningPublicJwk: publicJwk.value
+  };
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
 }
 
 export async function runBridgeDaemon(options: BridgeDaemonOptions = {}): Promise<RunningBridgeDaemon> {

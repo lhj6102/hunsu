@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -39,6 +40,31 @@ test("the typed control probe distinguishes offline, foreign, healthy, and unhea
     fetchImpl: async () => healthResponse()
   });
   assert.deepEqual(await healthy.probe(), { state: "hunsu-healthy" });
+});
+
+test("a live loopback redirect is a foreign listener rather than an offline bridge", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(302, { location: "https://example.invalid/not-hunsu" });
+    response.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const client = createBridgeControlClient({
+      endpoint: `http://127.0.0.1:${address.port}`
+    });
+    assert.deepEqual(await client.probe(), { state: "foreign-listener" });
+    assertFailure(await client.request("/v1/control/status"), "BRIDGE_PORT_IN_USE");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
 });
 
 test("invalid config JSON, schema, and non-loopback endpoints remain BRIDGE_STATE_INVALID with safe messages", async () => {
@@ -82,8 +108,20 @@ test("invalid and unreadable credentials remain BRIDGE_STATE_INVALID after valid
   try {
     await mkdir(paths.home, { recursive: true });
     await writeFile(paths.credentialsFile, `${JSON.stringify({ schema: "wrong" })}\n`, "utf8");
+    if (process.platform !== "win32") await chmod(paths.credentialsFile, 0o600);
     const invalidSchema = await createBridgeControlClient({ paths, fetchImpl }).request("/v1/control/status");
     assertSafeStateFailure(invalidSchema, root, "credentials.json");
+
+    if (process.platform !== "win32") {
+      await writeFile(paths.credentialsFile, `${JSON.stringify({
+        schema: "hunsu.bridge.credentials.v2",
+        controlToken: "hunsu_control_valid_but_exposed",
+        connect: null
+      })}\n`, "utf8");
+      await chmod(paths.credentialsFile, 0o644);
+      const unsafePermissions = await createBridgeControlClient({ paths, fetchImpl }).request("/v1/control/status");
+      assertSafeStateFailure(unsafePermissions, root, "credentials.json");
+    }
 
     await rm(paths.credentialsFile, { recursive: true, force: true });
     await mkdir(paths.credentialsFile);

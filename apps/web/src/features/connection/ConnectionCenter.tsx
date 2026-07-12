@@ -321,10 +321,10 @@ function RemoteBridgeSection({
           <p className="text-[12px] leading-5 text-muted-foreground">Checking your secure Connect session…</p>
         ) : session.status === "signed_out" ? (
           <div className="flex items-center justify-between gap-3">
-            <p className="text-[12px] leading-5 text-muted-foreground">Sign in through Cloudflare Access to connect a Remote Bridge.</p>
+            <p className="text-[12px] leading-5 text-muted-foreground">Sign in with Google to connect a Remote Bridge.</p>
             <Button type="button" size="sm" onClick={onSignIn}>
               <LogIn className="size-4" />
-              Sign in
+              Sign in with Google
             </Button>
           </div>
         ) : session.status === "error" ? (

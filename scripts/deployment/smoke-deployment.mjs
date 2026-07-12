@@ -131,11 +131,41 @@ async function verifyDeploymentIdentity() {
   ) {
     throw new Error("Deployed Connect health identity does not match the target environment.");
   }
+
+  const sessionResponse = await fetchForSmoke(`${connectApiBaseUrl}/auth/session`, {
+    redirect: "manual",
+    headers: {
+      accept: "application/json",
+      origin: webPublicUrl
+    }
+  });
+  if (sessionResponse.status !== 401
+    || sessionResponse.headers.get("access-control-allow-origin") !== webPublicUrl) {
+    throw new Error("Connect session status must bypass Access and enforce its own browser-session CORS boundary.");
+  }
+
+  const preflightResponse = await fetchForSmoke(`${connectApiBaseUrl}/auth/session`, {
+    method: "OPTIONS",
+    redirect: "manual",
+    headers: {
+      origin: webPublicUrl,
+      "access-control-request-method": "DELETE",
+      "access-control-request-headers": "content-type"
+    }
+  });
+  if (preflightResponse.status !== 204
+    || preflightResponse.headers.get("access-control-allow-origin") !== webPublicUrl
+    || preflightResponse.headers.get("access-control-allow-credentials") !== "true") {
+    throw new Error("Connect session preflight must reach the Worker CORS policy instead of the Access wildcard.");
+  }
 }
 
-function fetchForSmoke(url) {
+function fetchForSmoke(url, init = {}) {
+  const headers = new Headers(init.headers);
+  headers.set("cache-control", "no-cache");
   return fetch(url, {
-    headers: { "cache-control": "no-cache" },
+    ...init,
+    headers,
     signal: AbortSignal.timeout(10000)
   });
 }

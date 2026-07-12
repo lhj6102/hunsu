@@ -1,4 +1,4 @@
-export const CLOUDFLARE_RESOURCE_ALLOWLIST_SCHEMA: "hunsu.cloudflare-resource-allowlist.v2";
+export const CLOUDFLARE_RESOURCE_ALLOWLIST_SCHEMA: "hunsu.cloudflare-resource-allowlist.v3";
 
 export type CloudflareResourceAllowlist = {
   accountId: string;
@@ -9,6 +9,10 @@ export type CloudflareResourceAllowlist = {
   connectWorkerName: string;
   connectD1DatabaseName: string;
   connectD1DatabaseId: string;
+  connectAccessIssuer: string;
+  connectAccessAud: string;
+  connectSigningPublicJwk: string;
+  connectSigningKeyId: string;
   workerName: string;
   originName: string;
   hubPublicApiUrl: string;
@@ -20,4 +24,8 @@ export type CloudflareResourceAllowlist = {
 export function assertCloudflareResourceAllowlist(
   target: "preview" | "production",
   actual: CloudflareResourceAllowlist
+): CloudflareResourceAllowlist;
+
+export function cloudflareResourceAllowlist(
+  target: "preview" | "production"
 ): CloudflareResourceAllowlist;
