@@ -133,7 +133,7 @@ export async function runBridgeServiceSmoke(input) {
     process.stdout.write(`[bridge-service-smoke] ${process.platform} ${launcher.version}: ${(durationMs / 1_000).toFixed(2)}s\n`);
     return { platform: process.platform, version: launcher.version, durationMs };
   } catch (error) {
-    await reportWindowsTaskFailure();
+    await reportWindowsTaskFailure({ launcher, env: environment, cwd: bootstrap, home });
     throw error;
   } finally {
     if (setupCompleted && launcher) {
@@ -343,7 +343,7 @@ async function runPowerShell(script) {
   });
 }
 
-async function reportWindowsTaskFailure() {
+async function reportWindowsTaskFailure(input) {
   if (process.platform !== "win32") return;
   try {
     const result = await runPowerShell([
@@ -354,6 +354,59 @@ async function reportWindowsTaskFailure() {
     process.stderr.write(`[bridge-service-smoke] Windows task diagnostic: ${sanitize(result.stdout.trim())}\n`);
   } catch (_error) {
     process.stderr.write("[bridge-service-smoke] Windows task diagnostic was unavailable.\n");
+  }
+  if (input.launcher) {
+    try {
+      const status = await runCli(
+        input.launcher,
+        ["service", "status", "--home", input.home, "--json"],
+        input.env,
+        input.cwd,
+        { allowFailure: true }
+      );
+      process.stderr.write(`[bridge-service-smoke] Windows Bridge diagnostic: ${safeJson({
+        ok: status.ok,
+        code: status.code,
+        installed: status.value?.installed,
+        managerState: status.value?.managerState,
+        health: status.value?.health,
+        authentication: status.value?.authentication,
+        packageVersion: status.value?.packageVersion
+      })}\n`);
+    } catch (_error) {
+      process.stderr.write("[bridge-service-smoke] Windows Bridge status diagnostic was unavailable.\n");
+    }
+  }
+  const stateFiles = {
+    config: join(input.home, "config.json"),
+    runtimeIdentity: join(input.home, "runtime.json"),
+    daemonLock: join(input.home, "runtime", "daemon.lock"),
+    setupTransaction: join(input.home, "runtime", "setup-transaction.json")
+  };
+  const presence = {};
+  for (const [name, path] of Object.entries(stateFiles)) {
+    presence[name] = await access(path).then(() => true, () => false);
+  }
+  process.stderr.write(`[bridge-service-smoke] Windows state presence: ${safeJson(presence)}\n`);
+  try {
+    const lines = (await readFile(join(input.home, "logs", "bridge.jsonl"), "utf8"))
+      .split(/\r?\n/u)
+      .filter(Boolean)
+      .slice(-12);
+    const events = lines.map(line => {
+      try {
+        const value = JSON.parse(line);
+        return {
+          level: typeof value.level === "string" ? value.level : "unknown",
+          event: typeof value.event === "string" ? value.event : "unknown"
+        };
+      } catch (_error) {
+        return { level: "unknown", event: "malformed" };
+      }
+    });
+    process.stderr.write(`[bridge-service-smoke] Windows log events: ${safeJson(events)}\n`);
+  } catch (_error) {
+    process.stderr.write("[bridge-service-smoke] Windows log event diagnostic was unavailable.\n");
   }
 }
 
