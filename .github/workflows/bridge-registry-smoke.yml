@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: Exact candidate Git tag, for example v0.2.0-next.3
+        description: Exact candidate Git tag, for example v0.2.0-next.4
         required: true
         type: string
 

@@ -26,7 +26,7 @@ export function verifyBridgeNpmProvenanceAudit(input) {
   const candidates = audit.verified.filter(value => value?.name === PACKAGE_NAME && value?.version === version);
   ensure(candidates.length === 1, "npm did not verify exactly one attestation for the exact Bridge candidate.");
   const candidate = requiredObject(candidates[0], "verified Bridge attestation");
-  ensure(candidate.registry === "https://registry.npmjs.org/", "The Bridge attestation came from an unexpected registry.");
+  ensure(isTrustedNpmRegistry(candidate.registry), "The Bridge attestation came from an unexpected registry.");
 
   const provenanceUrl = registryAttestationUrl(candidate.attestations?.url, version);
   ensure(candidate.attestations?.provenance?.predicateType === SLSA_PREDICATE, "The registry did not advertise SLSA v1 provenance.");
@@ -114,6 +114,21 @@ function registryAttestationUrl(value, version) {
     "The attestation URL did not identify the exact Bridge candidate."
   );
   return url.toString();
+}
+
+function isTrustedNpmRegistry(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const url = new URL(value.trim());
+    return url.origin === "https://registry.npmjs.org"
+      && url.pathname === "/"
+      && !url.username
+      && !url.password
+      && !url.search
+      && !url.hash;
+  } catch (_error) {
+    return false;
+  }
 }
 
 function exactVersion(value) {
