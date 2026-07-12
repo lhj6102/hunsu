@@ -208,26 +208,29 @@ async function assertPlatformDefinition(install, home) {
   }
   if (process.platform === "win32") {
     const task = await runPowerShell([
+      "function Resolve-Sid([string]$Value) { try { return ([System.Security.Principal.NTAccount]$Value).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { try { return ([System.Security.Principal.SecurityIdentifier]$Value).Value } catch { return $null } } }",
       "$Task = Get-ScheduledTask -TaskName 'Hunsu Bridge'",
-      "$Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
-      "@{ Execute = $Task.Actions[0].Execute; Arguments = $Task.Actions[0].Arguments; WorkingDirectory = $Task.Actions[0].WorkingDirectory; UserId = $Task.Principal.UserId; CurrentIdentity = $Identity } | ConvertTo-Json -Compress"
+      "$CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+      "$PrincipalSid = Resolve-Sid $Task.Principal.UserId",
+      "@{ Execute = $Task.Actions[0].Execute; Arguments = $Task.Actions[0].Arguments; WorkingDirectory = $Task.Actions[0].WorkingDirectory; PrincipalSid = $PrincipalSid; CurrentSid = $CurrentSid } | ConvertTo-Json -Compress"
     ].join("; "));
     const value = JSON.parse(task.stdout.replace(/^\uFEFF/u, "").trim());
     ensure(samePath(value.Execute, nodePath), "Task Scheduler did not use the selected Node executable");
     ensure(String(value.Arguments).includes(cliPath), "Task Scheduler did not use the stable CLI path");
     ensure(samePath(value.WorkingDirectory, runtimePath), "Task Scheduler did not use the stable runtime working directory");
-    ensure(String(value.UserId).toLowerCase() === String(value.CurrentIdentity).toLowerCase(), "Task Scheduler did not use the current user");
+    ensure(value.PrincipalSid && value.PrincipalSid === value.CurrentSid, "Task Scheduler did not use the current user");
 
     const acl = await runPowerShell([
+      "function Resolve-Sid([string]$Value) { try { return ([System.Security.Principal.NTAccount]$Value).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { try { return ([System.Security.Principal.SecurityIdentifier]$Value).Value } catch { return $null } } }",
       `$Acl = Get-Acl -LiteralPath ${powerShellQuote(join(home, "credentials.json"))}`,
-      "$Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
-      "@{ Owner = $Acl.Owner; Protected = $Acl.AreAccessRulesProtected; Rules = @($Acl.Access | ForEach-Object { @{ Identity = $_.IdentityReference.Value; Type = $_.AccessControlType.ToString(); Rights = $_.FileSystemRights.ToString() } }); CurrentIdentity = $Identity } | ConvertTo-Json -Depth 6 -Compress"
+      "$CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+      "@{ OwnerSid = (Resolve-Sid $Acl.Owner); Protected = $Acl.AreAccessRulesProtected; Rules = @($Acl.Access | ForEach-Object { @{ Sid = (Resolve-Sid $_.IdentityReference.Value); Type = $_.AccessControlType.ToString(); Rights = $_.FileSystemRights.ToString() } }); CurrentSid = $CurrentSid } | ConvertTo-Json -Depth 6 -Compress"
     ].join("; "));
     const aclValue = JSON.parse(acl.stdout.replace(/^\uFEFF/u, "").trim());
-    ensure(String(aclValue.Owner).toLowerCase() === String(aclValue.CurrentIdentity).toLowerCase(), "Windows credentials owner was not the current user");
+    ensure(aclValue.OwnerSid && aclValue.OwnerSid === aclValue.CurrentSid, "Windows credentials owner was not the current user");
     ensure(aclValue.Protected === true, "Windows credentials ACL inherited broader rules");
     ensure(Array.isArray(aclValue.Rules) && aclValue.Rules.length === 1, "Windows credentials ACL was not current-user-only");
-    ensure(String(aclValue.Rules[0]?.Identity).toLowerCase() === String(aclValue.CurrentIdentity).toLowerCase(), "Windows credentials ACL identity was not the current user");
+    ensure(aclValue.Rules[0]?.Sid && aclValue.Rules[0].Sid === aclValue.CurrentSid, "Windows credentials ACL identity was not the current user");
     ensure(aclValue.Rules[0]?.Type === "Allow" && String(aclValue.Rules[0]?.Rights).includes("FullControl"), "Windows credentials ACL did not grant only current-user FullControl");
   }
 }
