@@ -19,9 +19,9 @@ env:
 
 jobs:
   validate:
-    name: Validate
+    name: Validate and enforce local gate budget
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 7
     steps:
       - name: Record start
         id: timer
@@ -39,12 +39,13 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Reject deprecated infrastructure
-        run: pnpm run check:no-desktop-prototype
-      - name: Typecheck
-        run: pnpm run typecheck
-      - name: Unit and contract tests
-        run: pnpm test
+      - name: Install Chromium for the complete local gate
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run the complete Bridge gate with its documented threshold
+        env:
+          HUNSU_VERIFY_BRIDGE_BUDGET_MS: 330000
+          HUNSU_VERIFY_BRIDGE_THRESHOLD_MS: 30000
+        run: pnpm run verify:bridge:budget
       - name: Report elapsed time
         if: always()
         shell: bash
@@ -73,8 +74,8 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Run isolated daemon integration
-        run: node --conditions=development --test tests/bridge-headless-*.test.ts
+      - name: Run the CLI foreground scenario
+        run: pnpm run test:headless:scenario
       - name: Report elapsed time
         if: always()
         shell: bash

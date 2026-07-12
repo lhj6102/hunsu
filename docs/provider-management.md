@@ -9,7 +9,11 @@ mutates that state through the authenticated control API:
 ~~~sh
 hunsu-bridge provider list --json
 hunsu-bridge provider status --json
-hunsu-bridge provider set codex --binary <path> --home <path> --json
+hunsu-bridge provider set codex \
+  --binary <path> \
+  --codex-home <codex-path> \
+  --home <hunsu-home> \
+  --json
 hunsu-bridge provider check codex --json
 hunsu-bridge provider reset codex --json
 ~~~
@@ -31,6 +35,11 @@ Stable failures include PROVIDER_NOT_CONFIGURED, PROVIDER_BINARY_NOT_FOUND,
 PROVIDER_LOGIN_REQUIRED, and PROVIDER_CHECK_FAILED. Results expose safe status
 and recovery commands, not raw app-server payloads, environment dumps, or
 credential files.
+
+`--home` always means `HUNSU_HOME`; it has no provider-specific meaning.
+`--codex-home` is the explicit Codex Home setting, and both options may be used
+together. The prerelease rejects the old ambiguous provider use of `--home`
+with guidance to use `--codex-home`.
 
 Codex Home and binary overrides are explicit settings. The daemon applies the
 same effective provider configuration to status checks, login, local Execute,

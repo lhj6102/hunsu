@@ -11,11 +11,23 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const devStackPath = join(repositoryRoot, "scripts", "dev-stack.mjs");
+const scenarioSmokePath = join(repositoryRoot, "scripts", "headless-scenario-smoke.mjs");
+const serviceSmokePath = join(repositoryRoot, "scripts", "bridge-service-smoke.mjs");
+const verifyBridgePath = join(repositoryRoot, "scripts", "verify-bridge.mjs");
+const evidenceValidatorPath = join(repositoryRoot, "scripts", "validate-bridge-production-evidence.mjs");
 const fakeCodexPath = join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs");
 const fakeRelayPath = join(repositoryRoot, "tests", "fixtures", "fake-relay.mjs");
 
 test("development scripts have valid Node syntax and safe helper contracts", async () => {
-  await Promise.all([devStackPath, fakeCodexPath, fakeRelayPath].map(path =>
+  await Promise.all([
+    devStackPath,
+    scenarioSmokePath,
+    serviceSmokePath,
+    verifyBridgePath,
+    evidenceValidatorPath,
+    fakeCodexPath,
+    fakeRelayPath
+  ].map(path =>
     execFileAsync(process.execPath, ["--check", path])
   ));
   const stackModuleUrl = pathToFileURL(devStackPath).href;
@@ -39,13 +51,13 @@ test("development scripts have valid Node syntax and safe helper contracts", asy
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.0",
+    version: "0.2.0-next.1",
     protocolVersion: "local-bridge-v1"
   }), true);
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.0",
+    version: "0.2.0-next.1",
     protocolVersion: "local-bridge-v1",
     daemonPid: 123
   }), false);
@@ -69,6 +81,65 @@ test("development scripts have valid Node syntax and safe helper contracts", asy
   assert.equal(safe.includes("hunsu_bridge_pair_secret"), false);
   assert.equal(safe.includes("hunsu_control_secret"), false);
   assert.equal(safe.includes("Bearer secret"), false);
+});
+
+test("Bridge verification budget and production evidence contracts are explicit and safe", async () => {
+  const verify = await import(pathToFileURL(verifyBridgePath).href) as {
+    verificationBudget(env?: Record<string, string>): { targetMs: number; thresholdMs: number; limitMs: number };
+    parseVerifyArguments(argv?: string[]): { help: boolean; enforceBudget: boolean };
+  };
+  assert.deepEqual(verify.verificationBudget({}), {
+    targetMs: 300_000,
+    thresholdMs: 30_000,
+    limitMs: 330_000
+  });
+  assert.deepEqual(verify.parseVerifyArguments(["--enforce-budget"]), { help: false, enforceBudget: true });
+
+  const evidence = await import(pathToFileURL(evidenceValidatorPath).href) as {
+    validateProductionEvidence(input: Record<string, string>): Record<string, unknown>;
+  };
+  const record = evidence.validateProductionEvidence({
+    npmVersion: "0.2.0-next.1",
+    npmIntegrity: `sha512-${"a".repeat(86)}==`,
+    npmProvenanceUrl: "https://registry.example.test/provenance/bridge-next-1",
+    evidenceUrl: "https://evidence.example.test/bridge-next-1",
+    hunsuAppDeployment: "https://hunsu.app/deployments/bridge-next-1",
+    codexVersion: "codex-cli 1.2.3",
+    relayEnvironment: "production-qa",
+    workspaceFixtureId: "ws_disposable_001",
+    platformEvidence: JSON.stringify({
+      windows: { os: "windows-latest", node: "22.18.0", serviceManager: "Task Scheduler" },
+      macos: { os: "macos-latest", node: "22.18.0", serviceManager: "LaunchAgent" },
+      linux: { os: "ubuntu-latest", node: "22.18.0", serviceManager: "systemd --user" }
+    })
+  });
+  assert.equal(record.schema, "hunsu.bridge.production-evidence.v1");
+  assert.throws(() => evidence.validateProductionEvidence({
+    npmVersion: "0.2.0-next.1",
+    npmIntegrity: "sha512-YQ==",
+    npmProvenanceUrl: "https://registry.example.test/provenance/bridge-next-1",
+    evidenceUrl: "https://evidence.example.test/bridge-next-1",
+    hunsuAppDeployment: "https://hunsu.app/deployments/bridge-next-1",
+    codexVersion: "codex-cli 1.2.3",
+    relayEnvironment: "production-qa",
+    workspaceFixtureId: "ws_disposable_001",
+    platformEvidence: JSON.stringify({
+      windows: { os: "windows-latest", node: "22.18.0", serviceManager: "Task Scheduler" },
+      macos: { os: "macos-latest", node: "22.18.0", serviceManager: "LaunchAgent" },
+      linux: { os: "ubuntu-latest", node: "22.18.0", serviceManager: "systemd --user" }
+    })
+  }));
+  assert.throws(() => evidence.validateProductionEvidence({
+    npmVersion: "0.2.0-next.1",
+    npmIntegrity: "sha512-invalid",
+    npmProvenanceUrl: "https://example.test/?token=secret",
+    evidenceUrl: "https://example.test/evidence",
+    hunsuAppDeployment: "https://hunsu.app",
+    codexVersion: "codex-cli 1.2.3",
+    relayEnvironment: "production-qa",
+    workspaceFixtureId: "ws_disposable_001",
+    platformEvidence: "{}"
+  }));
 });
 
 test("fake Codex provides version, readiness, login-required, unsupported-model, and controlled app-server responses", async () => {
@@ -191,7 +262,12 @@ test("fake Relay supports deterministic device login, registration, commands, di
 });
 
 test("dev stack launches isolated Bridge and Web processes with all same-origin proxy paths", { timeout: 35_000 }, async t => {
-  const stack = spawn(process.execPath, [devStackPath], {
+  const stack = spawn(process.execPath, [
+    "--no-warnings",
+    "--conditions=development",
+    "--experimental-transform-types",
+    devStackPath
+  ], {
     cwd: repositoryRoot,
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"]
@@ -209,27 +285,37 @@ test("dev stack launches isolated Bridge and Web processes with all same-origin 
   await waitForOutput(stack, () => output, /^\[state\] .+$/mu, 25_000);
   const bridgeUrl = output.match(/^\[bridge\] ready at (http:\/\/\S+)$/mu)?.[1];
   const webUrl = output.match(/^\[web\] ready at (http:\/\/\S+)$/mu)?.[1];
+  const relayUrl = output.match(/^\[relay\] ready at (http:\/\/\S+)$/mu)?.[1];
   const stateHome = output.match(/^\[state\] (.+)$/mu)?.[1];
   assert.ok(bridgeUrl);
   assert.ok(webUrl);
+  assert.ok(relayUrl);
   assert.ok(stateHome);
   await access(stateHome);
 
   const expectedHealth = {
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.0",
+    version: "0.2.0-next.1",
     protocolVersion: "local-bridge-v1"
   };
   assert.deepEqual(await fetch(`${bridgeUrl}/health`).then(response => response.json()), expectedHealth);
   assert.deepEqual(await fetch(`${webUrl}/health`).then(response => response.json()), expectedHealth);
   assert.deepEqual(await fetch(`${webUrl}/__bridge/health`).then(response => response.json()), expectedHealth);
+  assert.deepEqual(await fetch(`${relayUrl}/health`).then(response => response.json()), {
+    ok: true,
+    service: "hunsu-relay",
+    issuer: relayUrl
+  });
   const apiResponse = await fetch(`${webUrl}/api/roadmaps/recent`);
   assert.notEqual(apiResponse.status, 404);
 
   assert.equal(/hunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+/iu.test(output), false);
   assert.match(output, /^\[bridge\] /mu);
   assert.match(output, /^\[web\] /mu);
+  assert.match(output, /^\[relay\] /mu);
+  assert.match(output, /^\[timing\] daemon ready: \d+ ms$/mu);
+  assert.match(output, /^\[timing\] Web ready: \d+ ms$/mu);
 
   stack.kill("SIGTERM");
   await waitForExit(stack);

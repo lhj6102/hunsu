@@ -92,6 +92,8 @@ pnpm run check
 pnpm run test:e2e:stack
 pnpm run test:package:bridge
 pnpm run check:no-desktop-prototype
+pnpm run check:bridge-state-boundaries
+pnpm verify:bridge
 ~~~
 
 The normal Bridge gate runs on Ubuntu. Cross-platform service-manager smoke is

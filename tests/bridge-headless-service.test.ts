@@ -15,7 +15,7 @@ const linuxInstall: ServiceInstallInput = {
   nodePath: "/opt/Hunsu 100%/node",
   cliPath: "/opt/Hunsu 100%/runtime/hunsu-bridge.js",
   hunsuHome: "/home/test/Hunsu \"safe\" 100%",
-  packageVersion: "0.2.0-next.0",
+  packageVersion: "0.2.0-next.1",
   runtimePath: "/opt/Hunsu 100%/runtime"
 };
 
@@ -98,8 +98,8 @@ test("offline service status combines manager, health, authentication, version, 
     probeHealth: async () => false,
     probeAuthenticatedStatus: async () => ({ state: "authenticated" }),
     readInstalledRuntime: async () => ({
-      packageVersion: "0.2.0-next.0",
-      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.0"
+      packageVersion: "0.2.0-next.1",
+      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.1"
     })
   });
   assert.deepEqual(await manager.status(), {
@@ -109,8 +109,8 @@ test("offline service status combines manager, health, authentication, version, 
     health: "offline",
     authentication: "unavailable",
     definitionPath: "/home/test/.config/systemd/user/hunsu-bridge.service",
-    packageVersion: "0.2.0-next.0",
-    runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.0",
+    packageVersion: "0.2.0-next.1",
+    runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.1",
     detail: "inactive"
   });
 });
@@ -140,7 +140,7 @@ test("macOS LaunchAgent is a direct daemon with RunAtLoad, crash-only KeepAlive,
     nodePath: "/Applications/Hunsu & Node/node",
     cliPath: "/Users/test/Hunsu <next>/cli.js",
     hunsuHome: "/Users/test/Library/Application Support/Hunsu & Bridge",
-    packageVersion: "0.2.0-next.0",
+    packageVersion: "0.2.0-next.1",
     runtimePath: "/Users/test/Hunsu/runtime"
   };
   const plist = macosLaunchAgentPlist(input);
@@ -194,10 +194,10 @@ test("macOS reloads a changed cached LaunchAgent definition before starting the 
 
   const result = await manager.install({
     nodePath: "/opt/node/bin/node",
-    cliPath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.0/dist/cli.js",
+    cliPath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.1/dist/cli.js",
     hunsuHome: "/Users/test/.hunsu",
-    packageVersion: "0.2.0-next.0",
-    runtimePath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.0"
+    packageVersion: "0.2.0-next.1",
+    runtimePath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.1"
   });
 
   assert.equal(result.ok, true);
@@ -236,7 +236,7 @@ test("Windows Task Scheduler uses current-user ScheduledTasks, hidden settings, 
     nodePath: "C:\\Program Files\\nodejs\\node.exe",
     cliPath: "C:\\Users\\O'Brien\\Hunsu Bridge\\cli.js",
     hunsuHome: "C:\\Users\\O'Brien\\AppData\\Local\\Hunsu\\Bridge",
-    packageVersion: "0.2.0-next.0",
+    packageVersion: "0.2.0-next.1",
     runtimePath: "C:\\Users\\O'Brien\\AppData\\Local\\Hunsu\\Bridge\\runtime"
   };
   const script = windowsTaskInstallScript(input);
@@ -271,10 +271,10 @@ test("Windows Task Scheduler uses current-user ScheduledTasks, hidden settings, 
 test("Windows service install reports changes when the stable action contract changes", async () => {
   const input: ServiceInstallInput = {
     nodePath: "C:\\Program Files\\nodejs\\node.exe",
-    cliPath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.0\\cli.js",
+    cliPath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.1\\cli.js",
     hunsuHome: "C:\\Users\\test\\Hunsu",
-    packageVersion: "0.2.0-next.0",
-    runtimePath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.0"
+    packageVersion: "0.2.0-next.1",
+    runtimePath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.1"
   };
   const actionArguments = `"${input.cliPath}" daemon --home "${input.hunsuHome}"`;
   let existingArguments = actionArguments;

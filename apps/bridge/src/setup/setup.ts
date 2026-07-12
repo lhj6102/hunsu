@@ -1,34 +1,79 @@
+import { randomUUID } from "node:crypto";
+import type { BridgeServiceManager, ServiceErrorCode, ServiceInstallInput, ServiceResult } from "../service/types.ts";
 import type { CredentialStore } from "../state/credentialStore.ts";
 import type { HunsuPaths } from "../state/paths.ts";
-import type { BridgeServiceManager, ServiceErrorCode, ServiceInstallInput, ServiceResult } from "../service/types.ts";
+import {
+  createHomeOwnershipStore,
+  ensureHomeOwnership,
+  type HomeOwnershipStore
+} from "./homeOwnership.ts";
 import {
   BRIDGE_PACKAGE_VERSION,
   RUNTIME_INSTALL_SCHEMA,
   createRuntimeInstallStore,
-  defaultRuntimeFileSystem,
-  installStableRuntime,
-  planStableRuntimeInstall,
   serviceInputForInstallation,
-  type RuntimeCommand,
-  type RuntimeCommandRunner,
-  type RuntimeFileSystem,
   type RuntimeInstallDocument,
   type RuntimeInstallation,
-  type RuntimeInstallStore,
-  type StableRuntimePlan
+  type RuntimeInstallStore
 } from "./runtimeInstaller.ts";
+import {
+  executingBridgeRuntimeSource,
+  type RuntimePackageSource
+} from "./runtimePackageSource.ts";
+import {
+  StagedRuntimeCleanupError,
+  installStagedRuntime,
+  planStagedRuntimeInstall,
+  removeCandidateRuntime,
+  verifyExistingStableRuntime,
+  type StagedRuntimeCommand,
+  type StagedRuntimeCommandRunner,
+  type StagedRuntimeFileSystem,
+  type StagedRuntimePlan
+} from "./stagedRuntimeInstaller.ts";
+import {
+  SETUP_TRANSACTION_SCHEMA,
+  SetupInProgressError,
+  acquireSetupOperationLock,
+  createSetupTransactionStore,
+  type SetupOperationLease,
+  type SetupTransaction,
+  type SetupTransactionPhase,
+  type SetupTransactionStore
+} from "./setupTransaction.ts";
 
 export const MINIMUM_NODE_VERSION = Object.freeze({ major: 22, minor: 18, patch: 0 });
 
 export type SetupVerification = {
   health: boolean;
   authenticated: boolean;
-  version?: string;
+  version: string;
+  runtimePath: string;
 };
+
+export type SetupFailurePhase =
+  | "ownership-marker"
+  | "credential-ensure"
+  | "npm-install"
+  | "candidate-verification"
+  | "staging-rename"
+  | "transaction-write"
+  | "previous-service-stop"
+  | "service-definition-install"
+  | "service-start"
+  | "health-verification"
+  | "authentication-verification"
+  | "version-verification"
+  | "install-record-commit"
+  | "candidate-service-cleanup"
+  | "candidate-runtime-cleanup"
+  | "previous-definition-restore"
+  | "previous-runtime-restart";
 
 export type SetupErrorCode =
   | "NODE_VERSION_UNSUPPORTED"
   | "RUNTIME_INSTALL_FAILED"
+  | "SETUP_IN_PROGRESS"
   | "SETUP_VERIFICATION_FAILED"
   | "ROLLBACK_FAILED"
   | ServiceErrorCode;
@@ -39,10 +84,10 @@ export type SetupResult =
       code: "OK";
       message: string;
       value: {
-        packageVersion: typeof BRIDGE_PACKAGE_VERSION;
+        packageVersion: string;
         runtimePath: string;
         cliPath: string;
-        npmCommand: RuntimeCommand;
+        npmCommand: StagedRuntimeCommand;
         idempotent: boolean;
         upgraded: boolean;
         started: boolean;
@@ -65,15 +110,27 @@ export type BridgeSetupOptions = {
   credentialStore: Pick<CredentialStore, "ensure">;
   serviceManager: BridgeServiceManager;
   verifyRuntime: (installation: RuntimeInstallation) => Promise<SetupVerification>;
+  runtimeSource?: RuntimePackageSource;
   installStore?: RuntimeInstallStore;
-  fileSystem?: RuntimeFileSystem;
-  npmRunner?: RuntimeCommandRunner;
+  transactionStore?: SetupTransactionStore;
+  ownershipStore?: HomeOwnershipStore;
+  stagedFileSystem?: StagedRuntimeFileSystem;
+  npmRunner?: StagedRuntimeCommandRunner;
   npmCommand?: string;
   nodePath?: string;
   nodeVersion?: string;
   platform?: NodeJS.Platform;
   now?: () => Date;
+  createInstallationId?: () => string;
+  createTransactionId?: () => string;
+  acquireOperationLock?: (paths: HunsuPaths) => Promise<SetupOperationLease>;
+  onPhase?: (phase: SetupFailurePhase) => void | Promise<void>;
   dryRun?: boolean;
+};
+
+type SetupAbort = {
+  code: SetupErrorCode;
+  message: string;
 };
 
 export async function setupBridge(options: BridgeSetupOptions): Promise<SetupResult> {
@@ -82,16 +139,19 @@ export async function setupBridge(options: BridgeSetupOptions): Promise<SetupRes
     return failure("NODE_VERSION_UNSUPPORTED", "Hunsu Bridge requires Node 22.18 or newer.");
   }
 
-  let plan: StableRuntimePlan;
+  const transactionId = options.createTransactionId?.() ?? `setup_${randomUUID()}`;
+  let plan: StagedRuntimePlan;
   try {
-    plan = planStableRuntimeInstall({
+    plan = planStagedRuntimeInstall({
       paths: options.paths,
+      transactionId,
       nodePath: options.nodePath ?? process.execPath,
-      platform: options.platform,
-      npmCommand: options.npmCommand
+      source: options.runtimeSource ?? executingBridgeRuntimeSource(),
+      ...(options.npmCommand ? { npmCommand: options.npmCommand } : {}),
+      ...(options.platform ? { platform: options.platform } : {})
     });
   } catch (_error) {
-    return failure("RUNTIME_INSTALL_FAILED", "Hunsu Bridge requires an absolute Node executable path.");
+    return failure("RUNTIME_INSTALL_FAILED", "The exact Hunsu Bridge runtime source or executable path is invalid.");
   }
 
   if (options.dryRun) {
@@ -103,8 +163,60 @@ export async function setupBridge(options: BridgeSetupOptions): Promise<SetupRes
     });
   }
 
+  let lease: SetupOperationLease;
+  try {
+    lease = await (options.acquireOperationLock
+      ? options.acquireOperationLock(options.paths)
+      : acquireSetupOperationLock(options.paths, "setup", options.now ? { now: options.now } : {}));
+  } catch (error) {
+    if (error instanceof SetupInProgressError) return failure(error.code, error.message);
+    return failure("RUNTIME_INSTALL_FAILED", "The Bridge setup lock could not be acquired safely.");
+  }
+
+  let result: SetupResult;
+  try {
+    result = await setupWhileLocked(options, plan, nodeVersion);
+  } catch (_error) {
+    result = failure("RUNTIME_INSTALL_FAILED", "Hunsu Bridge setup failed unexpectedly before activation.");
+  }
+  try {
+    await lease.release();
+  } catch (_error) {
+    return failure(
+      "ROLLBACK_FAILED",
+      "Bridge setup finished but its operation lock could not be released; run `hunsu-bridge doctor --json` before retrying."
+    );
+  }
+  return result;
+}
+
+async function setupWhileLocked(
+  options: BridgeSetupOptions,
+  plan: StagedRuntimePlan,
+  nodeVersion: string
+): Promise<SetupResult> {
   const installStore = options.installStore ?? createRuntimeInstallStore(options.paths);
-  const fileSystem = options.fileSystem ?? defaultRuntimeFileSystem;
+  const transactionStore = options.transactionStore ?? createSetupTransactionStore(options.paths);
+  const ownershipStore = options.ownershipStore ?? createHomeOwnershipStore(options.paths);
+  const now = options.now ?? (() => new Date());
+
+  let pending: SetupTransaction | undefined;
+  try {
+    pending = await transactionStore.read();
+  } catch (_error) {
+    return failure("RUNTIME_INSTALL_FAILED", "The pending Bridge setup transaction is invalid.");
+  }
+  if (pending) {
+    const recovered = await compensateTransaction({
+      options,
+      transaction: pending,
+      transactionStore,
+      installStore,
+      installationId: pending.previous?.installationId ?? null
+    });
+    if (!recovered.ok) return rollbackFailure(recovered.failures);
+  }
+
   let existing: RuntimeInstallDocument | undefined;
   try {
     existing = await installStore.read();
@@ -112,82 +224,240 @@ export async function setupBridge(options: BridgeSetupOptions): Promise<SetupRes
     return failure("RUNTIME_INSTALL_FAILED", "The installed Hunsu Bridge runtime record is invalid.");
   }
 
-  const sameRuntimeReady = existing !== undefined
-    && existing.current.packageVersion === BRIDGE_PACKAGE_VERSION
-    && existing.current.runtimePath === plan.runtimePath
-    && existing.current.cliPath === plan.cliPath
-    && await fileSystem.exists(plan.cliPath);
-
-  if (sameRuntimeReady && existing) {
-    return reconcileSameVersion(options, plan, existing, installStore);
-  }
-
-  let candidate: RuntimeInstallation;
+  let installationId: string;
   try {
-    candidate = await installStableRuntime({
-      plan,
-      commandRunner: options.npmRunner,
-      fileSystem,
-      now: options.now
+    await runPhase(options, "ownership-marker");
+    const marker = await ensureHomeOwnership({
+      store: ownershipStore,
+      ...(existing?.installationId ? { expectedInstallationId: existing.installationId } : {}),
+      ...(options.now ? { now: options.now } : {}),
+      ...(options.createInstallationId ? { createInstallationId: options.createInstallationId } : {})
     });
+    installationId = marker.installationId;
   } catch (_error) {
-    return failure("RUNTIME_INSTALL_FAILED", "The exact Hunsu Bridge runtime package could not be installed.");
+    return failure("RUNTIME_INSTALL_FAILED", "The Hunsu home ownership marker could not be created or verified.");
   }
 
   try {
+    await runPhase(options, "credential-ensure");
     await options.credentialStore.ensure();
   } catch (_error) {
     return failure("RUNTIME_INSTALL_FAILED", "Hunsu Bridge credentials could not be created or preserved.");
   }
 
-  const upgraded = Boolean(existing && existing.current.packageVersion !== candidate.packageVersion);
-  if (upgraded) {
-    const stopped = await options.serviceManager.stop();
-    if (!stopped.ok) return serviceFailure(stopped);
-  }
-
-  const candidateServiceInput = serviceInputForInstallation(candidate, options.paths.home);
-  const installed = await options.serviceManager.install(candidateServiceInput);
-  if (!installed.ok) {
-    if (existing) {
-      return rollbackAfterFailure(options, existing, "The candidate Hunsu Bridge service definition could not be installed.");
-    }
-    return serviceFailure(installed);
-  }
-  const started = await options.serviceManager.start();
-  if (!started.ok) {
-    if (existing) return rollbackAfterFailure(options, existing, "The candidate Hunsu Bridge service could not start.");
-    return serviceFailure(started);
-  }
-
-  const verification = await safeVerify(options.verifyRuntime, candidate);
-  if (!verificationSucceeded(verification, candidate.packageVersion)) {
-    if (existing) return rollbackAfterFailure(options, existing, "The candidate Hunsu Bridge runtime failed verification.");
-    await options.serviceManager.uninstall().catch(() => undefined);
-    return failure("SETUP_VERIFICATION_FAILED", "The candidate Hunsu Bridge runtime failed health or authenticated status verification.");
-  }
-
-  const document = nextInstallDocument(candidate, existing?.current ?? null, candidateServiceInput, options.now);
+  let candidate: RuntimeInstallation | undefined;
+  let transaction: SetupTransaction | undefined;
+  let reusedStableRuntime = false;
   try {
+    if (existing
+      && existing.current.packageVersion === plan.packageVersion
+      && samePath(existing.current.runtimePath, plan.runtimePath)
+      && samePath(existing.current.cliPath, plan.cliPath)) {
+      try {
+        await verifyExistingStableRuntime({
+          plan,
+          ...(options.stagedFileSystem ? { fileSystem: options.stagedFileSystem } : {}),
+          nodeVersion
+        });
+        candidate = {
+          ...existing.current,
+          nodePath: plan.nodePath,
+          runtimePath: plan.runtimePath,
+          cliPath: plan.cliPath
+        };
+        reusedStableRuntime = true;
+      } catch (_error) {
+        // A recorded same-version runtime is protected from automatic deletion;
+        // the staged installer below will fail closed with repair guidance.
+      }
+    }
+
+    if (!candidate) {
+      const staged = await installStagedRuntime({
+        plan,
+        ...(options.npmRunner ? { commandRunner: options.npmRunner } : {}),
+        ...(options.stagedFileSystem ? { fileSystem: options.stagedFileSystem } : {}),
+        ...(options.now ? { now: options.now } : {}),
+        nodeVersion,
+        ...(existing ? { protectedRuntimePath: existing.current.runtimePath } : {}),
+        onPhase: phase => runPhase(options, phase)
+      });
+      candidate = staged.installation;
+      reusedStableRuntime = staged.reused;
+    }
+
+    const timestamp = now().toISOString();
+    transaction = {
+      schema: SETUP_TRANSACTION_SCHEMA,
+      transactionId: plan.transactionId,
+      phase: "candidate-staged",
+      candidate,
+      previous: existing ?? null,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    await runPhase(options, "transaction-write");
+    await transactionStore.write(transaction);
+
+    const candidateServiceInput = serviceInputForInstallation(candidate, options.paths.home);
+    if (existing && !sameServiceInput(existing.serviceInput, candidateServiceInput)) {
+      await runPhase(options, "previous-service-stop");
+      const stopped = await options.serviceManager.stop();
+      if (!stopped.ok && stopped.code !== "SERVICE_NOT_INSTALLED") throw serviceAbort(stopped);
+      transaction = await updateTransaction(transactionStore, transaction, "previous-stopped", now);
+    }
+
+    await runPhase(options, "service-definition-install");
+    const installed = await options.serviceManager.install(candidateServiceInput);
+    if (!installed.ok) throw serviceAbort(installed);
+    transaction = await updateTransaction(transactionStore, transaction, "service-switched", now);
+
+    let started = false;
+    const status = await options.serviceManager.status().catch(() => undefined);
+    if (!status) throw abort("SERVICE_STATUS_UNAVAILABLE", "The candidate service status could not be read.");
+    if (installed.changed && (status.managerState === "running" || status.health === "healthy")) {
+      await runPhase(options, "service-start");
+      const restarted = await options.serviceManager.restart();
+      if (!restarted.ok) throw serviceAbort(restarted);
+      started = true;
+    } else if (status.managerState !== "running" && status.health !== "healthy") {
+      await runPhase(options, "service-start");
+      const startResult = await options.serviceManager.start();
+      if (!startResult.ok) throw serviceAbort(startResult);
+      started = true;
+    }
+    transaction = await updateTransaction(transactionStore, transaction, "candidate-started", now);
+
+    const verification = await safeVerify(options.verifyRuntime, candidate);
+    await runPhase(options, "health-verification");
+    if (!verification.health) throw abort("SETUP_VERIFICATION_FAILED", "The candidate runtime health check failed.");
+    await runPhase(options, "authentication-verification");
+    if (!verification.authenticated) {
+      throw abort("SETUP_VERIFICATION_FAILED", "The candidate runtime control authentication check failed.");
+    }
+    await runPhase(options, "version-verification");
+    if (verification.version !== candidate.packageVersion || !samePath(verification.runtimePath, candidate.runtimePath)) {
+      throw abort("SETUP_VERIFICATION_FAILED", "The candidate runtime version or stable path check failed.");
+    }
+    transaction = await updateTransaction(transactionStore, transaction, "candidate-verified", now);
+    transaction = await updateTransaction(transactionStore, transaction, "committing", now);
+
+    const document = nextInstallDocument(
+      installationId,
+      candidate,
+      existing,
+      candidateServiceInput,
+      now
+    );
+    await runPhase(options, "install-record-commit");
     await installStore.write(document);
-  } catch (_error) {
-    if (existing) return rollbackAfterFailure(options, existing, "The verified runtime record could not be persisted.");
-    return failure("RUNTIME_INSTALL_FAILED", "The verified Hunsu Bridge runtime record could not be persisted.");
+    await transactionStore.clear();
+
+    return success(plan, {
+      idempotent: Boolean(existing && reusedStableRuntime && samePath(existing.current.runtimePath, candidate.runtimePath)),
+      upgraded: Boolean(existing && existing.current.packageVersion !== candidate.packageVersion),
+      started,
+      dryRun: false
+    });
+  } catch (error) {
+    const setupError = asSetupAbort(error);
+    if (!candidate || !transaction) return failure(setupError.code, setupError.message);
+    const compensated = await compensateTransaction({
+      options,
+      transaction,
+      transactionStore,
+      installStore,
+      installationId
+    });
+    if (!compensated.ok) return rollbackFailure(compensated.failures);
+    if (transaction.previous) {
+      return failure(
+        "SETUP_VERIFICATION_FAILED",
+        `${setupError.message} The previous verified runtime was restored.`
+      );
+    }
+    return failure(setupError.code, setupError.message);
+  }
+}
+
+async function compensateTransaction(input: {
+  options: BridgeSetupOptions;
+  transaction: SetupTransaction;
+  transactionStore: SetupTransactionStore;
+  installStore: RuntimeInstallStore;
+  installationId: string | null;
+}): Promise<{ ok: true } | { ok: false; failures: string[] }> {
+  const { options, transaction, transactionStore, installStore } = input;
+  const failures: string[] = [];
+  const now = options.now ?? (() => new Date());
+  await transactionStore.write({
+    ...transaction,
+    phase: "rolling-back",
+    updatedAt: now().toISOString()
+  }).catch(() => undefined);
+
+  const previous = transaction.previous;
+  if (!previous) {
+    await attemptRollback(failures, "candidate service cleanup", async () => {
+      await runPhase(options, "candidate-service-cleanup");
+      await options.serviceManager.stop().catch(() => undefined);
+      await options.serviceManager.uninstall().catch(() => undefined);
+      const status = await options.serviceManager.status();
+      if (status.installed || status.managerState === "running" || status.health === "healthy") {
+        throw new Error("candidate service remains active");
+      }
+    });
+    await attemptRollback(failures, "install record cleanup", () => installStore.clear());
+    await attemptRollback(failures, "candidate runtime cleanup", async () => {
+      await runPhase(options, "candidate-runtime-cleanup");
+      await removeCandidateRuntime({
+        paths: options.paths,
+        installation: transaction.candidate,
+        previous: null,
+        ...(options.stagedFileSystem ? { fileSystem: options.stagedFileSystem } : {})
+      });
+    });
+  } else {
+    await options.serviceManager.stop().catch(() => undefined);
+    await attemptRollback(failures, "previous service definition restore", async () => {
+      await runPhase(options, "previous-definition-restore");
+      const restored = await options.serviceManager.install(previous.serviceInput);
+      if (!restored.ok) throw new Error(restored.code);
+    });
+    await attemptRollback(failures, "previous runtime restart", async () => {
+      await runPhase(options, "previous-runtime-restart");
+      const restarted = await options.serviceManager.start();
+      if (!restarted.ok) throw new Error(restarted.code);
+    });
+    await attemptRollback(failures, "previous runtime verification", async () => {
+      const verification = await safeVerify(options.verifyRuntime, previous.current);
+      if (!verificationSucceeded(verification, previous.current)) throw new Error("previous runtime verification failed");
+    });
+    await attemptRollback(failures, "previous install record restore", () => installStore.write({
+      ...previous,
+      installationId: previous.installationId ?? input.installationId
+    }));
+    await attemptRollback(failures, "candidate runtime cleanup", async () => {
+      await runPhase(options, "candidate-runtime-cleanup");
+      await removeCandidateRuntime({
+        paths: options.paths,
+        installation: transaction.candidate,
+        previous: previous.current,
+        ...(options.stagedFileSystem ? { fileSystem: options.stagedFileSystem } : {})
+      });
+    });
   }
 
-  return success(plan, {
-    idempotent: false,
-    upgraded,
-    started: true,
-    dryRun: false
-  });
+  if (failures.length === 0) {
+    await attemptRollback(failures, "transaction journal cleanup", () => transactionStore.clear());
+  }
+  return failures.length === 0 ? { ok: true } : { ok: false, failures };
 }
 
 export function nodeVersionIsSupported(version: string): boolean {
   const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/u);
   if (!match) return false;
-  const [, majorText, minorText, patchText] = match;
-  const current = [Number(majorText), Number(minorText), Number(patchText)];
+  const current = [Number(match[1]), Number(match[2]), Number(match[3])];
   const minimum = [MINIMUM_NODE_VERSION.major, MINIMUM_NODE_VERSION.minor, MINIMUM_NODE_VERSION.patch];
   for (let index = 0; index < minimum.length; index += 1) {
     if (current[index]! > minimum[index]!) return true;
@@ -196,95 +466,34 @@ export function nodeVersionIsSupported(version: string): boolean {
   return true;
 }
 
-async function reconcileSameVersion(
-  options: BridgeSetupOptions,
-  plan: StableRuntimePlan,
-  existing: RuntimeInstallDocument,
-  installStore: RuntimeInstallStore
-): Promise<SetupResult> {
-  try {
-    await options.credentialStore.ensure();
-  } catch (_error) {
-    return failure("RUNTIME_INSTALL_FAILED", "Hunsu Bridge credentials could not be preserved.");
-  }
-
-  const current: RuntimeInstallation = {
-    ...existing.current,
-    nodePath: plan.nodePath,
-    runtimePath: plan.runtimePath,
-    cliPath: plan.cliPath
-  };
-  const serviceInput = serviceInputForInstallation(current, options.paths.home);
-  const installed = await options.serviceManager.install(serviceInput);
-  if (!installed.ok) return serviceFailure(installed);
-  const status = await options.serviceManager.status();
-  let started = false;
-  if (installed.changed && (status.managerState === "running" || status.health === "healthy")) {
-    const restarted = await options.serviceManager.restart();
-    if (!restarted.ok) return serviceFailure(restarted);
-    started = true;
-  } else if (status.managerState !== "running" && status.health !== "healthy") {
-    const startResult = await options.serviceManager.start();
-    if (!startResult.ok) return serviceFailure(startResult);
-    started = true;
-  }
-
-  const verification = await safeVerify(options.verifyRuntime, current);
-  if (!verificationSucceeded(verification, current.packageVersion)) {
-    return failure("SETUP_VERIFICATION_FAILED", "The installed Hunsu Bridge runtime failed health or authenticated status verification.");
-  }
-
-  const nextDocument: RuntimeInstallDocument = {
-    ...existing,
-    current,
-    serviceInput,
-    updatedAt: (options.now ?? (() => new Date()))().toISOString()
-  };
-  try {
-    await installStore.write(nextDocument);
-  } catch (_error) {
-    return failure("RUNTIME_INSTALL_FAILED", "The Hunsu Bridge runtime record could not be refreshed.");
-  }
-  return success(plan, {
-    idempotent: true,
-    upgraded: false,
-    started,
-    dryRun: false
-  });
-}
-
-async function rollbackAfterFailure(
-  options: BridgeSetupOptions,
-  previousDocument: RuntimeInstallDocument,
-  reason: string
-): Promise<SetupResult> {
-  const previous = previousDocument.current;
-  const previousServiceInput = previousDocument.serviceInput;
-  const stopped = await options.serviceManager.stop();
-  if (!stopped.ok) return failure("ROLLBACK_FAILED", "The failed candidate could not be stopped for rollback.");
-  const restored = await options.serviceManager.install(previousServiceInput);
-  if (!restored.ok) return failure("ROLLBACK_FAILED", "The previous Hunsu Bridge service definition could not be restored.");
-  const restarted = await options.serviceManager.start();
-  if (!restarted.ok) return failure("ROLLBACK_FAILED", "The previous Hunsu Bridge runtime could not be restarted.");
-  const verification = await safeVerify(options.verifyRuntime, previous);
-  if (!verificationSucceeded(verification, previous.packageVersion)) {
-    return failure("ROLLBACK_FAILED", "The previous Hunsu Bridge runtime failed rollback verification.");
-  }
-  return failure("SETUP_VERIFICATION_FAILED", `${reason} The previous runtime was restored.`);
+async function updateTransaction(
+  store: SetupTransactionStore,
+  transaction: SetupTransaction,
+  phase: SetupTransactionPhase,
+  now: () => Date
+): Promise<SetupTransaction> {
+  const next = { ...transaction, phase, updatedAt: now().toISOString() };
+  await store.write(next);
+  return next;
 }
 
 function nextInstallDocument(
+  installationId: string,
   current: RuntimeInstallation,
-  previous: RuntimeInstallation | null,
+  existing: RuntimeInstallDocument | undefined,
   serviceInput: ServiceInstallInput,
-  now: (() => Date) | undefined
+  now: () => Date
 ): RuntimeInstallDocument {
+  const sameRuntime = existing
+    && existing.current.packageVersion === current.packageVersion
+    && samePath(existing.current.runtimePath, current.runtimePath);
   return {
     schema: RUNTIME_INSTALL_SCHEMA,
+    installationId,
     current,
-    previous,
+    previous: sameRuntime ? existing.previous : existing?.current ?? null,
     serviceInput,
-    updatedAt: (now ?? (() => new Date()))().toISOString()
+    updatedAt: now().toISOString()
   };
 }
 
@@ -295,22 +504,115 @@ async function safeVerify(
   try {
     return await verify(installation);
   } catch (_error) {
-    return { health: false, authenticated: false, version: "unavailable" };
+    return {
+      health: false,
+      authenticated: false,
+      version: "unavailable",
+      runtimePath: "unavailable"
+    };
   }
 }
 
-function verificationSucceeded(verification: SetupVerification, expectedVersion: string): boolean {
+function verificationSucceeded(verification: SetupVerification, installation: RuntimeInstallation): boolean {
   return verification.health
     && verification.authenticated
-    && verification.version === expectedVersion;
+    && verification.version === installation.packageVersion
+    && samePath(verification.runtimePath, installation.runtimePath);
 }
 
-function serviceFailure(result: Extract<ServiceResult, { ok: false }>): SetupResult {
-  return failure(result.code, result.message);
+async function runPhase(options: BridgeSetupOptions, phase: SetupFailurePhase): Promise<void> {
+  await options.onPhase?.(phase);
+}
+
+async function attemptRollback(
+  failures: string[],
+  label: string,
+  action: () => void | Promise<void>
+): Promise<void> {
+  try {
+    await action();
+  } catch (_error) {
+    failures.push(label);
+  }
+}
+
+function serviceAbort(result: Extract<ServiceResult, { ok: false }>): SetupAbort {
+  return abort(result.code, result.message);
+}
+
+function abort(code: SetupErrorCode, message: string): SetupAbort {
+  return { code, message };
+}
+
+function asSetupAbort(error: unknown): SetupAbort {
+  if (isSetupAbort(error)) return error;
+  if (error instanceof StagedRuntimeCleanupError) return abort(error.code, error.message);
+  if (error instanceof Error && "code" in error && typeof error.code === "string") {
+    const code = error.code as SetupErrorCode;
+    if (isSetupErrorCode(code)) return abort(code, safeErrorMessage(error));
+  }
+  return abort("RUNTIME_INSTALL_FAILED", "The Hunsu Bridge runtime transaction failed.");
+}
+
+function isSetupAbort(value: unknown): value is SetupAbort {
+  return typeof value === "object"
+    && value !== null
+    && "code" in value
+    && isSetupErrorCode((value as { code?: unknown }).code)
+    && "message" in value
+    && typeof (value as { message?: unknown }).message === "string";
+}
+
+function isSetupErrorCode(value: unknown): value is SetupErrorCode {
+  return value === "NODE_VERSION_UNSUPPORTED"
+    || value === "RUNTIME_INSTALL_FAILED"
+    || value === "SETUP_IN_PROGRESS"
+    || value === "SETUP_VERIFICATION_FAILED"
+    || value === "ROLLBACK_FAILED"
+    || value === "SERVICE_NOT_INSTALLED"
+    || value === "SERVICE_ALREADY_INSTALLED"
+    || value === "SERVICE_INSTALL_FAILED"
+    || value === "SERVICE_START_FAILED"
+    || value === "SERVICE_STOP_FAILED"
+    || value === "SERVICE_STATUS_UNAVAILABLE";
+}
+
+function safeErrorMessage(error: Error): string {
+  if (error instanceof StagedRuntimeCleanupError) return error.message;
+  return error.message.includes("runtime") || error.message.includes("Bridge")
+    ? error.message
+    : "The Hunsu Bridge runtime transaction failed."
+}
+
+function sameServiceInput(left: ServiceInstallInput, right: ServiceInstallInput): boolean {
+  return samePath(left.nodePath, right.nodePath)
+    && samePath(left.cliPath, right.cliPath)
+    && samePath(left.hunsuHome, right.hunsuHome)
+    && left.packageVersion === right.packageVersion
+    && samePath(left.runtimePath, right.runtimePath);
+}
+
+function samePath(left: string, right: string): boolean {
+  const resolvedLeft = resolvePortable(left);
+  const resolvedRight = resolvePortable(right);
+  return process.platform === "win32"
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
+}
+
+function resolvePortable(path: string): string {
+  return path.replaceAll("\\", "/").replace(/\/$/u, "");
+}
+
+function rollbackFailure(failures: readonly string[]): SetupResult {
+  return failure(
+    "ROLLBACK_FAILED",
+    `Bridge setup rollback could not restore: ${failures.join(", ")}. Run \`hunsu-bridge doctor --json\` before retrying.`
+  );
 }
 
 function success(
-  plan: StableRuntimePlan,
+  plan: StagedRuntimePlan,
   state: Pick<Extract<SetupResult, { ok: true }>["value"], "idempotent" | "upgraded" | "started" | "dryRun">
 ): SetupResult {
   return {
@@ -322,7 +624,7 @@ function success(
         ? "Hunsu Bridge is already installed and verified."
         : "Hunsu Bridge installed and verified.",
     value: {
-      packageVersion: BRIDGE_PACKAGE_VERSION,
+      packageVersion: plan.packageVersion,
       runtimePath: plan.runtimePath,
       cliPath: plan.cliPath,
       npmCommand: plan.npmCommand,

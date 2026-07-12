@@ -44,8 +44,10 @@ HUNSU_HOME is the state-root override. Defaults are:
 - Linux: ~/.local/share/hunsu/bridge
 
 The root contains config.json, workspaces.json, credentials.json, runtime.json,
-logs/bridge.jsonl, and versioned stable runtime installations. Credentials are
-user-only. Logs are sanitized before persistence and bounded by rotation.
+logs/bridge.jsonl, the `.hunsu-bridge-home.json` ownership marker, and
+versioned stable runtime installations. Credentials and ownership/setup
+metadata are user-only. Logs are sanitized before persistence and bounded by
+rotation.
 
 runtime.json is informational. Live authenticated status plus service-manager
 state establishes identity and lifecycle; a PID, port, process name, state
@@ -58,4 +60,5 @@ over provider, Workspace, pairing, and Remote services. The internal control
 API is additive and does not leak HTTP shapes into domain services.
 
 See [Control API](control-api.md), [Service Management](../service-management.md),
-and [Web Pairing](../web-pairing.md).
+and [Web Pairing](../web-pairing.md). Credential and deletion boundaries are
+specified in [Bridge Security](../security.md).

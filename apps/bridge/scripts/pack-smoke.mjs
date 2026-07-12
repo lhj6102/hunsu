@@ -268,7 +268,7 @@ export async function runBridgePackSmoke(options = {}) {
 
 function auditManifest(manifest) {
   assert.equal(manifest.name, "@hunsu/bridge");
-  assert.equal(manifest.version, "0.2.0-next.0");
+  assert.equal(manifest.version, "0.2.0-next.1");
   assert.equal(manifest.private, false);
   assert.equal(manifest.type, "module");
   assert.deepEqual(manifest.repository, {

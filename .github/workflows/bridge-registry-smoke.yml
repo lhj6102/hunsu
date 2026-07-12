@@ -1,0 +1,87 @@
+name: Bridge Registry Candidate Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: Exact candidate Git tag, for example v0.2.0-next.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 22.18.0
+
+jobs:
+  identity:
+    name: Verify registry candidate identity
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      verified_sha: ${{ steps.identity.outputs.verified_sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.version_tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Require the exact published candidate
+        id: identity
+        env:
+          VERSION_TAG: ${{ inputs.version_tag }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
+            echo "Dispatch registry smoke from the exact candidate tag." >&2
+            exit 1
+          fi
+          version=$(node -p "require('./apps/bridge/package.json').version")
+          if [[ "$VERSION_TAG" != "v$version" ]]; then
+            echo "Candidate tag does not match the Bridge package version." >&2
+            exit 1
+          fi
+          registry_version=$(npm view "@hunsu/bridge@$version" version)
+          candidate_tag=$(npm view @hunsu/bridge dist-tags.candidate-next)
+          if [[ "$registry_version" != "$version" || "$candidate_tag" != "$version" ]]; then
+            echo "The exact version is not the active candidate-next publication." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "verified_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  service:
+    name: Registry setup (${{ matrix.os }})
+    needs: identity
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+    steps:
+      - name: Record start
+        id: timer
+        shell: bash
+        run: echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.identity.outputs.verified_sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+      - name: Exercise exact registry npx setup through the OS user service
+        run: node scripts/bridge-service-smoke.mjs --registry-version "${{ needs.identity.outputs.version }}"
+      - name: Report elapsed time
+        if: always()
+        shell: bash
+        run: |
+          elapsed=$(( $(date +%s) - ${{ steps.timer.outputs.started }} ))
+          echo "### ${{ matrix.os }} registry setup: $elapsed seconds" >> "$GITHUB_STEP_SUMMARY"

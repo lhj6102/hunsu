@@ -28,6 +28,11 @@ Hunsu exists for that human layer.
 
 ## Public Alpha Quickstart
 
+> [!WARNING]
+> The current headless prerelease is experimental. `0.2.0-next.1` is published
+> under `candidate-next` first; the `next` tag moves only after exact registry,
+> cross-platform service, and production integration verification succeeds.
+
 Prerequisites:
 
 - Node.js 22.18 or newer
@@ -57,7 +62,7 @@ For repository development:
 
 ```sh
 corepack enable
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev:stack
 ```
 
@@ -297,6 +302,8 @@ Troubleshooting:
   compatibility behavior.
 - [Remote Bridge](docs/remote-bridge.md): outbound Relay, login, grants, and
   path redaction.
+- [Bridge Security](docs/security.md): credential classes, filesystem
+  permissions, redaction, and ownership-safe removal.
 - [Bridge Releases](docs/releasing-bridge.md): protected OIDC publication,
   provenance, exact tags, and stable-promotion gates.
 - [Workspace Structure](docs/workspace-structure.md): pnpm workspace, Turbo
@@ -335,9 +342,9 @@ it in code comments or migration notes outside the published docs.
 ## Development Checks
 
 ```bash
-pnpm run check:no-desktop-prototype
-pnpm run check
-pnpm run build
-pnpm run test:e2e:stack
-pnpm run test:package:bridge
+pnpm verify:bridge
 ```
+
+The complete local gate reports its test-suite, scenario, Web, and package
+timings. CI enforces the five-minute target with a documented 30-second
+scheduling threshold after dependencies and Chromium are installed.

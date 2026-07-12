@@ -33,7 +33,7 @@ const fakeRelayPath = join(repositoryRoot, "tests", "fixtures", "fake-relay.mjs"
 const EXPECTED_HEALTH = {
   ok: true,
   service: "hunsu-bridge",
-  version: "0.2.0-next.0",
+  version: "0.2.0-next.1",
   protocolVersion: "local-bridge-v1"
 };
 

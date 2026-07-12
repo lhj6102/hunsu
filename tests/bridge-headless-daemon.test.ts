@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -74,7 +74,7 @@ test("control client verifies exact loopback health before sending its credentia
     const client = createBridgeControlClient({ paths, endpoint: `http://127.0.0.1:${address.port}` });
     const result = await client.request("/v1/control/status");
     assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.code, "BRIDGE_NOT_RUNNING");
+    if (!result.ok) assert.equal(result.code, "BRIDGE_PORT_IN_USE");
     assert.equal(receivedToken, undefined);
     assert.ok(credentials.controlToken);
   } finally {
@@ -245,6 +245,44 @@ test("legacy browser pairing and CLI control pairing share one rotation and revo
     assert.equal(legacyRevoke.status, 202);
     assert.equal((await legacyRevoke.json() as { revoked?: boolean }).revoked, true);
     assert.equal((await authorize(secondLegacyPairing.authToken)).status, 401);
+  } finally {
+    await daemon?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pair and open keep browser pairing credentials out of persistent state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-headless-pairing-persistence-"));
+  const openedUrls: string[] = [];
+  let daemon: RunningBridgeDaemon | undefined;
+  try {
+    daemon = await startBridgeDaemon({
+      home: join(root, "state"),
+      port: 0,
+      cwd: root,
+      webUrl: "http://localhost:5173/studio",
+      development: true,
+      openBrowser: async url => { openedUrls.push(url); }
+    });
+    const client = createBridgeControlClient({ paths: daemon.paths });
+    const paired = await client.request("/v1/control/pair", {
+      method: "POST",
+      body: { openBrowser: false }
+    });
+    assert.equal(paired.ok, true);
+    const opened = await client.request("/v1/control/pair", {
+      method: "POST",
+      body: { openBrowser: true }
+    });
+    assert.equal(opened.ok, true);
+    assert.equal(openedUrls.length, 1);
+    const browserCredential = new URL(openedUrls[0]!).searchParams.get("hunsuBridgeToken");
+    assert.ok(browserCredential);
+
+    const persistentContents = (await readTreeFiles(daemon.paths.home)).join("\n");
+    assert.equal(persistentContents.includes(browserCredential), false);
+    assert.equal(persistentContents.includes("hunsuBridgeToken"), false);
+    assert.doesNotMatch(persistentContents, /hunsu_bridge_pair_[A-Za-z0-9_-]+/u);
   } finally {
     await daemon?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
@@ -532,4 +570,14 @@ async function listen(server: ReturnType<typeof createServer>, port: number): Pr
 async function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
   if (!server.listening) return;
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+}
+
+async function readTreeFiles(root: string): Promise<string[]> {
+  const contents: string[] = [];
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) contents.push(...await readTreeFiles(path));
+    else if (entry.isFile()) contents.push(await readFile(path, "utf8"));
+  }
+  return contents;
 }

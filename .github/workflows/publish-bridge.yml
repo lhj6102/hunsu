@@ -1,22 +1,23 @@
-name: Publish Bridge
+name: Publish Or Promote Bridge
 
 on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: Exact Git tag, for example v0.2.0-next.0
+        description: Exact immutable Git tag, for example v0.2.0-next.1
         required: true
         type: string
-      dist_tag:
-        description: npm distribution tag
+      operation:
+        description: Publish a candidate first, or promote a fully verified candidate
         required: true
-        default: next
+        default: publish-candidate
         type: choice
         options:
-          - next
-          - latest
-      confirm_stable:
-        description: Confirm that all stable-promotion gates passed
+          - publish-candidate
+          - promote-next
+          - promote-latest
+      confirm_promotion:
+        description: Confirm registry smoke and production attestation passed for this exact candidate
         required: true
         default: false
         type: boolean
@@ -32,43 +33,43 @@ env:
 
 jobs:
   verify_headless:
-    name: Verify release identity and headless gate
+    name: Verify release identity and gates
     runs-on: ubuntu-latest
     outputs:
+      package_version: ${{ steps.identity.outputs.package_version }}
       verified_sha: ${{ steps.identity.outputs.verified_sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.version_tag }}
           fetch-depth: 0
-      - name: Require the selected exact tag
+      - name: Require the selected exact tag on main
         id: identity
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
-          DIST_TAG: ${{ inputs.dist_tag }}
-          CONFIRM_STABLE: ${{ inputs.confirm_stable }}
+          OPERATION: ${{ inputs.operation }}
+          CONFIRM_PROMOTION: ${{ inputs.confirm_promotion }}
         shell: bash
         run: |
           if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF_NAME" != "main" ]]; then
-            echo "Dispatch this protected workflow from main; version_tag selects the exact release tag." >&2
+            echo "Dispatch this protected workflow from main; version_tag selects the immutable release tag." >&2
             exit 1
           fi
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
             const pkg = JSON.parse(readFileSync("apps/bridge/package.json", "utf8"));
-            const expected = "v" + pkg.version;
-            if (process.env.VERSION_TAG !== expected) {
-              throw new Error("Git tag " + process.env.VERSION_TAG + " does not match package version " + pkg.version);
+            if (process.env.VERSION_TAG !== `v${pkg.version}`) {
+              throw new Error(`Git tag ${process.env.VERSION_TAG} does not match package version ${pkg.version}.`);
             }
             const prerelease = pkg.version.includes("-");
-            if (process.env.DIST_TAG === "next" && !prerelease) {
-              throw new Error("The next dist-tag requires a prerelease package version.");
+            if (process.env.OPERATION === "promote-next" && !prerelease) {
+              throw new Error("Only a prerelease can be promoted to next.");
             }
-            if (process.env.DIST_TAG === "latest" && prerelease) {
-              throw new Error("A prerelease cannot be published under latest.");
+            if (process.env.OPERATION === "promote-latest" && prerelease) {
+              throw new Error("A prerelease cannot be promoted to latest.");
             }
-            if (process.env.DIST_TAG === "latest" && process.env.CONFIRM_STABLE !== "true") {
-              throw new Error("Stable promotion requires explicit confirmation.");
+            if (process.env.OPERATION !== "publish-candidate" && process.env.CONFIRM_PROMOTION !== "true") {
+              throw new Error("Promotion requires explicit confirmation after every exact-version gate passes.");
             }
           '
           verified_sha=$(git rev-parse "${VERSION_TAG}^{commit}")
@@ -82,6 +83,7 @@ jobs:
             echo "Bridge releases must point to a commit already merged into main." >&2
             exit 1
           fi
+          echo "package_version=${VERSION_TAG#v}" >> "$GITHUB_OUTPUT"
           echo "verified_sha=$verified_sha" >> "$GITHUB_OUTPUT"
       - name: Require successful Bridge Headless run for this commit
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -98,26 +100,47 @@ jobs:
               per_page: 100
             });
             const successful = response.data.workflow_runs.find(
-              run => run.conclusion === "success"
-                && run.event === "push"
-                && run.head_branch === "main"
+              run => run.conclusion === "success" && run.event === "push" && run.head_branch === "main"
             );
             if (!successful) {
-              core.setFailed(
-                "No successful Bridge Headless main push run exists for commit " + process.env.VERIFIED_SHA
-              );
+              core.setFailed(`No successful Bridge Headless main run exists for ${process.env.VERIFIED_SHA}.`);
               return;
             }
-            core.info("Using Bridge Headless run " + successful.html_url);
-      - name: Require stable service and production attestations
-        if: inputs.dist_tag == 'latest'
+            core.info(`Using Bridge Headless run ${successful.html_url}.`);
+      - name: Require successful cross-platform local tarball setup
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           VERIFIED_SHA: ${{ steps.identity.outputs.verified_sha }}
+          VERSION_TAG: ${{ inputs.version_tag }}
+        with:
+          script: |
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "bridge-service-smoke.yml",
+              head_sha: process.env.VERIFIED_SHA,
+              status: "completed",
+              per_page: 100
+            });
+            const successful = response.data.workflow_runs.find(run =>
+              run.conclusion === "success"
+              && run.event === "push"
+            );
+            if (!successful) {
+              core.setFailed(`No successful cross-platform local tarball setup run exists for ${process.env.VERSION_TAG}.`);
+              return;
+            }
+            core.info(`Using local tarball service run ${successful.html_url}.`);
+      - name: Require exact registry smoke and production attestation before promotion
+        if: inputs.operation != 'publish-candidate'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          VERIFIED_SHA: ${{ steps.identity.outputs.verified_sha }}
+          VERSION_TAG: ${{ inputs.version_tag }}
         with:
           script: |
             const required = [
-              { workflow_id: "bridge-service-smoke.yml", label: "cross-platform service smoke" },
+              { workflow_id: "bridge-registry-smoke.yml", label: "cross-platform exact registry setup" },
               { workflow_id: "bridge-production-integration.yml", label: "production integration attestation" }
             ];
             for (const requirement of required) {
@@ -129,16 +152,20 @@ jobs:
                 status: "completed",
                 per_page: 100
               });
-              const successful = response.data.workflow_runs.find(run => run.conclusion === "success");
+              const successful = response.data.workflow_runs.find(run =>
+                run.conclusion === "success"
+                && run.event === "workflow_dispatch"
+              );
               if (!successful) {
-                core.setFailed(`No successful ${requirement.label} run exists for ${process.env.VERIFIED_SHA}.`);
+                core.setFailed(`No successful ${requirement.label} run exists for ${process.env.VERSION_TAG} (${process.env.VERIFIED_SHA}).`);
                 return;
               }
-              core.info(`Using ${requirement.label} run ${successful.html_url}`);
+              core.info(`Using ${requirement.label} run ${successful.html_url}.`);
             }
 
   package:
-    name: Re-run package smoke
+    name: Build and retain one release tarball
+    if: inputs.operation == 'publish-candidate'
     needs: verify_headless
     runs-on: ubuntu-latest
     steps:
@@ -156,6 +183,7 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check:no-desktop-prototype
+      - run: pnpm run check:bridge-state-boundaries
       - name: Smoke and retain the exact pnpm-normalized release tarball
         shell: bash
         run: |
@@ -169,13 +197,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: Publish @hunsu/bridge
+  publish_candidate:
+    name: Publish @hunsu/bridge under candidate-next
+    if: inputs.operation == 'publish-candidate' && needs.package.result == 'success'
     needs:
       - verify_headless
       - package
     runs-on: ubuntu-latest
-    # Configure required reviewers for this environment in repository settings.
     environment: bridge-npm-release
     permissions:
       actions: read
@@ -194,8 +222,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
-      - name: Install the minimum trusted-publishing npm CLI
-        run: npm install --global "npm@${NPM_VERSION}"
+      - run: npm install --global "npm@${NPM_VERSION}"
       - name: Reverify immutable release identity and artifact
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
@@ -205,12 +232,54 @@ jobs:
           sha256sum --check bridge-release/SHA256SUMS
           git fetch --force origin "refs/tags/${VERSION_TAG}:refs/tags/hunsu-release-candidate"
           current_tag_sha=$(git rev-parse "refs/tags/hunsu-release-candidate^{commit}")
-          checked_out_sha=$(git rev-parse HEAD)
-          if [[ "$current_tag_sha" != "$VERIFIED_SHA" || "$checked_out_sha" != "$VERIFIED_SHA" ]]; then
+          if [[ "$current_tag_sha" != "$VERIFIED_SHA" || "$(git rev-parse HEAD)" != "$VERIFIED_SHA" ]]; then
             echo "The release tag moved after verification." >&2
             exit 1
           fi
-      - name: Publish exact version with provenance
+      - name: Publish exact version without moving next or latest
+        run: npm publish ./bridge-release/*.tgz --tag candidate-next --provenance
+
+  promote:
+    name: Authorize verified candidate promotion
+    if: inputs.operation != 'publish-candidate'
+    needs: verify_headless
+    runs-on: ubuntu-latest
+    environment: bridge-production-promotion
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+      - name: Require candidate-next to still identify this exact version
         env:
-          DIST_TAG: ${{ inputs.dist_tag }}
-        run: npm publish ./bridge-release/*.tgz --tag "$DIST_TAG" --provenance
+          PACKAGE_VERSION: ${{ needs.verify_headless.outputs.package_version }}
+        shell: bash
+        run: |
+          candidate=$(npm view @hunsu/bridge dist-tags.candidate-next)
+          exact=$(npm view "@hunsu/bridge@$PACKAGE_VERSION" version)
+          if [[ "$candidate" != "$PACKAGE_VERSION" || "$exact" != "$PACKAGE_VERSION" ]]; then
+            echo "candidate-next no longer identifies the attested exact version." >&2
+            exit 1
+          fi
+      - name: Record the proof-of-presence promotion command
+        env:
+          PACKAGE_VERSION: ${{ needs.verify_headless.outputs.package_version }}
+          OPERATION: ${{ inputs.operation }}
+        shell: bash
+        run: |
+          if [[ "$OPERATION" == "promote-next" ]]; then
+            target=next
+          else
+            target=latest
+          fi
+          {
+            echo "### Candidate promotion authorized"
+            echo "- Exact version: \`@hunsu/bridge@$PACKAGE_VERSION\`"
+            echo "- Target dist-tag: \`$target\`"
+            echo "- Run with an npm owner session and proof of presence:"
+            echo "  \`npm dist-tag add @hunsu/bridge@$PACKAGE_VERSION $target\`"
+            echo "- After verification, remove or advance candidate-next."
+          } >> "$GITHUB_STEP_SUMMARY"

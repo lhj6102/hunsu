@@ -155,7 +155,7 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-one",
       daemonPid: 1234,
-      version: "0.2.0-next.0",
+      version: "0.2.0-next.1",
       protocolVersion: "local-bridge-v1",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",

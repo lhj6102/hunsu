@@ -4,35 +4,67 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: Exact stable release candidate tag
+        description: Exact candidate tag under production review
+        required: true
+        type: string
+      npm_version:
+        description: Exact published npm candidate version
+        required: true
+        type: string
+      npm_integrity:
+        description: Exact sha512 integrity reported by npm
+        required: true
+        type: string
+      npm_provenance_url:
+        description: Credential-free HTTPS provenance or transparency-log URL
         required: true
         type: string
       evidence_url:
-        description: HTTPS URL to the retained, redacted production test record
+        description: Credential-free HTTPS URL to the retained redacted QA record
+        required: true
+        type: string
+      platform_evidence:
+        description: JSON for windows/macos/linux with os, node, and serviceManager
+        required: true
+        type: string
+      hunsu_app_deployment:
+        description: Exact credential-free hunsu.app deployment URL tested
+        required: true
+        type: string
+      codex_version:
+        description: Exact Codex version tested on the controlled QA device
+        required: true
+        type: string
+      relay_environment:
+        description: Non-secret Relay environment identifier
+        required: true
+        type: string
+      workspace_fixture_id:
+        description: Opaque disposable Workspace fixture ID, never a local path
         required: true
         type: string
       hunsu_app_pairing:
-        description: Real hunsu.app pairing passed
+        description: Real pairing, URL cleanup, Workspace UI, and streaming passed in existing and fresh/InPrivate profiles
         required: true
         default: false
         type: boolean
       hunsu_login:
-        description: Real headless Hunsu login passed
+        description: Real headless device login, persisted account, Remote status, and logout passed
         required: true
         default: false
         type: boolean
       relay_round_trip:
-        description: Real Relay command round trip passed
+        description: Granted Relay round-trip, revocation, disable, and local-path redaction passed
         required: true
         default: false
         type: boolean
       codex_provider:
-        description: Real Codex provider check passed
+        description: Real Codex installed/configured/authenticated/ready check passed
         required: true
         default: false
         type: boolean
       granted_workspace:
-        description: One explicitly granted Workspace passed and ungranted access failed
+        description: Explicitly granted Workspace passed and ungranted access failed
         required: true
         default: false
         type: boolean
@@ -42,7 +74,7 @@ permissions:
 
 jobs:
   attest:
-    name: Attest real production integration
+    name: Bind redacted production evidence
     runs-on: ubuntu-latest
     environment: bridge-production-promotion
     steps:
@@ -50,10 +82,23 @@ jobs:
         with:
           ref: ${{ inputs.version_tag }}
           fetch-depth: 0
-      - name: Bind the reviewed evidence to this exact tag and commit
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.18.0
+          registry-url: https://registry.npmjs.org
+      - name: Validate and bind the production evidence record
+        id: evidence
         env:
           VERSION_TAG: ${{ inputs.version_tag }}
-          EVIDENCE_URL: ${{ inputs.evidence_url }}
+          HUNSU_EVIDENCE_NPM_VERSION: ${{ inputs.npm_version }}
+          HUNSU_EVIDENCE_NPM_INTEGRITY: ${{ inputs.npm_integrity }}
+          HUNSU_EVIDENCE_NPM_PROVENANCE_URL: ${{ inputs.npm_provenance_url }}
+          HUNSU_EVIDENCE_URL: ${{ inputs.evidence_url }}
+          HUNSU_EVIDENCE_PLATFORMS: ${{ inputs.platform_evidence }}
+          HUNSU_EVIDENCE_HUNSU_APP_DEPLOYMENT: ${{ inputs.hunsu_app_deployment }}
+          HUNSU_EVIDENCE_CODEX_VERSION: ${{ inputs.codex_version }}
+          HUNSU_EVIDENCE_RELAY_ENVIRONMENT: ${{ inputs.relay_environment }}
+          HUNSU_EVIDENCE_WORKSPACE_FIXTURE_ID: ${{ inputs.workspace_fixture_id }}
           HUNSU_APP_PAIRING: ${{ inputs.hunsu_app_pairing }}
           HUNSU_LOGIN: ${{ inputs.hunsu_login }}
           RELAY_ROUND_TRIP: ${{ inputs.relay_round_trip }}
@@ -65,34 +110,66 @@ jobs:
             echo "Dispatch this attestation from the exact reviewed tag." >&2
             exit 1
           fi
-          safe_evidence_url=$(node --input-type=module -e '
-            const raw = process.env.EVIDENCE_URL ?? "";
-            let url;
-            try {
-              url = new URL(raw);
-            } catch {
-              process.stderr.write("Production evidence URL is invalid.\n");
-              process.exit(1);
-            }
-            const unsafe = url.protocol !== "https:"
-              || Boolean(url.username || url.password || url.search || url.hash)
-              || /[\u0000-\u001f\u007f]/u.test(raw)
-              || /hunsu_(?:control|bridge_pair)_[A-Za-z0-9_-]+|access[_-]?token|x-amz-signature/iu.test(raw);
-            if (unsafe) {
-              process.stderr.write("Production evidence URL must be public, credential-free HTTPS without query or fragment data.\n");
-              process.exit(1);
-            }
-            process.stdout.write(url.toString());
-          ')
+          if [[ "$VERSION_TAG" != "v$HUNSU_EVIDENCE_NPM_VERSION" ]]; then
+            echo "The Git tag and npm exact version do not match." >&2
+            exit 1
+          fi
+          package_version=$(node -p "require('./apps/bridge/package.json').version")
+          if [[ "$package_version" != "$HUNSU_EVIDENCE_NPM_VERSION" ]]; then
+            echo "The checked-out package version does not match the evidence." >&2
+            exit 1
+          fi
           for result in "$HUNSU_APP_PAIRING" "$HUNSU_LOGIN" "$RELAY_ROUND_TRIP" "$CODEX_PROVIDER" "$GRANTED_WORKSPACE"; do
             if [[ "$result" != "true" ]]; then
               echo "Every production integration result must be explicitly attested." >&2
               exit 1
             fi
           done
-          {
-            echo "### Production integration attestation"
-            echo "- Commit: $GITHUB_SHA"
-            echo "- Tag: $VERSION_TAG"
-            echo "- Evidence: $safe_evidence_url"
-          } >> "$GITHUB_STEP_SUMMARY"
+          record=$(node scripts/validate-bridge-production-evidence.mjs)
+          registry=$(npm view "@hunsu/bridge@$HUNSU_EVIDENCE_NPM_VERSION" version dist.integrity --json)
+          EVIDENCE_RECORD="$record" REGISTRY_RECORD="$registry" node --input-type=module -e '
+            import { writeFileSync } from "node:fs";
+            const record = JSON.parse(process.env.EVIDENCE_RECORD);
+            const registry = JSON.parse(process.env.REGISTRY_RECORD);
+            if (registry.version !== record.npm.version || registry["dist.integrity"] !== record.npm.integrity) {
+              throw new Error("npm registry identity does not match the supplied production evidence.");
+            }
+            const bound = {
+              ...record,
+              git: { sha: process.env.GITHUB_SHA, tag: process.env.VERSION_TAG },
+              results: {
+                hunsuAppPairing: true,
+                hunsuLogin: true,
+                relayRoundTrip: true,
+                codexProvider: true,
+                grantedWorkspace: true
+              }
+            };
+            writeFileSync("production-evidence.json", `${JSON.stringify(bound, null, 2)}\n`, { mode: 0o600 });
+            const platforms = Object.entries(bound.platforms)
+              .map(([name, value]) => `${name}: ${value.os}, Node ${value.node}, ${value.serviceManager}`)
+              .join("; ");
+            const summary = [
+              "### Production integration attestation",
+              `- Commit: ${bound.git.sha}`,
+              `- Tag: ${bound.git.tag}`,
+              `- npm: @hunsu/bridge@${bound.npm.version}`,
+              `- npm integrity: ${bound.npm.integrity}`,
+              `- npm provenance: ${bound.npm.provenanceUrl}`,
+              `- Platforms: ${platforms}`,
+              `- hunsu.app deployment: ${bound.hunsuAppDeployment}`,
+              `- Codex: ${bound.codexVersion}`,
+              `- Relay environment: ${bound.relayEnvironment}`,
+              `- Workspace fixture: ${bound.workspaceFixtureId}`,
+              "- Results: pairing, login, Relay round-trip/revocation, Codex readiness, and Workspace grant isolation passed",
+              `- Retained evidence: ${bound.evidenceUrl}`,
+              ""
+            ].join("\n");
+            writeFileSync(process.env.GITHUB_STEP_SUMMARY, summary, { flag: "a" });
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bridge-production-evidence-${{ github.sha }}
+          path: production-evidence.json
+          if-no-files-found: error
+          retention-days: 90

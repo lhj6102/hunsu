@@ -1,17 +1,11 @@
 import type { HunsuPaths } from "./paths.ts";
 import { invalidState, readJsonState, writeJsonStateAtomic } from "./atomicJsonStore.ts";
+import {
+  BRIDGE_REMOTE_WORKSPACE_SCOPES,
+  type BridgeRemoteWorkspaceScope
+} from "../workspaces/remoteScopes.ts";
 
 export const WORKSPACE_STORE_SCHEMA = "hunsu.bridge.workspaces.v1" as const;
-
-export const BRIDGE_REMOTE_WORKSPACE_SCOPES = [
-  "remoteRelay.access",
-  "execute.start",
-  "artifactAction.run",
-  "env.read",
-  "hostAlias.expose"
-] as const;
-
-export type BridgeRemoteWorkspaceScope = typeof BRIDGE_REMOTE_WORKSPACE_SCOPES[number];
 
 export type StoredWorkspace = {
   workspaceId: string;
