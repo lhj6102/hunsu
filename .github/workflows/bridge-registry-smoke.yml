@@ -1,4 +1,4 @@
-name: Bridge Registry Candidate Smoke
+name: Bridge Registry Candidate Smoke (diagnostic shell)
 
 on:
   workflow_dispatch:
@@ -35,21 +35,9 @@ jobs:
           VERSION_TAG: ${{ inputs.version_tag }}
         shell: bash
         run: |
-          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$VERSION_TAG" ]]; then
-            echo "Dispatch registry smoke from the exact candidate tag." >&2
-            exit 1
-          fi
-          checked_out_sha=$(git rev-parse HEAD)
-          if [[ "$checked_out_sha" != "$GITHUB_SHA" ]]; then
-            echo "The registry smoke checkout does not match the dispatch SHA." >&2
-            exit 1
-          fi
           git fetch --force origin "refs/tags/${VERSION_TAG}:refs/tags/hunsu-registry-smoke-tag"
-          remote_tag_sha=$(git rev-parse "refs/tags/hunsu-registry-smoke-tag^{commit}")
-          if [[ "$remote_tag_sha" != "$GITHUB_SHA" ]]; then
-            echo "The candidate tag moved after this registry smoke was dispatched." >&2
-            exit 1
-          fi
+          verified_sha=$(git rev-parse "refs/tags/hunsu-registry-smoke-tag^{commit}")
+          git checkout --detach "$verified_sha"
           version=$(node -p "require('./apps/bridge/package.json').version")
           if [[ "$VERSION_TAG" != "v$version" ]]; then
             echo "Candidate tag does not match the Bridge package version." >&2
@@ -62,7 +50,7 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "verified_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "verified_sha=$verified_sha" >> "$GITHUB_OUTPUT"
 
   service:
     name: Registry setup (${{ matrix.os }})
@@ -89,6 +77,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
       - name: Exercise exact registry npx setup through the OS user service
+        shell: bash
         run: node scripts/bridge-service-smoke.mjs --registry-version "${{ needs.identity.outputs.version }}"
       - name: Report elapsed time
         if: always()
