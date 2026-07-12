@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { Server } from "node:http";
 import { mkdir } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { resolveBridgeRuntimeConfig, unwrapConfigResult } from "@hunsu/config";
 import { createStudioServer, openStudioInBrowser } from "../index.ts";
 import { endpointFromHostPort } from "../client/controlClient.ts";
@@ -34,6 +35,7 @@ export type BridgeDaemonOptions = HunsuPathInput & {
   host?: string;
   port?: number;
   cwd?: string;
+  runtimePath?: string;
   webUrl?: string;
   development?: boolean;
   serviceManager?: BridgeServiceManagerKind;
@@ -68,6 +70,12 @@ export async function rotateDaemonControlCredential(input: {
 export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Promise<RunningBridgeDaemon> {
   const environment = { ...process.env, ...(options.env ?? {}) };
   const paths = resolveHunsuPaths({ ...options, env: environment });
+  const requestedRuntimePath = options.runtimePath ?? options.cwd ?? process.cwd();
+  if ((options.runtimePath !== undefined && !isAbsolute(options.runtimePath))
+    || /[\u0000-\u001f\u007f]/u.test(requestedRuntimePath)) {
+    throw new BridgeError("BRIDGE_STATE_INVALID", "Bridge runtime path must be absolute and contain no control characters.");
+  }
+  const runtimePath = resolve(requestedRuntimePath);
   await mkdir(paths.home, { recursive: true, mode: 0o700 });
   const configStore = createConfigStore(paths);
   const credentialStore = createCredentialStore(paths);
@@ -244,6 +252,7 @@ export async function startBridgeDaemon(options: BridgeDaemonOptions = {}): Prom
       protocolVersion: HUNSU_BRIDGE_PROTOCOL_VERSION,
       startedAt,
       endpoint,
+      runtimePath,
       serviceManager,
       lastHealthyAt: healthyAt
     };

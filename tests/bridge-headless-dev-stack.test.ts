@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
@@ -11,11 +12,25 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const devStackPath = join(repositoryRoot, "scripts", "dev-stack.mjs");
+const scenarioSmokePath = join(repositoryRoot, "scripts", "headless-scenario-smoke.mjs");
+const serviceSmokePath = join(repositoryRoot, "scripts", "bridge-service-smoke.mjs");
+const verifyBridgePath = join(repositoryRoot, "scripts", "verify-bridge.mjs");
+const evidenceValidatorPath = join(repositoryRoot, "scripts", "validate-bridge-production-evidence.mjs");
+const npmProvenanceVerifierPath = join(repositoryRoot, "scripts", "verify-bridge-npm-provenance.mjs");
 const fakeCodexPath = join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs");
 const fakeRelayPath = join(repositoryRoot, "tests", "fixtures", "fake-relay.mjs");
 
 test("development scripts have valid Node syntax and safe helper contracts", async () => {
-  await Promise.all([devStackPath, fakeCodexPath, fakeRelayPath].map(path =>
+  await Promise.all([
+    devStackPath,
+    scenarioSmokePath,
+    serviceSmokePath,
+    verifyBridgePath,
+    evidenceValidatorPath,
+    npmProvenanceVerifierPath,
+    fakeCodexPath,
+    fakeRelayPath
+  ].map(path =>
     execFileAsync(process.execPath, ["--check", path])
   ));
   const stackModuleUrl = pathToFileURL(devStackPath).href;
@@ -39,13 +54,13 @@ test("development scripts have valid Node syntax and safe helper contracts", asy
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.0",
+    version: "0.2.0-next.1",
     protocolVersion: "local-bridge-v1"
   }), true);
   assert.equal(stack.isExactBridgeHealth({
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.0",
+    version: "0.2.0-next.1",
     protocolVersion: "local-bridge-v1",
     daemonPid: 123
   }), false);
@@ -69,6 +84,180 @@ test("development scripts have valid Node syntax and safe helper contracts", asy
   assert.equal(safe.includes("hunsu_bridge_pair_secret"), false);
   assert.equal(safe.includes("hunsu_control_secret"), false);
   assert.equal(safe.includes("Bearer secret"), false);
+});
+
+test("Bridge verification budget and production evidence contracts are explicit and safe", async () => {
+  const verify = await import(pathToFileURL(verifyBridgePath).href) as {
+    verificationBudget(env?: Record<string, string>): { targetMs: number; thresholdMs: number; limitMs: number };
+    parseVerifyArguments(argv?: string[]): { help: boolean; enforceBudget: boolean };
+  };
+  assert.deepEqual(verify.verificationBudget({}), {
+    targetMs: 300_000,
+    thresholdMs: 30_000,
+    limitMs: 330_000
+  });
+  assert.deepEqual(verify.parseVerifyArguments(["--enforce-budget"]), { help: false, enforceBudget: true });
+
+  const evidence = await import(pathToFileURL(evidenceValidatorPath).href) as {
+    validateProductionEvidence(input: Record<string, string>): Record<string, unknown>;
+    verifyRetainedProductionEvidence(
+      input: Record<string, string>,
+      options: { fetchImpl: (url: string, init: RequestInit) => Promise<Response> }
+    ): Promise<{ url: string; sha256: string }>;
+  };
+  const retainedBody = Buffer.from('{"schema":"hunsu.bridge.qa-evidence.v1","result":"passed"}\n', "utf8");
+  const retainedDigest = `sha256:${createHash("sha256").update(retainedBody).digest("hex")}`;
+  const record = evidence.validateProductionEvidence({
+    npmVersion: "0.2.0-next.1",
+    npmIntegrity: `sha512-${"a".repeat(86)}==`,
+    evidenceUrl: "https://evidence.example.test/bridge-next-1",
+    evidenceSha256: retainedDigest,
+    hunsuAppDeployment: "https://hunsu.app/deployments/bridge-next-1",
+    codexVersion: "codex-cli 1.2.3",
+    relayEnvironment: "production-qa",
+    workspaceFixtureId: "ws_disposable_001",
+    platformEvidence: JSON.stringify({
+      windows: { os: "windows-latest", node: "22.18.0", serviceManager: "Task Scheduler" },
+      macos: { os: "macos-latest", node: "22.18.0", serviceManager: "LaunchAgent" },
+      linux: { os: "ubuntu-latest", node: "22.18.0", serviceManager: "systemd --user" }
+    })
+  });
+  assert.equal(record.schema, "hunsu.bridge.production-evidence.v1");
+  assert.deepEqual(record.evidence, {
+    url: "https://evidence.example.test/bridge-next-1",
+    sha256: retainedDigest
+  });
+  const retained = await evidence.verifyRetainedProductionEvidence({
+    evidenceUrl: "https://evidence.example.test/bridge-next-1",
+    evidenceSha256: retainedDigest
+  }, {
+    fetchImpl: async (_url, init) => {
+      assert.equal(init.redirect, "error");
+      return new Response(retainedBody, {
+        status: 200,
+        headers: { "content-type": "application/json", "content-length": String(retainedBody.length) }
+      });
+    }
+  });
+  assert.equal(retained.sha256, retainedDigest);
+  await assert.rejects(() => evidence.verifyRetainedProductionEvidence({
+    evidenceUrl: "https://evidence.example.test/bridge-next-1",
+    evidenceSha256: `sha256:${"0".repeat(64)}`
+  }, {
+    fetchImpl: async () => new Response(retainedBody, { status: 200 })
+  }), /digest does not match/u);
+  const unsafeBody = Buffer.from('{"openaiApiKey":"sk-proj-abcdefghijklmnop"}\n', "utf8");
+  const unsafeDigest = `sha256:${createHash("sha256").update(unsafeBody).digest("hex")}`;
+  await assert.rejects(() => evidence.verifyRetainedProductionEvidence({
+    evidenceUrl: "https://evidence.example.test/bridge-next-1",
+    evidenceSha256: unsafeDigest
+  }, {
+    fetchImpl: async () => new Response(unsafeBody, { status: 200 })
+  }), /credential or private local path/u);
+  assert.throws(() => evidence.validateProductionEvidence({
+    npmVersion: "0.2.0-next.1",
+    npmIntegrity: "sha512-YQ==",
+    evidenceUrl: "https://evidence.example.test/bridge-next-1",
+    evidenceSha256: retainedDigest,
+    hunsuAppDeployment: "https://hunsu.app/deployments/bridge-next-1",
+    codexVersion: "codex-cli 1.2.3",
+    relayEnvironment: "production-qa",
+    workspaceFixtureId: "ws_disposable_001",
+    platformEvidence: JSON.stringify({
+      windows: { os: "windows-latest", node: "22.18.0", serviceManager: "Task Scheduler" },
+      macos: { os: "macos-latest", node: "22.18.0", serviceManager: "LaunchAgent" },
+      linux: { os: "ubuntu-latest", node: "22.18.0", serviceManager: "systemd --user" }
+    })
+  }));
+  assert.throws(() => evidence.validateProductionEvidence({
+    npmVersion: "0.2.0-next.1",
+    npmIntegrity: "sha512-invalid",
+    evidenceUrl: "https://example.test/?token=secret",
+    evidenceSha256: retainedDigest,
+    hunsuAppDeployment: "https://hunsu.app",
+    codexVersion: "codex-cli 1.2.3",
+    relayEnvironment: "production-qa",
+    workspaceFixtureId: "ws_disposable_001",
+    platformEvidence: "{}"
+  }));
+});
+
+test("npm provenance verification binds the signed package subject to the exact tag, workflow, and Git SHA", async () => {
+  const provenance = await import(pathToFileURL(npmProvenanceVerifierPath).href) as {
+    verifyBridgeNpmProvenanceAudit(input: Record<string, unknown>): Record<string, unknown>;
+  };
+  const version = "0.2.0-next.1";
+  const versionTag = `v${version}`;
+  const gitSha = "1".repeat(40);
+  const subjectSha512 = "ab".repeat(64);
+  const integrity = `sha512-${Buffer.from(subjectSha512, "hex").toString("base64")}`;
+  const statement = {
+    _type: "https://in-toto.io/Statement/v1",
+    subject: [{ name: `pkg:npm/%40hunsu/bridge@${version}`, digest: { sha512: subjectSha512 } }],
+    predicateType: "https://slsa.dev/provenance/v1",
+    predicate: {
+      buildDefinition: {
+        buildType: "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1",
+        externalParameters: {
+          workflow: {
+            ref: `refs/tags/${versionTag}`,
+            repository: "https://github.com/lhj6102/hunsu",
+            path: ".github/workflows/publish-bridge.yml"
+          }
+        },
+        internalParameters: { github: { event_name: "workflow_dispatch" } },
+        resolvedDependencies: [{
+          uri: `git+https://github.com/lhj6102/hunsu@refs/tags/${versionTag}`,
+          digest: { gitCommit: gitSha }
+        }]
+      },
+      runDetails: {
+        builder: { id: "https://github.com/actions/runner/github-hosted" },
+        metadata: { invocationId: "https://github.com/lhj6102/hunsu/actions/runs/123/attempts/1" }
+      }
+    }
+  };
+  const audit = {
+    invalid: [],
+    missing: [],
+    verified: [{
+      name: "@hunsu/bridge",
+      version,
+      registry: "https://registry.npmjs.org/",
+      attestations: {
+        url: `https://registry.npmjs.org/-/npm/v1/attestations/@hunsu%2fbridge@${version}`,
+        provenance: { predicateType: "https://slsa.dev/provenance/v1" }
+      },
+      attestationBundles: [{
+        predicateType: "https://slsa.dev/provenance/v1",
+        bundle: {
+          verificationMaterial: { tlogEntries: [{}] },
+          dsseEnvelope: {
+            payloadType: "application/vnd.in-toto+json",
+            payload: Buffer.from(JSON.stringify(statement), "utf8").toString("base64"),
+            signatures: [{ sig: "verified-by-npm-audit" }]
+          }
+        }
+      }]
+    }]
+  };
+  const verified = provenance.verifyBridgeNpmProvenanceAudit({ audit, version, versionTag, gitSha, integrity });
+  assert.equal(verified.schema, "hunsu.bridge.npm-provenance.v1");
+  assert.deepEqual((verified.source as { gitSha: string; ref: string }), {
+    repository: "https://github.com/lhj6102/hunsu",
+    workflow: ".github/workflows/publish-bridge.yml",
+    ref: `refs/tags/${versionTag}`,
+    gitSha,
+    builder: "https://github.com/actions/runner/github-hosted",
+    invocationId: "https://github.com/lhj6102/hunsu/actions/runs/123/attempts/1"
+  });
+  assert.throws(() => provenance.verifyBridgeNpmProvenanceAudit({
+    audit,
+    version,
+    versionTag,
+    gitSha: "2".repeat(40),
+    integrity
+  }), /source commit/u);
 });
 
 test("fake Codex provides version, readiness, login-required, unsupported-model, and controlled app-server responses", async () => {
@@ -191,7 +380,12 @@ test("fake Relay supports deterministic device login, registration, commands, di
 });
 
 test("dev stack launches isolated Bridge and Web processes with all same-origin proxy paths", { timeout: 35_000 }, async t => {
-  const stack = spawn(process.execPath, [devStackPath], {
+  const stack = spawn(process.execPath, [
+    "--no-warnings",
+    "--conditions=development",
+    "--experimental-transform-types",
+    devStackPath
+  ], {
     cwd: repositoryRoot,
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"]
@@ -209,27 +403,37 @@ test("dev stack launches isolated Bridge and Web processes with all same-origin 
   await waitForOutput(stack, () => output, /^\[state\] .+$/mu, 25_000);
   const bridgeUrl = output.match(/^\[bridge\] ready at (http:\/\/\S+)$/mu)?.[1];
   const webUrl = output.match(/^\[web\] ready at (http:\/\/\S+)$/mu)?.[1];
+  const relayUrl = output.match(/^\[relay\] ready at (http:\/\/\S+)$/mu)?.[1];
   const stateHome = output.match(/^\[state\] (.+)$/mu)?.[1];
   assert.ok(bridgeUrl);
   assert.ok(webUrl);
+  assert.ok(relayUrl);
   assert.ok(stateHome);
   await access(stateHome);
 
   const expectedHealth = {
     ok: true,
     service: "hunsu-bridge",
-    version: "0.2.0-next.0",
+    version: "0.2.0-next.1",
     protocolVersion: "local-bridge-v1"
   };
   assert.deepEqual(await fetch(`${bridgeUrl}/health`).then(response => response.json()), expectedHealth);
   assert.deepEqual(await fetch(`${webUrl}/health`).then(response => response.json()), expectedHealth);
   assert.deepEqual(await fetch(`${webUrl}/__bridge/health`).then(response => response.json()), expectedHealth);
+  assert.deepEqual(await fetch(`${relayUrl}/health`).then(response => response.json()), {
+    ok: true,
+    service: "hunsu-relay",
+    issuer: relayUrl
+  });
   const apiResponse = await fetch(`${webUrl}/api/roadmaps/recent`);
   assert.notEqual(apiResponse.status, 404);
 
   assert.equal(/hunsu_(?:bridge|control|pairing|relay)_[A-Za-z0-9_-]+/iu.test(output), false);
   assert.match(output, /^\[bridge\] /mu);
   assert.match(output, /^\[web\] /mu);
+  assert.match(output, /^\[relay\] /mu);
+  assert.match(output, /^\[timing\] daemon ready: \d+ ms$/mu);
+  assert.match(output, /^\[timing\] Web ready: \d+ ms$/mu);
 
   stack.kill("SIGTERM");
   await waitForExit(stack);

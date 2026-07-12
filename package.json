@@ -9,7 +9,7 @@
     "dev": "turbo run dev --parallel",
     "dev:bridge": "node --experimental-transform-types --conditions=development apps/bridge/src/cli.ts dev",
     "dev:web": "node --conditions=development --experimental-transform-types apps/web/node_modules/vite/bin/vite.js apps/web --configLoader native",
-    "dev:stack": "node scripts/dev-stack.mjs",
+    "dev:stack": "node --no-warnings --conditions=development --experimental-transform-types scripts/dev-stack.mjs",
     "build": "turbo run build",
     "e2e:local": "PLAYWRIGHT_HTML_OPEN=never playwright test",
     "e2e:local:headed": "PLAYWRIGHT_HTML_OPEN=never playwright test --headed",
@@ -17,8 +17,12 @@
     "typecheck": "tsc -p tsconfig.json",
     "check": "pnpm run typecheck && pnpm test",
     "check:no-desktop-prototype": "node scripts/check-no-desktop-prototype.mjs",
+    "check:bridge-state-boundaries": "node scripts/check-bridge-state-boundaries.mjs",
+    "test:headless:scenario": "node --no-warnings --conditions=development --experimental-transform-types scripts/headless-scenario-smoke.mjs",
     "test:e2e:stack": "playwright test --config=playwright.headless.config.ts",
     "test:package:bridge": "node --test tests/bridge-headless-package.package-test.ts",
+    "verify:bridge": "node scripts/verify-bridge.mjs",
+    "verify:bridge:budget": "node scripts/verify-bridge.mjs --enforce-budget",
     "hunsu": "pnpm --filter hunsu hunsu"
   },
   "engines": {

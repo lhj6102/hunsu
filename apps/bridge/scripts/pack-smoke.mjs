@@ -198,6 +198,7 @@ export async function runBridgePackSmoke(options = {}) {
     assertCliSuccess(statusResult);
     assert.equal(statusResult.value?.endpoint, endpoint.toString().replace(/\/$/u, ""));
     assert.equal(statusResult.value?.version, manifest.version);
+    assert.equal(statusResult.value?.runtimePath, installDirectory);
 
     const credentialRotationRun = await run(command("npx"), [
       "--no-install",
@@ -268,7 +269,7 @@ export async function runBridgePackSmoke(options = {}) {
 
 function auditManifest(manifest) {
   assert.equal(manifest.name, "@hunsu/bridge");
-  assert.equal(manifest.version, "0.2.0-next.0");
+  assert.equal(manifest.version, "0.2.0-next.1");
   assert.equal(manifest.private, false);
   assert.equal(manifest.type, "module");
   assert.deepEqual(manifest.repository, {

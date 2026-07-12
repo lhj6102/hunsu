@@ -1,4 +1,4 @@
-export const HUNSU_BRIDGE_VERSION: "0.2.0-next.0";
+export const HUNSU_BRIDGE_VERSION: "0.2.0-next.1";
 export const HUNSU_BRIDGE_PROTOCOL_VERSION: "local-bridge-v1";
 export const BRIDGE_CLI_RESULT_SCHEMA: "hunsu.bridge.cli-result.v1";
 
@@ -16,6 +16,7 @@ export type HunsuPathInput = {
 
 export type HunsuPaths = {
   home: string;
+  homeOwnershipFile: string;
   configFile: string;
   workspacesFile: string;
   credentialsFile: string;
@@ -23,8 +24,11 @@ export type HunsuPaths = {
   logsDirectory: string;
   structuredLogFile: string;
   runtimeDirectory: string;
+  runtimeStagingDirectory: string;
   runtimeVersionsDirectory: string;
   runtimeInstallFile: string;
+  setupTransactionFile: string;
+  setupLockFile: string;
   daemonLockFile: string;
 };
 
@@ -35,6 +39,12 @@ export type BridgeHealth = {
   protocolVersion: "local-bridge-v1";
 };
 
+export type ControlEndpointProbe =
+  | { state: "offline" }
+  | { state: "foreign-listener" }
+  | { state: "hunsu-healthy" }
+  | { state: "hunsu-unhealthy"; status?: number };
+
 export type BridgeControlRequest = {
   method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
@@ -43,6 +53,7 @@ export type BridgeControlRequest = {
 
 export type BridgeControlClient = {
   endpoint(): Promise<string>;
+  probe(): Promise<ControlEndpointProbe>;
   health(): Promise<BridgeHealth | undefined>;
   request<T = unknown>(path: string, input?: BridgeControlRequest): Promise<BridgeCliResult<T>>;
 };
@@ -58,6 +69,7 @@ export type BridgeDaemonOptions = HunsuPathInput & {
   host?: string;
   port?: number;
   cwd?: string;
+  runtimePath?: string;
   webUrl?: string;
   development?: boolean;
   serviceManager?: "windows-task-scheduler" | "macos-launch-agent" | "linux-systemd-user" | "development";
@@ -74,6 +86,7 @@ export type BridgeRuntimeIdentity = {
   protocolVersion: "local-bridge-v1";
   startedAt: string;
   endpoint: string;
+  runtimePath: string;
   serviceManager: NonNullable<BridgeDaemonOptions["serviceManager"]>;
   lastHealthyAt: string;
 };

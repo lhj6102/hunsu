@@ -5,10 +5,10 @@ import { err, ok, type Brand, type Result } from "@hunsu/protocol";
 import { BridgeStateError, isNodeError } from "../state/atomicJsonStore.ts";
 import {
   WORKSPACE_STORE_SCHEMA,
-  type BridgeRemoteWorkspaceScope,
   type StoredWorkspace,
   type WorkspaceStore
 } from "../state/workspaceStore.ts";
+import type { BridgeRemoteWorkspaceScope } from "./remoteScopes.ts";
 
 export type WorkspaceId = Brand<string, "WorkspaceId">;
 

@@ -155,14 +155,27 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-one",
       daemonPid: 1234,
-      version: "0.2.0-next.0",
+      version: "0.2.0-next.1",
       protocolVersion: "local-bridge-v1",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",
+      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.1",
       serviceManager: "development",
       lastHealthyAt: "2026-07-12T00:00:00.000Z"
     });
     assert.equal((await runtimeStore.read())?.instanceId, "instance-one");
+    await assert.rejects(() => runtimeStore.write({
+      schema: BRIDGE_RUNTIME_SCHEMA,
+      instanceId: "instance-invalid",
+      daemonPid: 1234,
+      version: "0.2.0-next.1",
+      protocolVersion: "local-bridge-v1",
+      startedAt: "2026-07-12T00:00:00.000Z",
+      endpoint: "http://127.0.0.1:43127",
+      runtimePath: "relative/runtime",
+      serviceManager: "development",
+      lastHealthyAt: "2026-07-12T00:00:00.000Z"
+    }), /runtimePath must be an absolute path/u);
     assert.equal(await runtimeStore.clear("another-instance"), false);
     assert.equal(await runtimeStore.clear("instance-one"), true);
     assert.equal(await runtimeStore.read(), undefined);

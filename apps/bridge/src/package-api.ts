@@ -1,7 +1,12 @@
 export { BRIDGE_CLI_RESULT_SCHEMA } from "./client/cliResult.ts";
 export type { BridgeCliResult } from "./client/cliResult.ts";
 export { createBridgeControlClient } from "./client/controlClient.ts";
-export type { BridgeControlClient, BridgeControlRequest, BridgeHealth } from "./client/controlClient.ts";
+export type {
+  BridgeControlClient,
+  BridgeControlRequest,
+  BridgeHealth,
+  ControlEndpointProbe
+} from "./client/controlClient.ts";
 export { runBridgeCli } from "./cli.ts";
 export { startBridgeDaemon } from "./daemon/daemon.ts";
 export type { BridgeDaemonOptions, RunningBridgeDaemon } from "./daemon/daemon.ts";

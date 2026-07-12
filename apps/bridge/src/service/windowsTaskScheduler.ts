@@ -103,6 +103,8 @@ function windowsTaskActionArguments(input: ServiceInstallInput): string {
   return [
     windowsArgument(input.cliPath),
     "daemon",
+    "--runtime-path",
+    windowsArgument(input.runtimePath),
     "--home",
     windowsArgument(input.hunsuHome)
   ].join(" ");

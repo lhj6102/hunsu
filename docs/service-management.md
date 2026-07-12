@@ -52,5 +52,27 @@ BRIDGE_ALREADY_RUNNING; a foreign listener fails with BRIDGE_PORT_IN_USE.
 npx @hunsu/bridge@next setup installs the exact package version under
 HUNSU_HOME/runtime/versions, installs or repairs the service definition, starts
 it, and verifies health plus authenticated status. Re-running setup is
-idempotent. A failed upgrade restores the previous service definition and
-runtime version.
+idempotent and cannot create a second daemon.
+
+Setup is a serialized side-by-side transaction:
+
+1. acquire `HUNSU_HOME/runtime/setup.lock`;
+2. recover any incomplete `setup-transaction.json`;
+3. verify the home ownership marker and ensure control credentials;
+4. install into `runtime/staging/<transaction-id>` and verify the exact package;
+5. atomically move the candidate to `runtime/versions/<version>`;
+6. switch the service definition to stable absolute Node and CLI paths;
+7. start and verify health, authentication, version, and runtime path;
+8. atomically commit `runtime/install.json`, then clear the journal and lock.
+
+An initial-install failure stops and uninstalls the service and removes only
+the failed candidate runtime. Config, Workspaces, and credentials remain. An
+upgrade failure restores the previous service definition, starts it, verifies
+it, and restores the previous install record. `ROLLBACK_FAILED` means an
+invariant could not be restored and includes explicit recovery guidance;
+otherwise the original candidate failure is returned after rollback.
+
+Normal setup uses the executing CLI's exact registry version. The advanced
+`--runtime-package <absolute.tgz>` option exists for local tarball verification
+and is never written as a dist-tag, range, URL, Git spec, or npm-cache service
+path.

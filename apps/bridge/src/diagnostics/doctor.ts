@@ -9,6 +9,10 @@ import {
 } from "../state/index.ts";
 import { createWorkspaceService, toWorkspaceSafeMetadata } from "../workspaces/workspaceService.ts";
 import { HUNSU_BRIDGE_PROTOCOL_VERSION, HUNSU_BRIDGE_VERSION } from "../version.ts";
+import {
+  createSetupTransactionStore,
+  type SetupTransactionPhase
+} from "../setup/setupTransaction.ts";
 import { assertDiagnosticsSafe, sanitizeDiagnostics } from "./redaction.ts";
 
 export type BridgeDoctorReport = {
@@ -22,6 +26,7 @@ export type BridgeDoctorReport = {
     credentialsPresent: boolean;
     runtimePresent: boolean;
     workspaceCount: number;
+    setupTransactionPhase?: SetupTransactionPhase;
   };
   provider?: {
     providerId: string;
@@ -57,6 +62,21 @@ export async function createDoctorReport(input: {
     }
   }
   const runtime = await createRuntimeStore(input.paths).read().catch(() => undefined);
+  let setupTransactionPhase: SetupTransactionPhase | undefined;
+  try {
+    setupTransactionPhase = (await createSetupTransactionStore(input.paths).read())?.phase;
+    if (setupTransactionPhase) {
+      issues.push({
+        code: "SETUP_TRANSACTION_INCOMPLETE",
+        message: `Bridge setup has an incomplete ${setupTransactionPhase} transaction.`
+      });
+    }
+  } catch (_error) {
+    issues.push({
+      code: "BRIDGE_STATE_INVALID",
+      message: "Bridge setup transaction state is invalid."
+    });
+  }
   const workspaceResult = await createWorkspaceService({ store: createWorkspaceStore(input.paths) }).list();
   const workspaces = workspaceResult.ok ? workspaceResult.value.map(toWorkspaceSafeMetadata) : [];
   if (!workspaceResult.ok) issues.push({ code: workspaceResult.error.code, message: workspaceResult.error.message });
@@ -73,7 +93,8 @@ export async function createDoctorReport(input: {
       config: configValid ? "valid" : "invalid",
       credentialsPresent,
       runtimePresent: runtime !== undefined,
-      workspaceCount: workspaces.length
+      workspaceCount: workspaces.length,
+      ...(setupTransactionPhase ? { setupTransactionPhase } : {})
     },
     ...(providerStatus ? {
       provider: {

@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { redactDiagnosticText } from "../apps/bridge/src/diagnostics/redaction.ts";
+import { createHunsuRelayServer } from "../apps/relay/src/index.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = resolve(dirname(scriptPath), "..");
@@ -16,7 +17,7 @@ const fakeCodexPath = join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs"
 const EXPECTED_HEALTH = Object.freeze({
   ok: true,
   service: "hunsu-bridge",
-  version: "0.2.0-next.0",
+  version: "0.2.0-next.1",
   protocolVersion: "local-bridge-v1"
 });
 
@@ -80,6 +81,7 @@ export function safeChildOutputLine(component, line) {
 }
 
 export async function startDevStack(options = {}) {
+  const startedAt = performance.now();
   const host = "127.0.0.1";
   const keepState = options.keepState === true;
   const stateHome = await mkdtemp(join(tmpdir(), "hunsu-dev-"));
@@ -87,24 +89,30 @@ export async function startDevStack(options = {}) {
   const webHost = await resolveDevelopmentWebHost(options.lookupImpl);
   const bridgeUrl = `http://${host}:${bridgePort}`;
   const webUrl = `http://${webHost}:${webPort}`;
-  const childEnvironment = developmentEnvironment({
-    stateHome,
-    host,
-    bridgePort,
-    webPort,
-    webUrl
-  });
   const children = [];
+  let relay;
   let cleaned = false;
 
   const cleanup = async () => {
     if (cleaned) return;
     cleaned = true;
     await Promise.all(children.map(terminateChildTree));
+    await relay?.close().catch(() => undefined);
     if (!keepState) await rm(stateHome, { recursive: true, force: true });
   };
 
   try {
+    relay = createHunsuRelayServer({ config: developmentRelayConfig(join(stateHome, "relay-state.json")) });
+    const relayUrls = await relay.listen();
+    const childEnvironment = developmentEnvironment({
+      stateHome,
+      host,
+      bridgePort,
+      webPort,
+      webUrl,
+      relayUrl: relayUrls.apiUrl,
+      relayWsUrl: relayUrls.wsUrl
+    });
     const bridge = spawn(process.execPath, [
       "--experimental-transform-types",
       "--conditions=development",
@@ -118,6 +126,7 @@ export async function startDevStack(options = {}) {
     children.push(bridge);
     forwardChildOutput(bridge, "bridge", options.stdout ?? process.stdout, options.stderr ?? process.stderr);
     await waitForBridgeHealth(bridgeUrl, bridge, options.startupTimeoutMs);
+    const daemonReadyMs = Math.round(performance.now() - startedAt);
 
     const pnpm = pnpmLaunchCommand([
       "--filter", "@hunsu/web", "dev",
@@ -130,17 +139,24 @@ export async function startDevStack(options = {}) {
     children.push(web);
     forwardChildOutput(web, "web", options.stdout ?? process.stdout, options.stderr ?? process.stderr);
     await waitForBridgeHealth(webUrl, web, options.startupTimeoutMs, "Web development server");
+    const webReadyMs = Math.round(performance.now() - startedAt);
 
     writeSafe(options.stdout ?? process.stdout, `[bridge] ready at ${bridgeUrl}`);
     writeSafe(options.stdout ?? process.stdout, `[web] ready at ${webUrl}`);
+    writeSafe(options.stdout ?? process.stdout, `[relay] ready at ${relayUrls.apiUrl}`);
     writeSafe(options.stdout ?? process.stdout, `[state] ${stateHome}`);
+    writeSafe(options.stdout ?? process.stdout, `[timing] daemon ready: ${daemonReadyMs} ms`);
+    writeSafe(options.stdout ?? process.stdout, `[timing] Web ready: ${webReadyMs} ms`);
 
     return {
       bridgeUrl,
       webUrl,
+      relayUrl: relayUrls.apiUrl,
       stateHome,
       bridgePort,
       webPort,
+      relayPort: Number(new URL(relayUrls.apiUrl).port),
+      timings: { daemonReadyMs, webReadyMs },
       children: [...children],
       cleanup,
       async waitForChildExit() {
@@ -168,11 +184,27 @@ function developmentEnvironment(input) {
     HUNSU_CODEX_APP_SERVER_COMMAND: process.execPath,
     HUNSU_CODEX_APP_SERVER_ARGS: JSON.stringify([fakeCodexPath, "app-server", "--stdio"]),
     HUNSU_FAKE_CODEX_MODE: process.env.HUNSU_FAKE_CODEX_MODE ?? "ready",
+    HUNSU_BRIDGE_AUTH_BASE_URL: input.relayUrl,
+    HUNSU_RELAY_API_URL: input.relayUrl,
+    HUNSU_RELAY_PUBLIC_API_URL: input.relayUrl,
+    HUNSU_RELAY_WS_URL: input.relayWsUrl,
     NODE_OPTIONS: [
       process.env.NODE_OPTIONS,
+      "--no-warnings",
       "--conditions=development",
       "--experimental-transform-types"
     ].filter(Boolean).join(" ")
+  };
+}
+
+function developmentRelayConfig(storagePath) {
+  return {
+    relay: { name: "relay", host: "127.0.0.1", hostSource: "override", port: 0, portSource: "override", reserved: false },
+    publicApiUrl: "http://127.0.0.1:0",
+    publicWsUrl: "ws://127.0.0.1:0/v1/device/connect",
+    issuer: "http://127.0.0.1:0",
+    storagePath,
+    processEnv: {}
   };
 }
 

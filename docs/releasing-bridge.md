@@ -1,14 +1,15 @@
 # Releasing Hunsu Bridge
 
-Bridge releases are tag-bound, provenance-bearing npm publications. The
-publish workflow accepts an exact Git tag and refuses a tag that does not match
-`apps/bridge/package.json` or lacks a successful Bridge Headless run for the
-same commit.
+Bridge releases are immutable, tag-bound, provenance-bearing npm
+publications. `0.2.0-next.1` is published under `candidate-next` first. Neither
+`next` nor `latest` moves until exact registry setup and production evidence
+for the same Git SHA, tag, npm version, and integrity have passed.
 
 ## One-time repository and npm setup
 
-Create the GitHub environment `bridge-npm-release` and configure its required
-reviewers. Then configure the existing npm package with this trusted publisher:
+The GitHub environments `bridge-npm-release` and
+`bridge-production-promotion` must have required reviewers. Configure the
+existing npm package with this trusted publisher:
 
 ~~~text
 package:      @hunsu/bridge
@@ -20,23 +21,13 @@ environment:  bridge-npm-release
 allowed:      npm publish
 ~~~
 
-Also protect the `bridge-production-promotion` environment with required
-reviewers. Stable publication requires successful service-smoke and production
-integration-attestation runs for the exact release SHA; a confirmation input
-alone cannot promote `latest`. The retained evidence URL must itself be public
-and credential-free: HTTPS with no userinfo, query string, fragment, or secret
-path segment.
-
-The package manifest's repository URL must remain the exact public GitHub
-repository. Publishing uses GitHub OIDC with npm 11.5.1 or newer; no long-lived
-write token belongs in repository or environment secrets.
-
-An npm package owner can configure the same trust relationship from the
-npmjs.com package settings UI. If using the CLI, authenticate with npm 11.18.0
-or newer (the allowed-action flags were added after the publishing minimum):
+The package manifest repository URL must remain the exact public GitHub
+repository. Candidate publication uses GitHub OIDC with npm 11.5.1 or newer;
+no long-lived write token belongs in repository or environment secrets. An npm
+owner can configure the trust relationship from npmjs.com or, with npm 11.18.0
+or newer and an interactive owner session:
 
 ~~~sh
-npm install --global npm@11.18.0
 npm trust github @hunsu/bridge \
   --file publish-bridge.yml \
   --repo lhj6102/hunsu \
@@ -45,40 +36,119 @@ npm trust github @hunsu/bridge \
   --yes
 ~~~
 
-## Prerelease
+Trusted-publisher OIDC authorizes `npm publish`, not `npm dist-tag`. Promotion
+therefore keeps proof of presence: the protected workflow verifies every gate
+and records the exact command, then an npm owner runs that command with an
+interactive, 2FA-protected session. Do not add a long-lived automation token to
+work around this boundary.
 
-After the final commit is merged to `main` and passes the normal headless
-push workflow:
+## Candidate publication
+
+Only after Workstreams 1–7 and `pnpm verify:bridge` pass, merge the candidate
+commit to `main`. Create a new immutable tag; never move or reuse an earlier
+release tag:
 
 ~~~sh
-git tag -a v0.2.0-next.0 -m "Release @hunsu/bridge 0.2.0-next.0"
-git push origin v0.2.0-next.0
+git tag -a v0.2.0-next.1 -m "Release @hunsu/bridge 0.2.0-next.1 candidate"
+git push origin v0.2.0-next.1
+# Wait for bridge-service-smoke.yml on this exact tag to pass on all three OSes.
 gh workflow run publish-bridge.yml \
-  --ref main \
-  -f version_tag=v0.2.0-next.0 \
-  -f dist_tag=next \
-  -f confirm_stable=false
+  --ref v0.2.0-next.1 \
+  -f version_tag=v0.2.0-next.1 \
+  -f operation=publish-candidate \
+  -f confirm_promotion=false
 ~~~
 
-The protected workflow definition always runs from `main`, checks out the
-selected immutable tag, and verifies that its commit is already in `main`.
-Approve the protected environment only after the verification and clean
-tarball jobs pass. The workflow publishes the checksum-pinned,
-pnpm-normalized tarball that passed the package job, not a newly packed source
-directory. Confirm the registry version and `next` dist-tag after the publish
-job completes.
+The protected workflow pins the dispatch SHA, verifies that the remote tag has
+not moved, checks that the tag matches `apps/bridge/package.json`, resolves to a
+commit already merged into `main`, and has successful headless main and
+cross-platform local-tarball service runs. It builds and tests one
+pnpm-normalized tarball, retains its checksum, rechecks the tag and artifact,
+then publishes the exact version under `candidate-next` with provenance. It
+does not move `next` or `latest`.
 
-## Stable promotion
+The npm trusted-publisher settings are an external prerequisite. A publication
+authentication failure leaves the immutable version unpublished and must be
+fixed in npm package settings; do not change the tag to retry different source.
 
-Do not publish under `latest` until real hunsu.app pairing, Hunsu login, Relay,
-Codex, one explicitly granted Workspace, and the Windows/macOS/Linux service
-matrix pass. Dispatch stable publication only from the exact stable version
-tag with `confirm_stable=true`.
+## Exact registry and production gates
 
-After `0.2.0` is stable, deprecate the prototype line without unpublishing any
-version:
+Dispatch registry setup from the exact tag:
 
 ~~~sh
-npm deprecate "@hunsu/bridge@<0.2.0" \
-  "Deprecated prototype runtime contract. Upgrade to @hunsu/bridge >=0.2.0."
+gh workflow run bridge-registry-smoke.yml \
+  --ref v0.2.0-next.1 \
+  -f version_tag=v0.2.0-next.1
 ~~~
+
+The workflow first proves `candidate-next` and the exact npm version agree. Its
+Windows, macOS, and Linux jobs invoke the exact registry package through `npx`,
+run real `setup`, verify the stable service runtime, fake Codex provider,
+Workspace, pairing, idempotent setup, stop/port release, removal, and service
+uninstallation. A service path into npm cache, the bootstrap project, or the
+repository fails the job.
+
+Production QA then uses the same exact candidate on controlled devices. Test:
+
+- real Codex installed, configured, authenticated, and ready;
+- hunsu.app pairing in an existing and fresh/InPrivate profile, URL cleanup,
+  Workspace list/open, and SSE/streaming;
+- headless Hunsu device login, persisted account, Remote status, and logout;
+- one explicitly granted disposable Workspace, outbound Relay command,
+  rejection of an ungranted Workspace, revocation, and Remote disable;
+- local path redaction before and after grant changes.
+
+Dispatch `bridge-production-integration.yml` from the exact tag. Publish the
+redacted QA record at a public, credential-free HTTPS URL and calculate its
+immutable digest locally, for example:
+
+~~~sh
+sha256sum bridge-production-qa.json
+~~~
+
+Pass the digest as `sha256:<64 lowercase hex>`. The workflow pins the dispatch
+SHA, rechecks the remote tag, downloads the retained record without redirects,
+verifies its digest, rejects credential-like evidence, and retains the exact
+verified bytes with the attestation. It installs the exact npm candidate and
+uses npm 11.13's signed-attestation audit to verify the registry signature and
+SLSA provenance. The signed subject digest, Hunsu repository,
+`publish-bridge.yml`, candidate tag, and candidate Git SHA must all agree. The
+result binds those facts to each OS/Node/service manager, hunsu.app deployment,
+Codex version, Relay environment, and opaque Workspace fixture ID, and requires
+explicit booleans for every real integration gate. Do not supply provenance as
+an unchecked manual URL; it is derived from the verified npm attestation.
+
+Never include a control, pairing, account, refresh, or Relay token;
+Authorization header; token-bearing URL; or private repository path.
+
+## Promotion
+
+After both exact-version workflows succeed, authorize promotion from the exact
+immutable candidate tag:
+
+~~~sh
+gh workflow run publish-bridge.yml \
+  --ref v0.2.0-next.1 \
+  -f version_tag=v0.2.0-next.1 \
+  -f operation=promote-next \
+  -f confirm_promotion=true
+~~~
+
+The workflow requires successful registry-smoke and production-attestation
+runs whose `head_sha` and dispatch tag match the candidate, confirms
+`candidate-next=0.2.0-next.1`, and passes the protected promotion environment.
+It records the proof-of-presence command. An npm owner then runs:
+
+~~~sh
+npm dist-tag add @hunsu/bridge@0.2.0-next.1 next
+npm dist-tag rm @hunsu/bridge candidate-next
+~~~
+
+Removing `candidate-next` is optional if it is immediately advanced to the next
+candidate instead. Verify the registry after the mutation. If registry setup or
+production QA fails, leave `next` on the previous verified version, retain the
+failed immutable prerelease for diagnosis, and never unpublish it.
+
+Stable `latest` promotion uses the same sequence with a stable version tag and
+`operation=promote-latest`. Do not authorize it until all stable-line service
+and production gates pass.

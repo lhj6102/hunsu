@@ -344,6 +344,17 @@ test("headless daemon registers with the real Relay and routes only explicitly g
     );
     assert.equal(inspected.ok, true);
     if (inspected.ok) assert.equal(inspected.value?.remoteAccess?.enabled, true);
+
+    const revoked = await client.request(`/v1/control/workspaces/${encodeURIComponent(added.value.workspaceId)}/remote-access`, {
+      method: "PUT",
+      body: { enabled: false, scopes: [] }
+    });
+    assert.equal(revoked.ok, true);
+    const revokedWorkspace = await client.request<{ remoteAccess?: { enabled?: boolean; scopes?: unknown[] } }>(
+      `/v1/control/workspaces/${encodeURIComponent(added.value.workspaceId)}`
+    );
+    assert.equal(revokedWorkspace.ok, true);
+    if (revokedWorkspace.ok) assert.deepEqual(revokedWorkspace.value?.remoteAccess, { enabled: false, scopes: [] });
   } finally {
     await daemon?.close().catch(() => undefined);
     await relay.close().catch(() => undefined);

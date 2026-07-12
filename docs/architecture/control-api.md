@@ -18,7 +18,7 @@ GET /health is unauthenticated and returns only safe service identity:
 {
   "ok": true,
   "service": "hunsu-bridge",
-  "version": "0.2.0-next.0",
+  "version": "0.2.0-next.1",
   "protocolVersion": "local-bridge-v1"
 }
 ~~~
@@ -56,8 +56,26 @@ POST   /v1/control/shutdown
 ~~~
 
 Unknown, missing, or invalid credentials fail with
-BRIDGE_CONTROL_UNAUTHORIZED. An offline endpoint fails at the client boundary
-with BRIDGE_NOT_RUNNING or BRIDGE_CONTROL_UNAVAILABLE.
+`BRIDGE_CONTROL_UNAUTHORIZED`. Client probing keeps phases distinct:
+
+- refused/timed-out loopback connection: `BRIDGE_NOT_RUNNING`;
+- corrupt config/credential state or a non-loopback endpoint:
+  `BRIDGE_STATE_INVALID`;
+- a foreign loopback listener: `BRIDGE_PORT_IN_USE`;
+- healthy Hunsu with a missing/wrong control credential:
+  `BRIDGE_CONTROL_UNAUTHORIZED`;
+- healthy Hunsu whose authenticated request times out or returns a malformed
+  control response:
+  `BRIDGE_CONTROL_UNAVAILABLE`.
+
+Authenticated `GET /v1/control/status` includes the daemon's exact package
+version and stable runtime path. Transactional setup compares both values with
+the staged candidate before committing `runtime/install.json`; the
+unauthenticated health route never exposes the path.
+
+Safe state errors expose only a basename, stable code, and recovery guidance.
+Offline `doctor` still returns a successful diagnostic envelope; corrupt state
+appears as `BRIDGE_STATE_INVALID` issue entries without full paths or contents.
 
 `hunsu-bridge credential rotate` authenticates with the current control
 credential, atomically replaces it in `credentials.json`, and immediately

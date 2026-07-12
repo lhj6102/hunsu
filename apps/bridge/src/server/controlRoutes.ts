@@ -16,7 +16,7 @@ import type { PairingService } from "../pairing/pairingService.ts";
 import type { HeadlessProviderService } from "../provider/providerRegistry.ts";
 import type { RemoteService } from "../remote/remoteService.ts";
 import type { BridgeRuntimeIdentity } from "../state/index.ts";
-import { BRIDGE_REMOTE_WORKSPACE_SCOPES, type BridgeRemoteWorkspaceScope } from "../state/workspaceStore.ts";
+import { BRIDGE_REMOTE_WORKSPACE_SCOPES, type BridgeRemoteWorkspaceScope } from "../workspaces/remoteScopes.ts";
 import type { WorkspaceService } from "../workspaces/workspaceService.ts";
 
 export type HeadlessControlContext = {
@@ -145,10 +145,10 @@ export function createHeadlessControlRouteHandler(context: HeadlessControlContex
         if (typeof body.enabled !== "boolean") {
           throw new BridgeError("BRIDGE_STATE_INVALID", "Workspace Remote access requires an enabled boolean.");
         }
-        const scopes = parseRemoteWorkspaceScopes(body.scopes);
+        const scopes = body.enabled ? parseRemoteWorkspaceScopes(body.scopes) : [];
         sendWorkspaceResult(response, await context.workspaceService.setRemoteAccess(workspaceRoute.workspaceId, {
           enabled: body.enabled,
-          scopes: body.enabled ? scopes : []
+          scopes
         }), body.enabled ? "Workspace Remote access was granted." : "Workspace Remote access was revoked.");
         return true;
       }

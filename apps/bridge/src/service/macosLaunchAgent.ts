@@ -106,6 +106,8 @@ export function macosLaunchAgentPlist(input: ServiceInstallInput): string {
     `    <string>${xmlEscape(input.nodePath)}</string>`,
     `    <string>${xmlEscape(input.cliPath)}</string>`,
     "    <string>daemon</string>",
+    "    <string>--runtime-path</string>",
+    `    <string>${xmlEscape(input.runtimePath)}</string>`,
     "  </array>",
     "  <key>EnvironmentVariables</key>",
     "  <dict>",

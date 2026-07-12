@@ -11,6 +11,7 @@ export type HunsuPathInput = {
 
 export type HunsuPaths = {
   home: string;
+  homeOwnershipFile: string;
   configFile: string;
   workspacesFile: string;
   credentialsFile: string;
@@ -18,8 +19,11 @@ export type HunsuPaths = {
   logsDirectory: string;
   structuredLogFile: string;
   runtimeDirectory: string;
+  runtimeStagingDirectory: string;
   runtimeVersionsDirectory: string;
   runtimeInstallFile: string;
+  setupTransactionFile: string;
+  setupLockFile: string;
   daemonLockFile: string;
 };
 
@@ -52,6 +56,7 @@ export function resolveHunsuPaths(input: HunsuPathInput = {}): HunsuPaths {
   const runtimeDirectory = path.join(home, "runtime");
   return {
     home,
+    homeOwnershipFile: path.join(home, ".hunsu-bridge-home.json"),
     configFile: path.join(home, "config.json"),
     workspacesFile: path.join(home, "workspaces.json"),
     credentialsFile: path.join(home, "credentials.json"),
@@ -59,8 +64,11 @@ export function resolveHunsuPaths(input: HunsuPathInput = {}): HunsuPaths {
     logsDirectory,
     structuredLogFile: path.join(logsDirectory, "bridge.jsonl"),
     runtimeDirectory,
+    runtimeStagingDirectory: path.join(runtimeDirectory, "staging"),
     runtimeVersionsDirectory: path.join(runtimeDirectory, "versions"),
     runtimeInstallFile: path.join(runtimeDirectory, "install.json"),
+    setupTransactionFile: path.join(runtimeDirectory, "setup-transaction.json"),
+    setupLockFile: path.join(runtimeDirectory, "setup.lock"),
     daemonLockFile: path.join(runtimeDirectory, "daemon.lock")
   };
 }

@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { currentProcessEnv } from "@hunsu/config";
 import type { RuntimeProviderInstallPlan } from "../types.ts";
+import { codexCommandLaunch, type CodexCommandLaunch } from "./windowsCommandShim.ts";
 
 export type CodexInstaller = (input: {
   env: Record<string, string | undefined>;
@@ -33,7 +34,8 @@ export function detectCodexInstallerPrerequisite(input: {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     env,
-    windowsHide: true
+    windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments
   });
   if (result.status === 0) {
     const version = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim().split(/\r?\n/u).find(Boolean);
@@ -76,7 +78,8 @@ export const runDefaultCodexInstaller: CodexInstaller = async input => {
     const child = spawn(launch.command, launch.args, {
       stdio: ["ignore", "pipe", "pipe"],
       env,
-      windowsHide: true
+      windowsHide: true,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments
     });
     let output = "";
     const append = (chunk: Buffer | string) => {
@@ -105,21 +108,6 @@ export function codexInstallerLaunchCommand(
   args: string[],
   env: Record<string, string | undefined>,
   platform = process.platform
-): { command: string; args: string[] } {
-  if (platform !== "win32") {
-    return { command, args };
-  }
-  const comSpec = env.ComSpec ?? env.COMSPEC ?? "cmd.exe";
-  return {
-    command: comSpec,
-    args: ["/d", "/s", "/c", windowsCmdCommandLine(command, args)]
-  };
-}
-
-function windowsCmdCommandLine(command: string, args: string[]): string {
-  return `"${[command, ...args].map(quoteWindowsCmdArgument).join(" ")}"`;
-}
-
-function quoteWindowsCmdArgument(value: string): string {
-  return `"${value.replace(/"/g, "\"\"")}"`;
+): CodexCommandLaunch {
+  return codexCommandLaunch(command, args, env, platform);
 }

@@ -1,11 +1,12 @@
-import { execFile } from "node:child_process";
-import { mkdir, rm, unlink } from "node:fs/promises";
-import { isAbsolute, posix, win32 } from "node:path";
+import { randomUUID } from "node:crypto";
+import { unlink } from "node:fs/promises";
+import { isAbsolute, win32 } from "node:path";
 import type { HunsuPaths } from "../state/paths.ts";
 import { invalidState, isNodeError, readJsonState, writeJsonStateAtomic } from "../state/atomicJsonStore.ts";
 import type { ServiceInstallInput } from "../service/types.ts";
+import { HUNSU_BRIDGE_VERSION } from "../version.ts";
 
-export const BRIDGE_PACKAGE_VERSION = "0.2.0-next.0" as const;
+export const BRIDGE_PACKAGE_VERSION = HUNSU_BRIDGE_VERSION;
 export const BRIDGE_PACKAGE_SPEC = `@hunsu/bridge@${BRIDGE_PACKAGE_VERSION}` as const;
 export const RUNTIME_INSTALL_SCHEMA = "hunsu.bridge.runtime-install.v1" as const;
 
@@ -19,6 +20,7 @@ export type RuntimeInstallation = {
 
 export type RuntimeInstallDocument = {
   schema: typeof RUNTIME_INSTALL_SCHEMA;
+  installationId: string | null;
   current: RuntimeInstallation;
   previous: RuntimeInstallation | null;
   serviceInput: ServiceInstallInput;
@@ -31,34 +33,6 @@ export type RuntimeInstallStore = {
   clear(): Promise<void>;
 };
 
-export type RuntimeFileSystem = {
-  exists(path: string): Promise<boolean>;
-  mkdir(path: string): Promise<void>;
-  remove(path: string): Promise<void>;
-};
-
-export type RuntimeCommand = {
-  command: string;
-  args: string[];
-};
-
-export type RuntimeCommandResult = {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-};
-
-export type RuntimeCommandRunner = (command: RuntimeCommand) => Promise<RuntimeCommandResult>;
-
-export type StableRuntimePlan = {
-  packageVersion: typeof BRIDGE_PACKAGE_VERSION;
-  packageSpec: typeof BRIDGE_PACKAGE_SPEC;
-  runtimePath: string;
-  cliPath: string;
-  nodePath: string;
-  npmCommand: RuntimeCommand;
-};
-
 export class RuntimeInstallError extends Error {
   readonly code = "RUNTIME_INSTALL_FAILED" as const;
 
@@ -66,6 +40,10 @@ export class RuntimeInstallError extends Error {
     super(message, options);
     this.name = "RuntimeInstallError";
   }
+}
+
+export function createRuntimeInstallationId(): string {
+  return `install_${randomUUID()}`;
 }
 
 export function createRuntimeInstallStore(paths: HunsuPaths): RuntimeInstallStore {
@@ -91,95 +69,6 @@ export function createRuntimeInstallStore(paths: HunsuPaths): RuntimeInstallStor
   };
 }
 
-export const defaultRuntimeFileSystem: RuntimeFileSystem = {
-  async exists(path) {
-    try {
-      const { access } = await import("node:fs/promises");
-      await access(path);
-      return true;
-    } catch (_error) {
-      return false;
-    }
-  },
-  async mkdir(path) {
-    await mkdir(path, { recursive: true, mode: 0o700 });
-  },
-  async remove(path) {
-    await rm(path, { recursive: true, force: true });
-  }
-};
-
-export const defaultRuntimeCommandRunner: RuntimeCommandRunner = command => new Promise(resolve => {
-  execFile(command.command, command.args, {
-    encoding: "utf8",
-    windowsHide: true,
-    maxBuffer: 1024 * 1024
-  }, (error, stdout, stderr) => {
-    resolve({
-      exitCode: error && "code" in error && typeof error.code === "number" ? error.code : error ? 1 : 0,
-      stdout: stdout ?? "",
-      stderr: stderr ?? (error instanceof Error ? error.message : "")
-    });
-  });
-});
-
-export function planStableRuntimeInstall(input: {
-  paths: HunsuPaths;
-  nodePath: string;
-  platform?: NodeJS.Platform;
-  npmCommand?: string;
-}): StableRuntimePlan {
-  const platform = input.platform ?? process.platform;
-  const path = platform === "win32" ? win32 : posix;
-  const absolute = platform === "win32" ? win32.isAbsolute : isAbsolute;
-  if (!absolute(input.nodePath) || containsControlCharacter(input.nodePath)) {
-    throw new RuntimeInstallError("The Node executable path must be absolute.");
-  }
-  const runtimePath = path.join(input.paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION);
-  const cliPath = path.join(runtimePath, "node_modules", "@hunsu", "bridge", "dist", "cli.js");
-  return {
-    packageVersion: BRIDGE_PACKAGE_VERSION,
-    packageSpec: BRIDGE_PACKAGE_SPEC,
-    runtimePath,
-    cliPath,
-    nodePath: input.nodePath,
-    npmCommand: {
-      command: input.npmCommand ?? "npm",
-      args: ["install", "--omit=dev", "--prefix", runtimePath, BRIDGE_PACKAGE_SPEC]
-    }
-  };
-}
-
-export async function installStableRuntime(input: {
-  plan: StableRuntimePlan;
-  commandRunner?: RuntimeCommandRunner;
-  fileSystem?: RuntimeFileSystem;
-  now?: () => Date;
-  dryRun?: boolean;
-}): Promise<RuntimeInstallation> {
-  const now = input.now ?? (() => new Date());
-  const installation: RuntimeInstallation = {
-    packageVersion: input.plan.packageVersion,
-    runtimePath: input.plan.runtimePath,
-    nodePath: input.plan.nodePath,
-    cliPath: input.plan.cliPath,
-    installedAt: now().toISOString()
-  };
-  if (input.dryRun) return installation;
-
-  const fileSystem = input.fileSystem ?? defaultRuntimeFileSystem;
-  const commandRunner = input.commandRunner ?? defaultRuntimeCommandRunner;
-  await fileSystem.mkdir(input.plan.runtimePath);
-  const result = await commandRunner(input.plan.npmCommand);
-  if (result.exitCode !== 0) {
-    throw new RuntimeInstallError("npm could not install the exact Hunsu Bridge runtime package.");
-  }
-  if (!await fileSystem.exists(input.plan.cliPath)) {
-    throw new RuntimeInstallError("The installed Hunsu Bridge runtime does not contain dist/cli.js.");
-  }
-  return installation;
-}
-
 export function serviceInputForInstallation(
   installation: RuntimeInstallation,
   hunsuHome: string
@@ -193,20 +82,30 @@ export function serviceInputForInstallation(
   };
 }
 
-function decodeRuntimeInstallDocument(file: string, value: unknown): RuntimeInstallDocument {
+export function decodeRuntimeInstallDocument(file: string, value: unknown): RuntimeInstallDocument {
   if (!isRecord(value) || value.schema !== RUNTIME_INSTALL_SCHEMA) {
     throw invalidState(file, `expected schema ${RUNTIME_INSTALL_SCHEMA}`);
   }
   return {
     schema: RUNTIME_INSTALL_SCHEMA,
-    current: decodeInstallation(file, "current", value.current),
-    previous: value.previous === null ? null : decodeInstallation(file, "previous", value.previous),
+    installationId: decodeInstallationId(file, value.installationId),
+    current: decodeRuntimeInstallation(file, "current", value.current),
+    previous: value.previous === null ? null : decodeRuntimeInstallation(file, "previous", value.previous),
     serviceInput: decodeServiceInput(file, value.serviceInput),
     updatedAt: requiredString(file, "updatedAt", value.updatedAt)
   };
 }
 
-function decodeInstallation(file: string, field: string, value: unknown): RuntimeInstallation {
+function decodeInstallationId(file: string, value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const installationId = requiredString(file, "installationId", value);
+  if (!/^install_[A-Za-z0-9_-]{8,}$/u.test(installationId)) {
+    throw invalidState(file, "installationId must be a Hunsu installation id");
+  }
+  return installationId;
+}
+
+export function decodeRuntimeInstallation(file: string, field: string, value: unknown): RuntimeInstallation {
   if (!isRecord(value)) throw invalidState(file, `${field} must be an installation record`);
   return {
     packageVersion: requiredString(file, `${field}.packageVersion`, value.packageVersion),
@@ -248,4 +147,3 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function containsControlCharacter(value: string): boolean {
   return /[\u0000-\u001f\u007f]/u.test(value);
 }
-

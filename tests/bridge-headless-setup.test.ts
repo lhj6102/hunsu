@@ -1,639 +1,513 @@
 import assert from "node:assert/strict";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { resolveHunsuPaths } from "../apps/bridge/src/state/paths.ts";
-import type { BridgeCredentials } from "../apps/bridge/src/state/credentialStore.ts";
 import type {
   BridgeServiceManager,
   ServiceInstallInput,
   ServiceResult,
   ServiceStatus
 } from "../apps/bridge/src/service/types.ts";
+import { resolveHunsuPaths, type HunsuPaths } from "../apps/bridge/src/state/paths.ts";
 import {
-  BRIDGE_PACKAGE_SPEC,
+  HOME_OWNERSHIP_SCHEMA,
+  createHomeOwnershipStore
+} from "../apps/bridge/src/setup/homeOwnership.ts";
+import {
   BRIDGE_PACKAGE_VERSION,
   RUNTIME_INSTALL_SCHEMA,
-  planStableRuntimeInstall,
+  createRuntimeInstallStore,
   serviceInputForInstallation,
-  type RuntimeCommand,
-  type RuntimeFileSystem,
   type RuntimeInstallDocument,
-  type RuntimeInstallation,
-  type RuntimeInstallStore
+  type RuntimeInstallation
 } from "../apps/bridge/src/setup/runtimeInstaller.ts";
-import { nodeVersionIsSupported, setupBridge } from "../apps/bridge/src/setup/setup.ts";
-import { removeBridge } from "../apps/bridge/src/setup/uninstall.ts";
+import type { StagedRuntimeCommandRunner } from "../apps/bridge/src/setup/stagedRuntimeInstaller.ts";
+import {
+  SETUP_TRANSACTION_SCHEMA,
+  createSetupTransactionStore,
+  setupLockPath,
+  setupTransactionPath,
+  type SetupTransaction
+} from "../apps/bridge/src/setup/setupTransaction.ts";
+import {
+  nodeVersionIsSupported,
+  setupBridge,
+  type BridgeSetupOptions,
+  type SetupFailurePhase,
+  type SetupVerification
+} from "../apps/bridge/src/setup/setup.ts";
 
-const paths = resolveHunsuPaths({ home: "/tmp/hunsu-setup", platform: "linux" });
-const targetPlan = planStableRuntimeInstall({
-  paths,
-  nodePath: "/opt/node/bin/node",
-  platform: "linux"
-});
+const INSTALLATION_ID = "install_setup_transaction_test";
 
-test("setup rejects Node below 22.18 and dry-run performs no external action", async () => {
+test("setup rejects unsupported Node and dry-run has no filesystem or service side effects", async () => {
   assert.equal(nodeVersionIsSupported("v22.17.99"), false);
   assert.equal(nodeVersionIsSupported("v22.18.0"), true);
   assert.equal(nodeVersionIsSupported("v23.0.0"), true);
+  const fixture = await createFixture();
+  try {
+    const unsupported = await setupBridge({ ...fixture.options(), nodeVersion: "v22.17.99" });
+    assert.equal(unsupported.ok, false);
+    if (!unsupported.ok) assert.equal(unsupported.code, "NODE_VERSION_UNSUPPORTED");
+    assert.deepEqual(fixture.events, []);
 
-  const events: string[] = [];
-  const unsupported = await setupBridge({
-    paths,
-    credentialStore: credentials(events),
-    serviceManager: fakeServiceManager(events),
-    verifyRuntime: async () => {
-      events.push("verify");
-      return { health: true, authenticated: true, version: BRIDGE_PACKAGE_VERSION };
-    },
-    installStore: memoryInstallStore(),
-    fileSystem: memoryRuntimeFileSystem(),
-    npmRunner: async command => {
-      events.push(`npm:${command.args.join(" ")}`);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.17.99"
-  });
-  assert.equal(unsupported.ok, false);
-  if (!unsupported.ok) assert.equal(unsupported.code, "NODE_VERSION_UNSUPPORTED");
-  assert.equal(events.length, 0);
-
-  const dryRun = await setupBridge({
-    paths,
-    credentialStore: credentials(events),
-    serviceManager: fakeServiceManager(events),
-    verifyRuntime: async () => {
-      events.push("verify");
-      return { health: true, authenticated: true, version: BRIDGE_PACKAGE_VERSION };
-    },
-    installStore: memoryInstallStore(),
-    fileSystem: memoryRuntimeFileSystem(),
-    npmRunner: async command => {
-      events.push(`npm:${command.args.join(" ")}`);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.0",
-    dryRun: true
-  });
-  assert.equal(dryRun.ok, true);
-  if (dryRun.ok) {
-    assert.equal(dryRun.value.dryRun, true);
-    assert.deepEqual(dryRun.value.npmCommand, {
-      command: "npm",
-      args: ["install", "--omit=dev", "--prefix", targetPlan.runtimePath, BRIDGE_PACKAGE_SPEC]
-    });
-  }
-  assert.deepEqual(events, []);
-});
-
-test("initial setup installs the exact package to a stable path, preserves credentials, starts once, and commits install.json", async () => {
-  const events: string[] = [];
-  const fileSystem = memoryRuntimeFileSystem();
-  const installStore = memoryInstallStore();
-  const service = fakeServiceManager(events);
-  const credentialStore = credentials(events);
-  const npmCommands: RuntimeCommand[] = [];
-  const result = await setupBridge({
-    paths,
-    credentialStore,
-    serviceManager: service,
-    verifyRuntime: async installation => {
-      events.push(`verify:${installation.packageVersion}`);
-      return { health: true, authenticated: true, version: installation.packageVersion };
-    },
-    installStore,
-    fileSystem,
-    npmRunner: async command => {
-      events.push("npm.install");
-      npmCommands.push(command);
-      fileSystem.add(targetPlan.cliPath);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.0",
-    platform: "linux",
-    now: () => new Date("2026-07-12T01:02:03.000Z")
-  });
-
-  assert.equal(result.ok, true);
-  if (result.ok) {
-    assert.deepEqual(result.value.commands, {
-      status: "npx @hunsu/bridge@next status",
-      doctor: "npx @hunsu/bridge@next doctor",
-      remove: "npx @hunsu/bridge@next remove"
-    });
-  }
-  assert.deepEqual(npmCommands, [{
-    command: "npm",
-    args: ["install", "--omit=dev", "--prefix", targetPlan.runtimePath, `@hunsu/bridge@${BRIDGE_PACKAGE_VERSION}`]
-  }]);
-  assert.deepEqual(events, [
-    "npm.install",
-    "credentials.ensure",
-    `service.install:${BRIDGE_PACKAGE_VERSION}`,
-    "service.start",
-    `verify:${BRIDGE_PACKAGE_VERSION}`
-  ]);
-  assert.equal(credentialStore.controlToken(), "stable-control-token");
-
-  const document = installStore.value();
-  assert.ok(document);
-  assert.equal(document.current.packageVersion, BRIDGE_PACKAGE_VERSION);
-  assert.equal(document.current.runtimePath, targetPlan.runtimePath);
-  assert.equal(document.current.cliPath, targetPlan.cliPath);
-  assert.equal(document.previous, null);
-  assert.deepEqual(document.serviceInput, {
-    nodePath: "/opt/node/bin/node",
-    cliPath: targetPlan.cliPath,
-    hunsuHome: paths.home,
-    packageVersion: BRIDGE_PACKAGE_VERSION,
-    runtimePath: targetPlan.runtimePath
-  });
-});
-
-test("same-version setup is idempotent: no npm install, credential rotation, service duplication, or second daemon", async () => {
-  const events: string[] = [];
-  const current = targetInstallation();
-  const document = installDocument(current, null);
-  const installStore = memoryInstallStore(document);
-  const fileSystem = memoryRuntimeFileSystem([current.cliPath]);
-  const credentialStore = credentials(events);
-  const service = fakeServiceManager(events, { installed: true, running: true, installChanged: false });
-  let npmCalls = 0;
-
-  const result = await setupBridge({
-    paths,
-    credentialStore,
-    serviceManager: service,
-    verifyRuntime: async installation => {
-      events.push(`verify:${installation.packageVersion}`);
-      return { health: true, authenticated: true, version: BRIDGE_PACKAGE_VERSION };
-    },
-    installStore,
-    fileSystem,
-    npmRunner: async () => {
-      npmCalls += 1;
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.9",
-    platform: "linux"
-  });
-
-  assert.equal(result.ok, true);
-  if (result.ok) {
-    assert.equal(result.value.idempotent, true);
-    assert.equal(result.value.started, false);
-  }
-  assert.equal(npmCalls, 0);
-  assert.equal(credentialStore.controlToken(), "stable-control-token");
-  assert.deepEqual(events, [
-    "credentials.ensure",
-    `service.install:${BRIDGE_PACKAGE_VERSION}`,
-    "service.status",
-    `verify:${BRIDGE_PACKAGE_VERSION}`
-  ]);
-});
-
-test("upgrade installs side-by-side, stops the old service, switches once, verifies, and records previous", async () => {
-  const events: string[] = [];
-  const previous = oldInstallation();
-  const installStore = memoryInstallStore(installDocument(previous, null));
-  const fileSystem = memoryRuntimeFileSystem([previous.cliPath]);
-  const result = await setupBridge({
-    paths,
-    credentialStore: credentials(events),
-    serviceManager: fakeServiceManager(events, { installed: true, running: true, installChanged: true }),
-    verifyRuntime: async installation => {
-      events.push(`verify:${installation.packageVersion}`);
-      return { health: true, authenticated: true, version: installation.packageVersion };
-    },
-    installStore,
-    fileSystem,
-    npmRunner: async command => {
-      events.push("npm.install");
-      assert.deepEqual(command.args, ["install", "--omit=dev", "--prefix", targetPlan.runtimePath, BRIDGE_PACKAGE_SPEC]);
-      fileSystem.add(targetPlan.cliPath);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.0",
-    platform: "linux"
-  });
-
-  assert.equal(result.ok, true);
-  if (result.ok) assert.equal(result.value.upgraded, true);
-  assert.deepEqual(events, [
-    "npm.install",
-    "credentials.ensure",
-    "service.stop",
-    `service.install:${BRIDGE_PACKAGE_VERSION}`,
-    "service.start",
-    `verify:${BRIDGE_PACKAGE_VERSION}`
-  ]);
-  const document = installStore.value();
-  assert.equal(document?.current.packageVersion, BRIDGE_PACKAGE_VERSION);
-  assert.deepEqual(document?.previous, previous);
-  assert.equal(await fileSystem.exists(previous.cliPath), true);
-  assert.equal(await fileSystem.exists(targetPlan.cliPath), true);
-});
-
-test("failed candidate verification restores and verifies the previous service definition", async () => {
-  const events: string[] = [];
-  const previous = oldInstallation();
-  const originalDocument = installDocument(previous, null);
-  const installStore = memoryInstallStore(originalDocument);
-  const fileSystem = memoryRuntimeFileSystem([previous.cliPath]);
-  const service = fakeServiceManager(events, { installed: true, running: true, installChanged: true });
-  const result = await setupBridge({
-    paths,
-    credentialStore: credentials(events),
-    serviceManager: service,
-    verifyRuntime: async installation => {
-      events.push(`verify:${installation.packageVersion}`);
-      return installation.packageVersion === previous.packageVersion
-        ? { health: true, authenticated: true, version: previous.packageVersion }
-        : { health: true, authenticated: false, version: BRIDGE_PACKAGE_VERSION };
-    },
-    installStore,
-    fileSystem,
-    npmRunner: async () => {
-      events.push("npm.install");
-      fileSystem.add(targetPlan.cliPath);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.0",
-    platform: "linux"
-  });
-
-  assert.equal(result.ok, false);
-  if (!result.ok) assert.equal(result.code, "SETUP_VERIFICATION_FAILED");
-  assert.deepEqual(events, [
-    "npm.install",
-    "credentials.ensure",
-    "service.stop",
-    `service.install:${BRIDGE_PACKAGE_VERSION}`,
-    "service.start",
-    `verify:${BRIDGE_PACKAGE_VERSION}`,
-    "service.stop",
-    `service.install:${previous.packageVersion}`,
-    "service.start",
-    `verify:${previous.packageVersion}`
-  ]);
-  assert.deepEqual(installStore.value(), originalDocument);
-  assert.equal(service.installInputs().at(-1)?.cliPath, previous.cliPath);
-});
-
-test("an upgrade service-definition failure restores and verifies the previous runtime", async () => {
-  const events: string[] = [];
-  const previous = oldInstallation();
-  const originalDocument = installDocument(previous, null);
-  const installStore = memoryInstallStore(originalDocument);
-  const fileSystem = memoryRuntimeFileSystem([previous.cliPath]);
-  let installCount = 0;
-  const service = fakeServiceManager(events, {
-    installed: true,
-    running: true,
-    installChanged: true,
-    installResult: input => {
-      installCount += 1;
-      return installCount === 1
-        ? serviceFailure("systemd-user", "SERVICE_INSTALL_FAILED")
-        : serviceOk("systemd-user", true);
+    const dryRun = await setupBridge({ ...fixture.options(), dryRun: true });
+    assert.equal(dryRun.ok, true);
+    if (dryRun.ok) {
+      assert.equal(dryRun.value.dryRun, true);
+      assert.equal(dryRun.value.runtimePath, join(fixture.paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION));
+      assert.equal(dryRun.value.npmCommand.args.includes(dryRun.value.runtimePath), false);
+      assert.equal(dryRun.value.npmCommand.args.some(value => value.includes("staging")), true);
     }
-  });
-  const result = await setupBridge({
-    paths,
-    credentialStore: credentials(events),
-    serviceManager: service,
-    verifyRuntime: async installation => {
-      events.push(`verify:${installation.packageVersion}`);
-      return {
-        health: true,
-        authenticated: true,
-        version: installation.packageVersion
-      };
-    },
-    installStore,
-    fileSystem,
-    npmRunner: async () => {
-      events.push("npm.install");
-      fileSystem.add(targetPlan.cliPath);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.0",
-    platform: "linux"
-  });
-
-  assert.equal(result.ok, false);
-  if (!result.ok) assert.equal(result.code, "SETUP_VERIFICATION_FAILED");
-  assert.deepEqual(events, [
-    "npm.install",
-    "credentials.ensure",
-    "service.stop",
-    `service.install:${BRIDGE_PACKAGE_VERSION}`,
-    "service.stop",
-    `service.install:${previous.packageVersion}`,
-    "service.start",
-    `verify:${previous.packageVersion}`
-  ]);
-  assert.deepEqual(installStore.value(), originalDocument);
-  assert.equal(service.installInputs().at(-1)?.cliPath, previous.cliPath);
+    assert.equal(await exists(fixture.paths.home), false);
+    assert.deepEqual(fixture.events, []);
+  } finally {
+    await fixture.cleanup();
+  }
 });
 
-test("a rollback that cannot restore the previous definition reports ROLLBACK_FAILED", async () => {
-  const previous = oldInstallation();
-  const installStore = memoryInstallStore(installDocument(previous, null));
-  const fileSystem = memoryRuntimeFileSystem([previous.cliPath]);
-  let installCount = 0;
-  const service = fakeServiceManager([], {
-    installed: true,
-    running: true,
-    installChanged: true,
-    installResult: input => {
-      installCount += 1;
-      return installCount === 1
-        ? serviceOk("systemd-user", true)
-        : serviceFailure("systemd-user", "SERVICE_INSTALL_FAILED");
-    }
-  });
-  const result = await setupBridge({
-    paths,
-    credentialStore: credentials([]),
-    serviceManager: service,
-    verifyRuntime: async installation => ({
-      health: true,
-      authenticated: false,
-      version: installation.packageVersion
-    }),
-    installStore,
-    fileSystem,
-    npmRunner: async () => {
-      fileSystem.add(targetPlan.cliPath);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.0",
-    platform: "linux"
-  });
-  assert.equal(result.ok, false);
-  if (!result.ok) assert.equal(result.code, "ROLLBACK_FAILED");
+test("initial setup stages, verifies, activates, journals, starts, and atomically commits one exact runtime", async () => {
+  const fixture = await createFixture();
+  try {
+    const result = await setupBridge(fixture.options());
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.packageVersion, BRIDGE_PACKAGE_VERSION);
+    assert.equal(result.value.started, true);
+    assert.equal(result.value.idempotent, false);
+    assert.equal(await exists(result.value.cliPath), true);
+    assert.equal(await exists(setupTransactionPath(fixture.paths)), false);
+    assert.equal(await exists(setupLockPath(fixture.paths)), false);
+    assert.equal(await exists(join(fixture.paths.runtimeDirectory, "staging", "setup-test")), false);
+    assert.deepEqual(fixture.events.slice(0, 6), [
+      "phase:ownership-marker",
+      "phase:credential-ensure",
+      "credentials.ensure",
+      "phase:npm-install",
+      "npm.install",
+      "phase:candidate-verification"
+    ]);
+    assert.ok(fixture.events.indexOf("credentials.ensure") < fixture.events.indexOf("npm.install"));
+    assert.equal(fixture.service.installed(), true);
+    assert.equal(fixture.service.running(), true);
+    assert.equal(fixture.service.input()?.runtimePath, result.value.runtimePath);
+    const install = await createRuntimeInstallStore(fixture.paths).read();
+    assert.equal(install?.installationId, INSTALLATION_ID);
+    assert.equal(install?.current.packageVersion, BRIDGE_PACKAGE_VERSION);
+    assert.equal(install?.current.runtimePath, result.value.runtimePath);
+    assert.equal(install?.previous, null);
+    const marker = JSON.parse(await readFile(fixture.paths.homeOwnershipFile, "utf8")) as { schema?: string; installationId?: string };
+    assert.equal(marker.schema, HOME_OWNERSHIP_SCHEMA);
+    assert.equal(marker.installationId, INSTALLATION_ID);
+  } finally {
+    await fixture.cleanup();
+  }
 });
 
-test("initial setup rejects a healthy authenticated daemon with the wrong version and removes its service definition", async () => {
-  const events: string[] = [];
-  const fileSystem = memoryRuntimeFileSystem();
-  const installStore = memoryInstallStore();
-  const result = await setupBridge({
-    paths,
-    credentialStore: credentials(events),
-    serviceManager: fakeServiceManager(events),
-    verifyRuntime: async () => {
-      events.push("verify:wrong-version");
-      return { health: true, authenticated: true, version: "0.1.2" };
-    },
-    installStore,
-    fileSystem,
-    npmRunner: async () => {
-      events.push("npm.install");
-      fileSystem.add(targetPlan.cliPath);
-      return commandOk();
-    },
-    nodePath: "/opt/node/bin/node",
-    nodeVersion: "v22.18.0",
-    platform: "linux"
-  });
-  assert.equal(result.ok, false);
-  if (!result.ok) assert.equal(result.code, "SETUP_VERIFICATION_FAILED");
-  assert.deepEqual(events, [
-    "npm.install",
-    "credentials.ensure",
-    `service.install:${BRIDGE_PACKAGE_VERSION}`,
-    "service.start",
-    "verify:wrong-version",
-    "service.uninstall"
-  ]);
-  assert.equal(installStore.value(), undefined);
+test("same-version setup verifies and reuses the exact CLI without npm or a second daemon", async () => {
+  const fixture = await createFixture();
+  try {
+    assert.equal((await setupBridge(fixture.options())).ok, true);
+    fixture.events.length = 0;
+    const second = await setupBridge(fixture.options({ transactionId: "setup-second" }));
+    assert.equal(second.ok, true);
+    if (!second.ok) return;
+    assert.equal(second.value.idempotent, true);
+    assert.equal(second.value.started, false);
+    assert.equal(fixture.events.includes("npm.install"), false);
+    assert.equal(fixture.events.filter(event => event === "service.start").length, 0);
+    assert.equal(fixture.events.filter(event => event === "service.restart").length, 0);
+    assert.equal(fixture.service.daemonStarts(), 1);
+  } finally {
+    await fixture.cleanup();
+  }
 });
 
-test("remove preserves user state by default and destructive removal requires explicit confirmation", async () => {
-  const stateFiles = [paths.configFile, paths.workspacesFile, paths.credentialsFile];
-  const fileSystem = memoryRuntimeFileSystem([
-    ...stateFiles,
-    paths.runtimeFile,
-    paths.runtimeInstallFile,
-    targetPlan.cliPath
-  ]);
-  const installStore = memoryInstallStore(installDocument(targetInstallation(), null));
-  const events: string[] = [];
-  const service = fakeServiceManager(events, { installed: true, running: true });
-
-  const result = await removeBridge({}, { paths, serviceManager: service, fileSystem, installStore });
-  assert.equal(result.ok, true);
-  assert.deepEqual(events, ["service.uninstall"]);
-  for (const path of stateFiles) assert.equal(await fileSystem.exists(path), true);
-  assert.equal(await fileSystem.exists(paths.runtimeFile), false);
-  assert.equal(await fileSystem.exists(targetPlan.cliPath), false);
-  assert.equal(installStore.value(), undefined);
-
-  const destructiveEvents: string[] = [];
-  const destructiveFiles = memoryRuntimeFileSystem([...stateFiles, targetPlan.cliPath]);
-  const destructiveService = fakeServiceManager(destructiveEvents, { installed: true, running: true });
-  const blocked = await removeBridge({ deleteData: true }, {
-    paths,
-    serviceManager: destructiveService,
-    fileSystem: destructiveFiles,
-    installStore: memoryInstallStore()
-  });
-  assert.equal(blocked.ok, false);
-  if (!blocked.ok) assert.equal(blocked.code, "CONFIRMATION_REQUIRED");
-  assert.deepEqual(destructiveEvents, []);
-  for (const path of stateFiles) assert.equal(await destructiveFiles.exists(path), true);
-
-  const confirmed = await removeBridge({ deleteData: true, confirmed: true }, {
-    paths,
-    serviceManager: destructiveService,
-    fileSystem: destructiveFiles,
-    installStore: memoryInstallStore(installDocument(targetInstallation(), null))
-  });
-  assert.equal(confirmed.ok, true);
-  for (const path of stateFiles) assert.equal(await destructiveFiles.exists(path), false);
+test("upgrade switches side-by-side and records the previous verified runtime", async () => {
+  const fixture = await createFixture();
+  try {
+    const previous = await fixture.seedPreviousRuntime("0.2.0-next.0");
+    const result = await setupBridge(fixture.options());
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.upgraded, true);
+    assert.equal(fixture.service.input()?.packageVersion, BRIDGE_PACKAGE_VERSION);
+    const install = await createRuntimeInstallStore(fixture.paths).read();
+    assert.deepEqual(install?.previous, previous.current);
+    assert.equal(await exists(previous.current.cliPath), true);
+    assert.equal(await exists(result.value.cliPath), true);
+  } finally {
+    await fixture.cleanup();
+  }
 });
 
-test("destructive removal refuses an unverified or mismatched HUNSU_HOME before touching the service", async () => {
-  const events: string[] = [];
-  const service = fakeServiceManager(events, { installed: true, running: true });
-  const unverified = await removeBridge({ deleteData: true, confirmed: true }, {
-    paths,
-    serviceManager: service,
-    fileSystem: memoryRuntimeFileSystem(),
-    installStore: memoryInstallStore()
-  });
-  assert.equal(unverified.ok, false);
-  if (!unverified.ok) assert.equal(unverified.code, "RUNTIME_INSTALL_FAILED");
+const FIRST_INSTALL_FAILURES: SetupFailurePhase[] = [
+  "ownership-marker",
+  "credential-ensure",
+  "npm-install",
+  "candidate-verification",
+  "staging-rename",
+  "transaction-write",
+  "service-definition-install",
+  "service-start",
+  "health-verification",
+  "authentication-verification",
+  "version-verification",
+  "install-record-commit"
+];
 
-  const mismatched = installDocument(targetInstallation(), null);
-  mismatched.serviceInput.hunsuHome = `${paths.home}-different`;
-  const mismatch = await removeBridge({ deleteData: true, confirmed: true }, {
-    paths,
-    serviceManager: service,
-    fileSystem: memoryRuntimeFileSystem(),
-    installStore: memoryInstallStore(mismatched)
-  });
-  assert.equal(mismatch.ok, false);
-  if (!mismatch.ok) assert.equal(mismatch.code, "RUNTIME_INSTALL_FAILED");
-  assert.deepEqual(events, []);
-});
-
-function targetInstallation(): RuntimeInstallation {
-  return {
-    packageVersion: BRIDGE_PACKAGE_VERSION,
-    runtimePath: targetPlan.runtimePath,
-    nodePath: "/opt/node/bin/node",
-    cliPath: targetPlan.cliPath,
-    installedAt: "2026-07-12T00:00:00.000Z"
-  };
-}
-
-function oldInstallation(): RuntimeInstallation {
-  return {
-    packageVersion: "0.1.2",
-    runtimePath: `${paths.runtimeVersionsDirectory}/0.1.2`,
-    nodePath: "/opt/node/bin/node",
-    cliPath: `${paths.runtimeVersionsDirectory}/0.1.2/node_modules/@hunsu/bridge/dist/cli.js`,
-    installedAt: "2026-07-11T00:00:00.000Z"
-  };
-}
-
-function installDocument(current: RuntimeInstallation, previous: RuntimeInstallation | null): RuntimeInstallDocument {
-  return {
-    schema: RUNTIME_INSTALL_SCHEMA,
-    current,
-    previous,
-    serviceInput: serviceInputForInstallation(current, paths.home),
-    updatedAt: current.installedAt
-  };
-}
-
-function memoryInstallStore(initial?: RuntimeInstallDocument): RuntimeInstallStore & {
-  value(): RuntimeInstallDocument | undefined;
-} {
-  let document = initial === undefined ? undefined : structuredClone(initial);
-  return {
-    read: async () => document === undefined ? undefined : structuredClone(document),
-    write: async value => {
-      document = structuredClone(value);
-    },
-    clear: async () => {
-      document = undefined;
-    },
-    value: () => document === undefined ? undefined : structuredClone(document)
-  };
-}
-
-function memoryRuntimeFileSystem(initial: string[] = []): RuntimeFileSystem & {
-  add(path: string): void;
-} {
-  const entries = new Set(initial);
-  return {
-    exists: async path => entries.has(path),
-    mkdir: async path => {
-      entries.add(path);
-    },
-    remove: async path => {
-      for (const entry of [...entries]) {
-        if (entry === path || entry.startsWith(`${path}/`)) entries.delete(entry);
+test("every first-install phase failure compensates to no daemon, definition, candidate, record, or journal", async t => {
+  for (const phase of FIRST_INSTALL_FAILURES) {
+    await t.test(phase, async () => {
+      const fixture = await createFixture();
+      try {
+        const result = await setupBridge(fixture.options({ failPhases: [phase] }));
+        assert.equal(result.ok, false);
+        assert.equal(fixture.service.installed(), false, phase);
+        assert.equal(fixture.service.running(), false, phase);
+        assert.equal(await exists(join(fixture.paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION)), false, phase);
+        assert.equal(await exists(fixture.paths.runtimeInstallFile), false, phase);
+        assert.equal(await exists(setupTransactionPath(fixture.paths)), false, phase);
+        assert.equal(await readFile(fixture.paths.configFile, "utf8"), "config-preserved\n", phase);
+        assert.equal(await readFile(fixture.paths.workspacesFile, "utf8"), "workspaces-preserved\n", phase);
+        assert.equal(await readFile(fixture.paths.credentialsFile, "utf8"), "credentials-preserved\n", phase);
+      } finally {
+        await fixture.cleanup();
       }
-    },
-    add: path => entries.add(path)
-  };
-}
+    });
+  }
+});
 
-function credentials(events: string[]): {
-  ensure(): Promise<BridgeCredentials>;
-  controlToken(): string;
-} {
-  const value: BridgeCredentials = {
-    schema: "hunsu.bridge.credentials.v1",
-    controlToken: "stable-control-token",
-    account: null,
-    relay: null
+test("upgrade failures restore the previous service, install record, and runtime", async t => {
+  const phases: SetupFailurePhase[] = [
+    "previous-service-stop",
+    "service-definition-install",
+    "service-start",
+    "health-verification",
+    "authentication-verification",
+    "version-verification",
+    "install-record-commit"
+  ];
+  for (const phase of phases) {
+    await t.test(phase, async () => {
+      const fixture = await createFixture();
+      try {
+        const previous = await fixture.seedPreviousRuntime("0.2.0-next.0");
+        const result = await setupBridge(fixture.options({ failPhases: [phase] }));
+        assert.equal(result.ok, false);
+        if (!result.ok) assert.equal(result.code, "SETUP_VERIFICATION_FAILED");
+        assert.equal(fixture.service.installed(), true);
+        assert.equal(fixture.service.running(), true);
+        assert.equal(fixture.service.input()?.packageVersion, previous.current.packageVersion);
+        assert.deepEqual(await createRuntimeInstallStore(fixture.paths).read(), previous);
+        assert.equal(await exists(previous.current.cliPath), true);
+        assert.equal(await exists(join(fixture.paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION)), false);
+        assert.equal(await exists(setupTransactionPath(fixture.paths)), false);
+      } finally {
+        await fixture.cleanup();
+      }
+    });
+  }
+});
+
+test("cleanup and previous-restore failures return ROLLBACK_FAILED with a retained recovery journal", async t => {
+  await t.test("first install service cleanup", async () => {
+    const fixture = await createFixture();
+    try {
+      const result = await setupBridge(fixture.options({
+        failPhases: ["health-verification", "candidate-service-cleanup"]
+      }));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.code, "ROLLBACK_FAILED");
+      assert.equal(await exists(setupTransactionPath(fixture.paths)), true);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+  await t.test("first install runtime cleanup", async () => {
+    const fixture = await createFixture();
+    try {
+      const result = await setupBridge(fixture.options({
+        failPhases: ["health-verification", "candidate-runtime-cleanup"]
+      }));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.code, "ROLLBACK_FAILED");
+      assert.equal(await exists(join(fixture.paths.runtimeVersionsDirectory, BRIDGE_PACKAGE_VERSION)), true);
+      assert.equal(await exists(setupTransactionPath(fixture.paths)), true);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+  for (const restorePhase of ["previous-definition-restore", "previous-runtime-restart"] as const) {
+    await t.test(restorePhase, async () => {
+      const fixture = await createFixture();
+      try {
+        await fixture.seedPreviousRuntime("0.2.0-next.0");
+        const result = await setupBridge(fixture.options({
+          failPhases: ["health-verification", restorePhase]
+        }));
+        assert.equal(result.ok, false);
+        if (!result.ok) assert.equal(result.code, "ROLLBACK_FAILED");
+        assert.equal(await exists(setupTransactionPath(fixture.paths)), true);
+      } finally {
+        await fixture.cleanup();
+      }
+    });
+  }
+});
+
+test("setup automatically recovers an interrupted first-install transaction before continuing", async () => {
+  const fixture = await createFixture();
+  try {
+    await fixture.prepareHome();
+    const candidate = await seedRuntime(fixture.paths, BRIDGE_PACKAGE_VERSION, "interrupted-candidate");
+    fixture.service.seed(serviceInputForInstallation(candidate, fixture.paths.home), true, true);
+    const timestamp = "2026-07-12T00:00:00.000Z";
+    const pending: SetupTransaction = {
+      schema: SETUP_TRANSACTION_SCHEMA,
+      transactionId: "interrupted",
+      phase: "candidate-started",
+      candidate,
+      previous: null,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    await createSetupTransactionStore(fixture.paths).write(pending);
+    const result = await setupBridge(fixture.options());
+    assert.equal(result.ok, true);
+    assert.equal(await exists(setupTransactionPath(fixture.paths)), false);
+    assert.equal(fixture.service.installed(), true);
+    assert.equal(fixture.service.running(), true);
+    assert.equal(fixture.service.input()?.packageVersion, BRIDGE_PACKAGE_VERSION);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+type Fixture = Awaited<ReturnType<typeof createFixture>>;
+
+async function createFixture() {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-transactional-setup-"));
+  const paths = resolveHunsuPaths({ home: join(root, "home") });
+  const events: string[] = [];
+  const service = fakeServiceManager(events);
+  let prepared = false;
+
+  const prepareHome = async (): Promise<void> => {
+    if (prepared) return;
+    prepared = true;
+    await mkdir(paths.home, { recursive: true });
+    await Promise.all([
+      writeFile(paths.configFile, "config-preserved\n", "utf8"),
+      writeFile(paths.workspacesFile, "workspaces-preserved\n", "utf8"),
+      writeFile(paths.credentialsFile, "credentials-preserved\n", { encoding: "utf8", mode: 0o600 })
+    ]);
   };
+
+  const options = (input: {
+    failPhases?: SetupFailurePhase[];
+    transactionId?: string;
+  } = {}): BridgeSetupOptions => {
+    const remaining = new Set(input.failPhases ?? []);
+    return {
+      paths,
+      credentialStore: {
+        async ensure() {
+          await prepareHome();
+          events.push("credentials.ensure");
+          return {
+            schema: "hunsu.bridge.credentials.v1",
+            controlToken: "hunsu_control_fixture",
+            account: null,
+            relay: null
+          };
+        }
+      },
+      serviceManager: service,
+      verifyRuntime: async installation => service.verification(installation),
+      npmRunner: packageRunner(events),
+      nodePath: process.execPath,
+      nodeVersion: process.version,
+      now: () => new Date("2026-07-12T01:02:03.000Z"),
+      createInstallationId: () => INSTALLATION_ID,
+      createTransactionId: () => input.transactionId ?? "setup-test",
+      onPhase: async phase => {
+        await prepareHome();
+        events.push(`phase:${phase}`);
+        if (remaining.delete(phase)) throw new Error(`injected ${phase}`);
+      }
+    };
+  };
+
+  const seedPreviousRuntime = async (version: string): Promise<RuntimeInstallDocument> => {
+    await prepareHome();
+    const current = await seedRuntime(paths, version, `previous-${version}`);
+    const document: RuntimeInstallDocument = {
+      schema: RUNTIME_INSTALL_SCHEMA,
+      installationId: INSTALLATION_ID,
+      current,
+      previous: null,
+      serviceInput: serviceInputForInstallation(current, paths.home),
+      updatedAt: current.installedAt
+    };
+    await createRuntimeInstallStore(paths).write(document);
+    await createHomeOwnershipStore(paths).write({
+      schema: HOME_OWNERSHIP_SCHEMA,
+      installationId: INSTALLATION_ID,
+      createdAt: current.installedAt,
+      home: paths.home
+    });
+    service.seed(document.serviceInput, true, true);
+    return document;
+  };
+
   return {
-    async ensure() {
-      events.push("credentials.ensure");
-      return value;
-    },
-    controlToken: () => value.controlToken
+    root,
+    paths,
+    events,
+    service,
+    options,
+    prepareHome,
+    seedPreviousRuntime,
+    cleanup: () => rm(root, { recursive: true, force: true })
   };
 }
 
-function fakeServiceManager(events: string[], options: {
-  installed?: boolean;
-  running?: boolean;
-  installChanged?: boolean;
-  installResult?: (input: ServiceInstallInput) => ServiceResult;
-} = {}): BridgeServiceManager & { installInputs(): ServiceInstallInput[] } {
-  let installed = options.installed ?? false;
-  let running = options.running ?? false;
-  const inputs: ServiceInstallInput[] = [];
-  const manager = "systemd-user" as const;
+function packageRunner(events: string[]): StagedRuntimeCommandRunner {
+  return async command => {
+    events.push("npm.install");
+    const prefixIndex = command.args.indexOf("--prefix");
+    assert.notEqual(prefixIndex, -1);
+    const prefix = command.args[prefixIndex + 1]!;
+    const packageRoot = join(prefix, "node_modules", "@hunsu", "bridge");
+    await mkdir(join(packageRoot, "dist"), { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), `${JSON.stringify({
+      name: "@hunsu/bridge",
+      version: BRIDGE_PACKAGE_VERSION,
+      engines: { node: ">=22.18" }
+    })}\n`, "utf8");
+    await writeFile(join(packageRoot, "dist", "cli.js"), "#!/usr/bin/env node\n", "utf8");
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+}
+
+function fakeServiceManager(events: string[]): BridgeServiceManager & {
+  installed(): boolean;
+  running(): boolean;
+  input(): ServiceInstallInput | undefined;
+  daemonStarts(): number;
+  seed(input: ServiceInstallInput, installed: boolean, running: boolean): void;
+  verification(installation: RuntimeInstallation): SetupVerification;
+} {
+  let installed = false;
+  let running = false;
+  let currentInput: ServiceInstallInput | undefined;
+  let daemonStarts = 0;
   return {
     async install(input) {
-      inputs.push(structuredClone(input));
-      events.push(`service.install:${input.packageVersion}`);
-      const custom = options.installResult?.(input);
-      if (custom) return custom;
-      const changed = options.installChanged ?? !installed;
+      const changed = !currentInput || JSON.stringify(currentInput) !== JSON.stringify(input);
+      currentInput = structuredClone(input);
       installed = true;
-      return serviceOk(manager, changed);
+      events.push(`service.install:${input.packageVersion}`);
+      return serviceOk(changed);
     },
     async uninstall() {
       events.push("service.uninstall");
       installed = false;
       running = false;
-      return serviceOk(manager, true);
+      currentInput = undefined;
+      return serviceOk(true);
     },
     async start() {
       events.push("service.start");
+      if (!installed) return serviceFailure("SERVICE_NOT_INSTALLED");
+      if (!running) daemonStarts += 1;
       running = true;
-      return serviceOk(manager, true);
+      return serviceOk(true);
     },
     async stop() {
       events.push("service.stop");
       running = false;
-      return serviceOk(manager, true);
+      return installed ? serviceOk(true) : serviceFailure("SERVICE_NOT_INSTALLED");
     },
     async restart() {
       events.push("service.restart");
+      if (!installed) return serviceFailure("SERVICE_NOT_INSTALLED");
+      daemonStarts += 1;
       running = true;
-      return serviceOk(manager, true);
+      return serviceOk(true);
     },
     async status(): Promise<ServiceStatus> {
       events.push("service.status");
       return {
         installed,
-        manager,
+        manager: "systemd-user",
         managerState: running ? "running" : "stopped",
         health: running ? "healthy" : "offline",
         authentication: running ? "authenticated" : "unavailable",
-        definitionPath: "/home/test/.config/systemd/user/hunsu-bridge.service"
+        definitionPath: "fixture",
+        ...(currentInput ? {
+          packageVersion: currentInput.packageVersion,
+          runtimePath: currentInput.runtimePath
+        } : {})
       };
     },
-    installInputs: () => structuredClone(inputs)
+    installed: () => installed,
+    running: () => running,
+    input: () => currentInput && structuredClone(currentInput),
+    daemonStarts: () => daemonStarts,
+    seed(input, nextInstalled, nextRunning) {
+      currentInput = structuredClone(input);
+      installed = nextInstalled;
+      running = nextRunning;
+      if (nextRunning) daemonStarts = 1;
+    },
+    verification(installation) {
+      return {
+        health: running,
+        authenticated: running,
+        version: currentInput?.packageVersion ?? "unavailable",
+        runtimePath: currentInput?.runtimePath ?? installation.runtimePath
+      };
+    }
   };
 }
 
-function serviceOk(manager: "systemd-user", changed: boolean): ServiceResult {
-  return { ok: true, code: "OK", message: "ok", manager, changed };
+async function seedRuntime(paths: HunsuPaths, version: string, cliText: string): Promise<RuntimeInstallation> {
+  const runtimePath = join(paths.runtimeVersionsDirectory, version);
+  const packageRoot = join(runtimePath, "node_modules", "@hunsu", "bridge");
+  const cliPath = join(packageRoot, "dist", "cli.js");
+  await mkdir(join(packageRoot, "dist"), { recursive: true });
+  await writeFile(join(packageRoot, "package.json"), `${JSON.stringify({
+    name: "@hunsu/bridge",
+    version,
+    engines: { node: ">=22.18" }
+  })}\n`, "utf8");
+  await writeFile(cliPath, `${cliText}\n`, "utf8");
+  return {
+    packageVersion: version,
+    runtimePath,
+    nodePath: process.execPath,
+    cliPath,
+    installedAt: "2026-07-12T00:00:00.000Z"
+  };
 }
 
-function serviceFailure(manager: "systemd-user", code: "SERVICE_INSTALL_FAILED"): ServiceResult {
-  return { ok: false, code, message: "failed", manager };
+function serviceOk(changed: boolean): ServiceResult {
+  return { ok: true, code: "OK", message: "ok", manager: "systemd-user", changed };
 }
 
-function commandOk() {
-  return { exitCode: 0, stdout: "", stderr: "" };
+function serviceFailure(code: "SERVICE_NOT_INSTALLED"): ServiceResult {
+  return { ok: false, code, message: "not installed", manager: "systemd-user" };
 }
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+void (undefined as unknown as Fixture);
