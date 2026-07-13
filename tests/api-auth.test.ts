@@ -9,7 +9,8 @@ import {
   OAuthProtocolError,
   SessionManager,
   SignedTokenService,
-  type AuthContext
+  type AuthContext,
+  type GitHubOAuthFailure
 } from "../apps/api/src/index.ts";
 
 const sessionConfig = {
@@ -327,7 +328,10 @@ test("GitHub OAuth resolves the user and granted App installations through authe
   assert.equal(authorizationUrl.searchParams.get("code_challenge"), challenge);
   assert.equal(authorizationUrl.searchParams.get("code_challenge_method"), "S256");
 
-  const identity = await oauth.authenticate("github-code", verifier);
+  const identityResult = await oauth.authenticate("github-code", verifier);
+  assert.equal(identityResult.ok, true);
+  if (!identityResult.ok) assert.fail("GitHub OAuth unexpectedly failed.");
+  const identity = identityResult.value;
   assert.deepEqual(identity, {
     user: {
       id: "7",
@@ -374,6 +378,107 @@ test("GitHub OAuth resolves the user and granted App installations through authe
   }
 });
 
+test("GitHub OAuth failures expose only closed diagnostic metadata", async t => {
+  const callbackCode = "callback-code-sentinel";
+  const verifier = "v".repeat(43);
+  const clientSecret = "client-secret-sentinel";
+  const rawFailure = "raw-upstream-failure-sentinel";
+  const cases: Array<{
+    name: string;
+    fetch: NonNullable<ConstructorParameters<typeof GitHubOAuthClient>[0]["fetch"]>;
+    expected: {
+      stage: GitHubOAuthFailure["stage"];
+      reason: GitHubOAuthFailure["reason"];
+      upstreamStatus: number | null;
+      providerCode: GitHubOAuthFailure["providerCode"];
+    };
+  }> = [
+    {
+      name: "token transport",
+      fetch: async () => { throw new Error(rawFailure); },
+      expected: { stage: "code_exchange", reason: "transport", upstreamStatus: null, providerCode: null }
+    },
+    {
+      name: "token provider rejection",
+      fetch: async () => jsonResponse({
+        error: "incorrect_client_credentials",
+        error_description: rawFailure
+      }),
+      expected: {
+        stage: "code_exchange",
+        reason: "upstream_response",
+        upstreamStatus: 200,
+        providerCode: "incorrect_client_credentials"
+      }
+    },
+    {
+      name: "token malformed payload",
+      fetch: async () => new Response(rawFailure, { status: 200 }),
+      expected: { stage: "code_exchange", reason: "invalid_payload", upstreamStatus: 200, providerCode: null }
+    },
+    {
+      name: "user lookup",
+      fetch: async input => {
+        const url = String(input);
+        if (url.endsWith("/login/oauth/access_token")) return jsonResponse({ access_token: "token-sentinel" });
+        if (url.endsWith("/user")) return jsonResponse({ message: rawFailure }, 502);
+        return jsonResponse({ installations: [] });
+      },
+      expected: { stage: "user_lookup", reason: "upstream_response", upstreamStatus: 502, providerCode: null }
+    },
+    {
+      name: "installation lookup",
+      fetch: async input => {
+        const url = String(input);
+        if (url.endsWith("/login/oauth/access_token")) return jsonResponse({ access_token: "token-sentinel" });
+        if (url.endsWith("/user")) return jsonResponse({ id: 7, login: "octocat" });
+        return jsonResponse({ message: rawFailure }, 403);
+      },
+      expected: { stage: "installation_lookup", reason: "upstream_response", upstreamStatus: 403, providerCode: null }
+    },
+    {
+      name: "repository lookup",
+      fetch: async input => {
+        const url = String(input);
+        if (url.endsWith("/login/oauth/access_token")) return jsonResponse({ access_token: "token-sentinel" });
+        if (url.endsWith("/user")) return jsonResponse({ id: 7, login: "octocat" });
+        if (url.includes("/user/installations?")) {
+          return jsonResponse({ installations: [{ id: 17, account: { login: "acme", type: "Organization" } }] });
+        }
+        return jsonResponse({ message: rawFailure }, 403);
+      },
+      expected: { stage: "repository_lookup", reason: "upstream_response", upstreamStatus: 403, providerCode: null }
+    }
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const oauth = new GitHubOAuthClient({
+        clientId: "client-id-sentinel",
+        clientSecret,
+        publicApiUrl: "https://api.example.test",
+        apiBaseUrl: "https://github-api.example.test",
+        webBaseUrl: "https://github.example.test",
+        fetch: fixture.fetch
+      });
+      const result = await oauth.authenticate(callbackCode, verifier);
+      assert.equal(result.ok, false);
+      if (result.ok) assert.fail("GitHub OAuth failure fixture unexpectedly succeeded.");
+      const failure = result.error;
+      assert.deepEqual({
+        stage: failure.stage,
+        reason: failure.reason,
+        upstreamStatus: failure.upstreamStatus,
+        providerCode: failure.providerCode
+      }, fixture.expected);
+      const serialized = JSON.stringify(failure);
+      for (const forbidden of [callbackCode, verifier, clientSecret, rawFailure, "token-sentinel", "github.example.test"]) {
+        assert.doesNotMatch(serialized, new RegExp(forbidden, "u"));
+      }
+    });
+  }
+});
+
 test("GitHub OAuth paginates every user-authorized repository for an installation", async () => {
   const repositoryCalls: string[] = [];
   const firstPage = Array.from({ length: 100 }, (_, index) => githubRepository(
@@ -403,7 +508,10 @@ test("GitHub OAuth paginates every user-authorized repository for an installatio
     }
   });
 
-  const identity = await oauth.authenticate("github-code", "v".repeat(43));
+  const identityResult = await oauth.authenticate("github-code", "v".repeat(43));
+  assert.equal(identityResult.ok, true);
+  if (!identityResult.ok) assert.fail("GitHub OAuth unexpectedly failed.");
+  const identity = identityResult.value;
   assert.equal(identity.installations[0]?.repositories.length, 101);
   assert.deepEqual(identity.installations[0]?.repositories[0], {
     repositoryId: 1,

@@ -1,7 +1,7 @@
 import { handleMcpRequest } from "@hunsu/plugin-contract";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { HunsuApplicationService } from "./application-service.ts";
-import type { GitHubOAuthClient } from "./auth/github.ts";
+import type { GitHubOAuthClient, GitHubOAuthFailure, GitHubOAuthProviderCode } from "./auth/github.ts";
 import { McpOAuthService, OAuthProtocolError } from "./auth/oauth-resource.ts";
 import type { SessionManager } from "./auth/session.ts";
 import type { ApiError, ApiResult, AuthContext } from "./types.ts";
@@ -239,22 +239,66 @@ export class HunsuHttpApp {
     const cookieNonce = this.#sessions.readCookie(request, OAUTH_STATE_COOKIE);
     const codeVerifier = this.#sessions.readCookie(request, OAUTH_PKCE_COOKIE);
     if (!claims || typeof claims.nonce !== "string" || claims.nonce !== cookieNonce || typeof claims.returnTo !== "string" || !code || !codeVerifier) {
-      return problem({ code: "invalid_request", message: "GitHub OAuth state is invalid or expired.", status: 400, retryable: false });
+      return problem(
+        { code: "invalid_request", message: "GitHub OAuth state is invalid or expired.", status: 400, retryable: false },
+        { "referrer-policy": "no-referrer" }
+      );
     }
-    const identity = await this.#githubOAuth.authenticate(code, codeVerifier);
-    const session = this.#sessions.issue({
-      user: identity.user,
-      installations: identity.installations,
-      ...(identity.installations[0] ? { selectedInstallationId: identity.installations[0].id } : {})
-    });
-    const target = claims.returnTo.startsWith("/oauth/authorize")
-      ? `${this.#publicApiUrl}${claims.returnTo}`
-      : `${this.#webUrl}${safeReturnTo(claims.returnTo)}`;
-    const headers = new Headers({ location: target, "cache-control": "no-store" });
-    headers.append("set-cookie", session.cookie);
-    headers.append("set-cookie", this.#sessions.transientCookie(OAUTH_STATE_COOKIE, "", 0));
-    headers.append("set-cookie", this.#sessions.transientCookie(OAUTH_PKCE_COOKIE, "", 0));
-    return new Response(null, { status: 302, headers });
+    try {
+      const identityResult = await this.#githubOAuth.authenticate(code, codeVerifier);
+      if (!identityResult.ok) {
+        const failure = identityResult.error;
+        return this.#githubOAuthFailure(failure.stage, failure.reason, failure.upstreamStatus, failure.providerCode);
+      }
+      const identity = identityResult.value;
+      let session: ReturnType<SessionManager["issue"]>;
+      try {
+        session = this.#sessions.issue({
+          user: identity.user,
+          installations: identity.installations,
+          ...(identity.installations[0] ? { selectedInstallationId: identity.installations[0].id } : {})
+        });
+      } catch {
+        return this.#githubOAuthFailure("session_issue", "local_failure", null, null);
+      }
+      const target = claims.returnTo.startsWith("/oauth/authorize")
+        ? `${this.#publicApiUrl}${claims.returnTo}`
+        : `${this.#webUrl}${safeReturnTo(claims.returnTo)}`;
+      const headers = new Headers({ location: target, "cache-control": "no-store", "referrer-policy": "no-referrer" });
+      headers.append("set-cookie", session.cookie);
+      headers.append("set-cookie", this.#sessions.transientCookie(OAUTH_STATE_COOKIE, "", 0));
+      headers.append("set-cookie", this.#sessions.transientCookie(OAUTH_PKCE_COOKIE, "", 0));
+      return new Response(null, { status: 302, headers });
+    } catch {
+      return this.#githubOAuthFailure("callback_internal", "local_failure", null, null);
+    }
+  }
+
+  #githubOAuthFailure(
+    stage: GitHubOAuthFailure["stage"] | "session_issue" | "callback_internal",
+    reason: GitHubOAuthFailure["reason"] | "local_failure",
+    upstreamStatus: number | null,
+    providerCode: GitHubOAuthProviderCode | null
+  ): Response {
+    const retryable = githubOAuthRetryable({ stage, reason, upstreamStatus, providerCode });
+    const response = json({
+      error: {
+        code: "temporarily_unavailable",
+        message: "GitHub sign-in could not be completed.",
+        retryable,
+        diagnostic: {
+          schema: "hunsu.github-oauth-diagnostic.v1",
+          id: randomUUID(),
+          stage,
+          reason,
+          upstreamStatus,
+          providerCode
+        }
+      }
+    }, 503, { "cache-control": "no-store", "referrer-policy": "no-referrer" });
+    response.headers.append("set-cookie", this.#sessions.transientCookie(OAUTH_STATE_COOKIE, "", 0));
+    response.headers.append("set-cookie", this.#sessions.transientCookie(OAUTH_PKCE_COOKIE, "", 0));
+    return response;
   }
 
   #requireWebMutation(request: Request): void {
@@ -297,6 +341,26 @@ export class HunsuHttpApp {
     headers.set("access-control-allow-credentials", "true");
     headers.append("vary", "Origin");
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  }
+}
+
+type GitHubOAuthCallbackFailure = {
+  stage: GitHubOAuthFailure["stage"] | "session_issue" | "callback_internal";
+  reason: GitHubOAuthFailure["reason"] | "local_failure";
+  upstreamStatus: number | null;
+  providerCode: GitHubOAuthProviderCode | null;
+};
+
+function githubOAuthRetryable(failure: GitHubOAuthCallbackFailure): boolean {
+  if (failure.providerCode !== null) return false;
+  switch (failure.reason) {
+    case "transport":
+      return true;
+    case "upstream_response":
+      return failure.upstreamStatus === 429 || (failure.upstreamStatus !== null && failure.upstreamStatus >= 500);
+    case "invalid_payload":
+    case "local_failure":
+      return false;
   }
 }
 
