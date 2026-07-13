@@ -1,5 +1,6 @@
 import { createSign } from "node:crypto";
 import type { GitHubAppConfig } from "@hunsu/config";
+import type { ContentsWriteInstallationAuthority } from "@hunsu/github-store";
 import { err, ok, type Result } from "@hunsu/protocol";
 import type { AuthorizedInstallation, GitHubUser } from "../types.ts";
 
@@ -14,7 +15,7 @@ export class GitHubAppTokenProvider {
   readonly #fetch: FetchLike;
   readonly #apiBaseUrl: string;
   readonly #now: () => number;
-  readonly #cache = new Map<number, { token: string; expiresAt: number }>();
+  readonly #cache = new Map<number, { authority: ContentsWriteInstallationAuthority; expiresAt: number }>();
 
   constructor(input: {
     appId: number;
@@ -33,11 +34,11 @@ export class GitHubAppTokenProvider {
     this.#now = input.now ?? (() => Date.now());
   }
 
-  getToken = async (installationId: number): Promise<string> => {
+  getAuthority = async (installationId: number): Promise<ContentsWriteInstallationAuthority> => {
     if (!Number.isSafeInteger(installationId) || installationId <= 0) throw new Error("Invalid GitHub installation id.");
     const now = Math.floor(this.#now() / 1000);
     const cached = this.#cache.get(installationId);
-    if (cached && cached.expiresAt - 60 > now) return cached.token;
+    if (cached && cached.expiresAt - 60 > now) return cached.authority;
 
     const response = await this.#fetch(`${this.#apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
       method: "POST",
@@ -63,8 +64,12 @@ export class GitHubAppTokenProvider {
     }
     const expiresAt = Math.floor(Date.parse(body.expires_at) / 1000);
     if (!Number.isFinite(expiresAt) || expiresAt <= now) throw new Error("GitHub returned an already-expired installation token.");
-    this.#cache.set(installationId, { token: body.token, expiresAt });
-    return body.token;
+    const authority: ContentsWriteInstallationAuthority = {
+      token: body.token,
+      permissions: { contents: "write" }
+    };
+    this.#cache.set(installationId, { authority, expiresAt });
+    return authority;
   };
 
   invalidate(installationId: number): void {

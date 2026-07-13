@@ -16,10 +16,10 @@ test("GitHub REST transport uses installation authority and a non-forced CAS upd
   const calls: Array<{ url: string; init: RequestInit }> = [];
   let tokenRequests = 0;
   const transport = new GitHubRestTransport({
-    async tokenProvider(installationId) {
+    async authorityProvider(installationId) {
       tokenRequests += 1;
       assert.equal(installationId, repository.installationId);
-      return "test-installation-value";
+      return verifiedAuthority("test-installation-value");
     },
     fetch: async function (this: unknown, input, init = {}) {
       assert.equal(this, undefined);
@@ -66,7 +66,7 @@ test("GitHub REST transport uses installation authority and a non-forced CAS upd
 test("GitHub REST transport rejects a stale head before creating blobs", async () => {
   let calls = 0;
   const transport = new GitHubRestTransport({
-    tokenProvider: async () => "test-installation-value",
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
     fetch: async () => {
       calls += 1;
       return json({ object: { sha: "c".repeat(40) } });
@@ -84,9 +84,9 @@ test("GitHub REST transport rejects a stale head before creating blobs", async (
   assert.equal(calls, 1);
 });
 
-test("GitHub REST accepts installation repository payloads without repository permissions", async () => {
+test("GitHub REST uses verified installation authority instead of user-oriented repository permissions", async () => {
   const transport = new GitHubRestTransport({
-    tokenProvider: async () => "verified-contents-write-token",
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
     fetch: async input => {
       assert.equal(
         String(input),
@@ -99,7 +99,8 @@ test("GitHub REST accepts installation repository payloads without repository pe
           name: repository.name,
           default_branch: repository.defaultBranch,
           private: true,
-          owner: { login: repository.owner }
+          owner: { login: repository.owner },
+          permissions: { admin: false, push: false, pull: true }
         }]
       });
     }
@@ -115,7 +116,7 @@ test("GitHub REST reads only the dedicated state subtree", async () => {
   const headSha = "d".repeat(40);
   const calls: string[] = [];
   const transport = new GitHubRestTransport({
-    tokenProvider: async () => "test-installation-value",
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
     fetch: async input => {
       const url = String(input);
       calls.push(url);
@@ -142,7 +143,7 @@ test("GitHub REST reads only the dedicated state subtree", async () => {
 test("GitHub REST resolves non-state branch heads without downloading trees", async () => {
   let calls = 0;
   const transport = new GitHubRestTransport({
-    tokenProvider: async () => "test-installation-value",
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
     fetch: async () => {
       calls += 1;
       return json({ object: { sha: "e".repeat(40) } });
@@ -160,4 +161,8 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" }
   });
+}
+
+function verifiedAuthority(token: string) {
+  return { token, permissions: { contents: "write" as const } };
 }

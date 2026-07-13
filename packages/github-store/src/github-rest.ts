@@ -15,21 +15,28 @@ const GITHUB_USER_AGENT = "hunsu-plugin-production";
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-export type InstallationTokenProvider = (installationId: number) => Promise<string>;
+export type ContentsWriteInstallationAuthority = {
+  token: string;
+  permissions: { contents: "write" };
+};
+
+export type InstallationAuthorityProvider = (
+  installationId: number
+) => Promise<ContentsWriteInstallationAuthority>;
 
 export type GitHubRestTransportOptions = {
-  tokenProvider: InstallationTokenProvider;
+  authorityProvider: InstallationAuthorityProvider;
   fetch?: FetchLike;
   apiBaseUrl?: string;
 };
 
 export class GitHubRestTransport implements GitHubTransport {
-  readonly #tokenProvider: InstallationTokenProvider;
+  readonly #authorityProvider: InstallationAuthorityProvider;
   readonly #fetch: FetchLike;
   readonly #apiBaseUrl: string;
 
   constructor(options: GitHubRestTransportOptions) {
-    this.#tokenProvider = options.tokenProvider;
+    this.#authorityProvider = options.authorityProvider;
     const fetch = options.fetch;
     this.#fetch = fetch
       ? (request, init) => fetch(request, init)
@@ -226,12 +233,12 @@ export class GitHubRestTransport implements GitHubTransport {
     allowNotFound = false
   ): Promise<TransportResult<T>> {
     try {
-      const token = await this.#tokenProvider(installationId);
+      const authority = await this.#authorityProvider(installationId);
       const response = await this.#fetch(`${this.#apiBaseUrl}${path}`, {
         ...init,
         headers: {
           accept: "application/vnd.github+json",
-          authorization: `Bearer ${token}`,
+          authorization: `Bearer ${authority.token}`,
           "content-type": "application/json",
           "user-agent": GITHUB_USER_AGENT,
           "x-github-api-version": GITHUB_API_VERSION,
@@ -278,10 +285,9 @@ function decodeRepositoryGrant(input: unknown, installationId: number): Transpor
   ) {
     return invalidResponse("GitHub returned an invalid repository grant.");
   }
-  // GitHub's installation-repository response may omit the user-oriented
-  // repository.permissions object. Production installation tokens are minted
-  // only after their Contents write grant is verified by the token provider.
-  const permission = isRecord(input.permissions) && input.permissions.push === false ? "read" : "write";
+  // This endpoint establishes installation repository membership only. The
+  // transport accepts a Contents-write authority that was verified when the
+  // installation token was minted; user permissions are overlaid separately.
   return ok({
     installationId,
     repositoryId: input.id,
@@ -289,7 +295,7 @@ function decodeRepositoryGrant(input: unknown, installationId: number): Transpor
     name: input.name,
     defaultBranch: input.default_branch,
     private: input.private,
-    permissions: { contents: permission }
+    permissions: { contents: "write" }
   });
 }
 

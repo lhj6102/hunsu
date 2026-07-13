@@ -38,12 +38,22 @@ describe("GitHubOAuthClient in workerd", () => {
       now: () => Date.UTC(2026, 6, 13)
     });
 
-    await expect(provider.getToken(17)).resolves.toBe("github-installation-token");
+    await expect(provider.getAuthority(17)).resolves.toEqual({
+      token: "github-installation-token",
+      permissions: { contents: "write" }
+    });
   });
 
   it("sends the fixed REST User-Agent for installation-scoped repository access", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const provider = new GitHubAppTokenProvider({
+      appId: 42,
+      privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      apiBaseUrl: "https://github-api.test",
+      now: () => Date.UTC(2026, 6, 13)
+    });
     const transport = new GitHubRestTransport({
-      tokenProvider: async () => "github-installation-token",
+      authorityProvider: provider.getAuthority,
       apiBaseUrl: "https://github-api.test"
     });
 
