@@ -60,7 +60,7 @@ added to bypass that proof-of-presence boundary.
 
 Before merging a change that affects packed Bridge bytes into `preview`, bump
 `apps/bridge/package.json` to a new explicit prerelease such as
-`0.2.0-next.9`. npm versions are immutable. CI never invents or rewrites a
+`0.2.0-next.10`. npm versions are immutable. CI never invents or rewrites a
 version.
 
 A push to protected `preview` starts both `bridge-headless.yml` and
@@ -103,7 +103,7 @@ Preview devices install the exact version recorded in candidate evidence, for
 example:
 
 ~~~sh
-npx @hunsu/bridge@0.2.0-next.9 setup --profile preview
+npx @hunsu/bridge@0.2.0-next.10 setup --profile preview
 ~~~
 
 Do not use only the movable `candidate-next` name in a QA record. Record the
@@ -114,9 +114,9 @@ manually on the recorded preview SHA and push it. Never move or reuse a release
 tag:
 
 ~~~sh
-git tag -a v0.2.0-next.9 <approved-preview-sha> \
-  -m "Release @hunsu/bridge 0.2.0-next.9 candidate"
-git push origin v0.2.0-next.9
+git tag -a v0.2.0-next.10 <approved-preview-sha> \
+  -m "Release @hunsu/bridge 0.2.0-next.10 candidate"
+git push origin v0.2.0-next.10
 ~~~
 
 The tag starts the cross-platform local-tarball service workflow. Dispatch the
@@ -124,8 +124,8 @@ exact registry setup from the same tag:
 
 ~~~sh
 gh workflow run bridge-registry-smoke.yml \
-  --ref v0.2.0-next.9 \
-  -f version_tag=v0.2.0-next.9
+  --ref v0.2.0-next.10 \
+  -f version_tag=v0.2.0-next.10
 ~~~
 
 The registry workflow proves that the tag, source SHA, exact version,
@@ -173,8 +173,8 @@ gates pass, authorize promotion from the immutable candidate tag:
 
 ~~~sh
 gh workflow run publish-bridge.yml \
-  --ref v0.2.0-next.9 \
-  -f version_tag=v0.2.0-next.9 \
+  --ref v0.2.0-next.10 \
+  -f version_tag=v0.2.0-next.10 \
   -f operation=promote-next \
   -f confirm_promotion=true
 ~~~
@@ -185,7 +185,7 @@ that `candidate-next` still identifies the attested version. It records—but
 does not execute—the proof-of-presence command. An npm owner then runs:
 
 ~~~sh
-npm dist-tag add @hunsu/bridge@0.2.0-next.9 next
+npm dist-tag add @hunsu/bridge@0.2.0-next.10 next
 npm dist-tag rm @hunsu/bridge candidate-next
 ~~~
 

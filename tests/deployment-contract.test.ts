@@ -68,7 +68,7 @@ test("deployment release manifest detects artifact changes", () => {
     createReleaseManifest(root, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.9",
+      bridgePackageVersion: "0.2.0-next.10",
       connectTrust: CONNECT_TRUST,
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
@@ -546,7 +546,7 @@ test("deployment preparation binds exact retained Connect bytes and target confi
     createReleaseManifest(release, {
       sourceSha: SOURCE_SHA,
       sourceTree: "c".repeat(40),
-      bridgePackageVersion: "0.2.0-next.9",
+      bridgePackageVersion: "0.2.0-next.10",
       connectTrust: CONNECT_TRUST,
       repository: "lhj6102/hunsu",
       ref: "refs/heads/preview",
@@ -724,7 +724,7 @@ test("Bridge candidate evidence binds exact source, version, tarball, and regist
     assert.equal(binding.source.sha, SOURCE_SHA);
     assert.throws(() => verifyBridgeCandidate(root, {
       ...releaseManifest,
-      bridgePackageVersion: "0.2.0-next.9"
+      bridgePackageVersion: "0.2.0-next.10"
     }), /does not match retained release/u);
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -393,12 +393,12 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-one",
       daemonPid: 1234,
-      version: "0.2.0-next.9",
+      version: "0.2.0-next.10",
       protocolVersion: "local-bridge-v1",
       deploymentProfile: "preview",
       startedAt: "2026-07-12T00:00:00.000Z",
       endpoint: "http://127.0.0.1:43127",
-      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.9",
+      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.10",
       serviceManager: "development",
       lastHealthyAt: "2026-07-12T00:00:00.000Z"
     });
@@ -407,7 +407,7 @@ test("atomic state stores persist config, preserve credentials, and guard runtim
       schema: BRIDGE_RUNTIME_SCHEMA,
       instanceId: "instance-invalid",
       daemonPid: 1234,
-      version: "0.2.0-next.9",
+      version: "0.2.0-next.10",
       protocolVersion: "local-bridge-v1",
       deploymentProfile: "preview",
       startedAt: "2026-07-12T00:00:00.000Z",
@@ -514,13 +514,13 @@ test("runtime install state migrates v1 without trusting an unversioned digest a
   const home = await mkdtemp(join(tmpdir(), "hunsu-headless-runtime-install-state-"));
   const paths = resolveHunsuPaths({ home });
   const timestamp = "2026-07-12T00:00:00.000Z";
-  const runtimePath = join(paths.runtimeVersionsDirectory, "0.2.0-next.9");
+  const runtimePath = join(paths.runtimeVersionsDirectory, "0.2.0-next.10");
   const cliPath = join(runtimePath, "node_modules", "@hunsu", "bridge", "dist", "cli.js");
   const legacy = {
     schema: LEGACY_RUNTIME_INSTALL_SCHEMA,
     installationId: "install_runtime_state_test",
     current: {
-      packageVersion: "0.2.0-next.9",
+      packageVersion: "0.2.0-next.10",
       runtimePath,
       nodePath: process.execPath,
       cliPath,
@@ -532,7 +532,7 @@ test("runtime install state migrates v1 without trusting an unversioned digest a
       nodePath: process.execPath,
       cliPath,
       hunsuHome: home,
-      packageVersion: "0.2.0-next.9",
+      packageVersion: "0.2.0-next.10",
       runtimePath,
       deploymentProfile: "production"
     },
