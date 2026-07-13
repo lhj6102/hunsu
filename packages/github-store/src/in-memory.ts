@@ -65,13 +65,14 @@ export class MemoryGitHubTransport implements GitHubTransport {
     return ok({ headSha: sha, files: { ...commit.files } });
   }
 
-  async createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<string>> {
+  async createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<BranchSnapshot>> {
     const found = this.#repository(repository);
     if (!found.ok) return found;
     if (found.value.branches.has(branch)) return conflict(`Branch ${branch} already exists.`);
-    if (!found.value.commits.has(fromSha)) return notFound(`Commit ${fromSha} does not exist.`);
+    const commit = found.value.commits.get(fromSha);
+    if (!commit) return notFound(`Commit ${fromSha} does not exist.`);
     found.value.branches.set(branch, fromSha);
-    return ok(fromSha);
+    return ok({ headSha: fromSha, files: { ...commit.files } });
   }
 
   async commitFiles(input: {

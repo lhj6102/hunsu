@@ -40,7 +40,7 @@ export type TransportResult<T> =
 export interface GitHubTransport {
   listInstallationRepositories(installationId: number): Promise<TransportResult<RepositoryGrant[]>>;
   readBranch(repository: RepositoryLocator, branch: string): Promise<TransportResult<BranchSnapshot | undefined>>;
-  createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<string>>;
+  createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<BranchSnapshot>>;
   commitFiles(input: {
     repository: RepositoryLocator;
     branch: string;

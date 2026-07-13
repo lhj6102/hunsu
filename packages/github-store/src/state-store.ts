@@ -20,14 +20,21 @@ const FULL_SHA = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const STORED_EVENT_ID = /^[0-9a-f]{32}$/u;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const STATE_BRANCH_VISIBILITY_DELAYS_MS = [0, 50, 150] as const;
 
 export class GitHubProjectStore<Event, State> {
   readonly #transport: GitHubTransport;
   readonly #codec: ProjectStateCodec<Event, State>;
+  readonly #wait: (delayMs: number) => Promise<void>;
 
-  constructor(transport: GitHubTransport, codec: ProjectStateCodec<Event, State>) {
+  constructor(
+    transport: GitHubTransport,
+    codec: ProjectStateCodec<Event, State>,
+    options: { wait?: (delayMs: number) => Promise<void> } = {}
+  ) {
     this.#transport = transport;
     this.#codec = codec;
+    this.#wait = options.wait ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs)));
   }
 
   async readProject(repository: RepositoryLocator, projectId: string): Promise<StoreResult<ReconstructedProject<State>>> {
@@ -57,16 +64,20 @@ export class GitHubProjectStore<Event, State> {
     const safeCommand = ensureSafeValue(command.command, "command");
     if (!safeCommand.ok) return safeCommand;
 
-    let branchResult = await this.#transport.readBranch(command.repository, HUNSU_STATE_BRANCH);
+    const branchResult = await this.#transport.readBranch(command.repository, HUNSU_STATE_BRANCH);
     if (!branchResult.ok) return transportFailure(branchResult.error);
-    if (!branchResult.value) {
+    let branch = branchResult.value;
+    if (!branch) {
       const created = await this.#transport.createBranch(command.repository, HUNSU_STATE_BRANCH, command.baseSha);
       if (!created.ok && created.error.code !== "conflict") return transportFailure(created.error);
-      branchResult = await this.#transport.readBranch(command.repository, HUNSU_STATE_BRANCH);
-      if (!branchResult.ok) return transportFailure(branchResult.error);
-      if (!branchResult.value) return failure({ code: "state_not_found", message: "Hunsu state branch could not be initialized." });
+      if (created.ok) {
+        branch = created.value;
+      } else {
+        const concurrentBranch = await this.#readConcurrentStateBranch(command.repository);
+        if (!concurrentBranch.ok) return concurrentBranch;
+        branch = concurrentBranch.value;
+      }
     }
-    const branch = branchResult.value;
     const decoded = this.#decodeStoredEvents(branch.files, command.repository, command.projectId);
     if (!decoded.ok) return decoded;
 
@@ -175,6 +186,19 @@ export class GitHubProjectStore<Event, State> {
       return transportFailure(committed.error);
     }
     return ok({ state: next.value, stateHeadSha: committed.value, idempotentReplay: false });
+  }
+
+  async #readConcurrentStateBranch(repository: RepositoryLocator): Promise<StoreResult<BranchSnapshot>> {
+    for (const delayMs of STATE_BRANCH_VISIBILITY_DELAYS_MS) {
+      if (delayMs > 0) await this.#wait(delayMs);
+      const branch = await this.#transport.readBranch(repository, HUNSU_STATE_BRANCH);
+      if (!branch.ok) return transportFailure(branch.error);
+      if (branch.value) return ok(branch.value);
+    }
+    return transportFailure({
+      code: "not_found",
+      message: "The concurrently created Hunsu state branch is not yet visible."
+    });
   }
 
   async createRunBranch(input: {

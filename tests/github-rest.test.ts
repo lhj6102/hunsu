@@ -61,6 +61,11 @@ test("GitHub REST transport uses installation authority and a non-forced CAS upd
   assert.deepEqual(JSON.parse(String(update.init.body)), { sha: resultSha, force: false });
   const commitBody = JSON.parse(String(calls.find(call => call.url.endsWith("/git/commits") && call.init.method === "POST")?.init.body));
   assert.deepEqual(commitBody.parents, [parentSha]);
+  const referenceReads = calls.filter(call => call.url.includes("/git/ref/"));
+  assert.ok(referenceReads.length > 0);
+  for (const call of referenceReads) {
+    assert.equal(call.init.cache, "no-store");
+  }
 });
 
 test("GitHub REST transport rejects a stale head before creating blobs", async () => {
@@ -110,6 +115,45 @@ test("GitHub REST uses verified installation authority instead of user-oriented 
     ok: true,
     value: [{ ...repository, private: true, permissions: { contents: "write" } }]
   });
+});
+
+test("GitHub REST initializes state from the created ref response without rereading the ref", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (init.method === "POST" && url.endsWith("/git/refs")) {
+        return json({ object: { sha: "a".repeat(40) } }, 201);
+      }
+      if (url.endsWith(`/git/commits/${"a".repeat(40)}`)) {
+        return json({ tree: { sha: "created-root-tree" } });
+      }
+      if (url.endsWith("/git/trees/created-root-tree")) {
+        return json({ tree: [{ path: ".hunsu", type: "tree", sha: "created-state-tree" }] });
+      }
+      if (url.endsWith("/git/trees/created-state-tree?recursive=1")) {
+        return json({ truncated: false, tree: [{ path: "reserved.json", type: "blob", sha: "reserved-blob" }] });
+      }
+      if (url.endsWith("/git/blobs/reserved-blob")) {
+        return json({
+          encoding: "base64",
+          content: Buffer.from("reserved\n", "utf8").toString("base64")
+        });
+      }
+      return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
+    }
+  });
+
+  assert.deepEqual(await transport.createBranch(repository, "hunsu/state", "a".repeat(40)), {
+    ok: true,
+    value: {
+      headSha: "a".repeat(40),
+      files: { ".hunsu/reserved.json": "reserved\n" }
+    }
+  });
+  assert.equal(calls.some(call => call.url.includes("/git/ref/")), false);
 });
 
 test("GitHub REST reads only the dedicated state subtree", async () => {

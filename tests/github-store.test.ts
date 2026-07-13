@@ -7,6 +7,7 @@ import {
   normalizeGitHubWebhook,
   type ProjectStateCodec,
   type RepositoryGrant,
+  type GitHubTransport,
   type StoreResult
 } from "../packages/github-store/src/index.ts";
 
@@ -126,6 +127,158 @@ test("GitHub state writes are append-only, idempotent, and reconstruct from even
   const reconstructed = await store.readProject(repository, "project-alpha");
   assert.equal(reconstructed.ok, true);
   if (reconstructed.ok) assert.deepEqual(reconstructed.value.state, { projectId: "project-alpha", title: "Alpha" });
+});
+
+test("fresh state initialization uses the authoritative created snapshot without a ref reread", async () => {
+  const inheritedState = await storedProjectFiles();
+  const memory = new MemoryGitHubTransport([{
+    repository,
+    initialSha: baseSha,
+    initialFiles: inheritedState
+  }]);
+  let stateReads = 0;
+  const transport: GitHubTransport = {
+    listInstallationRepositories: installationId => memory.listInstallationRepositories(installationId),
+    readBranch: async (target, branch) => {
+      if (branch === HUNSU_STATE_BRANCH) {
+        stateReads += 1;
+        if (stateReads <= 2) return { ok: true, value: undefined };
+      }
+      return memory.readBranch(target, branch);
+    },
+    createBranch: (target, branch, fromSha) => memory.createBranch(target, branch, fromSha),
+    commitFiles: input => memory.commitFiles(input),
+    compareCommits: (target, base, head) => memory.compareCommits(target, base, head),
+    commitExists: (target, sha) => memory.commitExists(target, sha)
+  };
+  const store = new GitHubProjectStore(transport, codec);
+
+  const result = await store.append({
+    repository,
+    projectId: "project-alpha",
+    baseSha,
+    idempotencyKey: "created-snapshot",
+    occurredAt: "2026-07-13T00:00:00.000Z",
+    actor: { kind: "user", id: "user-1" },
+    command: { type: "RenameProject", title: "Created snapshot" },
+    decide: state => state?.title === "Alpha"
+      ? {
+          ok: true,
+          value: [{ type: "ProjectRenamed", projectId: "project-alpha", title: "Created snapshot" }]
+        }
+      : { ok: false, error: { code: "invalid_event", message: "Created snapshot did not preserve inherited state." } }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.value.state.title, "Created snapshot");
+  assert.equal(stateReads, 1);
+});
+
+test("an invisible concurrent state initialization fails retryably without deciding or committing", async () => {
+  const memory = new MemoryGitHubTransport([{ repository, initialSha: baseSha }]);
+  let decisions = 0;
+  let commits = 0;
+  const delays: number[] = [];
+  const transport: GitHubTransport = {
+    listInstallationRepositories: installationId => memory.listInstallationRepositories(installationId),
+    readBranch: async () => ({ ok: true, value: undefined }),
+    createBranch: async () => ({
+      ok: false,
+      error: { code: "conflict", message: "The state branch was created concurrently." }
+    }),
+    commitFiles: async () => {
+      commits += 1;
+      return { ok: false, error: { code: "conflict", message: "Unexpected commit." } };
+    },
+    compareCommits: (target, base, head) => memory.compareCommits(target, base, head),
+    commitExists: (target, sha) => memory.commitExists(target, sha)
+  };
+  const store = new GitHubProjectStore(transport, codec, {
+    wait: async delayMs => { delays.push(delayMs); }
+  });
+
+  const result = await store.append({
+    repository,
+    projectId: "project-concurrent-init",
+    baseSha,
+    idempotencyKey: "concurrent-init",
+    occurredAt: "2026-07-13T00:00:00.000Z",
+    actor: { kind: "user", id: "user-1" },
+    command: { type: "CreateProject", title: "Concurrent" },
+    decide: () => {
+      decisions += 1;
+      return {
+        ok: true,
+        value: [{ type: "ProjectCreated", projectId: "project-concurrent-init", title: "Concurrent" }]
+      };
+    }
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "transport");
+    assert.equal(result.error.cause?.code, "not_found");
+  }
+  assert.equal(decisions, 0);
+  assert.equal(commits, 0);
+  assert.deepEqual(delays, [50, 150]);
+});
+
+test("a concurrent state creator is observed through bounded retries before the CAS write", async () => {
+  const inheritedState = await storedProjectFiles();
+  const winnerHeadSha = "b".repeat(40);
+  const memory = new MemoryGitHubTransport([{
+    repository,
+    initialSha: winnerHeadSha,
+    initialFiles: inheritedState,
+    branches: {
+      [repository.defaultBranch]: baseSha,
+      [HUNSU_STATE_BRANCH]: winnerHeadSha
+    }
+  }]);
+  let stateReads = 0;
+  const delays: number[] = [];
+  const transport: GitHubTransport = {
+    listInstallationRepositories: installationId => memory.listInstallationRepositories(installationId),
+    readBranch: async (target, branch) => {
+      if (branch === HUNSU_STATE_BRANCH) {
+        stateReads += 1;
+        if (stateReads <= 2) return { ok: true, value: undefined };
+      }
+      return memory.readBranch(target, branch);
+    },
+    createBranch: async () => ({
+      ok: false,
+      error: { code: "conflict", message: "The state branch was created concurrently." }
+    }),
+    commitFiles: input => memory.commitFiles(input),
+    compareCommits: (target, base, head) => memory.compareCommits(target, base, head),
+    commitExists: (target, sha) => memory.commitExists(target, sha)
+  };
+  const store = new GitHubProjectStore(transport, codec, {
+    wait: async delayMs => { delays.push(delayMs); }
+  });
+
+  const result = await store.append({
+    repository,
+    projectId: "project-alpha",
+    baseSha,
+    idempotencyKey: "concurrent-winner",
+    occurredAt: "2026-07-13T00:00:00.000Z",
+    actor: { kind: "user", id: "user-1" },
+    command: { type: "RenameProject", title: "Concurrent winner" },
+    decide: state => state?.title === "Alpha"
+      ? {
+          ok: true,
+          value: [{ type: "ProjectRenamed", projectId: "project-alpha", title: "Concurrent winner" }]
+        }
+      : { ok: false, error: { code: "invalid_event", message: "Concurrent winner state was not preserved." } }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ok && result.value.state.title, "Concurrent winner");
+  assert.equal(stateReads, 3);
+  assert.deepEqual(delays, [50]);
 });
 
 test("GitHub state reconstructs a valid multi-event command batch", async () => {
