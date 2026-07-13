@@ -227,8 +227,14 @@ test("GitHub App installation tokens are short-lived and cached without exposing
       });
     }
   });
-  assert.equal(await provider.getToken(17), "installation-token-1");
-  assert.equal(await provider.getToken(17), "installation-token-1");
+  assert.deepEqual(await provider.getAuthority(17), {
+    token: "installation-token-1",
+    permissions: { contents: "write" }
+  });
+  assert.deepEqual(await provider.getAuthority(17), {
+    token: "installation-token-1",
+    permissions: { contents: "write" }
+  });
   assert.equal(calls, 1);
 
   const request = requests[0];
@@ -259,28 +265,38 @@ test("GitHub App installation tokens are short-lived and cached without exposing
   ), true);
 
   now += 3_541_000;
-  assert.equal(await provider.getToken(17), "installation-token-2");
+  assert.deepEqual(await provider.getAuthority(17), {
+    token: "installation-token-2",
+    permissions: { contents: "write" }
+  });
   assert.equal(calls, 2);
 });
 
 test("GitHub App installation tokens fail closed without Contents write permission", async () => {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const now = Date.UTC(2026, 6, 13);
+  let calls = 0;
   const provider = new GitHubAppTokenProvider({
     appId: 42,
     privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
     apiBaseUrl: "https://github-api.example.test",
     now: () => now,
-    fetch: async () => jsonResponse({
-      token: "underprivileged-installation-token",
-      expires_at: new Date(now + 3_600_000).toISOString(),
-      permissions: { metadata: "read" }
-    }, 201)
+    fetch: async () => {
+      calls += 1;
+      return jsonResponse({
+        token: "underprivileged-installation-token",
+        expires_at: new Date(now + 3_600_000).toISOString(),
+        permissions: { contents: "read" }
+      }, 201);
+    }
   });
-  await assert.rejects(
-    provider.getToken(17),
-    /missing the required Contents write permission/u
-  );
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(
+      provider.getAuthority(17),
+      /missing the required Contents write permission/u
+    );
+  }
+  assert.equal(calls, 2);
 });
 
 test("GitHub OAuth resolves the user and granted App installations through authenticated API lookups", async () => {

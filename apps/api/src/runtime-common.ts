@@ -17,7 +17,7 @@ export function createHunsuRuntime(env: Env, stateStore: EphemeralStateStore) {
   const githubConfig = unwrapConfigResult(resolveGitHubAppConfig(env));
   const sessionConfig = unwrapConfigResult(resolveSessionConfig(env));
   const githubAuth = createGitHubAuth(githubConfig);
-  const transport = new GitHubRestTransport({ tokenProvider: githubAuth.tokenProvider.getToken });
+  const transport = new GitHubRestTransport({ authorityProvider: githubAuth.tokenProvider.getAuthority });
   const service = new HunsuApplicationService({ transport });
   const sessions = new SessionManager(sessionConfig);
   const mcpOAuth = new McpOAuthService({

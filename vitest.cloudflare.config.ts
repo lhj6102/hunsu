@@ -44,7 +44,8 @@ export default defineConfig({
                 name: "sample",
                 default_branch: "main",
                 private: true,
-                owner: { login: "acme" }
+                owner: { login: "acme" },
+                permissions: { admin: false, push: false, pull: true }
               }]
             });
           }
