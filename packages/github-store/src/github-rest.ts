@@ -64,10 +64,29 @@ export class GitHubRestTransport implements GitHubTransport {
     const ref = await this.#reference(repository, branch);
     if (!ref.ok) return ref;
     if (ref.value === undefined) return ok(undefined);
-    if (branch !== HUNSU_STATE_BRANCH) return ok({ headSha: ref.value, files: {} });
+    return this.#branchSnapshot(repository, branch, ref.value);
+  }
+
+  async createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<BranchSnapshot>> {
+    const response = await this.#request<Record<string, unknown>>(repository.installationId, `${repositoryPath(repository)}/git/refs`, {
+      method: "POST",
+      body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: fromSha })
+    });
+    if (!response.ok) return response;
+    const sha = readNestedString(response.value, "object", "sha");
+    if (!sha) return invalidResponse("Created GitHub ref is missing its commit SHA.");
+    return this.#branchSnapshot(repository, branch, sha);
+  }
+
+  async #branchSnapshot(
+    repository: RepositoryLocator,
+    branch: string,
+    headSha: string
+  ): Promise<TransportResult<BranchSnapshot>> {
+    if (branch !== HUNSU_STATE_BRANCH) return ok({ headSha, files: {} });
     const commit = await this.#request<Record<string, unknown>>(
       repository.installationId,
-      `${repositoryPath(repository)}/git/commits/${encodeURIComponent(ref.value)}`
+      `${repositoryPath(repository)}/git/commits/${encodeURIComponent(headSha)}`
     );
     if (!commit.ok) return commit;
     const treeSha = readNestedString(commit.value, "tree", "sha");
@@ -81,7 +100,7 @@ export class GitHubRestTransport implements GitHubTransport {
     const rootEntries = Array.isArray(rootTree.value.tree) ? rootTree.value.tree : undefined;
     if (!rootEntries) return invalidResponse("GitHub root tree response is missing entries.");
     const stateTreeSha = rootEntries.find(entry => isRecord(entry) && entry.path === ".hunsu" && entry.type === "tree" && typeof entry.sha === "string");
-    if (!isRecord(stateTreeSha) || typeof stateTreeSha.sha !== "string") return ok({ headSha: ref.value, files: {} });
+    if (!isRecord(stateTreeSha) || typeof stateTreeSha.sha !== "string") return ok({ headSha, files: {} });
 
     const tree = await this.#request<Record<string, unknown>>(
       repository.installationId,
@@ -104,17 +123,7 @@ export class GitHubRestTransport implements GitHubTransport {
       if (!result.ok) return result;
       files[blob.path] = result.value;
     }
-    return ok({ headSha: ref.value, files });
-  }
-
-  async createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<string>> {
-    const response = await this.#request<Record<string, unknown>>(repository.installationId, `${repositoryPath(repository)}/git/refs`, {
-      method: "POST",
-      body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: fromSha })
-    });
-    if (!response.ok) return response;
-    const sha = readNestedString(response.value, "object", "sha");
-    return sha ? ok(sha) : invalidResponse("Created GitHub ref is missing its commit SHA.");
+    return ok({ headSha, files });
   }
 
   async commitFiles(input: {
@@ -203,7 +212,7 @@ export class GitHubRestTransport implements GitHubTransport {
     const response = await this.#request<Record<string, unknown>>(
       repository.installationId,
       `${repositoryPath(repository)}/git/ref/${encodeRef(`heads/${branch}`)}`,
-      undefined,
+      { cache: "no-store" },
       false,
       true
     );
