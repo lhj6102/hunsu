@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: Exact immutable Git tag, for example v0.2.0-next.10
+        description: Exact immutable Git tag, for example v0.2.0-next.11
         required: true
         type: string
       operation:

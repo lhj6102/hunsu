@@ -1091,7 +1091,7 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
     "rl.on('line', line => {",
     "  const msg = JSON.parse(line);",
     "  if (msg.method === 'initialize') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 'test' } }));",
-    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { authMethod: 'chatgpt', email: 'dev@example.test', planLabel: 'Team' } }));",
+    "  else if (msg.method === 'account/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { account: { type: 'chatgpt', email: 'dev@example.test', planType: 'team' }, requiresOpenaiAuth: true } }));",
     "  else if (msg.method === 'account/rateLimits/read') console.log(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { label: 'Available', remaining: 'available' } }));",
     "});",
     ""
@@ -1131,6 +1131,8 @@ test("Bridge Codex runtime status detects missing and custom Codex CLI without r
     assert.equal(ready.auth.state, "authenticated");
     assert.equal(ready.auth.method, "chatgpt");
     assert.equal(ready.auth.access, "subscription");
+    assert.equal(ready.auth.accountSummary?.email, "dev@example.test");
+    assert.equal(ready.auth.accountSummary?.planLabel, "team");
     assert.equal(ready.ready, true);
     assert.equal(codexRuntimePreflightError(ready), undefined);
 
@@ -3049,7 +3051,7 @@ test("Bridge server exposes sanitized legacy Codex provider status", async () =>
         planType: "plus",
         apiKey: "sk-provider-secret"
       },
-      requiresOpenaiAuth: false,
+      requiresOpenaiAuth: true,
       refreshToken: "refresh-provider-secret"
     },
     rateLimits: {
@@ -3068,6 +3070,7 @@ test("Bridge server exposes sanitized legacy Codex provider status", async () =>
   assert.equal(response.status, 200);
   assert.equal(response.body.backend, "app-server");
   assert.equal(response.body.available, true);
+  assert.equal(response.body.auth.state, "authenticated");
   assert.equal(response.body.auth.method, "chatgpt");
   assert.equal(response.body.auth.access, "subscription");
   assert.equal(response.body.accountSummary.email, "test@hunsu.app");

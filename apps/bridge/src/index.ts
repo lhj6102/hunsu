@@ -1761,9 +1761,9 @@ function codexProviderAccountSummary(account: unknown): {
   if (!isRecord(account)) {
     return undefined;
   }
-  const nested = isRecord(account.account) ? account.account : {};
-  const merged = { ...nested, ...account };
-  const requiresAuth = merged.requiresOpenaiAuth === true;
+  const nestedAccount = isRecord(account.account) ? account.account : undefined;
+  const merged = nestedAccount ? { ...account, ...nestedAccount } : account;
+  const requiresAuth = account.requiresOpenaiAuth === true && !nestedAccount;
   const method = legacyAuthMethod(merged);
   return {
     auth: {

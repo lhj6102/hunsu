@@ -102,5 +102,6 @@ export type ServiceLifecycleDependencies = {
   readInstalledRuntime?: () => Promise<InstalledRuntimeInfo | undefined>;
   sleep?: (milliseconds: number) => Promise<void>;
   stopTimeoutMs?: number;
+  startTimeoutMs?: number;
   pollIntervalMs?: number;
 };

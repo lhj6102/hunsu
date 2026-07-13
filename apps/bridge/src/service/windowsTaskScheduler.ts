@@ -10,6 +10,13 @@ import {
 import type { BridgeServiceManager, ServiceCommandResult, ServiceInstallInput } from "./types.ts";
 
 const WINDOWS_TASK_NAME = "Hunsu Bridge";
+const WINDOWS_TASK_NOT_FOUND_MARKER = "__HUNSU_TASK_NOT_FOUND__";
+const WINDOWS_TASK_STOPPED_STATES = new Set(["ready", "disabled"]);
+
+type WindowsTaskProbe =
+  | { kind: "missing" }
+  | { kind: "state"; state: string }
+  | { kind: "unavailable" };
 
 export type WindowsTaskSchedulerOptions = ServiceAdapterDependencies & {
   taskName?: string;
@@ -30,7 +37,10 @@ export function createWindowsTaskSchedulerServiceManager(options: WindowsTaskSch
 
   const probeTask = async (): Promise<ServiceCommandResult> => runPowerShell([
     "$ErrorActionPreference = 'Stop'",
-    `Get-ScheduledTask -TaskName ${powerShellQuote(taskName)} | Select-Object -ExpandProperty State`
+    `$Task = @(Get-ScheduledTask | Where-Object { $_.TaskName -eq ${powerShellQuote(taskName)} })`,
+    `if ($Task.Count -eq 0) { Write-Output ${powerShellQuote(WINDOWS_TASK_NOT_FOUND_MARKER)}; exit 0 }`,
+    "if ($Task.Count -ne 1) { throw 'Expected exactly one Hunsu Bridge scheduled task.' }",
+    "$Task[0] | Select-Object -ExpandProperty State"
   ].join("; "));
 
   const probeTaskAction = async (): Promise<ServiceCommandResult> => runPowerShell([
@@ -53,15 +63,24 @@ export function createWindowsTaskSchedulerServiceManager(options: WindowsTaskSch
     },
     async uninstall() {
       const before = await probeTask();
+      const task = windowsTaskProbe(before);
+      if (task.kind === "unavailable") {
+        throw new Error("Unable to verify the current-user scheduled task before unregistering it.");
+      }
+      if (task.kind === "missing") {
+        installed = false;
+        return { changed: false };
+      }
+      if (!WINDOWS_TASK_STOPPED_STATES.has(task.state)) {
+        throw new Error("The current-user scheduled task is not definitively stopped.");
+      }
       const result = await runPowerShell([
         "$ErrorActionPreference = 'Stop'",
         `Unregister-ScheduledTask -TaskName ${powerShellQuote(taskName)} -Confirm:$false`
       ].join("; "));
-      if (before.exitCode === 0) {
-        requireCommandSuccess(result, "unregister the current-user scheduled task");
-      }
+      requireCommandSuccess(result, "unregister the current-user scheduled task");
       installed = false;
-      return { changed: before.exitCode === 0 };
+      return { changed: true };
     },
     async start() {
       requireCommandSuccess(await runPowerShell(`Start-ScheduledTask -TaskName ${powerShellQuote(taskName)}`), "start the current-user scheduled task");
@@ -70,21 +89,34 @@ export function createWindowsTaskSchedulerServiceManager(options: WindowsTaskSch
       requireCommandSuccess(await runPowerShell(`Stop-ScheduledTask -TaskName ${powerShellQuote(taskName)}`), "stop the current-user scheduled task");
     },
     async status() {
-      const result = await probeTask();
-      if (result.exitCode !== 0) {
-        return { installed, state: "stopped", detail: "task not registered" };
+      const task = windowsTaskProbe(await probeTask());
+      if (task.kind === "missing") {
+        installed = false;
+        return { installed: false, state: "stopped", detail: "task not registered" };
+      }
+      if (task.kind === "unavailable") {
+        return { installed: true, state: "unknown", detail: "scheduled task status unavailable" };
       }
       installed = true;
-      const taskState = result.stdout.trim().toLowerCase();
       return {
         installed: true,
-        state: taskState === "running" ? "running" : taskState ? "stopped" : "unknown",
-        detail: taskState || undefined
+        state: task.state === "running"
+          ? "running"
+          : WINDOWS_TASK_STOPPED_STATES.has(task.state) ? "stopped" : "unknown",
+        detail: task.state
       };
     }
   };
 
   return createManagedBridgeService(adapter, options);
+}
+
+function windowsTaskProbe(result: ServiceCommandResult): WindowsTaskProbe {
+  if (result.exitCode !== 0) return { kind: "unavailable" };
+  const output = result.stdout.trim().replace(/^\uFEFF/u, "");
+  if (output === WINDOWS_TASK_NOT_FOUND_MARKER) return { kind: "missing" };
+  if (!output || output.includes("\n") || output.includes("\r")) return { kind: "unavailable" };
+  return { kind: "state", state: output.toLowerCase() };
 }
 
 export function windowsTaskInstallScript(input: ServiceInstallInput, taskName = WINDOWS_TASK_NAME): string {
