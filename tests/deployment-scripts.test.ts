@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test, { type TestContext } from "node:test";
+import { findRetiredOriginReferences } from "../scripts/deployment/retired-origin-scan.mjs";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const smokeScript = resolve(repoRoot, "scripts/deployment/smoke-plugin-production.mjs");
@@ -23,6 +24,35 @@ const smokeChecks = [
   ["mcp-authentication-challenge", 401],
   ["github-oauth-redirect", 302]
 ] as const;
+
+test("retired production origin scan covers workflows and deployment scripts", async t => {
+  const directory = await temporaryDirectory(t);
+  const roots = [
+    "apps",
+    "packages",
+    "plugins",
+    ".github/workflows",
+    "scripts/deployment"
+  ];
+  await Promise.all(roots.map(root => mkdir(join(directory, root), { recursive: true })));
+  await Promise.all([
+    writeFile(join(directory, "wrangler.jsonc"), "{}\n", "utf8"),
+    writeFile(join(directory, "apps/api.ts"), "export const origin = \"https://api.hunsu.app\";\n", "utf8"),
+    writeFile(join(directory, ".github/workflows/deploy.yml"), "run: curl https://api.hunsu.app/health\n", "utf8"),
+    writeFile(join(directory, ".github/workflows/reusable.yaml"), "env:\n  API_ORIGIN: https://api.hunsu.app\n", "utf8"),
+    writeFile(join(directory, "scripts/deployment/deploy.mjs"), "export const origin = \"https://api.hunsu.app\";\n", "utf8"),
+    writeFile(join(directory, "scripts/deployment/sentinel.mjs"), "export const retired = [\"api\", \"hunsu\", \"app\"].join(\".\");\n", "utf8"),
+    writeFile(join(directory, "packages/ignored.txt"), "https://api.hunsu.app\n", "utf8"),
+    writeFile(join(directory, "plugins/config.json"), "{}\n", "utf8")
+  ]);
+
+  assert.deepEqual(await findRetiredOriginReferences(directory), [
+    ".github/workflows/deploy.yml",
+    ".github/workflows/reusable.yaml",
+    "apps/api.ts",
+    "scripts/deployment/deploy.mjs"
+  ]);
+});
 
 test("production smoke writes structured failure evidence instead of crashing", async t => {
   const directory = await temporaryDirectory(t);

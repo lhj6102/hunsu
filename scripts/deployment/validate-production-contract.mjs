@@ -1,6 +1,7 @@
-import { readFile, readdir } from "node:fs/promises";
-import { dirname, extname, relative, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { findRetiredOriginReferences, retiredOrigin } from "./retired-origin-scan.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const errors = [];
@@ -123,28 +124,9 @@ function validatePlugin(value) {
 }
 
 async function validateRetiredOriginIsAbsent() {
-  const roots = ["apps", "packages", "plugins"].map(path => resolve(repoRoot, path));
-  const files = [];
-  for (const root of roots) files.push(...await walk(root));
-  files.push(resolve(repoRoot, "wrangler.jsonc"));
-  for (const file of files) {
-    if (![".css", ".html", ".js", ".json", ".jsonc", ".md", ".mjs", ".ts", ".tsx"].includes(extname(file))) continue;
-    const source = await readFile(file, "utf8");
-    if (source.includes("api.hunsu.app")) {
-      issue(`${relative(repoRoot, file)} still refers to retired production origin api.hunsu.app.`);
-    }
+  for (const path of await findRetiredOriginReferences(repoRoot)) {
+    issue(`${path} still refers to retired production origin ${retiredOrigin}.`);
   }
-}
-
-async function walk(root) {
-  const files = [];
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    if (entry.isSymbolicLink()) continue;
-    const path = resolve(root, entry.name);
-    if (entry.isDirectory()) files.push(...await walk(path));
-    else if (entry.isFile()) files.push(path);
-  }
-  return files;
 }
 
 async function readJson(path) {
