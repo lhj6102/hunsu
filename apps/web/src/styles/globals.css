@@ -71,38 +71,6 @@
   --input: rgba(210, 210, 215, 0.76);
   --ring: var(--apple-blue-focus);
 
-  --team-01: #007aff;
-  --team-02: #34c759;
-  --team-03: #5856d6;
-  --team-04: #ff9500;
-  --team-05: #ff2d55;
-  --team-06: #af52de;
-  --team-07: #ff3b30;
-  --team-08: #30b0c7;
-  --team-09: #32ade6;
-  --team-10: #ffcc00;
-  --team-11: #00c7be;
-  --team-12: #a2845e;
-  --studio-faker: var(--team-01);
-  --studio-ruler: var(--team-07);
-  --studio-canyon: var(--team-02);
-  --studio-galio: var(--team-06);
-  --studio-warning: var(--apple-orange);
-  --studio-success: var(--apple-green);
-  --studio-danger: var(--apple-red);
-  --studio-shell-surface: var(--apple-glass);
-  --studio-canvas-tint: var(--apple-canvas-alt);
-  --studio-card-surface: rgba(255, 255, 255, 0.88);
-  --studio-immutable-accent: var(--apple-blue);
-  --studio-border-subtle: rgba(210, 210, 215, 0.72);
-  --studio-destination-completed: rgba(29, 29, 31, 0.82);
-  --studio-destination-pending: rgba(255, 255, 255, 0.86);
-  --studio-destination-pending-stroke: rgba(210, 210, 215, 0.84);
-  --studio-destination-failed: rgba(255, 59, 48, 0.13);
-  --studio-execute-phase: var(--apple-blue);
-  --studio-path-dependency: var(--apple-muted);
-  --studio-commit: var(--apple-green);
-  --studio-canvas-grid: rgba(210, 210, 215, 0.34);
 }
 
 * {
@@ -133,18 +101,6 @@ select {
   min-height: 100vh;
 }
 
-.studio-canvas-grid {
-  background-image:
-    linear-gradient(var(--studio-canvas-grid) 1px, transparent 1px),
-    linear-gradient(90deg, var(--studio-canvas-grid) 1px, transparent 1px);
-  background-size: 32px 32px;
-}
-
-.studio-scrollbar {
-  scrollbar-color: color-mix(in oklab, var(--muted-foreground), transparent 56%) transparent;
-  scrollbar-width: thin;
-}
-
 .apple-glass {
   border: 1px solid rgba(210, 210, 215, 0.72);
   background: var(--apple-glass);
@@ -159,14 +115,6 @@ select {
   box-shadow: var(--apple-shadow), 0 1px 0 rgba(255, 255, 255, 0.72) inset;
   -webkit-backdrop-filter: blur(28px) saturate(170%);
   backdrop-filter: blur(28px) saturate(170%);
-}
-
-.hub-detail-dialog {
-  border: 1px solid var(--apple-hairline);
-  background: var(--apple-canvas);
-  box-shadow: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
 }
 
 .apple-page {

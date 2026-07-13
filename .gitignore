@@ -5,11 +5,10 @@ npm-debug.log*
 dist/
 **/dist/
 .playwright-cli/
-handoffs/*
-**/.wrangler/
 playwright-report/
 test-results/
-ops/hub/env/*.env
+.wrangler/
+.artifacts/
 
 # Local secrets and environment files
 .env
@@ -32,5 +31,8 @@ id_ed25519
 
 # Local runtime and agent state
 .hunsu/
-.agents/
+.agents/*
+!.agents/plugins/
+.agents/plugins/*
+!.agents/plugins/marketplace.json
 .codex/

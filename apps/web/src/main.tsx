@@ -7,7 +7,7 @@ import "@/styles/globals.css";
 const root = document.getElementById("root");
 
 if (!root) {
-  throw new Error("Hunsu Studio root element is missing.");
+  throw new Error("Hunsu Web root element is missing.");
 }
 
 const queryClient = new QueryClient({

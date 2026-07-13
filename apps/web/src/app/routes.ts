@@ -1,77 +1,64 @@
-export type StudioRoute =
-  | { kind: "hub" }
-  | { kind: "setup"; next: string }
-  | { kind: "modelAliases" }
-  | { kind: "launcher" }
-  | { kind: "open"; path: string | undefined; browseToken?: string; rootId?: string }
-  | { kind: "port"; path: string | undefined; browseToken?: string; rootId?: string }
-  | { kind: "roadmap"; roadmapId: string };
+export type AppRoute =
+  | { kind: "projects" }
+  | { kind: "project"; projectId: string }
+  | { kind: "goal"; projectId: string; goalId: string }
+  | { kind: "runners"; projectId: string }
+  | { kind: "coach"; projectId: string }
+  | { kind: "run"; projectId: string; runId: string };
 
-export function parseStudioRoute(location: Location): StudioRoute {
-  if (location.pathname === "/hub" || location.pathname.startsWith("/hub/")) {
-    return { kind: "hub" };
+export function parseAppRoute(location: Pick<Location, "pathname">): AppRoute {
+  const parts = location.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  if (parts.length === 1 && parts[0] === "projects") {
+    return { kind: "projects" };
   }
-  if (location.pathname === "/studio/setup") {
-    const params = new URLSearchParams(location.search);
-    return { kind: "setup", next: safeStudioNext(params.get("next")) };
+  if (parts[0] !== "projects" || !parts[1]) {
+    return { kind: "projects" };
   }
-  if (location.pathname === "/studio/settings/model-aliases") {
-    return { kind: "modelAliases" };
+  const projectId = parts[1];
+  if (parts.length === 2) {
+    return { kind: "project", projectId };
   }
-  if (location.pathname === "/" || location.pathname === "" || location.pathname === "/studio") {
-    return { kind: "launcher" };
+  if (parts.length === 4 && parts[2] === "goals" && parts[3]) {
+    return { kind: "goal", projectId, goalId: parts[3] };
   }
-  if (location.pathname === "/studio/open") {
-    const params = new URLSearchParams(location.search);
-    return { kind: "open", path: params.get("path") ?? undefined, browseToken: params.get("browseToken") ?? undefined, rootId: params.get("rootId") ?? undefined };
+  if (parts.length === 3 && parts[2] === "runners") {
+    return { kind: "runners", projectId };
   }
-  if (location.pathname === "/studio/port") {
-    const params = new URLSearchParams(location.search);
-    return { kind: "port", path: params.get("path") ?? undefined, browseToken: params.get("browseToken") ?? undefined, rootId: params.get("rootId") ?? undefined };
+  if (parts.length === 3 && parts[2] === "coach") {
+    return { kind: "coach", projectId };
   }
-  const roadmapMatch = location.pathname.match(/^\/studio\/roadmaps\/([^/]+)$/);
-  if (roadmapMatch?.[1]) {
-    return { kind: "roadmap", roadmapId: decodeURIComponent(roadmapMatch[1]) };
+  if (parts.length === 4 && parts[2] === "runs" && parts[3]) {
+    return { kind: "run", projectId, runId: parts[3] };
   }
-  return { kind: "launcher" };
+  return { kind: "project", projectId };
 }
 
-export function isBridgeBackedStudioRoute(route: StudioRoute): boolean {
-  return route.kind === "launcher" || route.kind === "open" || route.kind === "port" || route.kind === "roadmap" || route.kind === "modelAliases";
+export function projectPath(projectId: string): string {
+  return `/projects/${encodeURIComponent(projectId)}`;
 }
 
-export function roadmapApiPath(roadmapId: string, suffix: string): string {
-  return `/api/roadmaps/${encodeURIComponent(roadmapId)}${suffix}`;
+export function goalPath(projectId: string, goalId: string): string {
+  return `${projectPath(projectId)}/goals/${encodeURIComponent(goalId)}`;
 }
 
-export function studioRoadmapPath(roadmapId: string): string {
-  return `/studio/roadmaps/${encodeURIComponent(roadmapId)}`;
+export function runnersPath(projectId: string): string {
+  return `${projectPath(projectId)}/runners`;
 }
 
-export function pushStudioPath(path: string): void {
+export function coachPath(projectId: string): string {
+  return `${projectPath(projectId)}/coach`;
+}
+
+export function runPath(projectId: string, runId: string): string {
+  return `${projectPath(projectId)}/runs/${encodeURIComponent(runId)}`;
+}
+
+export function pushAppPath(path: string): void {
   window.history.pushState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
-export function replaceStudioPath(path: string): void {
+export function replaceAppPath(path: string): void {
   window.history.replaceState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
-}
-
-export function setupPath(next = "/studio"): string {
-  return `/studio/setup?next=${encodeURIComponent(safeStudioNext(next))}`;
-}
-
-export function currentStudioNext(location: Location): string {
-  return safeStudioNext(`${location.pathname}${location.search}${location.hash}`);
-}
-
-export function safeStudioNext(next: string | null | undefined): string {
-  if (!next?.startsWith("/studio")) {
-    return "/studio";
-  }
-  if (next.startsWith("//")) {
-    return "/studio";
-  }
-  return next;
 }

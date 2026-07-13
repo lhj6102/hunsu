@@ -1,49 +1,25 @@
 # AGENTS.md
 
-This file routes agents to docs they are likely to miss. Do not duplicate those
-docs here.
+This file routes contributors to the current source-of-truth documents.
 
-## Routing Guidance
+## Domain, model, protocol, and workflow code
 
-### Domain, Model, Protocol, Workflow, Or Runtime Code
+Read [Domain language](docs/domain-language.md) and [DMMF rules](docs/dmmf-refactoring-spec.md).
 
-Read [DMMF Refactoring Spec](docs/dmmf-refactoring-spec.md).
+Prefer explicit domain variants and `Result` boundaries. Do not add aliases, permissive decoders, or optional-field lifecycle states.
 
-Prefer explicit domain types and Result boundaries. Do not add compatibility
-shims or optional-field lifecycle states by habit.
+## Package boundaries and dependencies
 
-### Package Boundaries Or Workspace Dependencies
+Read [Workspace structure](docs/workspace-structure.md).
 
-Read [Workspace Structure](docs/workspace-structure.md).
+Keep GitHub access, HTTP, authentication, MCP, runtime interaction, and repository worktrees outside `apps/web`, `packages/protocol`, and `packages/core`.
 
-Keep Git, Codex, runtime orchestration, and worktrees out of `apps/web`. Do not
-pull app/runtime dependencies into lower-level packages.
+## GitHub state, Runs, and reconstruction
 
-### `.hunsu`, Execute Worktrees, Provider Goals, Or Runtime Persistence
+Read [GitHub-backed architecture](docs/architecture/github-backed-projects.md) and [Codex plugin architecture](docs/architecture/codex-plugin.md).
 
-Read [Executable Runtime State](docs/executable-runtime-state.md) and
-[Codex Runner](docs/codex-runner.md).
+Do not inspect or edit `.hunsu/state.hunsu`. Never bypass the event append, idempotency, compare-and-swap, branch-verification, or explicit-confirmation boundaries.
 
-Do not inspect or edit `.hunsu/state.hunsu`. Execute worktrees start from the
-selected MOVE position.
+## Service configuration
 
-### Artifact Actions, Action Runs, Host/Check Behavior, Or Old Preview Behavior
-
-Read [Artifact Actions](docs/artifact-actions.md).
-
-Use Artifact Action aliases as the Studio/E2E contract. Concrete host ports and
-unmanaged dev servers are debug fallbacks only.
-
-### Origin, Harness Registry, Or Skill Package Resolution
-
-Read [Hub, Origin, And Package Registry](docs/harness-registry.md).
-
-Environment variables must not silently change committed
-origin/key/version/integrity locks.
-
-### Hunsu Service Ports
-
-Use `@hunsu/config`.
-
-Use the monadic environment-variable pass pipeline. Do not hard-code service
-ports in app code.
+Use `@hunsu/config`. Pass environment values through its `Result`-based resolvers and never hard-code service ports or secrets in application code.

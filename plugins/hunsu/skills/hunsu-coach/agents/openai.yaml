@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunsu Coach"
+  short_description: "Review Project evidence and propose next steps."
+  default_prompt: "Use $hunsu-coach to review the latest Run evidence and recommend a next step."

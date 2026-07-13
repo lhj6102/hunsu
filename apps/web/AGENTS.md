@@ -2,33 +2,34 @@
 
 ## Boundary
 
-- `apps/web` is the React/Vite browser app for `/studio`, `/studio/roadmaps/:roadmapId`, `/hub`, and `/dev/handoffs/roadmap-v3`.
-- Keep Git, Codex execution, worktree mutation, and runtime persistence out of this app. Use Bridge API calls for runtime control.
-- Do not inspect or edit `.hunsu/state.hunsu` from web code.
+- `apps/web` is the React/Vite browser app for GitHub-backed Projects, Goals, Runners, Runs, and Coach review.
+- Keep Git operations, Codex execution, worktree mutation, and runtime persistence out of this app. Use same-origin REST endpoints under `/api`.
+- Do not inspect or edit `.hunsu/state.hunsu` from Web code.
+- Do not add browser token storage. GitHub authentication is an HTTP-only server session.
 
 ## Styling
 
 - Use Tailwind CSS v4, shadcn/ui primitives in `src/shared/ui`, and lucide-react icons.
 - Use `src/styles/globals.css` as the only global Tailwind entry.
-- Start from shadcn neutral tokens. Reintroduce Hunsu colors through semantic variables in `src/shared/design`.
-- Do not re-add legacy `styles.css`, `studio-white-theme.css`, or legacy class-name contracts.
+- Prefer the existing neutral semantic tokens and accessible status badges.
 
 ## Components
 
 - Feature screens live in `src/features`.
 - Shared primitives live in `src/shared/ui`.
 - Cross-feature helpers live in `src/shared`.
-- Use `@/shared/ui/*`, `@/lib/utils`, and feature-local imports.
+- Keep API DTOs and the small REST boundary in `src/shared/api`.
 
 ## Routes
 
-- Preserve `/studio`, `/studio/open`, `/studio/port`, `/studio/roadmaps/:roadmapId`, `/hub`, and `/dev/handoffs/roadmap-v3`.
-- The active Roadmap comes from the URL. Query params may hold selected MOVE, Execute, and panel state.
+- The supported routes are `/projects`, `/projects/:projectId`, `/projects/:projectId/goals/:goalId`, `/projects/:projectId/runners`, `/projects/:projectId/coach`, and `/projects/:projectId/runs/:runId`.
+- Project and Goal identifiers come from the URL. Comparison remains a secondary section within Goal detail.
 
-## Figma Contract
+## Product Rules
 
-- Preserve the data contract names in `src/shared/design/figmaContracts.ts`.
-- `/dev/handoffs/roadmap-v3` is the lightweight design QA surface until formal Storybook is added.
+- Present lists, boards, and detail views before comparison UI.
+- Require explicit confirmation for Hunsu, alternative selection or rejection, and consequential Coach proposals.
+- Use bounded, visibility-aware polling. Surface structured conflicts and avoid optimistic success for GitHub writes.
 
 ## Verification
 

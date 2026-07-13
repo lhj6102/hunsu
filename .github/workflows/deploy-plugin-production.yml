@@ -1,0 +1,198 @@
+name: Deploy plugin.hunsu.app
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hunsu-plugin-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: hunsu-production
+      url: https://plugin.hunsu.app
+    steps:
+      - name: Check out exact main commit with full history
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up pnpm 10.30.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.2
+          run_install: false
+
+      - name: Set up Node.js 24.18
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - name: Validate hunsu-production before any Cloudflare mutation
+        env:
+          HUNSU_DEPLOYMENT_ENVIRONMENT: hunsu-production
+          GITHUB_SHA: ${{ github.sha }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HUNSU_GITHUB_APP_ID: ${{ vars.HUNSU_GITHUB_APP_ID }}
+          HUNSU_GITHUB_CLIENT_ID: ${{ vars.HUNSU_GITHUB_CLIENT_ID }}
+          HUNSU_GITHUB_APP_SLUG: ${{ vars.HUNSU_GITHUB_APP_SLUG }}
+          HUNSU_GITHUB_CLIENT_SECRET: ${{ secrets.HUNSU_GITHUB_CLIENT_SECRET }}
+          HUNSU_GITHUB_PRIVATE_KEY: ${{ secrets.HUNSU_GITHUB_PRIVATE_KEY }}
+          HUNSU_GITHUB_WEBHOOK_SECRET: ${{ secrets.HUNSU_GITHUB_WEBHOOK_SECRET }}
+          HUNSU_SESSION_SECRET: ${{ secrets.HUNSU_SESSION_SECRET }}
+        run: node scripts/deployment/validate-production-env.mjs
+
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run complete validation gate
+        run: pnpm check
+
+      - name: Build all production packages and applications
+        run: pnpm build
+
+      - name: Validate production and Plugin contracts
+        run: |
+          pnpm run plugin:validate
+          pnpm run worker:types:check
+          node scripts/deployment/validate-production-contract.mjs
+
+      - name: Write exact-main production runtime overlay
+        run: node scripts/deployment/write-web-runtime-config.mjs --source-sha "$GITHUB_SHA"
+
+      - name: Bundle and inspect the production Worker
+        run: |
+          mkdir -p .artifacts
+          pnpm exec wrangler deploy --dry-run --outdir .artifacts/worker-bundle --metafile .artifacts/worker-bundle-meta.json
+          node scripts/deployment/validate-worker-bundle.mjs --bundle-dir .artifacts/worker-bundle --metafile .artifacts/worker-bundle-meta.json
+
+      - name: Run Cloudflare adapter and OAuth Durable Object tests
+        run: pnpm run test:cloudflare
+
+      - name: Record pinned Wrangler version
+        run: pnpm exec wrangler --version > .artifacts/wrangler-version.txt
+
+      - name: Read current production deployment
+        id: current_production
+        continue-on-error: true
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          FORCE_COLOR: "0"
+          WRANGLER_LOG_SANITIZE: "true"
+        run: pnpm exec wrangler deployments status --name hunsu-plugin-production --json > .artifacts/pre-deploy-deployment.json
+
+      - name: Verify current production as a rollback baseline
+        id: baseline_smoke
+        if: steps.current_production.outcome == 'success'
+        continue-on-error: true
+        run: node scripts/deployment/smoke-plugin-production.mjs --discover-source-sha --attempts 1 --output .artifacts/pre-deploy-smoke.json
+
+      - name: Record known-good rollback target
+        id: rollback_target
+        if: steps.current_production.outcome == 'success' && steps.baseline_smoke.outcome == 'success'
+        continue-on-error: true
+        run: node scripts/deployment/select-rollback-target.mjs --deployment .artifacts/pre-deploy-deployment.json --smoke-results .artifacts/pre-deploy-smoke.json --output .artifacts/rollback-target.json
+
+      - name: Atomically deploy Worker, assets, secrets, migration, and custom domain
+        id: deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HUNSU_GITHUB_APP_ID: ${{ vars.HUNSU_GITHUB_APP_ID }}
+          HUNSU_GITHUB_CLIENT_ID: ${{ vars.HUNSU_GITHUB_CLIENT_ID }}
+          HUNSU_GITHUB_APP_SLUG: ${{ vars.HUNSU_GITHUB_APP_SLUG }}
+          HUNSU_GITHUB_CLIENT_SECRET: ${{ secrets.HUNSU_GITHUB_CLIENT_SECRET }}
+          HUNSU_GITHUB_PRIVATE_KEY: ${{ secrets.HUNSU_GITHUB_PRIVATE_KEY }}
+          HUNSU_GITHUB_WEBHOOK_SECRET: ${{ secrets.HUNSU_GITHUB_WEBHOOK_SECRET }}
+          HUNSU_SESSION_SECRET: ${{ secrets.HUNSU_SESSION_SECRET }}
+          FORCE_COLOR: "0"
+          WRANGLER_LOG_SANITIZE: "true"
+          WRANGLER_OUTPUT_FILE_PATH: ${{ github.workspace }}/.artifacts/wrangler-output.ndjson
+        run: |
+          secrets_file="${RUNNER_TEMP}/hunsu-plugin-production-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          trap 'rm -f "$secrets_file"' EXIT
+          node scripts/deployment/write-wrangler-secrets.mjs --output "$secrets_file"
+          unset HUNSU_GITHUB_CLIENT_SECRET HUNSU_GITHUB_PRIVATE_KEY HUNSU_GITHUB_WEBHOOK_SECRET HUNSU_SESSION_SECRET
+          pnpm exec wrangler deploy \
+            --secrets-file "$secrets_file" \
+            --var "HUNSU_GITHUB_APP_ID:${HUNSU_GITHUB_APP_ID}" \
+            --var "HUNSU_GITHUB_CLIENT_ID:${HUNSU_GITHUB_CLIENT_ID}" \
+            --var "HUNSU_GITHUB_APP_SLUG:${HUNSU_GITHUB_APP_SLUG}" \
+            --message "Deploy main ${GITHUB_SHA}"
+
+      - name: Run public custom-domain production smoke tests
+        id: smoke
+        continue-on-error: true
+        run: node scripts/deployment/smoke-plugin-production.mjs --source-sha "$GITHUB_SHA" --attempts 12 --retry-delay-ms 10000 --output .artifacts/smoke-results.json
+
+      - name: Capture Cloudflare deployment identifier
+        if: always() && steps.deploy.outcome == 'success'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          FORCE_COLOR: "0"
+          WRANGLER_LOG_SANITIZE: "true"
+        run: pnpm exec wrangler deployments list --name hunsu-plugin-production --json > .artifacts/deployments.json
+
+      - name: Write credential-free deployment evidence
+        if: steps.smoke.outcome == 'success'
+        run: |
+          node scripts/deployment/write-deployment-evidence.mjs \
+            --source-sha "$GITHUB_SHA" \
+            --wrangler-output .artifacts/wrangler-output.ndjson \
+            --deployments .artifacts/deployments.json \
+            --smoke-results .artifacts/smoke-results.json \
+            --wrangler-version .artifacts/wrangler-version.txt \
+            --output .artifacts/deployment-evidence.json
+
+      - name: Upload credential-free deployment evidence
+        if: steps.smoke.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: plugin-production-evidence-${{ github.sha }}
+          path: .artifacts/deployment-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Restore the previous known-good Worker after smoke failure
+        id: rollback
+        if: always() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure'
+        continue-on-error: true
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          FORCE_COLOR: "0"
+          WRANGLER_LOG_SANITIZE: "true"
+        run: |
+          if [ ! -f .artifacts/rollback-target.json ]; then
+            echo "No previously verified production version is available; rollback is not feasible."
+            echo "performed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version_id="$(node -p "JSON.parse(require('node:fs').readFileSync('.artifacts/rollback-target.json', 'utf8')).workerVersionId")"
+          source_sha="$(node -p "JSON.parse(require('node:fs').readFileSync('.artifacts/rollback-target.json', 'utf8')).sourceSha")"
+          pnpm exec wrangler rollback "$version_id" --name hunsu-plugin-production --message "Restore known-good production after ${GITHUB_SHA} smoke failure" --yes
+          node scripts/deployment/smoke-plugin-production.mjs --source-sha "$source_sha" --attempts 12 --retry-delay-ms 10000 --output .artifacts/rollback-smoke-results.json
+          echo "performed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Fail deployment after unsuccessful production smoke tests
+        if: always() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure'
+        run: |
+          echo "The uploaded main SHA failed production smoke tests."
+          echo "Rollback performed: ${{ steps.rollback.outputs.performed || 'false' }}"
+          echo "Rollback step outcome: ${{ steps.rollback.outcome }}"
+          exit 1

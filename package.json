@@ -3,35 +3,31 @@
   "version": "0.1.1",
   "private": true,
   "type": "module",
-  "description": "Git-native board recorder and Human-on-the-loop development harness for coding agents.",
+  "description": "GitHub-backed divergent project management for Codex.",
   "packageManager": "pnpm@10.30.2",
   "scripts": {
     "dev": "turbo run dev --parallel",
-    "dev:bridge": "node --experimental-transform-types --conditions=development apps/bridge/src/cli.ts dev",
-    "dev:web": "node --conditions=development --experimental-transform-types apps/web/node_modules/vite/bin/vite.js apps/web --configLoader native",
-    "dev:stack": "node --no-warnings --conditions=development --experimental-transform-types scripts/dev-stack.mjs",
+    "dev:api": "pnpm --filter @hunsu/api dev",
+    "dev:web": "pnpm --filter @hunsu/web dev",
     "build": "turbo run build",
-    "e2e:local": "PLAYWRIGHT_HTML_OPEN=never playwright test",
-    "e2e:local:headed": "PLAYWRIGHT_HTML_OPEN=never playwright test --headed",
     "test": "node --conditions=development --test tests/*.test.ts",
-    "typecheck": "tsc -p tsconfig.json",
-    "check": "pnpm run typecheck && pnpm test",
-    "check:no-desktop-prototype": "node scripts/check-no-desktop-prototype.mjs",
-    "check:bridge-state-boundaries": "node scripts/check-bridge-state-boundaries.mjs",
-    "test:headless:scenario": "node --no-warnings --conditions=development --experimental-transform-types scripts/headless-scenario-smoke.mjs",
-    "test:e2e:stack": "playwright test --config=playwright.headless.config.ts",
-    "test:package:bridge": "node --test tests/bridge-headless-package.package-test.ts",
-    "verify:bridge": "node scripts/verify-bridge.mjs",
-    "verify:bridge:budget": "node scripts/verify-bridge.mjs --enforce-budget",
-    "hunsu": "pnpm --filter hunsu hunsu"
+    "test:cloudflare": "vitest run --config vitest.cloudflare.config.ts",
+    "typecheck": "tsc -p tsconfig.json && turbo run typecheck",
+    "plugin:validate": "node scripts/validate-plugin.mjs",
+    "worker:types": "wrangler types apps/api/src/worker-configuration.d.ts",
+    "worker:types:check": "wrangler types apps/api/src/worker-configuration.d.ts --check",
+    "worker:dry-run": "wrangler deploy --dry-run --outdir .wrangler/bundle",
+    "check": "pnpm run typecheck && pnpm run test && pnpm run plugin:validate"
   },
   "engines": {
     "node": ">=24.18"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.0",
+    "@cloudflare/vitest-pool-workers": "0.18.4",
     "@types/node": "^24.13.3",
     "turbo": "^2.6.1",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.110.0"
   }
 }

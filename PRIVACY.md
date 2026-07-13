@@ -1,43 +1,11 @@
 # Privacy
 
-Hunsu is designed so sensitive repository access happens in Hunsu Bridge on the
-user's machine.
+Hunsu reads data only from GitHub repositories granted to the installed GitHub App and from product commands submitted by authenticated users or OAuth clients.
 
-## What Runs Where
+Repository source, Project state, Goal content, Runner definitions, Run evidence, and commit metadata remain in the selected GitHub repository unless an operator separately enables application telemetry. The Web projection cache is derived, disposable, and reconstructable from GitHub.
 
-- Hunsu Web renders Studio and Hub views in the browser.
-- Hunsu Bridge runs on localhost and owns repository access, Git worktrees,
-  Codex runner integration, Agent Conversation references, and Artifact Action
-  execution.
-- Hunsu Hub stores public or user-published Team, Member, Manager, and Skill
-  package metadata and immutable package manifests.
+Hunsu stores a signed browser session containing the minimum authorization context needed to select an installation and user. Installation tokens and OAuth values are short-lived credentials and are not committed to repositories or bundled with the plugin.
 
-## Repository Data
+Webhook delivery identifiers may be retained long enough to prevent duplicate processing. Logs should contain request correlation identifiers and safe error codes, never raw authorization headers, cookies, private keys, tokens, webhook bodies, or repository file contents.
 
-Hunsu Bridge may read repository files, Git history, `.hunsu` runtime files, and
-configured Artifact Action outputs for the Roadmap you open. This data is used
-locally to render Studio, execute agents, and record Hunsu runtime commits.
-
-Hunsu Web should not receive repository data unless your browser is connected to
-your own Hunsu Bridge instance and the UI needs that data to render the selected
-Roadmap.
-
-## Bridge API Pairing
-
-When you start Studio through the CLI, Hunsu Bridge creates a pairing token and
-passes it to the browser. The browser stores the token in local storage for the
-current Studio origin and sends it to protected Bridge APIs. You can clear it by
-clearing site data for that Studio origin.
-
-## Provider Data
-
-Agent prompts, model outputs, and provider session identifiers may be sent to the
-configured provider runtime, such as Codex, when you start an Execute or Hunsu
-Draft. Provider transcripts remain provider/runtime data unless Hunsu explicitly
-records compact references or evidence in local state.
-
-## Hub Data
-
-Published Hub packages are intended to be shared. Do not publish private prompts,
-secrets, proprietary Skill files, or package manifests that include sensitive
-metadata.
+Removing the GitHub App installation revokes future repository access. Deleting an application projection does not delete repository state; deleting durable state requires an intentional GitHub operation governed by the repository owner.

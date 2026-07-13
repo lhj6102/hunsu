@@ -2,7 +2,7 @@
   "name": "@hunsu/config",
   "version": "0.1.1",
   "private": false,
-  "description": "Hunsu app-boundary configuration helpers.",
+  "description": "Result-based Hunsu API, Web, GitHub App, and session configuration.",
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
@@ -11,12 +11,6 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./cloudflare": {
-      "development": "./src/cloudflare.ts",
-      "types": "./src/cloudflare.ts",
-      "import": "./dist/cloudflare.js",
-      "default": "./dist/cloudflare.js"
     }
   },
   "files": [

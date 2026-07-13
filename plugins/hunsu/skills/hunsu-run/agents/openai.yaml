@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunsu Run"
+  short_description: "Execute a Hunsu Goal through a Player or Team."
+  default_prompt: "Use $hunsu-run to start and complete a Player Run for the active Goal."

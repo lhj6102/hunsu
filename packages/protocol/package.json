@@ -2,7 +2,7 @@
   "name": "@hunsu/protocol",
   "version": "0.1.1",
   "private": false,
-  "description": "Hunsu Roadmap, MOVE, HUNSU, and Artifact Action protocol types.",
+  "description": "Stable Hunsu Project, Goal, Runner, Coach, Run, and divergence contracts.",
   "license": "Apache-2.0",
   "type": "module",
   "exports": {

@@ -1,715 +1,490 @@
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+export type Env = Readonly<Record<string, string | undefined>>;
 
 export type ConfigResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: HunsuConfigError };
 
 export type HunsuConfigError = {
-  code: "invalid_port" | "invalid_boolean" | "invalid_url" | "invalid_path" | "invalid_enum" | "invalid_json" | "missing_required_env" | "port_conflict";
+  code:
+    | "invalid_host"
+    | "invalid_integer"
+    | "invalid_port"
+    | "invalid_private_key"
+    | "invalid_secret"
+    | "invalid_url"
+    | "invalid_value"
+    | "missing_required_env"
+    | "port_conflict";
   message: string;
   env?: string;
   portName?: HunsuPortName;
   port?: number;
   value?: string;
-  path?: string;
-  allowed?: readonly string[];
 };
 
-export type HunsuPortName = "bridgeApi" | "studioWeb" | "agentPreview" | "relay";
+export type HunsuPortName = "api" | "web";
 
 export type HunsuEndpoint = {
   name: HunsuPortName;
   host: string;
-  hostSource: ConfigValueSource;
-  hostEnv?: string;
   port: number;
-  portSource: ConfigValueSource;
-  portEnv?: string;
-  reserved: boolean;
 };
 
-export type ConfigValueSource = "default" | "env" | "override";
-
-export type Env = Record<string, string | undefined>;
-
-export type HunsuPortConfig = Record<HunsuPortName, HunsuEndpoint>;
-
-export type HunsuPortOverrides = Partial<Record<HunsuPortName, {
-  host?: string;
-  port?: number;
-}>>;
-
-export type HunsuPortResolveOptions = {
-  overrides?: HunsuPortOverrides;
+export type ApiServerConfig = {
+  api: HunsuEndpoint;
 };
 
-export type HunsuPortValidationOptions = {
-  activePortNames: readonly HunsuPortName[];
-};
-
-export type StudioWebServerConfig = {
+export type WebServerConfig = {
   web: HunsuEndpoint;
-  bridgeApi: HunsuEndpoint;
+  api: HunsuEndpoint;
   strictPort: boolean;
   apiProxyTarget: string;
-  browserBridgeUrl?: string;
-  browserHubApiUrl?: string;
-  browserRelayApiUrl?: string;
+  browserApiUrl?: string;
 };
 
-export type StudioLauncherConfig = {
+export type GitHubAppConfig = {
+  appId: number;
+  clientId: string;
+  clientSecret: string;
+  privateKey: string;
+  webhookSecret: string;
+  appSlug: string;
+  publicApiUrl: string;
   webUrl: string;
 };
 
-export type BridgeApiServerConfig = {
-  bridgeApi: HunsuEndpoint;
-};
-
-export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
-export type CodexApprovalPolicy = "never" | "on-request" | "on-failure" | "untrusted";
-export type CodexApprovalsReviewer = "user" | "auto_review";
-
-export type CodexThreadOptionsConfig = {
-  sandboxMode?: CodexSandboxMode;
-  approvalPolicy?: CodexApprovalPolicy;
-  approvalsReviewer?: CodexApprovalsReviewer;
-  networkAccessEnabled?: boolean;
-  additionalDirectories?: string[];
-};
-
-export type CodexAppServerConfig = {
-  command: string;
-  args: string[];
-  environment: Record<string, string>;
-};
-
-export type BridgeRuntimeConfig = {
-  bridgeApi: HunsuEndpoint;
-  processEnv: Record<string, string>;
-  roadmapRegistryPath: string;
-  routeWorktreeRoot?: string;
-  actionWorktreeRoot?: string;
-  testRunner?: "deterministic";
-  codexAppServer: CodexAppServerConfig;
-  codexThreadOptions: CodexThreadOptionsConfig;
-};
-
-export type RelayServerConfig = {
-  relay: HunsuEndpoint;
-  publicApiUrl: string;
-  publicWsUrl: string;
-  issuer: string;
-  storagePath: string;
-  processEnv: Record<string, string>;
-};
-
-export type RelayClientConfig = {
-  authBaseUrl: string;
-  relayApiUrl?: string;
-  relayWsUrl?: string;
-};
-
-export type BridgeRuntimeConfigOptions = {
-  cwd?: string;
-  homeDir?: string;
-  processEnv?: Env;
-  roadmapRegistryPath?: string;
-  routeWorktreeRoot?: string;
-  actionWorktreeRoot?: string;
-  codexAppServer?: Partial<Omit<CodexAppServerConfig, "environment">> & { environment?: Env };
-  codexThreadOptions?: CodexThreadOptionsConfig;
+export type SessionConfig = {
+  secret: string;
+  ttlSeconds: number;
+  cookieName: "hunsu_session";
+  secure: boolean;
 };
 
 type PortSpec = {
   name: HunsuPortName;
   defaultHost: string;
-  hostEnv: readonly string[];
+  hostEnv: "HUNSU_API_HOST" | "HUNSU_WEB_HOST";
   defaultPort: number;
-  portEnv: readonly string[];
-  reserved: boolean;
+  portEnv: "HUNSU_API_PORT" | "HUNSU_WEB_PORT";
   allowPortZero: boolean;
 };
 
 const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_LOCAL_HUB_API_URL = "http://127.0.0.1:8787";
-const DEFAULT_STUDIO_WEB_URL = "https://hunsu.app/studio";
+const DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
 
-export const HUNSU_PORT_SPECS: Record<HunsuPortName, PortSpec> = {
-  bridgeApi: {
-    name: "bridgeApi",
+export const HUNSU_PORT_SPECS: Readonly<Record<HunsuPortName, PortSpec>> = {
+  api: {
+    name: "api",
     defaultHost: DEFAULT_HOST,
-    hostEnv: ["HUNSU_BRIDGE_HOST", "HOST"],
+    hostEnv: "HUNSU_API_HOST",
     defaultPort: 19687,
-    portEnv: ["HUNSU_BRIDGE_PORT", "PORT"],
-    reserved: false,
+    portEnv: "HUNSU_API_PORT",
     allowPortZero: true
   },
-  studioWeb: {
-    name: "studioWeb",
+  web: {
+    name: "web",
     defaultHost: DEFAULT_HOST,
-    hostEnv: ["HUNSU_WEB_HOST"],
+    hostEnv: "HUNSU_WEB_HOST",
     defaultPort: 19688,
-    portEnv: ["HUNSU_WEB_PORT"],
-    reserved: false,
+    portEnv: "HUNSU_WEB_PORT",
     allowPortZero: false
-  },
-  agentPreview: {
-    name: "agentPreview",
-    defaultHost: DEFAULT_HOST,
-    hostEnv: ["HUNSU_AGENT_PREVIEW_HOST"],
-    defaultPort: 19673,
-    portEnv: ["HUNSU_AGENT_PREVIEW_PORT"],
-    reserved: true,
-    allowPortZero: false
-  },
-  relay: {
-    name: "relay",
-    defaultHost: DEFAULT_HOST,
-    hostEnv: ["HUNSU_RELAY_HOST"],
-    defaultPort: 19690,
-    portEnv: ["HUNSU_RELAY_PORT"],
-    reserved: false,
-    allowPortZero: true
   }
 };
 
-export const HUNSU_ACTIVE_SERVICE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
-export const HUNSU_STUDIO_WEB_ACTIVE_PORTS = ["bridgeApi", "studioWeb"] as const satisfies readonly HunsuPortName[];
-export const HUNSU_RELAY_ACTIVE_PORTS = ["relay"] as const satisfies readonly HunsuPortName[];
-const CODEX_SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
-const CODEX_APPROVAL_POLICIES = ["never", "on-request", "on-failure", "untrusted"] as const;
-const CODEX_APPROVALS_REVIEWERS = ["user", "auto_review"] as const;
-const BRIDGE_TEST_RUNNERS = ["deterministic"] as const;
-
-export function ok<T>(value: T): ConfigResult<T> {
-  return { ok: true, value };
+export function resolveApiServerConfig(env: Env): ConfigResult<ApiServerConfig> {
+  const api = resolveEndpoint(HUNSU_PORT_SPECS.api, env);
+  return api.ok ? ok({ api: api.value }) : api;
 }
 
-export function err(error: HunsuConfigError): ConfigResult<never> {
-  return { ok: false, error };
-}
-
-export function mapConfigResult<T, U>(result: ConfigResult<T>, transform: (value: T) => U): ConfigResult<U> {
-  return result.ok ? ok(transform(result.value)) : result;
-}
-
-export function flatMapConfigResult<T, U>(result: ConfigResult<T>, transform: (value: T) => ConfigResult<U>): ConfigResult<U> {
-  return result.ok ? transform(result.value) : result;
-}
-
-export function unwrapConfigResult<T>(result: ConfigResult<T>): T {
-  if (result.ok) {
-    return result.value;
-  }
-  throw new Error(result.error.message);
-}
-
-export function resolveHunsuPorts(env: Env, options: HunsuPortResolveOptions = {}): ConfigResult<HunsuPortConfig> {
-  const bridgeApi = resolveEndpoint(HUNSU_PORT_SPECS.bridgeApi, env, options.overrides?.bridgeApi);
-  if (!bridgeApi.ok) {
-    return bridgeApi;
+export function resolveWebServerConfig(env: Env): ConfigResult<WebServerConfig> {
+  const api = resolveEndpoint(HUNSU_PORT_SPECS.api, env);
+  if (!api.ok) {
+    return api;
   }
 
-  const studioWeb = resolveEndpoint(HUNSU_PORT_SPECS.studioWeb, env, options.overrides?.studioWeb);
-  if (!studioWeb.ok) {
-    return studioWeb;
+  const web = resolveEndpoint(HUNSU_PORT_SPECS.web, env);
+  if (!web.ok) {
+    return web;
   }
 
-  const agentPreview = resolveEndpoint(HUNSU_PORT_SPECS.agentPreview, env, options.overrides?.agentPreview);
-  if (!agentPreview.ok) {
-    return agentPreview;
+  if (
+    api.value.port !== 0
+    && api.value.port === web.value.port
+    && hostsMayConflict(api.value.host, web.value.host)
+  ) {
+    return err({
+      code: "port_conflict",
+      message: "Hunsu port conflict: api and web resolve to the same listening address.",
+      port: api.value.port
+    });
   }
 
-  const relay = resolveEndpoint(HUNSU_PORT_SPECS.relay, env, options.overrides?.relay);
-  if (!relay.ok) {
-    return relay;
+  const browserApiUrl = readOptionalUrl(env, "VITE_HUNSU_API_URL");
+  if (!browserApiUrl.ok) {
+    return browserApiUrl;
+  }
+
+  const apiProxyTarget = readUrl(
+    env,
+    "HUNSU_API_PROXY_TARGET",
+    browserApiUrl.value ?? endpointUrl(api.value)
+  );
+  if (!apiProxyTarget.ok) {
+    return apiProxyTarget;
   }
 
   return ok({
-    bridgeApi: bridgeApi.value,
-    studioWeb: studioWeb.value,
-    agentPreview: agentPreview.value,
-    relay: relay.value
+    web: web.value,
+    api: api.value,
+    strictPort: true,
+    apiProxyTarget: apiProxyTarget.value,
+    ...(browserApiUrl.value === undefined ? {} : { browserApiUrl: browserApiUrl.value })
   });
 }
 
-export function resolveValidatedHunsuPorts(env: Env, options: HunsuPortResolveOptions & HunsuPortValidationOptions): ConfigResult<HunsuPortConfig> {
-  return flatMapConfigResult(resolveHunsuPorts(env, options), config => validateNoPortConflicts(config, options.activePortNames));
+export function resolveGitHubAppConfig(env: Env): ConfigResult<GitHubAppConfig> {
+  const appId = readPositiveInteger(env, "HUNSU_GITHUB_APP_ID");
+  if (!appId.ok) {
+    return appId;
+  }
+
+  const clientId = readRequiredString(env, "HUNSU_GITHUB_CLIENT_ID");
+  if (!clientId.ok) {
+    return clientId;
+  }
+
+  const clientSecret = readRequiredString(env, "HUNSU_GITHUB_CLIENT_SECRET");
+  if (!clientSecret.ok) {
+    return clientSecret;
+  }
+
+  const privateKey = readGitHubPrivateKey(env);
+  if (!privateKey.ok) {
+    return privateKey;
+  }
+
+  const webhookSecret = readRequiredString(env, "HUNSU_GITHUB_WEBHOOK_SECRET");
+  if (!webhookSecret.ok) {
+    return webhookSecret;
+  }
+
+  const appSlug = readGitHubAppSlug(env);
+  if (!appSlug.ok) {
+    return appSlug;
+  }
+
+  const publicApiUrl = resolvePublicApiUrl(env);
+  if (!publicApiUrl.ok) {
+    return publicApiUrl;
+  }
+
+  const webUrl = resolvePublicWebUrl(env);
+  if (!webUrl.ok) {
+    return webUrl;
+  }
+
+  return ok({
+    appId: appId.value,
+    clientId: clientId.value,
+    clientSecret: clientSecret.value,
+    privateKey: privateKey.value,
+    webhookSecret: webhookSecret.value,
+    appSlug: appSlug.value,
+    publicApiUrl: publicApiUrl.value,
+    webUrl: webUrl.value
+  });
 }
 
-export function resolveStudioWebServerConfig(env: Env): ConfigResult<StudioWebServerConfig> {
-  return flatMapConfigResult(
-    resolveValidatedHunsuPorts(env, { activePortNames: HUNSU_STUDIO_WEB_ACTIVE_PORTS }),
-    ports => flatMapConfigResult(readConfigBoolean(env, "HUNSU_WEB_STRICT_PORT", true), strictPort =>
-      flatMapConfigResult(readOptionalUrl(env, "VITE_HUNSU_BRIDGE_URL"), browserBridgeUrl =>
-        flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_HUB_API_URL", "HUNSU_HUB_PUBLIC_API_URL"], defaultBrowserHubApiUrl(env)), browserHubApiUrl =>
-          flatMapConfigResult(readFirstOptionalUrl(env, ["VITE_HUNSU_RELAY_API_URL", "HUNSU_RELAY_PUBLIC_API_URL"]), browserRelayApiUrl =>
-            mapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_API_PROXY_TARGET"], browserBridgeUrl ?? endpointUrl(ports.bridgeApi)), apiProxyTarget => ({
-              web: ports.studioWeb,
-              bridgeApi: ports.bridgeApi,
-              strictPort,
-              apiProxyTarget,
-              browserBridgeUrl,
-              browserHubApiUrl,
-              browserRelayApiUrl
-            }))
-          )
-        )
-      )
-    )
+export function resolveSessionConfig(env: Env): ConfigResult<SessionConfig> {
+  const secret = readRequiredString(env, "HUNSU_SESSION_SECRET");
+  if (!secret.ok) {
+    return secret;
+  }
+  if (secret.value.length < 32) {
+    return err({
+      code: "invalid_secret",
+      env: "HUNSU_SESSION_SECRET",
+      message: "Invalid HUNSU_SESSION_SECRET: expected at least 32 characters."
+    });
+  }
+
+  const ttlSeconds = readPositiveInteger(
+    env,
+    "HUNSU_SESSION_TTL_SECONDS",
+    DEFAULT_SESSION_TTL_SECONDS
   );
-}
+  if (!ttlSeconds.ok) {
+    return ttlSeconds;
+  }
 
-export function resolveStudioLauncherConfig(env: Env): ConfigResult<StudioLauncherConfig> {
-  return mapConfigResult(readConfigUrl(env, "HUNSU_WEB_URL", DEFAULT_STUDIO_WEB_URL), webUrl => ({ webUrl }));
+  const publicApiUrl = resolvePublicApiUrl(env);
+  if (!publicApiUrl.ok) {
+    return publicApiUrl;
+  }
+
+  return ok({
+    secret: secret.value,
+    ttlSeconds: ttlSeconds.value,
+    cookieName: "hunsu_session",
+    secure: new URL(publicApiUrl.value).protocol === "https:"
+  });
 }
 
 export function currentProcessEnv(): Env {
   return process.env;
 }
 
-function defaultBrowserHubApiUrl(env: Env): string | undefined {
-  const target = firstNonEmpty(env, ["HUNSU_DEPLOY_TARGET"])?.value;
-  if (target === undefined || target === "local") {
-    return DEFAULT_LOCAL_HUB_API_URL;
+export function unwrapConfigResult<T>(result: ConfigResult<T>): T {
+  if (result.ok) {
+    return result.value;
   }
-  return undefined;
-}
-
-export function resolveBridgeApiServerConfig(env: Env): ConfigResult<BridgeApiServerConfig> {
-  return mapConfigResult(
-    resolveValidatedHunsuPorts(env, { activePortNames: ["bridgeApi"] }),
-    ports => ({ bridgeApi: ports.bridgeApi })
-  );
-}
-
-export function resolveBridgeRuntimeConfig(env: Env, options: BridgeRuntimeConfigOptions = {}): ConfigResult<BridgeRuntimeConfig> {
-  const processEnv = filterEnv(options.processEnv ?? env);
-  return flatMapConfigResult(resolveBridgeApiServerConfig(env), ({ bridgeApi }) =>
-    flatMapConfigResult(resolveRequiredConfiguredPath(
-      options.roadmapRegistryPath,
-      env,
-      "HUNSU_ROADMAP_REGISTRY_PATH",
-      join(options.homeDir ?? homedir(), ".config", "hunsu", "roadmaps.json"),
-      options.cwd
-    ), roadmapRegistryPath =>
-      flatMapConfigResult(resolveConfiguredPath(options.routeWorktreeRoot, env, "HUNSU_ROUTE_WORKTREE_ROOT", undefined, options.cwd), routeWorktreeRoot =>
-        flatMapConfigResult(resolveConfiguredPath(options.actionWorktreeRoot, env, "HUNSU_ACTION_WORKTREE_ROOT", undefined, options.cwd), actionWorktreeRoot =>
-          flatMapConfigResult(readOptionalEnum(env, "HUNSU_BRIDGE_TEST_RUNNER", BRIDGE_TEST_RUNNERS), testRunner =>
-            flatMapConfigResult(resolveCodexAppServerConfig(env, options.codexAppServer), codexAppServer =>
-              mapConfigResult(resolveCodexThreadOptions(env, options.codexThreadOptions), codexThreadOptions => ({
-                bridgeApi,
-                processEnv,
-                roadmapRegistryPath,
-                routeWorktreeRoot,
-                actionWorktreeRoot,
-                testRunner,
-                codexAppServer,
-                codexThreadOptions
-              }))
-            )
-          )
-        )
-      )
-    )
-  );
-}
-
-export function resolveRelayServerConfig(env: Env, options: { storagePath?: string; homeDir?: string } = {}): ConfigResult<RelayServerConfig> {
-  const processEnv = filterEnv(env);
-  return flatMapConfigResult(resolveValidatedHunsuPorts(env, { activePortNames: HUNSU_RELAY_ACTIVE_PORTS }), ports =>
-    flatMapConfigResult(readFirstOptionalUrl(env, ["HUNSU_RELAY_PUBLIC_API_URL", "HUNSU_RELAY_API_URL"], endpointUrl(ports.relay)), publicApiUrl =>
-      flatMapConfigResult(readFirstOptionalWebSocketUrl(env, ["HUNSU_RELAY_PUBLIC_WS_URL", "HUNSU_RELAY_WS_URL"], httpUrlToWebSocketUrl(`${publicApiUrl ?? endpointUrl(ports.relay)}/v1/device/connect`)), publicWsUrl =>
-        flatMapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_AUTH_BASE_URL"], publicApiUrl ?? endpointUrl(ports.relay)), issuer =>
-          mapConfigResult(resolveRequiredConfiguredPath(
-            options.storagePath,
-            env,
-            "HUNSU_RELAY_STORAGE_PATH",
-            join(options.homeDir ?? homedir(), ".config", "hunsu", "relay-service.json")
-          ), storagePath => ({
-            relay: ports.relay,
-            publicApiUrl: publicApiUrl ?? endpointUrl(ports.relay),
-            publicWsUrl: publicWsUrl ?? httpUrlToWebSocketUrl(`${publicApiUrl ?? endpointUrl(ports.relay)}/v1/device/connect`),
-            issuer,
-            storagePath,
-            processEnv
-          }))
-        )
-      )
-    )
-  );
-}
-
-export function resolveRelayClientConfig(env: Env): ConfigResult<RelayClientConfig> {
-  return flatMapConfigResult(readFirstUrl(env, ["HUNSU_BRIDGE_AUTH_BASE_URL"], "https://hunsu.app"), authBaseUrl =>
-    flatMapConfigResult(readFirstOptionalUrl(env, ["HUNSU_RELAY_PUBLIC_API_URL", "HUNSU_RELAY_API_URL"]), relayApiUrl =>
-      mapConfigResult(readFirstOptionalWebSocketUrl(env, ["HUNSU_RELAY_PUBLIC_WS_URL", "HUNSU_RELAY_WS_URL"], relayApiUrl ? httpUrlToWebSocketUrl(`${relayApiUrl}/v1/device/connect`) : undefined), relayWsUrl => ({
-        authBaseUrl,
-        relayApiUrl,
-        relayWsUrl
-      }))
-    )
-  );
-}
-
-export function validateNoPortConflicts(config: HunsuPortConfig, activePortNames: readonly HunsuPortName[]): ConfigResult<HunsuPortConfig> {
-  for (let i = 0; i < activePortNames.length; i += 1) {
-    const left = config[activePortNames[i]];
-    if (left.port === 0) {
-      continue;
-    }
-    for (let j = i + 1; j < activePortNames.length; j += 1) {
-      const right = config[activePortNames[j]];
-      if (right.port !== left.port || right.port === 0) {
-        continue;
-      }
-      if (hostsMayConflict(left.host, right.host)) {
-        return err({
-          code: "port_conflict",
-          message: `Hunsu port conflict: ${left.name} and ${right.name} both use ${left.host}:${left.port}.`,
-          port: left.port
-        });
-      }
-    }
-  }
-  return ok(config);
+  const error = new Error(result.error.message);
+  error.name = "HunsuConfigError";
+  throw error;
 }
 
 export function endpointUrl(endpoint: Pick<HunsuEndpoint, "host" | "port">): string {
-  return `http://${endpoint.host}:${endpoint.port}`;
+  const host = endpoint.host.includes(":") && !endpoint.host.startsWith("[")
+    ? "[" + endpoint.host + "]"
+    : endpoint.host;
+  return "http://" + host + ":" + endpoint.port;
 }
 
-export function readConfigBoolean(env: Env, envName: string, fallback: boolean): ConfigResult<boolean> {
-  const raw = env[envName];
-  if (raw === undefined || raw.trim() === "") {
-    return ok(fallback);
+function resolveEndpoint(spec: PortSpec, env: Env): ConfigResult<HunsuEndpoint> {
+  const host = readHost(env, spec.hostEnv, spec.defaultHost);
+  if (!host.ok) {
+    return host;
   }
-  return parseConfigBoolean(envName, raw);
-}
 
-export function readConfigEnum<const T extends string>(env: Env, envName: string, allowed: readonly T[], fallback: T): ConfigResult<T> {
-  const raw = env[envName];
-  if (raw === undefined || raw.trim() === "") {
-    return ok(fallback);
+  const port = readPort(env, spec);
+  if (!port.ok) {
+    return port;
   }
-  return parseConfigEnum(envName, raw, allowed);
+
+  return ok({
+    name: spec.name,
+    host: host.value,
+    port: port.value
+  });
 }
 
-export function readConfigOptionalString(env: Env, envName: string): ConfigResult<string | undefined> {
+function readHost(env: Env, envName: string, fallback: string): ConfigResult<string> {
   const raw = env[envName];
-  return ok(raw === undefined || raw.trim() === "" ? undefined : raw);
-}
-
-export function readConfigUrl(env: Env, envName: string, fallback: string): ConfigResult<string> {
-  const raw = env[envName];
-  return validateUrl(raw === undefined || raw.trim() === "" ? fallback : raw, envName);
-}
-
-export function readConfigJsonStringArray(env: Env, envName: string, fallback: readonly string[] = []): ConfigResult<string[]> {
-  const raw = env[envName];
-  if (raw === undefined || raw.trim() === "") {
-    return ok([...fallback]);
-  }
-  return parseJsonStringArray(envName, raw);
-}
-
-export function readConfigPath(env: Env, envName: string, fallback: string, cwd?: string): ConfigResult<string> {
-  const raw = env[envName];
-  return validatePath(raw === undefined || raw.trim() === "" ? fallback : raw, envName, cwd);
-}
-
-export function resolveCodexAppServerConfig(env: Env, overrides: BridgeRuntimeConfigOptions["codexAppServer"] = {}): ConfigResult<CodexAppServerConfig> {
-  const command = overrides.command ?? firstNonEmpty(env, ["HUNSU_CODEX_APP_SERVER_COMMAND"])?.value ?? "codex";
-  if (command.trim() === "") {
+  const host = raw === undefined || raw.trim() === "" ? fallback : raw.trim();
+  const normalizedHost = stripIpv6Brackets(host);
+  const colonCount = normalizedHost.split(":").length - 1;
+  if (
+    host.length === 0
+    || /\s/u.test(host)
+    || host.includes("/")
+    || host.includes("?")
+    || host.includes("#")
+    || host.includes("@")
+    || (host.startsWith("[") !== host.endsWith("]"))
+    || (host.startsWith("[") && !normalizedHost.includes(":"))
+    || (
+      normalizedHost.includes(":")
+      && (colonCount < 2 || !/^[0-9a-f:.]+$/iu.test(normalizedHost))
+    )
+  ) {
     return err({
-      code: "missing_required_env",
-      env: "HUNSU_CODEX_APP_SERVER_COMMAND",
-      message: "Invalid HUNSU_CODEX_APP_SERVER_COMMAND: expected a non-empty command."
+      code: "invalid_host",
+      env: envName,
+      value: host,
+      message: "Invalid " + envName + ": expected a hostname or IP address without a scheme or path."
     });
   }
-  return mapConfigResult(resolveCodexAppServerArgs(env, overrides.args), args => ({
-    command,
-    args,
-    environment: filterEnv(overrides.environment ?? env)
-  }));
+  return ok(normalizedHost);
 }
 
-export function resolveCodexThreadOptions(env: Env, overrides: CodexThreadOptionsConfig = {}): ConfigResult<CodexThreadOptionsConfig> {
-  return flatMapConfigResult(readOptionalEnum(env, "HUNSU_CODEX_SANDBOX_MODE", CODEX_SANDBOX_MODES), sandboxMode =>
-    flatMapConfigResult(readOptionalEnum(env, "HUNSU_CODEX_APPROVAL_POLICY", CODEX_APPROVAL_POLICIES), approvalPolicy =>
-      flatMapConfigResult(readOptionalEnum(env, "HUNSU_CODEX_APPROVALS_REVIEWER", CODEX_APPROVALS_REVIEWERS), approvalsReviewer =>
-        flatMapConfigResult(readOptionalBoolean(env, "HUNSU_CODEX_NETWORK_ACCESS"), networkAccessEnabled =>
-          mapConfigResult(readCommaSeparatedList(env, "HUNSU_CODEX_ADDITIONAL_DIRECTORIES"), additionalDirectories => ({
-            ...(sandboxMode === undefined ? {} : { sandboxMode }),
-            ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
-            ...(approvalsReviewer === undefined ? {} : { approvalsReviewer }),
-            ...(networkAccessEnabled === undefined ? {} : { networkAccessEnabled }),
-            ...(additionalDirectories.length === 0 ? {} : { additionalDirectories }),
-            ...overrides
-          }))
-        )
-      )
-    )
-  );
-}
-
-function resolveEndpoint(spec: PortSpec, env: Env, override: { host?: string; port?: number } | undefined): ConfigResult<HunsuEndpoint> {
-  const hostValue = override?.host !== undefined
-    ? { value: override.host, source: "override" as const, env: undefined }
-    : firstNonEmpty(env, spec.hostEnv) ?? { value: spec.defaultHost, source: "default" as const, env: undefined };
-
-  const portValue = override?.port !== undefined
-    ? mapConfigResult(validatePort(override.port, spec, undefined), port => ({ value: port, source: "override" as const, env: undefined }))
-    : readPort(env, spec);
-
-  return mapConfigResult(portValue, port => ({
-    name: spec.name,
-    host: hostValue.value,
-    hostSource: hostValue.source,
-    hostEnv: hostValue.env,
-    port: port.value,
-    portSource: port.source,
-    portEnv: port.env,
-    reserved: spec.reserved
-  }));
-}
-
-function readPort(env: Env, spec: PortSpec): ConfigResult<{ value: number; source: ConfigValueSource; env?: string }> {
-  const envValue = firstNonEmpty(env, spec.portEnv);
-  if (!envValue) {
-    return ok({ value: spec.defaultPort, source: "default" });
+function readPort(env: Env, spec: PortSpec): ConfigResult<number> {
+  const raw = env[spec.portEnv];
+  if (raw === undefined || raw.trim() === "") {
+    return ok(spec.defaultPort);
   }
-  return mapConfigResult(validatePort(envValue.value, spec, envValue.env), port => ({
-    value: port,
-    source: "env",
-    env: envValue.env
-  }));
-}
 
-function validatePort(value: string | number, spec: PortSpec, envName: string | undefined): ConfigResult<number> {
-  const port = typeof value === "number" ? value : Number(value);
-  const min = spec.allowPortZero ? 0 : 1;
-  if (!Number.isInteger(port) || port < min || port > 65535) {
+  const value = raw.trim();
+  const port = /^\d+$/u.test(value) ? Number(value) : Number.NaN;
+  const minimum = spec.allowPortZero ? 0 : 1;
+  if (!Number.isSafeInteger(port) || port < minimum || port > 65535) {
     return err({
       code: "invalid_port",
-      env: envName,
+      env: spec.portEnv,
       portName: spec.name,
-      message: envName
-        ? `Invalid ${envName}: ${value}. Expected an integer port from ${min} to 65535.`
-        : `Invalid ${spec.name} port: ${value}. Expected an integer port from ${min} to 65535.`
+      value,
+      message:
+        "Invalid "
+        + spec.portEnv
+        + ": expected an integer port from "
+        + minimum
+        + " to 65535."
     });
   }
   return ok(port);
 }
 
-function parseConfigBoolean(envName: string, raw: string): ConfigResult<boolean> {
-  if (/^(1|true|yes|on)$/i.test(raw)) {
-    return ok(true);
-  }
-  if (/^(0|false|no|off)$/i.test(raw)) {
-    return ok(false);
-  }
-  return err({
-    code: "invalid_boolean",
-    env: envName,
-    message: `Invalid ${envName}: ${raw}. Expected true, false, 1, 0, yes, no, on, or off.`
-  });
-}
-
-function readOptionalBoolean(env: Env, envName: string): ConfigResult<boolean | undefined> {
+function readPositiveInteger(
+  env: Env,
+  envName: string,
+  fallback?: number
+): ConfigResult<number> {
   const raw = env[envName];
-  return raw === undefined || raw.trim() === "" ? ok(undefined) : parseConfigBoolean(envName, raw);
-}
-
-function parseConfigEnum<const T extends string>(envName: string, value: string, allowed: readonly T[]): ConfigResult<T> {
-  if (allowed.includes(value as T)) {
-    return ok(value as T);
+  if (raw === undefined || raw.trim() === "") {
+    return fallback === undefined
+      ? err({
+          code: "missing_required_env",
+          env: envName,
+          message: "Missing required environment variable " + envName + "."
+        })
+      : ok(fallback);
   }
-  return err({
-    code: "invalid_enum",
-    env: envName,
-    value,
-    allowed,
-    message: `Invalid ${envName}: ${value}. Expected one of: ${allowed.join(", ")}.`
-  });
+
+  const value = raw.trim();
+  const parsed = /^\d+$/u.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return err({
+      code: "invalid_integer",
+      env: envName,
+      value,
+      message: "Invalid " + envName + ": expected a positive integer."
+    });
+  }
+  return ok(parsed);
 }
 
-function readOptionalEnum<const T extends string>(env: Env, envName: string, allowed: readonly T[]): ConfigResult<T | undefined> {
-  const raw = env[envName];
-  return raw === undefined || raw.trim() === "" ? ok(undefined) : parseConfigEnum(envName, raw, allowed);
+function readRequiredString(env: Env, envName: string): ConfigResult<string> {
+  const value = env[envName]?.trim();
+  if (value === undefined || value === "") {
+    return err({
+      code: "missing_required_env",
+      env: envName,
+      message: "Missing required environment variable " + envName + "."
+    });
+  }
+  return ok(value);
+}
+
+function readGitHubPrivateKey(env: Env): ConfigResult<string> {
+  const raw = env.HUNSU_GITHUB_PRIVATE_KEY;
+  if (raw === undefined || raw.trim() === "") {
+    return err({
+      code: "missing_required_env",
+      env: "HUNSU_GITHUB_PRIVATE_KEY",
+      message: "Missing required environment variable HUNSU_GITHUB_PRIVATE_KEY."
+    });
+  }
+
+  const privateKey = raw
+    .trim()
+    .replace(/\\r\\n/gu, "\n")
+    .replace(/\\n/gu, "\n")
+    .replace(/\r\n?/gu, "\n");
+  if (!/^-----BEGIN ((?:RSA |EC )?PRIVATE KEY)-----\n[\s\S]+\n-----END \1-----$/u.test(privateKey)) {
+    return err({
+      code: "invalid_private_key",
+      env: "HUNSU_GITHUB_PRIVATE_KEY",
+      message: "Invalid HUNSU_GITHUB_PRIVATE_KEY: expected a PEM encoded private key."
+    });
+  }
+  return ok(privateKey);
+}
+
+function readGitHubAppSlug(env: Env): ConfigResult<string> {
+  const appSlug = readRequiredString(env, "HUNSU_GITHUB_APP_SLUG");
+  if (!appSlug.ok) {
+    return appSlug;
+  }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(appSlug.value)) {
+    return err({
+      code: "invalid_value",
+      env: "HUNSU_GITHUB_APP_SLUG",
+      value: appSlug.value,
+      message: "Invalid HUNSU_GITHUB_APP_SLUG: expected a lower-case GitHub App slug."
+    });
+  }
+  return appSlug;
+}
+
+function resolvePublicApiUrl(env: Env): ConfigResult<string> {
+  const api = resolveEndpoint(HUNSU_PORT_SPECS.api, env);
+  if (!api.ok) {
+    return api;
+  }
+  return readUrl(env, "HUNSU_PUBLIC_API_URL", endpointUrl(api.value));
+}
+
+function resolvePublicWebUrl(env: Env): ConfigResult<string> {
+  const web = resolveEndpoint(HUNSU_PORT_SPECS.web, env);
+  if (!web.ok) {
+    return web;
+  }
+  return readUrl(env, "HUNSU_WEB_URL", endpointUrl(web.value));
 }
 
 function readOptionalUrl(env: Env, envName: string): ConfigResult<string | undefined> {
   const raw = env[envName];
-  return raw === undefined || raw.trim() === "" ? ok(undefined) : validateUrl(raw, envName);
+  return raw === undefined || raw.trim() === ""
+    ? ok(undefined)
+    : validateUrl(raw, envName);
 }
 
-function readFirstUrl(env: Env, envNames: readonly string[], fallback: string): ConfigResult<string> {
-  const raw = firstNonEmpty(env, envNames);
-  return validateUrl(raw?.value ?? fallback, raw?.env ?? envNames[0]);
+function readUrl(env: Env, envName: string, fallback: string): ConfigResult<string> {
+  const raw = env[envName];
+  return validateUrl(raw === undefined || raw.trim() === "" ? fallback : raw, envName);
 }
 
-function readFirstOptionalUrl(env: Env, envNames: readonly string[], fallback?: string): ConfigResult<string | undefined> {
-  const raw = firstNonEmpty(env, envNames);
-  const value = raw?.value ?? fallback;
-  return value === undefined ? ok(undefined) : validateUrl(value, raw?.env ?? envNames[0]);
-}
-
-function readFirstOptionalWebSocketUrl(env: Env, envNames: readonly string[], fallback?: string): ConfigResult<string | undefined> {
-  const raw = firstNonEmpty(env, envNames);
-  const value = raw?.value ?? fallback;
-  return value === undefined ? ok(undefined) : validateWebSocketUrl(value, raw?.env ?? envNames[0]);
-}
-
-function validateUrl(value: string, envName: string | undefined): ConfigResult<string> {
+function validateUrl(raw: string, envName: string): ConfigResult<string> {
   try {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("Unsupported protocol");
+    const url = new URL(raw);
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:")
+      || url.username !== ""
+      || url.password !== ""
+      || url.search !== ""
+      || url.hash !== ""
+    ) {
+      throw new Error("unsupported URL");
     }
-    return ok(url.toString().replace(/\/$/, ""));
-  } catch (_error) {
+    return ok(url.toString().replace(/\/$/u, ""));
+  } catch {
     return err({
       code: "invalid_url",
       env: envName,
-      value,
-      message: envName
-        ? `Invalid ${envName}: ${value}. Expected an http or https URL.`
-        : `Invalid URL: ${value}. Expected an http or https URL.`
+      message:
+        "Invalid "
+        + envName
+        + ": expected a credential-free HTTP(S) URL without a query or fragment."
     });
   }
-}
-
-function validateWebSocketUrl(value: string, envName: string | undefined): ConfigResult<string> {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
-      throw new Error("Unsupported protocol");
-    }
-    return ok(url.toString().replace(/\/$/, ""));
-  } catch (_error) {
-    return err({
-      code: "invalid_url",
-      env: envName,
-      value,
-      message: envName
-        ? `Invalid ${envName}: ${value}. Expected a ws or wss URL.`
-        : `Invalid WebSocket URL: ${value}. Expected a ws or wss URL.`
-    });
-  }
-}
-
-function httpUrlToWebSocketUrl(value: string): string {
-  const url = new URL(value);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.toString().replace(/\/$/, "");
-}
-
-
-function resolveConfiguredPath(override: string | undefined, env: Env, envName: string, fallback: string | undefined, cwd?: string): ConfigResult<string | undefined> {
-  if (override !== undefined) {
-    return validatePath(override, undefined, cwd);
-  }
-  const raw = env[envName];
-  if (raw !== undefined && raw.trim() !== "") {
-    return validatePath(raw, envName, cwd);
-  }
-  return fallback === undefined ? ok(undefined) : validatePath(fallback, undefined, cwd);
-}
-
-function resolveRequiredConfiguredPath(override: string | undefined, env: Env, envName: string, fallback: string, cwd?: string): ConfigResult<string> {
-  return mapConfigResult(resolveConfiguredPath(override, env, envName, fallback, cwd), path => path ?? resolve(cwd ?? ".", fallback));
-}
-
-function validatePath(value: string, envName: string | undefined, cwd = "."): ConfigResult<string> {
-  if (value.trim() === "" || value.includes("\0")) {
-    return err({
-      code: "invalid_path",
-      env: envName,
-      path: value,
-      message: envName
-        ? `Invalid ${envName}: expected a non-empty filesystem path.`
-        : "Invalid filesystem path: expected a non-empty path."
-    });
-  }
-  return ok(resolve(cwd, value));
-}
-
-function resolveCodexAppServerArgs(env: Env, override: readonly string[] | undefined): ConfigResult<string[]> {
-  if (override !== undefined) {
-    return ok([...override]);
-  }
-  const raw = env.HUNSU_CODEX_APP_SERVER_ARGS;
-  if (raw === undefined || raw.trim() === "") {
-    return ok(["app-server", "--stdio"]);
-  }
-  if (raw.trim().startsWith("[")) {
-    return parseJsonStringArray("HUNSU_CODEX_APP_SERVER_ARGS", raw);
-  }
-  return ok(raw.split(/\s+/).filter(Boolean));
-}
-
-function parseJsonStringArray(envName: string, raw: string): ConfigResult<string[]> {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (Array.isArray(parsed) && parsed.every(item => typeof item === "string")) {
-      return ok(parsed);
-    }
-  } catch (_error) {
-    return err({
-      code: "invalid_json",
-      env: envName,
-      value: raw,
-      message: `Invalid ${envName}: expected a JSON string array.`
-    });
-  }
-  return err({
-    code: "invalid_json",
-    env: envName,
-    value: raw,
-    message: `Invalid ${envName}: expected a JSON string array.`
-  });
-}
-
-function readCommaSeparatedList(env: Env, envName: string): ConfigResult<string[]> {
-  const raw = env[envName];
-  return ok(raw === undefined || raw.trim() === ""
-    ? []
-    : raw.split(",").map(value => value.trim()).filter(Boolean));
-}
-
-function filterEnv(env: Env): Record<string, string> {
-  const next: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (value !== undefined) {
-      next[key] = value;
-    }
-  }
-  return next;
-}
-
-function firstNonEmpty(env: Env, names: readonly string[]): { value: string; source: "env"; env: string } | undefined {
-  for (const name of names) {
-    const value = env[name];
-    if (value !== undefined && value.trim() !== "") {
-      return { value, source: "env", env: name };
-    }
-  }
-  return undefined;
 }
 
 function hostsMayConflict(left: string, right: string): boolean {
   const normalizedLeft = normalizeHost(left);
   const normalizedRight = normalizeHost(right);
-  return normalizedLeft === normalizedRight || isWildcardHost(normalizedLeft) || isWildcardHost(normalizedRight);
+  return (
+    normalizedLeft === normalizedRight
+    || isWildcardHost(normalizedLeft)
+    || isWildcardHost(normalizedRight)
+  );
 }
 
 function normalizeHost(host: string): string {
-  const normalized = host.trim().toLowerCase();
+  const normalized = stripIpv6Brackets(host).toLowerCase();
   return normalized === "localhost" ? DEFAULT_HOST : normalized;
 }
 
+function stripIpv6Brackets(host: string): string {
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+
 function isWildcardHost(host: string): boolean {
-  return host === "0.0.0.0" || host === "::" || host === "[::]";
+  return host === "0.0.0.0" || host === "::";
+}
+
+function ok<T>(value: T): ConfigResult<T> {
+  return { ok: true, value };
+}
+
+function err(error: HunsuConfigError): ConfigResult<never> {
+  return { ok: false, error };
 }
