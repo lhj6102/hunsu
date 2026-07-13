@@ -1,52 +1,25 @@
-# Security Policy
+# Security policy
 
-Hunsu is local-first. Hunsu Web is a browser UI, while Hunsu Bridge is the
-localhost runtime that can read repositories, create Git worktrees, run Codex,
-and execute Artifact Actions.
+## Reporting
 
-## Supported Versions
+Please report suspected vulnerabilities privately to the maintainers. Include affected version or commit, impact, reproduction steps, and whether credentials or repository contents may have been exposed. Do not open a public issue for an unpatched vulnerability.
 
-Public alpha work is tracked on the main repository. Until the first stable
-release, security fixes target the latest `main` branch and the latest published
-`0.x` npm packages.
+## Trust boundaries
 
-## Reporting A Vulnerability
+- GitHub App installation grants bound every repository operation.
+- Browser requests use a signed, expiring, HttpOnly, SameSite session cookie.
+- MCP clients use OAuth and receive only plugin-safe structured errors.
+- Webhook signatures are verified over the raw request body before parsing, and delivery identifiers are deduplicated.
+- Durable writes use expected-head compare-and-swap and non-forced ref updates.
+- Run completion requires commit existence, base ancestry, and expected-branch reachability.
+- Coach output is advisory; consequential divergence and alternative decisions require an authenticated user actor.
 
-Please report security issues privately before opening a public issue. If no
-dedicated disclosure address is listed in the repository hosting profile, open a
-minimal issue asking for a private security contact without including exploit
-details.
+## Secret handling
 
-Include:
+GitHub private keys, client secrets, webhook secrets, session secrets, OAuth values, installation tokens, and Codex credentials must exist only in managed secret storage or short-lived memory. They must not appear in repository state, evidence, logs, errors, plugin files, query parameters, or generated fixtures.
 
-- affected version or commit
-- operating system and Node version
-- exact Hunsu command or API route involved
-- whether Hunsu Bridge was bound to `127.0.0.1` or another host
-- whether a pairing token or Artifact Action command was involved
+The state writer rejects credential-shaped fields and values before serialization. Installation access tokens should use the narrowest installation and repository permissions and remain short-lived.
 
-## Bridge API Boundary
+## GitHub state safety
 
-Hunsu Bridge defaults to localhost and should stay bound to `127.0.0.1` for
-normal use. Browser access to protected Bridge APIs requires:
-
-- an allowed `Origin`
-- a short-lived pairing token supplied by the Bridge launcher
-- no cookies or ambient browser credentials
-
-Do not expose Hunsu Bridge directly to a public network. If you intentionally bind
-to `0.0.0.0`, put it behind your own authenticated transport and understand that
-Bridge can operate on repositories and execute configured commands.
-
-## Artifact Actions
-
-Artifact Actions are explicit local runtime actions. They can run shell commands
-declared in committed Hunsu runtime state. Treat Artifact Action definitions from
-untrusted repositories like you would treat package scripts, CI jobs, or
-Makefiles from an untrusted repository: review them before running.
-
-## Secrets
-
-Do not commit real tokens, `.env` files, provider credentials, private keys, or
-agent transcripts containing secrets. Example env files must contain placeholders
-only.
+`hunsu/state` is application-managed. Never force-update it. Event files are append-only, snapshots are derived, and a rebuild must replay events rather than trust cached materializations. GitHub Actions may perform repository CI only; they are outside the Hunsu Run lifecycle.

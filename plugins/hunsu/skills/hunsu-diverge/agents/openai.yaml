@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunsu Diverge"
+  short_description: "Create, compare, and select Hunsu alternatives."
+  default_prompt: "Use $hunsu-diverge to create a sibling alternative and compare the results."

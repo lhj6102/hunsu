@@ -2,7 +2,7 @@
   "name": "@hunsu/core",
   "version": "0.1.1",
   "private": false,
-  "description": "Git-backed Hunsu runtime state and Artifact Action helpers.",
+  "description": "Pure Hunsu command decisions, state transitions, and invariant checks.",
   "license": "Apache-2.0",
   "type": "module",
   "exports": {

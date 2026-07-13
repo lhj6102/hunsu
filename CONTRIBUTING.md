@@ -1,65 +1,32 @@
-# Contributing
+# Contributing to Hunsu
 
-Thanks for helping make Hunsu easier to inspect, run, and trust.
+Use Node.js 24.18 or newer and pnpm 10.30.2.
 
-## Setup
-
-```sh
-corepack enable
+```bash
 pnpm install
-pnpm run check
+pnpm check
+pnpm build
 ```
 
-For the Bridge Studio launcher:
+Keep changes inside the package that owns the behavior:
 
-```sh
-pnpm --filter @hunsu/bridge bridge --dry-run
-pnpm hunsu studio --dry-run
-pnpm hunsu studio --no-open
+- protocol defines domain values, commands, events, and versioned codecs;
+- core owns pure validation, decisions, replay, and invariants;
+- github-store owns GitHub transport and durable state mechanics;
+- projections owns disposable query models;
+- plugin-contract owns MCP schemas and plugin-safe values;
+- api owns authentication, authorization, application services, HTTP, MCP, and reconciliation;
+- web owns presentation and user interaction;
+- config owns service endpoint and secret configuration validation.
+
+New mutations must be idempotent, compare-and-swap protected, represented by append-only events, and callable through the shared application service. Add parity coverage when REST and MCP expose the same command.
+
+Run completion tests must prove GitHub reachability. Coach and alternative-decision tests must prove that proposals cannot become consequential decisions without explicit user authority.
+
+Plugin changes must keep the manifest, marketplace entry, MCP binding, and every `SKILL.md` valid:
+
+```bash
+pnpm plugin:validate
 ```
 
-## Checks
-
-Run the narrowest useful check while developing, then run the full check before
-opening a PR:
-
-```sh
-pnpm run typecheck
-pnpm test
-pnpm run check
-```
-
-Frontend changes should also pass:
-
-```sh
-pnpm --filter @hunsu/web build
-```
-
-## Architecture Boundaries
-
-- Keep Git, Codex execution, worktree mutation, and runtime persistence out of
-  `apps/web`.
-- Keep lower-level packages from reading ambient process environment directly;
-  use `@hunsu/config` at app boundaries.
-- Treat `.hunsu/*` encoded runtime files as app-owned state. Agents and UI code
-  should use decoded API surfaces rather than editing those files directly.
-- Do not silently change committed Origin package locks from environment
-  variables.
-
-## Security-Sensitive Changes
-
-Be especially careful when changing:
-
-- Hunsu Bridge HTTP routes, CORS, pairing tokens, or filesystem browsing
-- Artifact Action command execution
-- Git worktree creation or cleanup
-- provider runner permissions, sandbox mode, approval policy, or network access
-- Hub publishing and Origin integrity verification
-
-Add tests for these changes whenever possible.
-
-## Secrets
-
-Do not commit real `.env` files, tokens, API keys, private keys, provider
-transcripts, generated Wrangler config, Playwright reports, or local runtime
-state.
+Do not commit credentials, generated installation tokens, personal repository data, or local `.env` files. See [Security](SECURITY.md) and [Workspace structure](docs/workspace-structure.md).

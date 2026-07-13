@@ -2,7 +2,7 @@
   "name": "@hunsu/protocol-registry",
   "version": "0.1.1",
   "private": false,
-  "description": "Hunsu Hub package manifests, integrity, and Origin resolution.",
+  "description": "Pure versioned Hunsu Runner and Coach definition registry.",
   "license": "Apache-2.0",
   "type": "module",
   "exports": {

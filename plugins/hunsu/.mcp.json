@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "hunsu": {
+      "url": "https://api.hunsu.app/mcp",
+      "auth": "oauth",
+      "oauth_resource": "https://api.hunsu.app/"
+    }
+  }
+}

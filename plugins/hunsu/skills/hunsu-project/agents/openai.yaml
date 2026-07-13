@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hunsu Project"
+  short_description: "Open and manage GitHub-backed Hunsu Projects."
+  default_prompt: "Use $hunsu-project to open the Hunsu Project for this repository."

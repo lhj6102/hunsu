@@ -1,47 +1,20 @@
 {
   "$schema": "https://turbo.build/schema.json",
-  "globalPassThroughEnv": [
-    "HUNSU_BRIDGE_HOST",
-    "HUNSU_BRIDGE_PORT",
-    "HUNSU_BRIDGE_ALLOWED_ORIGINS",
-    "HUNSU_WEB_URL",
+  "globalEnv": [
+    "HUNSU_API_HOST",
+    "HUNSU_API_PORT",
     "HUNSU_WEB_HOST",
     "HUNSU_WEB_PORT",
-    "HUNSU_WEB_STRICT_PORT",
-    "HUNSU_BRIDGE_API_PROXY_TARGET",
-    "VITE_HUNSU_BRIDGE_URL",
-    "VITE_HUNSU_HUB_API_URL",
-    "HUNSU_AGENT_PREVIEW_HOST",
-    "HUNSU_AGENT_PREVIEW_PORT",
-    "HUNSU_CONNECT_API_BASE_URL",
-    "HUNSU_CONNECT_WS_URL",
-    "VITE_HUNSU_CONNECT_API_URL",
-    "HUNSU_ROADMAP_REGISTRY_PATH",
-    "HUNSU_ROUTE_WORKTREE_ROOT",
-    "HUNSU_ACTION_WORKTREE_ROOT",
-    "HUNSU_BRIDGE_TEST_RUNNER",
-    "HUNSU_CODEX_APP_SERVER_COMMAND",
-    "HUNSU_CODEX_APP_SERVER_ARGS",
-    "HUNSU_CODEX_SANDBOX_MODE",
-    "HUNSU_CODEX_APPROVAL_POLICY",
-    "HUNSU_CODEX_APPROVALS_REVIEWER",
-    "HUNSU_CODEX_NETWORK_ACCESS",
-    "HUNSU_CODEX_ADDITIONAL_DIRECTORIES",
-    "HUNSU_HANDOFF_PORT",
-    "HUNSU_DEPLOY_TARGET",
-    "HUNSU_HUB_WORKER_NAME",
-    "HUNSU_HUB_ORIGIN_NAME",
-    "HUNSU_HUB_PUBLIC_API_URL",
-    "HUNSU_HUB_D1_DATABASE_NAME",
-    "HUNSU_HUB_D1_DATABASE_ID",
-    "HUNSU_HUB_R2_BUCKET_NAME",
-    "HUNSU_HUB_PUBLISH_QUEUE_NAME",
-    "HUNSU_HUB_ADMIN_TOKEN"
+    "HUNSU_API_PROXY_TARGET",
+    "VITE_HUNSU_API_URL",
+    "HUNSU_PUBLIC_API_URL",
+    "HUNSU_WEB_URL",
+    "HUNSU_SESSION_TTL_SECONDS"
   ],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": []
+      "outputs": ["dist/**"]
     },
     "typecheck": {
       "dependsOn": ["^typecheck"],
@@ -54,6 +27,19 @@
     "dev": {
       "cache": false,
       "persistent": true
+    },
+    "@hunsu/api#dev": {
+      "cache": false,
+      "persistent": true,
+      "passThroughEnv": [
+        "HUNSU_GITHUB_APP_ID",
+        "HUNSU_GITHUB_CLIENT_ID",
+        "HUNSU_GITHUB_CLIENT_SECRET",
+        "HUNSU_GITHUB_PRIVATE_KEY",
+        "HUNSU_GITHUB_WEBHOOK_SECRET",
+        "HUNSU_GITHUB_APP_SLUG",
+        "HUNSU_SESSION_SECRET"
+      ]
     }
   }
 }

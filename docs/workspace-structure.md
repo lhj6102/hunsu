@@ -1,103 +1,51 @@
-# Workspace Structure
+# Workspace structure
 
-Hunsu is a pnpm workspace coordinated by Turbo. Product applications live
-under apps, reusable implementation packages live under packages, and
-cross-package tests live under tests.
+Dependency direction is deliberate:
 
-~~~text
+```text
 apps/web
-  -> packages/config
-  -> packages/protocol
+  -> presentation DTOs and browser APIs only
 
-apps/bridge
+apps/api
   -> packages/config
   -> packages/core
-  -> packages/protocol
-  -> packages/protocol-registry
-  -> packages/codex-runner
-
-apps/hub-api
-  -> packages/config
-  -> packages/protocol-registry
-
-apps/connect-api
-  -> packages/config
+  -> packages/github-store
+  -> packages/plugin-contract
+  -> packages/projections
   -> packages/protocol
 
-packages/cli
-  -> apps/bridge
-  -> packages/config
-  -> packages/core
+packages/projections
   -> packages/protocol
 
 packages/core
   -> packages/protocol
 
+packages/github-store
+  -> transport-agnostic event/state codec interface
+
+packages/plugin-contract
+  -> no application dependency
+
 packages/protocol-registry
   -> packages/protocol
+```
 
-packages/codex-runner
-  -> packages/protocol
-  -> @openai/codex
-~~~
+`packages/protocol` owns domain primitives, unions, commands, events, and versioned JSON codecs. It has no Node, browser, GitHub, filesystem, or network dependency.
 
-Dependency direction stays inward. Protocol and domain packages do not import
-application lifecycle, service-manager, worktree orchestration, or browser UI
-code.
+`packages/core` owns pure command decisions, event application, replay, Runner graph validation, Run transitions, divergence invariants, and user-decision enforcement. It performs no I/O.
 
-## apps/web
+`packages/github-store` owns GitHub repository grants, refs, blobs, trees, commits, append-only event storage, compare-and-swap updates, Run branch creation and verification, and full reconstruction. It accepts domain behavior through a codec interface instead of importing application services.
 
-The React/Vite browser client owns presentation for Studio and Hub. It does not
-own Git, Codex execution, runtime persistence, service management, or daemon
-lifecycle. Runtime mutations go through Bridge APIs.
+`packages/projections` derives disposable Project, Goal, Runner, Run, Coach, evidence, and comparison query models from replayed state.
 
-## apps/bridge
+`packages/plugin-contract` owns strict MCP tool schemas, the immutable Run contract, OAuth-facing safe errors, confirmation metadata, and structured results.
 
-This is the single published @hunsu/bridge product package. It owns:
+`packages/protocol-registry` owns exact, integrity-checked definitions for Player and Team Runners, Coaches, Skills, and resources. It is a pure package: committed locks cannot be changed by environment variables or host state.
 
-- the foreground daemon and singleton boundary
-- the authenticated CLI control client
-- browser compatibility routes
-- provider, Workspace, pairing, and Remote services
-- HUNSU_HOME state and credential stores
-- OS user-service adapters
-- stable runtime setup and removal
-- Git, Execute, Artifact Action, and Codex runner integration
+`packages/config` is the only source for service hosts, ports, public URLs, GitHub App configuration, and session configuration.
 
-Domain services do not contain CLI parsing, HTTP request objects, or
-service-manager logic. CLI-only code performs no direct product-state writes;
-setup and service installation are the narrow filesystem exceptions.
+`apps/api` composes the packages. REST and MCP call one application service. It owns authentication, repository authorization, webhook verification, delivery deduplication, reconciliation, and projection caching.
 
-## apps/hub-api and apps/connect-api
+`apps/web` owns React presentation and user interaction. It cannot import GitHub transports, core command handling, Node APIs, runtime worktrees, or secrets.
 
-Hub API serves immutable reusable package metadata and versions. Connect
-authenticates accounts and devices, records device presence, issues short-lived
-peer tickets, and forwards only bounded opaque signaling between live sockets.
-It has no command or Workspace protocol. Neither service receives arbitrary
-local repository access.
-
-## packages
-
-packages/protocol defines stable domain and wire types. packages/core contains
-Git-backed runtime behavior. packages/codex-runner is the Codex app-server
-boundary. packages/config resolves application-boundary configuration.
-packages/protocol-registry resolves immutable Team, Member, Manager, and Skill
-packages. packages/cli is the separate Hunsu Roadmap/control-plane CLI, not a
-second Bridge daemon package.
-
-## Root commands
-
-~~~sh
-pnpm dev:bridge
-pnpm dev:web
-pnpm dev:stack
-pnpm run check
-pnpm run test:e2e:stack
-pnpm run test:package:bridge
-pnpm run check:no-desktop-prototype
-pnpm run check:bridge-state-boundaries
-pnpm verify:bridge
-~~~
-
-The normal Bridge gate runs on Ubuntu. Cross-platform service-manager smoke is
-isolated to nightly, manual, and release-candidate workflows.
+`plugins/hunsu` owns installation metadata and the guided Codex workflows. It calls MCP and never writes GitHub state directly.

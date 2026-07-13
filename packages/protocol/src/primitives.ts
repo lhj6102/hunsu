@@ -1,196 +1,252 @@
 import { err, ok, type Result } from "./result.ts";
 
-export type Brand<T, Name extends string> = T & { readonly __brand: Name };
-export type NonEmptyText = Brand<string, "NonEmptyText">;
-export type RequestTitle = Brand<string, "RequestTitle">;
-export type RequestGoal = Brand<string, "RequestGoal">;
-export type DestinationTitle = Brand<string, "DestinationTitle">;
-export type DestinationAcceptanceCriterion = Brand<string, "DestinationAcceptanceCriterion">;
-export type DestinationConstraint = Brand<string, "DestinationConstraint">;
-export type DestinationNotes = Brand<string, "DestinationNotes">;
-export type Summary = Brand<string, "Summary">;
-export type EvidenceText = Brand<string, "EvidenceText">;
-export type FailureReason = Brand<string, "FailureReason">;
-export type RiskText = Brand<string, "RiskText">;
-export type MoveCommit = Brand<string, "MoveCommit">;
-export type TeamName = Brand<string, "TeamName">;
-export type PositiveInteger = Brand<number, "PositiveInteger">;
-export type NonNegativeInteger = Brand<number, "NonNegativeInteger">;
-export type NonEmptyArray<T> = [T, ...T[]];
-export type SingleItemArray<T> = [T];
+declare const domainBrand: unique symbol;
 
-export type PrimitiveValidationError = {
-  type: "PrimitiveValidationError";
-  field: string;
-  message: string;
+export type Brand<T, Name extends string> = T & {
+  readonly [domainBrand]: Name;
 };
 
-export function makeNonEmptyText(value: unknown, field = "text"): Result<NonEmptyText, PrimitiveValidationError> {
+export type ProjectId = Brand<string, "ProjectId">;
+export type GoalId = Brand<string, "GoalId">;
+export type RunnerId = Brand<string, "RunnerId">;
+export type CoachId = Brand<string, "CoachId">;
+export type RunId = Brand<string, "RunId">;
+export type WorkspaceId = Brand<string, "WorkspaceId">;
+export type EventId = Brand<string, "EventId">;
+export type EvidenceId = Brand<string, "EvidenceId">;
+export type CheckpointId = Brand<string, "CheckpointId">;
+export type CoachReviewId = Brand<string, "CoachReviewId">;
+export type CoachProposalId = Brand<string, "CoachProposalId">;
+export type DivergenceId = Brand<string, "DivergenceId">;
+export type ComparisonId = Brand<string, "ComparisonId">;
+export type DecisionId = Brand<string, "DecisionId">;
+export type IdempotencyKey = Brand<string, "IdempotencyKey">;
+export type CommandFingerprint = Brand<string, "CommandFingerprint">;
+export type GitCommitSha = Brand<string, "GitCommitSha">;
+export type GitRef = Brand<string, "GitRef">;
+export type GitBranchName = Brand<string, "GitBranchName">;
+export type RepositoryOwner = Brand<string, "RepositoryOwner">;
+export type RepositoryName = Brand<string, "RepositoryName">;
+export type IsoTimestamp = Brand<string, "IsoTimestamp">;
+export type NonEmptyText = Brand<string, "NonEmptyText">;
+export type ProjectTitle = Brand<string, "ProjectTitle">;
+export type ProjectObjective = Brand<string, "ProjectObjective">;
+export type GoalTitle = Brand<string, "GoalTitle">;
+export type DesiredOutcome = Brand<string, "DesiredOutcome">;
+export type AcceptanceCriterion = Brand<string, "AcceptanceCriterion">;
+export type GoalConstraint = Brand<string, "GoalConstraint">;
+export type PromptTemplate = Brand<string, "PromptTemplate">;
+export type EvidenceSummary = Brand<string, "EvidenceSummary">;
+export type ResourceName = Brand<string, "ResourceName">;
+export type Reason = Brand<string, "Reason">;
+export type PositiveInteger = Brand<number, "PositiveInteger">;
+export type NonNegativeInteger = Brand<number, "NonNegativeInteger">;
+export type NonEmptyArray<T> = readonly [T, ...T[]];
+
+export type PrimitiveError = {
+  readonly type: "PrimitiveError";
+  readonly field: string;
+  readonly message: string;
+};
+
+export function makeProjectId(value: unknown): Result<ProjectId, PrimitiveError> {
+  return makeId(value, "projectId");
+}
+
+export function makeGoalId(value: unknown): Result<GoalId, PrimitiveError> {
+  return makeId(value, "goalId");
+}
+
+export function makeRunnerId(value: unknown): Result<RunnerId, PrimitiveError> {
+  return makeId(value, "runnerId");
+}
+
+export function makeCoachId(value: unknown): Result<CoachId, PrimitiveError> {
+  return makeId(value, "coachId");
+}
+
+export function makeRunId(value: unknown): Result<RunId, PrimitiveError> {
+  return makeId(value, "runId");
+}
+
+export function makeWorkspaceId(value: unknown): Result<WorkspaceId, PrimitiveError> {
+  return makeId(value, "workspaceId");
+}
+
+export function makeEventId(value: unknown): Result<EventId, PrimitiveError> {
+  return makeId(value, "eventId");
+}
+
+export function makeEvidenceId(value: unknown): Result<EvidenceId, PrimitiveError> {
+  return makeId(value, "evidenceId");
+}
+
+export function makeCheckpointId(value: unknown): Result<CheckpointId, PrimitiveError> {
+  return makeId(value, "checkpointId");
+}
+
+export function makeCoachReviewId(value: unknown): Result<CoachReviewId, PrimitiveError> {
+  return makeId(value, "coachReviewId");
+}
+
+export function makeCoachProposalId(value: unknown): Result<CoachProposalId, PrimitiveError> {
+  return makeId(value, "coachProposalId");
+}
+
+export function makeDivergenceId(value: unknown): Result<DivergenceId, PrimitiveError> {
+  return makeId(value, "divergenceId");
+}
+
+export function makeComparisonId(value: unknown): Result<ComparisonId, PrimitiveError> {
+  return makeId(value, "comparisonId");
+}
+
+export function makeDecisionId(value: unknown): Result<DecisionId, PrimitiveError> {
+  return makeId(value, "decisionId");
+}
+
+export function makeIdempotencyKey(value: unknown): Result<IdempotencyKey, PrimitiveError> {
+  if (typeof value !== "string" || !/^(?:sha256:)?[0-9a-f]{64}$/iu.test(value)) {
+    return invalid("idempotencyKey", "idempotencyKey must be a SHA-256 hexadecimal digest");
+  }
+  return ok(value.toLowerCase() as IdempotencyKey);
+}
+
+export function makeCommandFingerprint(value: unknown): Result<CommandFingerprint, PrimitiveError> {
+  if (typeof value !== "string" || !/^(?:sha256:)?[0-9a-f]{64}$/iu.test(value)) {
+    return invalid("commandFingerprint", "commandFingerprint must be a SHA-256 hexadecimal digest");
+  }
+  return ok(value.toLowerCase() as CommandFingerprint);
+}
+
+export function makeGitCommitSha(value: unknown, field = "sha"): Result<GitCommitSha, PrimitiveError> {
+  if (typeof value !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(value)) {
+    return invalid(field, field + " must be a 40- or 64-character hexadecimal Git commit SHA");
+  }
+  return ok(value.toLowerCase() as GitCommitSha);
+}
+
+export function makeGitRef(value: unknown, field = "ref"): Result<GitRef, PrimitiveError> {
+  if (typeof value !== "string" || !value.startsWith("refs/") || !isValidRefName(value)) {
+    return invalid(field, field + " must be a fully qualified, safe Git ref");
+  }
+  return ok(value as GitRef);
+}
+
+export function makeGitBranchName(value: unknown, field = "branch"): Result<GitBranchName, PrimitiveError> {
+  if (typeof value !== "string" || value.startsWith("refs/") || !isValidRefName("refs/heads/" + value)) {
+    return invalid(field, field + " must be a safe Git branch name without refs/heads/");
+  }
+  return ok(value as GitBranchName);
+}
+
+export function makeRepositoryOwner(value: unknown): Result<RepositoryOwner, PrimitiveError> {
+  if (typeof value !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u.test(value)) {
+    return invalid("repository.owner", "repository.owner must be a safe account or organization name");
+  }
+  return ok(value as RepositoryOwner);
+}
+
+export function makeRepositoryName(value: unknown): Result<RepositoryName, PrimitiveError> {
+  if (typeof value !== "string" || value.length > 100 || !/^[A-Za-z0-9._-]+$/u.test(value) || value === "." || value === "..") {
+    return invalid("repository.name", "repository.name must be a safe repository name");
+  }
+  return ok(value as RepositoryName);
+}
+
+export function makeIsoTimestamp(value: unknown, field = "timestamp"): Result<IsoTimestamp, PrimitiveError> {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u.test(value) || !Number.isFinite(Date.parse(value))) {
+    return invalid(field, field + " must be a valid RFC 3339 timestamp");
+  }
+  return ok(value as IsoTimestamp);
+}
+
+export function makeNonEmptyText(value: unknown, field = "text"): Result<NonEmptyText, PrimitiveError> {
   if (typeof value !== "string" || value.trim() === "") {
-    return invalid(field, `${field} must be a non-empty string`);
+    return invalid(field, field + " must be non-empty text");
   }
   return ok(value as NonEmptyText);
 }
 
-export function makeRequestTitle(value: unknown): Result<RequestTitle, PrimitiveValidationError> {
+export function makeProjectTitle(value: unknown): Result<ProjectTitle, PrimitiveError> {
   return makeTextBrand(value, "title");
 }
 
-export function makeRequestGoal(value: unknown): Result<RequestGoal, PrimitiveValidationError> {
-  return makeTextBrand(value, "goal");
+export function makeProjectObjective(value: unknown): Result<ProjectObjective, PrimitiveError> {
+  return makeTextBrand(value, "objective");
 }
 
-export function makeDestinationTitle(value: unknown, field = "title"): Result<DestinationTitle, PrimitiveValidationError> {
+export function makeGoalTitle(value: unknown): Result<GoalTitle, PrimitiveError> {
+  return makeTextBrand(value, "title");
+}
+
+export function makeDesiredOutcome(value: unknown): Result<DesiredOutcome, PrimitiveError> {
+  return makeTextBrand(value, "desiredOutcome");
+}
+
+export function makeAcceptanceCriterion(value: unknown, field = "acceptanceCriterion"): Result<AcceptanceCriterion, PrimitiveError> {
   return makeTextBrand(value, field);
 }
 
-export function makeDestinationAcceptanceCriterion(value: unknown, field = "acceptanceCriterion"): Result<DestinationAcceptanceCriterion, PrimitiveValidationError> {
+export function makeGoalConstraint(value: unknown, field = "constraint"): Result<GoalConstraint, PrimitiveError> {
   return makeTextBrand(value, field);
 }
 
-export function makeDestinationConstraint(value: unknown, field = "constraint"): Result<DestinationConstraint, PrimitiveValidationError> {
+export function makePromptTemplate(value: unknown, field = "promptTemplate"): Result<PromptTemplate, PrimitiveError> {
   return makeTextBrand(value, field);
 }
 
-export function makeDestinationNotes(value: unknown, field = "notes"): Result<DestinationNotes, PrimitiveValidationError> {
+export function makeEvidenceSummary(value: unknown, field = "summary"): Result<EvidenceSummary, PrimitiveError> {
   return makeTextBrand(value, field);
 }
 
-export function makeSummary(value: unknown, field = "summary"): Result<Summary, PrimitiveValidationError> {
+export function makeResourceName(value: unknown, field = "resourceName"): Result<ResourceName, PrimitiveError> {
   return makeTextBrand(value, field);
 }
 
-export function makeEvidenceText(value: unknown, field = "evidence"): Result<EvidenceText, PrimitiveValidationError> {
+export function makeReason(value: unknown, field = "reason"): Result<Reason, PrimitiveError> {
   return makeTextBrand(value, field);
 }
 
-export function makeFailureReason(value: unknown, field = "failureReason"): Result<FailureReason, PrimitiveValidationError> {
-  return makeTextBrand(value, field);
-}
-
-export function makeRiskText(value: unknown, field = "risk"): Result<RiskText, PrimitiveValidationError> {
-  return makeTextBrand(value, field);
-}
-
-export function makeMoveCommit(value: unknown, field = "commit"): Result<MoveCommit, PrimitiveValidationError> {
-  return makeTextBrand(value, field);
-}
-
-export function makeTeamName(value: unknown, field = "teamName"): Result<TeamName, PrimitiveValidationError> {
-  return makeTextBrand(value, field);
-}
-
-export function makePositiveInteger(value: unknown, field = "number"): Result<PositiveInteger, PrimitiveValidationError> {
-  if (!Number.isInteger(value) || Number(value) < 1) {
-    return invalid(field, `${field} must be a positive integer`);
+export function makePositiveInteger(value: unknown, field = "number"): Result<PositiveInteger, PrimitiveError> {
+  if (!Number.isSafeInteger(value) || Number(value) < 1) {
+    return invalid(field, field + " must be a positive safe integer");
   }
   return ok(value as PositiveInteger);
 }
 
-export function makeNonNegativeInteger(value: unknown, field = "number"): Result<NonNegativeInteger, PrimitiveValidationError> {
-  if (!Number.isInteger(value) || Number(value) < 0) {
-    return invalid(field, `${field} must be a non-negative integer`);
+export function makeNonNegativeInteger(value: unknown, field = "number"): Result<NonNegativeInteger, PrimitiveError> {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    return invalid(field, field + " must be a non-negative safe integer");
   }
   return ok(value as NonNegativeInteger);
 }
 
-export function makeNonEmptyArray<T>(value: T[], field = "array"): Result<NonEmptyArray<T>, PrimitiveValidationError> {
-  if (value.length === 0) {
-    return invalid(field, `${field} must include at least one item`);
+export function makeNonEmptyArray<T>(value: readonly T[], field = "items"): Result<NonEmptyArray<T>, PrimitiveError> {
+  return value.length > 0
+    ? ok(value as NonEmptyArray<T>)
+    : invalid(field, field + " must contain at least one item");
+}
+
+function makeId<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveError> {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(value)) {
+    return invalid(field, field + " must be a branch-safe identifier");
   }
-  return ok(value as NonEmptyArray<T>);
+  return ok(value as Brand<string, T>);
 }
 
-export function makeSingleItemArray<T>(value: T[], field = "array"): Result<SingleItemArray<T>, PrimitiveValidationError> {
-  if (value.length !== 1) {
-    return invalid(field, `${field} must include exactly one item`);
-  }
-  return ok(value as SingleItemArray<T>);
-}
-
-export function makeDomainId<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveValidationError> {
-  const text = makeNonEmptyText(value, field);
-  if (!text.ok) {
-    return text;
-  }
-  if (/\s/.test(text.value)) {
-    return invalid(field, `${field} must not contain whitespace`);
-  }
-  return ok(text.value as Brand<string, T>);
-}
-
-export function makeRequestId(value: unknown): Result<Brand<string, "RequestId">, PrimitiveValidationError> {
-  return makeDomainId(value, "requestId");
-}
-
-export function makeDestinationId(value: unknown): Result<Brand<string, "DestinationId">, PrimitiveValidationError> {
-  return makeDomainId(value, "destinationId");
-}
-
-export function makeMoveId(value: unknown): Result<Brand<string, "MoveId">, PrimitiveValidationError> {
-  return makeDomainId(value, "moveId");
-}
-
-export function makeHunsuId(value: unknown): Result<Brand<string, "HunsuId">, PrimitiveValidationError> {
-  return makeDomainId(value, "hunsuId");
-}
-
-export function makeHunsuDraftId(value: unknown): Result<Brand<string, "HunsuDraftId">, PrimitiveValidationError> {
-  return makeDomainId(value, "hunsuDraftId");
-}
-
-export function makeLineId(value: unknown): Result<Brand<string, "LineId">, PrimitiveValidationError> {
-  return makeDomainId(value, "lineId");
-}
-
-export function makeNodeId(value: unknown): Result<Brand<string, "NodeId">, PrimitiveValidationError> {
-  return makeDomainId(value, "nodeId");
-}
-
-export function makeArtifactId(value: unknown): Result<Brand<string, "ArtifactId">, PrimitiveValidationError> {
-  return makeDomainId(value, "artifactId");
-}
-
-export function makeArtifactActionId(value: unknown): Result<Brand<string, "ArtifactActionId">, PrimitiveValidationError> {
-  return makeDomainId(value, "artifactActionId");
-}
-
-export function makeTeamId(value: unknown): Result<Brand<string, "TeamId">, PrimitiveValidationError> {
-  return makeDomainId(value, "teamId");
-}
-
-export function makeSkillDraftId(value: unknown): Result<Brand<string, "SkillDraftId">, PrimitiveValidationError> {
-  return makeDomainId(value, "skillDraftId");
-}
-
-export function makeAgentConversationHash(value: unknown): Result<Brand<string, "AgentConversationHash">, PrimitiveValidationError> {
-  return makeDomainId(value, "agentConversationHash");
-}
-
-export function makeExecuteId(value: unknown): Result<Brand<string, "ExecuteId">, PrimitiveValidationError> {
-  return makeDomainId(value, "executeId");
-}
-
-export function makeRouteId(value: unknown): Result<Brand<string, "RouteId">, PrimitiveValidationError> {
-  return makeDomainId(value, "routeId");
-}
-
-export function makeWorktreeHash(value: unknown): Result<Brand<string, "WorktreeHash">, PrimitiveValidationError> {
-  return makeDomainId(value, "worktreeHash");
-}
-
-function invalid(field: string, message: string): Result<never, PrimitiveValidationError> {
-  return err({ type: "PrimitiveValidationError", field, message });
-}
-
-function makeTextBrand<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveValidationError> {
+function makeTextBrand<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveError> {
   const text = makeNonEmptyText(value, field);
   return text.ok ? ok(text.value as Brand<string, T>) : text;
 }
 
-function makeStringBrand<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveValidationError> {
-  if (typeof value !== "string") {
-    return invalid(field, `${field} must be a string`);
-  }
-  return ok(value as Brand<string, T>);
+function isValidRefName(value: string): boolean {
+  if (value.length > 1024 || value.endsWith("/") || value.endsWith(".") || value.endsWith(".lock")) return false;
+  if (value.includes("..") || value.includes("@{") || value.includes("//")) return false;
+  if (/[\u0000-\u0020\u007f~^:?*\\[\\\\]/u.test(value)) return false;
+  return value.split("/").every(part => part !== "" && part !== "." && part !== ".." && !part.startsWith(".") && !part.endsWith(".lock"));
+}
+
+function invalid(field: string, message: string): Result<never, PrimitiveError> {
+  return err({ type: "PrimitiveError", field, message });
 }
