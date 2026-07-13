@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = resolve(dirname(scriptPath), "..");
 const fakeCodexPath = join(repositoryRoot, "tests", "fixtures", "fake-codex.mjs");
+const RUNTIME_INSTALL_SCHEMA = "hunsu.bridge.runtime-install.v2";
 
 export async function runBridgeServiceSmoke(input) {
   const startedAt = performance.now();
@@ -177,12 +178,14 @@ async function waitForHealthyService(launcher, env, cwd, version) {
 
 async function readInstallDocument(home) {
   const value = JSON.parse(await readFile(join(home, "runtime", "install.json"), "utf8"));
-  ensure(value?.schema === "hunsu.bridge.runtime-install.v1", "runtime install document used the wrong schema");
+  ensure(value?.schema === RUNTIME_INSTALL_SCHEMA, "runtime install document used the wrong schema");
   return value;
 }
 
 function assertInstallIdentity(install, version, home, bootstrap, npmCache) {
+  ensure(/^install_[A-Za-z0-9_-]{8,}$/u.test(install.installationId ?? ""), "install.json omitted the installation identity");
   ensure(install.current?.packageVersion === version, "install.json reported the wrong exact package version");
+  ensure(/^[a-f0-9]{64}$/u.test(install.current?.cliSha256 ?? ""), "install.json omitted the verified CLI SHA-256");
   const expectedRuntime = resolve(home, "runtime", "versions", version);
   ensure(samePath(install.current?.runtimePath, expectedRuntime), "stable runtime path was not HUNSU_HOME/runtime/versions/<version>");
   ensure(isAbsolute(install.current?.nodePath ?? ""), "service Node path was not absolute");
