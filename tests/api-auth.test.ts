@@ -212,7 +212,8 @@ test("GitHub App installation tokens are short-lived and cached without exposing
     privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
     apiBaseUrl: "https://github-api.example.test",
     now: () => now,
-    fetch: async (input, init = {}) => {
+    fetch: async function (this: unknown, input, init = {}) {
+      assert.equal(this, undefined);
       calls += 1;
       const appJwt = new Headers(init.headers).get("authorization")?.replace(/^Bearer /u, "") ?? "";
       requests.push({ url: String(input), init, appJwt });
@@ -289,7 +290,8 @@ test("GitHub OAuth resolves the user and granted App installations through authe
     publicApiUrl: "https://api.example.test/",
     apiBaseUrl: "https://github-api.example.test/",
     webBaseUrl: "https://github.example.test/",
-    fetch: async (input, init = {}) => {
+    fetch: async function (this: unknown, input, init = {}) {
+      assert.equal(this, undefined);
       const url = String(input);
       calls.push({ url, init });
       if (url === "https://github.example.test/login/oauth/access_token") {

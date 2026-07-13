@@ -24,7 +24,10 @@ export class GitHubAppTokenProvider {
   }) {
     this.#appId = input.appId;
     this.#privateKey = input.privateKey;
-    this.#fetch = input.fetch ?? globalThis.fetch;
+    const fetch = input.fetch;
+    this.#fetch = fetch
+      ? (request, init) => fetch(request, init)
+      : (request, init) => globalThis.fetch(request, init);
     this.#apiBaseUrl = (input.apiBaseUrl ?? "https://api.github.com").replace(/\/$/u, "");
     this.#now = input.now ?? (() => Date.now());
   }
@@ -125,7 +128,10 @@ export class GitHubOAuthClient {
     this.#clientId = input.clientId;
     this.#clientSecret = input.clientSecret;
     this.#publicApiUrl = input.publicApiUrl.replace(/\/$/u, "");
-    this.#fetch = input.fetch ?? globalThis.fetch;
+    const fetch = input.fetch;
+    this.#fetch = fetch
+      ? (request, init) => fetch(request, init)
+      : (request, init) => globalThis.fetch(request, init);
     this.#apiBaseUrl = (input.apiBaseUrl ?? "https://api.github.com").replace(/\/$/u, "");
     this.#webBaseUrl = (input.webBaseUrl ?? "https://github.com").replace(/\/$/u, "");
   }

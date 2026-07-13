@@ -29,7 +29,10 @@ export class GitHubRestTransport implements GitHubTransport {
 
   constructor(options: GitHubRestTransportOptions) {
     this.#tokenProvider = options.tokenProvider;
-    this.#fetch = options.fetch ?? globalThis.fetch;
+    const fetch = options.fetch;
+    this.#fetch = fetch
+      ? (request, init) => fetch(request, init)
+      : (request, init) => globalThis.fetch(request, init);
     this.#apiBaseUrl = (options.apiBaseUrl ?? "https://api.github.com").replace(/\/$/u, "");
   }
 

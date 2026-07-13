@@ -21,7 +21,8 @@ test("GitHub REST transport uses installation authority and a non-forced CAS upd
       assert.equal(installationId, repository.installationId);
       return "test-installation-value";
     },
-    async fetch(input, init = {}) {
+    fetch: async function (this: unknown, input, init = {}) {
+      assert.equal(this, undefined);
       const url = String(input);
       calls.push({ url, init });
       const method = init.method ?? "GET";
