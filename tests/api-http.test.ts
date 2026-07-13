@@ -9,7 +9,8 @@ import {
   McpOAuthService,
   SessionManager,
   type AuthContext,
-  type GitHubOAuthClient
+  type GitHubOAuthClient,
+  type GitHubOAuthFailure
 } from "../apps/api/src/index.ts";
 import { MemoryGitHubTransport, type RepositoryGrant } from "../packages/github-store/src/index.ts";
 
@@ -65,7 +66,7 @@ test("GitHub App login uses PKCE and binds the callback to both transient cookie
     },
     authenticate: async (code: string, verifier: string) => {
       exchanged = { code, verifier };
-      return { user: webContext.user, installations: [...webContext.installations] };
+      return { ok: true, value: { user: webContext.user, installations: [...webContext.installations] } };
     }
   } as unknown as GitHubOAuthClient;
   const app = new HunsuHttpApp({
@@ -96,6 +97,7 @@ test("GitHub App login uses PKCE and binds the callback to both transient cookie
     headers: { cookie: `hunsu_oauth_state=${stateCookie}` }
   }));
   assert.equal(missingVerifier.status, 400);
+  assert.equal(missingVerifier.headers.get("referrer-policy"), "no-referrer");
   assert.equal(exchanged, undefined);
 
   const completed = await app.handle(new Request(callback, {
@@ -103,11 +105,77 @@ test("GitHub App login uses PKCE and binds the callback to both transient cookie
   }));
   assert.equal(completed.status, 302);
   assert.equal(completed.headers.get("location"), `${WEB}/projects`);
+  assert.equal(completed.headers.get("referrer-policy"), "no-referrer");
   assert.deepEqual(exchanged, { code: "github-code", verifier });
   const completedCookies = completed.headers.get("set-cookie") ?? "";
   assert.match(completedCookies, /hunsu_session=/u);
   assert.match(completedCookies, /hunsu_oauth_state=; Max-Age=0/u);
   assert.match(completedCookies, /hunsu_oauth_pkce=; Max-Age=0/u);
+});
+
+test("GitHub OAuth callback diagnostics are response-only, closed, and credential-free", async t => {
+  const typed = await runOAuthCallbackFailure(() => ({
+    ok: false,
+    error: {
+      type: "GitHubOAuthFailure",
+      stage: "code_exchange",
+      reason: "upstream_response",
+      upstreamStatus: 200,
+      providerCode: "incorrect_client_credentials"
+    } satisfies GitHubOAuthFailure
+  }));
+  assertOAuthDiagnostic(typed, {
+    retryable: false,
+    stage: "code_exchange",
+    reason: "upstream_response",
+    upstreamStatus: 200,
+    providerCode: "incorrect_client_credentials"
+  });
+
+  await t.test("transport failures remain retryable", async () => {
+    const transportFailure = await runOAuthCallbackFailure(() => ({
+      ok: false,
+      error: {
+        type: "GitHubOAuthFailure",
+        stage: "code_exchange",
+        reason: "transport",
+        upstreamStatus: null,
+        providerCode: null
+      } satisfies GitHubOAuthFailure
+    }));
+    assertOAuthDiagnostic(transportFailure, {
+      retryable: true,
+      stage: "code_exchange",
+      reason: "transport",
+      upstreamStatus: null,
+      providerCode: null
+    });
+  });
+
+  await t.test("unknown callback failures use a fixed local diagnostic", async () => {
+    const unknown = await runOAuthCallbackFailure(() => { throw new Error("raw-callback-error-sentinel"); });
+    assertOAuthDiagnostic(unknown, {
+      retryable: false,
+      stage: "callback_internal",
+      reason: "local_failure",
+      upstreamStatus: null,
+      providerCode: null
+    });
+  });
+
+  await t.test("session issuance failures use a fixed local diagnostic", async () => {
+    const session = await runOAuthCallbackFailure(async () => ({ ok: true, value: {
+      user: webContext.user,
+      installations: [...webContext.installations]
+    } }), true);
+    assertOAuthDiagnostic(session, {
+      retryable: false,
+      stage: "session_issue",
+      reason: "local_failure",
+      upstreamStatus: null,
+      providerCode: null
+    });
+  });
 });
 
 test("OAuth authorization requires an explicit, same-session, single-use consent POST", async () => {
@@ -127,7 +195,7 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
     sessions,
     githubOAuth: {
       authorizationUrl: () => "https://github.example.test/authorize",
-      authenticate: async () => ({ user: webContext.user, installations: [...webContext.installations] })
+      authenticate: async () => ({ ok: true, value: { user: webContext.user, installations: [...webContext.installations] } })
     } as unknown as GitHubOAuthClient,
     mcpOAuth,
     webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore }),
@@ -270,7 +338,7 @@ test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts
   const webhooks = new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore });
   const githubOAuth = {
     authorizationUrl: () => "https://github.example.test/authorize",
-    authenticate: async () => ({ user: webContext.user, installations: [...webContext.installations] })
+    authenticate: async () => ({ ok: true, value: { user: webContext.user, installations: [...webContext.installations] } })
   } as unknown as GitHubOAuthClient;
   const app = new HunsuHttpApp({
     service,
@@ -440,6 +508,118 @@ test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts
 
 function jsonRequest(url: string, body: unknown, headers: Record<string, string>, method = "POST"): Request {
   return new Request(url, { method, headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+}
+
+type OAuthDiagnosticResult = {
+  response: Response;
+  body: {
+    error: {
+      code: string;
+      message: string;
+      retryable: boolean;
+      diagnostic: {
+        schema: string;
+        id: string;
+        stage: string;
+        reason: string;
+        upstreamStatus: number | null;
+        providerCode: string | null;
+      };
+    };
+  };
+  forbidden: string[];
+};
+
+async function runOAuthCallbackFailure(
+  authenticate: (code: string, verifier: string) => Promise<unknown> | unknown,
+  failSessionIssue = false
+): Promise<OAuthDiagnosticResult> {
+  const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const sessions = new SessionManager({
+    secret: "test-session-secret-that-is-at-least-thirty-two-bytes",
+    ttlSeconds: 3600,
+    cookieName: "hunsu_session",
+    secure: true
+  });
+  if (failSessionIssue) sessions.issue = () => { throw new Error("raw-session-error-sentinel"); };
+  const stateStore = new InMemoryEphemeralStateStore();
+  let state = "";
+  const app = new HunsuHttpApp({
+    service,
+    sessions,
+    githubOAuth: {
+      authorizationUrl: (value: string) => {
+        state = value;
+        return "https://github.example.test/authorize";
+      },
+      authenticate
+    } as unknown as GitHubOAuthClient,
+    mcpOAuth: new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, stateStore }),
+    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore }),
+    publicApiUrl: API,
+    webUrl: WEB,
+    githubAppSlug: "hunsu-test"
+  });
+  const start = await app.handle(new Request(`${API}/api/auth/github`));
+  const cookies = start.headers.get("set-cookie") ?? "";
+  const stateCookie = cookies.match(/hunsu_oauth_state=([^;,]+)/u)?.[1];
+  const pkceCookie = cookies.match(/hunsu_oauth_pkce=([^;,]+)/u)?.[1];
+  assert.ok(stateCookie);
+  assert.ok(pkceCookie);
+  const callbackCode = "callback-code-sentinel";
+  const response = await app.handle(new Request(
+    `${API}/api/auth/github/callback?state=${encodeURIComponent(state)}&code=${callbackCode}`,
+    { headers: { cookie: `hunsu_oauth_state=${stateCookie}; hunsu_oauth_pkce=${pkceCookie}` } }
+  ));
+  const body = await response.json() as OAuthDiagnosticResult["body"];
+  return {
+    response,
+    body,
+    forbidden: [
+      callbackCode,
+      state,
+      stateCookie,
+      pkceCookie,
+      decodeURIComponent(pkceCookie),
+      "raw-callback-error-sentinel",
+      "raw-session-error-sentinel"
+    ]
+  };
+}
+
+function assertOAuthDiagnostic(
+  result: OAuthDiagnosticResult,
+  expected: Omit<OAuthDiagnosticResult["body"]["error"]["diagnostic"], "schema" | "id"> & { retryable: boolean }
+): void {
+  assert.equal(result.response.status, 503);
+  assert.equal(result.response.headers.get("cache-control"), "no-store");
+  assert.equal(result.response.headers.get("referrer-policy"), "no-referrer");
+  const clearedCookies = result.response.headers.get("set-cookie") ?? "";
+  assert.match(clearedCookies, /hunsu_oauth_state=; Max-Age=0/u);
+  assert.match(clearedCookies, /hunsu_oauth_pkce=; Max-Age=0/u);
+  assert.match(result.body.error.diagnostic.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+  const { retryable, ...diagnostic } = expected;
+  assert.deepEqual({
+    ...result.body,
+    error: {
+      ...result.body.error,
+      diagnostic: { ...result.body.error.diagnostic, id: "<uuid>" }
+    }
+  }, {
+    error: {
+      code: "temporarily_unavailable",
+      message: "GitHub sign-in could not be completed.",
+      retryable,
+      diagnostic: {
+        schema: "hunsu.github-oauth-diagnostic.v1",
+        id: "<uuid>",
+        ...diagnostic
+      }
+    }
+  });
+  const serialized = JSON.stringify(result.body);
+  for (const forbidden of result.forbidden) assert.doesNotMatch(serialized, new RegExp(forbidden, "u"));
 }
 
 function consentRequest(cookie: string, body: URLSearchParams, origin = API): Request {

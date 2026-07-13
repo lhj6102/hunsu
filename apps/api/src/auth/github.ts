@@ -1,5 +1,6 @@
 import { createSign } from "node:crypto";
 import type { GitHubAppConfig } from "@hunsu/config";
+import { err, ok, type Result } from "@hunsu/protocol";
 import type { AuthorizedInstallation, GitHubUser } from "../types.ts";
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -81,6 +82,30 @@ export type GitHubOAuthIdentity = {
   installations: AuthorizedInstallation[];
 };
 
+export type GitHubOAuthFailureStage =
+  | "code_exchange"
+  | "user_lookup"
+  | "installation_lookup"
+  | "repository_lookup";
+
+export type GitHubOAuthFailureReason = "transport" | "upstream_response" | "invalid_payload";
+
+export type GitHubOAuthProviderCode =
+  | "bad_verification_code"
+  | "incorrect_client_credentials"
+  | "redirect_uri_mismatch"
+  | "unverified_user_email";
+
+export type GitHubOAuthFailure = {
+  type: "GitHubOAuthFailure";
+  stage: GitHubOAuthFailureStage;
+  reason: GitHubOAuthFailureReason;
+  upstreamStatus: number | null;
+  providerCode: GitHubOAuthProviderCode | null;
+};
+
+export type GitHubOAuthResult = Result<GitHubOAuthIdentity, GitHubOAuthFailure>;
+
 export class GitHubOAuthClient {
   readonly #clientId: string;
   readonly #clientSecret: string;
@@ -116,9 +141,11 @@ export class GitHubOAuthClient {
     return url.toString();
   }
 
-  async authenticate(code: string, codeVerifier: string): Promise<GitHubOAuthIdentity> {
-    if (!/^[A-Za-z0-9_-]{43,128}$/u.test(codeVerifier)) throw new Error("GitHub OAuth PKCE verifier is invalid.");
-    const tokenResponse = await this.#fetch(`${this.#webBaseUrl}/login/oauth/access_token`, {
+  async authenticate(code: string, codeVerifier: string): Promise<GitHubOAuthResult> {
+    if (!/^[A-Za-z0-9_-]{43,128}$/u.test(codeVerifier)) {
+      return err(oauthFailure({ stage: "code_exchange", reason: "invalid_payload", upstreamStatus: null }));
+    }
+    const tokenResponseResult = await this.#request("code_exchange", `${this.#webBaseUrl}/login/oauth/access_token`, {
       method: "POST",
       headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -129,76 +156,132 @@ export class GitHubOAuthClient {
         code_verifier: codeVerifier
       }).toString()
     });
+    if (!tokenResponseResult.ok) return tokenResponseResult;
+    const tokenResponse = tokenResponseResult.value;
     const tokenBody = await readJson(tokenResponse);
-    if (!tokenResponse.ok
-      || !isRecord(tokenBody)
+    const providerRejected = isRecord(tokenBody) && typeof tokenBody.error === "string";
+    const providerCode = decodeProviderCode(tokenBody);
+    if (!tokenResponse.ok || providerRejected) {
+      return err(oauthFailure({
+        stage: "code_exchange",
+        reason: "upstream_response",
+        upstreamStatus: tokenResponse.status,
+        providerCode
+      }));
+    }
+    if (!isRecord(tokenBody)
       || typeof tokenBody.access_token !== "string"
       || tokenBody.access_token.length === 0) {
-      throw new Error("GitHub OAuth code exchange failed.");
+      return err(oauthFailure({
+        stage: "code_exchange",
+        reason: "invalid_payload",
+        upstreamStatus: tokenResponse.status
+      }));
     }
     const accessToken = tokenBody.access_token;
-    const [userResponse, installations] = await Promise.all([
-      this.#githubRequest("/user", accessToken),
+    const [userResponseResult, installationsResult] = await Promise.all([
+      this.#githubRequest("user_lookup", "/user", accessToken),
       this.#listInstallations(accessToken)
     ]);
-    if (!userResponse.ok) throw new Error("GitHub OAuth identity lookup failed.");
+    if (!userResponseResult.ok) return userResponseResult;
+    if (!installationsResult.ok) return installationsResult;
+    const userResponse = userResponseResult.value;
+    if (!userResponse.ok) {
+      return err(oauthFailure({ stage: "user_lookup", reason: "upstream_response", upstreamStatus: userResponse.status }));
+    }
     const userBody = await readJson(userResponse);
     const user = decodeUser(userBody);
-    if (!user) throw new Error("GitHub OAuth returned an invalid identity.");
-    const authorizedInstallations = await Promise.all(installations.map(async installation => ({
-      ...installation,
-      repositories: await this.#listUserInstallationRepositories(installation.id, accessToken)
-    })));
-    return { user, installations: authorizedInstallations };
+    if (!user) {
+      return err(oauthFailure({ stage: "user_lookup", reason: "invalid_payload", upstreamStatus: userResponse.status }));
+    }
+    const authorizedInstallations: AuthorizedInstallation[] = [];
+    for (const installation of installationsResult.value) {
+      const repositories = await this.#listUserInstallationRepositories(installation.id, accessToken);
+      if (!repositories.ok) return repositories;
+      authorizedInstallations.push({ ...installation, repositories: repositories.value });
+    }
+    return ok({ user, installations: authorizedInstallations });
   }
 
-  async #listInstallations(token: string): Promise<Array<Omit<AuthorizedInstallation, "repositories">>> {
+  async #listInstallations(token: string): Promise<Result<Array<Omit<AuthorizedInstallation, "repositories">>, GitHubOAuthFailure>> {
     const installations: Array<Omit<AuthorizedInstallation, "repositories">> = [];
     const seen = new Set<number>();
     for (let page = 1; ; page += 1) {
-      const response = await this.#githubRequest(`/user/installations?per_page=100&page=${page}`, token);
-      if (!response.ok) throw new Error("GitHub OAuth installation lookup failed.");
+      const responseResult = await this.#githubRequest("installation_lookup", `/user/installations?per_page=100&page=${page}`, token);
+      if (!responseResult.ok) return responseResult;
+      const response = responseResult.value;
+      if (!response.ok) {
+        return err(oauthFailure({ stage: "installation_lookup", reason: "upstream_response", upstreamStatus: response.status }));
+      }
       const body = await readJson(response);
       const decoded = decodeInstallations(body);
-      if (!decoded) throw new Error("GitHub OAuth returned invalid installations.");
+      if (!decoded) {
+        return err(oauthFailure({ stage: "installation_lookup", reason: "invalid_payload", upstreamStatus: response.status }));
+      }
       for (const installation of decoded) {
-        if (seen.has(installation.id)) throw new Error("GitHub OAuth returned duplicate installations.");
+        if (seen.has(installation.id)) {
+          return err(oauthFailure({ stage: "installation_lookup", reason: "invalid_payload", upstreamStatus: response.status }));
+        }
         seen.add(installation.id);
         installations.push(installation);
       }
-      if (decoded.length < 100) return installations;
+      if (decoded.length < 100) return ok(installations);
     }
   }
 
-  async #listUserInstallationRepositories(installationId: number, token: string): Promise<AuthorizedInstallation["repositories"]> {
+  async #listUserInstallationRepositories(
+    installationId: number,
+    token: string
+  ): Promise<Result<AuthorizedInstallation["repositories"], GitHubOAuthFailure>> {
     const repositories: AuthorizedInstallation["repositories"][number][] = [];
     const seen = new Set<number>();
     for (let page = 1; ; page += 1) {
-      const response = await this.#githubRequest(
+      const responseResult = await this.#githubRequest(
+        "repository_lookup",
         `/user/installations/${installationId}/repositories?per_page=100&page=${page}`,
         token
       );
-      if (!response.ok) throw new Error("GitHub OAuth repository authorization lookup failed.");
+      if (!responseResult.ok) return responseResult;
+      const response = responseResult.value;
+      if (!response.ok) {
+        return err(oauthFailure({ stage: "repository_lookup", reason: "upstream_response", upstreamStatus: response.status }));
+      }
       const body = await readJson(response);
       const decoded = decodeRepositoryAccesses(body);
-      if (!decoded) throw new Error("GitHub OAuth returned invalid repository authorization.");
+      if (!decoded) {
+        return err(oauthFailure({ stage: "repository_lookup", reason: "invalid_payload", upstreamStatus: response.status }));
+      }
       for (const repository of decoded) {
-        if (seen.has(repository.repositoryId)) throw new Error("GitHub OAuth returned duplicate repository authorization.");
+        if (seen.has(repository.repositoryId)) {
+          return err(oauthFailure({ stage: "repository_lookup", reason: "invalid_payload", upstreamStatus: response.status }));
+        }
         seen.add(repository.repositoryId);
         repositories.push(repository);
       }
-      if (decoded.length < 100) return repositories;
+      if (decoded.length < 100) return ok(repositories);
     }
   }
 
-  #githubRequest(path: string, token: string): Promise<Response> {
-    return this.#fetch(`${this.#apiBaseUrl}${path}`, {
+  #githubRequest(
+    stage: Exclude<GitHubOAuthFailureStage, "code_exchange">,
+    path: string,
+    token: string
+  ): Promise<Result<Response, GitHubOAuthFailure>> {
+    return this.#request(stage, `${this.#apiBaseUrl}${path}`, {
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${token}`,
         "x-github-api-version": GITHUB_API_VERSION
       }
     });
+  }
+
+  async #request(stage: GitHubOAuthFailureStage, input: string, init: RequestInit): Promise<Result<Response, GitHubOAuthFailure>> {
+    try {
+      return ok(await this.#fetch(input, init));
+    } catch {
+      return err(oauthFailure({ stage, reason: "transport", upstreamStatus: null }));
+    }
   }
 }
 
@@ -268,6 +351,30 @@ function decodeRepositoryAccesses(value: unknown): AuthorizedInstallation["repos
     });
   }
   return repositories;
+}
+
+function decodeProviderCode(value: unknown): GitHubOAuthProviderCode | null {
+  if (!isRecord(value) || typeof value.error !== "string") return null;
+  if (value.error === "bad_verification_code"
+    || value.error === "incorrect_client_credentials"
+    || value.error === "redirect_uri_mismatch"
+    || value.error === "unverified_user_email") return value.error;
+  return null;
+}
+
+function oauthFailure(input: {
+  stage: GitHubOAuthFailureStage;
+  reason: GitHubOAuthFailureReason;
+  upstreamStatus: number | null;
+  providerCode?: GitHubOAuthProviderCode | null;
+}): GitHubOAuthFailure {
+  return {
+    type: "GitHubOAuthFailure",
+    stage: input.stage,
+    reason: input.reason,
+    upstreamStatus: input.upstreamStatus,
+    providerCode: input.providerCode ?? null
+  };
 }
 
 async function readJson(response: Response): Promise<unknown> {

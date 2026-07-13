@@ -98,6 +98,15 @@ function validateWrangler(value) {
   }
   if (!isObject(value.observability) || value.observability.enabled !== true) {
     issue("Wrangler observability must be enabled for production.");
+  } else {
+    if (!isObject(value.observability.logs)
+      || value.observability.logs.enabled !== true
+      || value.observability.logs.invocation_logs !== false) {
+      issue("Wrangler logs must disable invocation logs so OAuth callback query values are not retained.");
+    }
+    if (!isObject(value.observability.traces) || value.observability.traces.enabled !== false) {
+      issue("Wrangler traces must be explicitly disabled for OAuth callback safety.");
+    }
   }
 }
 
