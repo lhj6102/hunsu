@@ -451,7 +451,8 @@ function oauthProblem(error: OAuthProtocolError): Response {
 
 function oauthConsentPage(input: { token: string; clientOrigin: string }): Response {
   const token = escapeHtml(input.token);
-  const clientOrigin = escapeHtml(input.clientOrigin);
+  const clientOrigin = new URL(input.clientOrigin).origin;
+  const escapedClientOrigin = escapeHtml(clientOrigin);
   const body = `<!doctype html>
 <html lang="en">
 <head>
@@ -462,7 +463,7 @@ function oauthConsentPage(input: { token: string; clientOrigin: string }): Respo
 <body>
   <main>
     <h1>Authorize Hunsu MCP access?</h1>
-    <p>A client returning to <code>${clientOrigin}</code> is requesting access to your Hunsu Projects and granted GitHub repositories.</p>
+    <p>A client returning to <code>${escapedClientOrigin}</code> is requesting access to your Hunsu Projects and granted GitHub repositories.</p>
     <p>Approve only if you initiated this connection and recognize the client.</p>
     <form action="/oauth/authorize" method="post" autocomplete="off">
       <input type="hidden" name="consent_request" value="${token}">
@@ -479,7 +480,9 @@ function oauthConsentPage(input: { token: string; clientOrigin: string }): Respo
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
       pragma: "no-cache",
-      "content-security-policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      // Chromium applies form-action to redirects after a form submission. Permit
+      // only the exact registered redirect origin carried by this consent request.
+      "content-security-policy": `default-src 'none'; form-action 'self' ${clientOrigin}; frame-ancestors 'none'; base-uri 'none'`,
       // `no-referrer` masks a navigation POST's Origin as `null`.
       // `same-origin` preserves the CSRF check and strips cross-origin referrers.
       "referrer-policy": "same-origin",

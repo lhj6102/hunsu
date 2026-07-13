@@ -207,12 +207,14 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
   const cookie = `hunsu_session=${encodeURIComponent(issued.token)}`;
   const verifier = "v".repeat(43);
   const challenge = createHash("sha256").update(verifier, "ascii").digest("base64url");
-  const registration = mcpOAuth.register({ redirect_uris: ["https://client.example.test/callback"] });
+  const redirectUri = "http://127.0.0.1:43123/callback";
+  const redirectOrigin = new URL(redirectUri).origin;
+  const registration = mcpOAuth.register({ redirect_uris: [redirectUri] });
   const clientId = String(registration.client_id);
   const authorizationUrl = new URL(`${API}/oauth/authorize`);
   authorizationUrl.searchParams.set("response_type", "code");
   authorizationUrl.searchParams.set("client_id", clientId);
-  authorizationUrl.searchParams.set("redirect_uri", "https://client.example.test/callback");
+  authorizationUrl.searchParams.set("redirect_uri", redirectUri);
   authorizationUrl.searchParams.set("state", "<unsafe-client-state>");
   authorizationUrl.searchParams.set("code_challenge", challenge);
   authorizationUrl.searchParams.set("code_challenge_method", "S256");
@@ -227,7 +229,10 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
     assert.equal(response.headers.get("location"), null);
     assert.equal(response.headers.get("cache-control"), "no-store");
     assert.equal(response.headers.get("referrer-policy"), "same-origin");
-    assert.match(response.headers.get("content-security-policy") ?? "", /form-action 'self'/u);
+    assert.equal(
+      response.headers.get("content-security-policy"),
+      `default-src 'none'; form-action 'self' ${redirectOrigin}; frame-ancestors 'none'; base-uri 'none'`
+    );
     const body = await response.text();
     assert.doesNotMatch(body, /<unsafe-client-state>/u);
     assert.doesNotMatch(body, /name="code"/u);
@@ -274,7 +279,7 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
   })));
   assert.equal(approved.status, 302);
   const approvedRedirect = new URL(approved.headers.get("location") ?? "");
-  assert.equal(approvedRedirect.origin, "https://client.example.test");
+  assert.equal(approvedRedirect.origin, redirectOrigin);
   assert.equal(approvedRedirect.searchParams.get("state"), "<unsafe-client-state>");
   const code = approvedRedirect.searchParams.get("code");
   assert.ok(code);
@@ -293,7 +298,7 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
       grant_type: "authorization_code",
       code,
       client_id: clientId,
-      redirect_uri: "https://client.example.test/callback",
+      redirect_uri: redirectUri,
       code_verifier: verifier
     })
   }));
