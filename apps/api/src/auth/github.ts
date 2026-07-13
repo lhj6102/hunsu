@@ -6,6 +6,7 @@ import type { AuthorizedInstallation, GitHubUser } from "../types.ts";
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 const GITHUB_API_VERSION = "2026-03-10";
+const GITHUB_USER_AGENT = "hunsu-plugin-production";
 
 export class GitHubAppTokenProvider {
   readonly #appId: number;
@@ -44,6 +45,7 @@ export class GitHubAppTokenProvider {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${this.#appJwt(now)}`,
         "content-type": "application/json",
+        "user-agent": GITHUB_USER_AGENT,
         "x-github-api-version": GITHUB_API_VERSION
       },
       body: JSON.stringify({ permissions: { contents: "write" } })
@@ -277,6 +279,7 @@ export class GitHubOAuthClient {
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${token}`,
+        "user-agent": GITHUB_USER_AGENT,
         "x-github-api-version": GITHUB_API_VERSION
       }
     });

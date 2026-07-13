@@ -15,8 +15,38 @@ export default defineConfig({
       miniflare: {
         outboundService(request) {
           const url = new URL(request.url);
+          if (
+            url.origin === "https://github-api.test"
+            && request.headers.get("user-agent") !== "hunsu-plugin-production"
+          ) {
+            return Response.json({ message: "Expected fixed GitHub REST User-Agent." }, { status: 599 });
+          }
           if (url.origin === "https://github-web.test" && url.pathname === "/login/oauth/access_token") {
             return Response.json({ access_token: "github-user-token" });
+          }
+          if (
+            request.method === "POST"
+            && url.href === "https://github-api.test/app/installations/17/access_tokens"
+          ) {
+            return Response.json({
+              token: "github-installation-token",
+              expires_at: "2026-07-13T01:00:00.000Z",
+              permissions: { contents: "write" }
+            }, { status: 201 });
+          }
+          if (
+            request.method === "GET"
+            && url.href === "https://github-api.test/installation/repositories?per_page=100&page=1"
+          ) {
+            return Response.json({
+              repositories: [{
+                id: 29,
+                name: "sample",
+                default_branch: "main",
+                private: true,
+                owner: { login: "acme" }
+              }]
+            });
           }
           if (url.href === "https://github-api.test/user") {
             return Response.json({ id: 7, login: "octocat" });

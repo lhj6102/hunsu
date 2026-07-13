@@ -238,6 +238,7 @@ test("GitHub App installation tokens are short-lived and cached without exposing
   assert.deepEqual(JSON.parse(String(request.init.body)), { permissions: { contents: "write" } });
   const headers = new Headers(request.init.headers);
   assert.equal(headers.get("content-type"), "application/json");
+  assert.equal(headers.get("user-agent"), "hunsu-plugin-production");
   assert.equal(headers.get("x-github-api-version"), "2026-03-10");
   const [encodedHeader, encodedClaims, encodedSignature, extra] = request.appJwt.split(".");
   assert.ok(encodedHeader);
@@ -375,6 +376,7 @@ test("GitHub OAuth resolves the user and granted App installations through authe
   for (const lookup of identityLookups) {
     const lookupHeaders = new Headers(lookup.init.headers);
     assert.equal(lookupHeaders.get("authorization"), "Bearer github-user-token");
+    assert.equal(lookupHeaders.get("user-agent"), "hunsu-plugin-production");
     assert.equal(lookupHeaders.get("x-github-api-version"), "2026-03-10");
     assert.equal(String(lookup.init.body), "undefined");
   }
