@@ -15,7 +15,7 @@ const linuxInstall: ServiceInstallInput = {
   nodePath: "/opt/Hunsu 100%/node",
   cliPath: "/opt/Hunsu 100%/runtime/hunsu-bridge.js",
   hunsuHome: "/home/test/Hunsu \"safe\" 100%",
-  packageVersion: "0.2.0-next.10",
+  packageVersion: "0.2.0-next.11",
   runtimePath: "/opt/Hunsu 100%/runtime",
   deploymentProfile: "preview"
 };
@@ -50,11 +50,18 @@ test("service stop uses authenticated shutdown first and falls back only to the 
   });
   const gracefulEvents: string[] = [];
   let healthChecks = 0;
+  let managerChecks = 0;
   const graceful = createLinuxSystemdUserServiceManager({
     unitPath: "/home/test/.config/systemd/user/hunsu-bridge.service",
     fileSystem: files,
     commandRunner: async command => {
       gracefulEvents.push(`${command.command} ${command.args.join(" ")}`);
+      if (command.args.includes("is-active")) {
+        managerChecks += 1;
+        return managerChecks < 2
+          ? { exitCode: 0, stdout: "active\n", stderr: "" }
+          : { exitCode: 3, stdout: "inactive\n", stderr: "" };
+      }
       return okCommand();
     },
     requestAuthenticatedShutdown: async () => {
@@ -71,19 +78,28 @@ test("service stop uses authenticated shutdown first and falls back only to the 
     pollIntervalMs: 5
   });
   assert.equal((await graceful.stop()).ok, true);
-  assert.deepEqual(gracefulEvents, ["shutdown", "health", "health"]);
+  assert.equal(gracefulEvents[0], "shutdown");
+  assert.equal(managerChecks, 2);
+  assert.equal(healthChecks, 2);
+  assert.equal(gracefulEvents.some(event => event.includes("systemctl --user stop")), false);
 
   const fallbackCommands: ServiceCommand[] = [];
   const fallback = createLinuxSystemdUserServiceManager({
     unitPath: "/home/test/.config/systemd/user/hunsu-bridge.service",
     fileSystem: files,
-    commandRunner: successfulRunner(fallbackCommands),
+    commandRunner: async command => {
+      fallbackCommands.push(command);
+      return command.args.includes("is-active")
+        ? { exitCode: 3, stdout: "inactive\n", stderr: "" }
+        : okCommand();
+    },
     requestAuthenticatedShutdown: async () => false,
     probeHealth: async () => false,
     sleep: async () => undefined
   });
   assert.equal((await fallback.stop()).ok, true);
-  assert.deepEqual(fallbackCommands, [{ command: "systemctl", args: ["--user", "stop", "hunsu-bridge.service"] }]);
+  assert.deepEqual(fallbackCommands[0], { command: "systemctl", args: ["--user", "stop", "hunsu-bridge.service"] });
+  assert.deepEqual(fallbackCommands[1], { command: "systemctl", args: ["--user", "is-active", "hunsu-bridge.service"] });
   assert.equal(JSON.stringify(fallbackCommands).match(/kill|pkill|pid|port/iu), null);
 });
 
@@ -99,8 +115,8 @@ test("offline service status combines manager, health, authentication, version, 
     probeHealth: async () => false,
     probeAuthenticatedStatus: async () => ({ state: "authenticated" }),
     readInstalledRuntime: async () => ({
-      packageVersion: "0.2.0-next.10",
-      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.10",
+      packageVersion: "0.2.0-next.11",
+      runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.11",
       deploymentProfile: "preview"
     })
   });
@@ -111,8 +127,8 @@ test("offline service status combines manager, health, authentication, version, 
     health: "offline",
     authentication: "unavailable",
     definitionPath: "/home/test/.config/systemd/user/hunsu-bridge.service",
-    packageVersion: "0.2.0-next.10",
-    runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.10",
+    packageVersion: "0.2.0-next.11",
+    runtimePath: "/home/test/.local/share/hunsu/bridge/runtime/versions/0.2.0-next.11",
     deploymentProfile: "preview",
     detail: "inactive"
   });
@@ -143,7 +159,7 @@ test("macOS LaunchAgent is a direct daemon with RunAtLoad, crash-only KeepAlive,
     nodePath: "/Applications/Hunsu & Node/node",
     cliPath: "/Users/test/Hunsu <next>/cli.js",
     hunsuHome: "/Users/test/Library/Application Support/Hunsu & Bridge",
-    packageVersion: "0.2.0-next.10",
+    packageVersion: "0.2.0-next.11",
     runtimePath: "/Users/test/Hunsu/runtime",
     deploymentProfile: "preview"
   };
@@ -200,10 +216,10 @@ test("macOS reloads a changed cached LaunchAgent definition before starting the 
 
   const result = await manager.install({
     nodePath: "/opt/node/bin/node",
-    cliPath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.10/dist/cli.js",
+    cliPath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.11/dist/cli.js",
     hunsuHome: "/Users/test/.hunsu",
-    packageVersion: "0.2.0-next.10",
-    runtimePath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.10",
+    packageVersion: "0.2.0-next.11",
+    runtimePath: "/Users/test/.hunsu/runtime/versions/0.2.0-next.11",
     deploymentProfile: "production"
   });
 
@@ -243,7 +259,7 @@ test("Windows Task Scheduler uses current-user ScheduledTasks, hidden settings, 
     nodePath: "C:\\Program Files\\nodejs\\node.exe",
     cliPath: "C:\\Users\\O'Brien\\Hunsu Bridge\\cli.js",
     hunsuHome: "C:\\Users\\O'Brien\\AppData\\Local\\Hunsu\\Bridge",
-    packageVersion: "0.2.0-next.10",
+    packageVersion: "0.2.0-next.11",
     runtimePath: "C:\\Users\\O'Brien\\AppData\\Local\\Hunsu\\Bridge\\runtime",
     deploymentProfile: "preview"
   };
@@ -280,10 +296,10 @@ test("Windows Task Scheduler uses current-user ScheduledTasks, hidden settings, 
 test("Windows service install reports changes when the stable action contract changes", async () => {
   const input: ServiceInstallInput = {
     nodePath: "C:\\Program Files\\nodejs\\node.exe",
-    cliPath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.10\\cli.js",
+    cliPath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.11\\cli.js",
     hunsuHome: "C:\\Users\\test\\Hunsu",
-    packageVersion: "0.2.0-next.10",
-    runtimePath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.10",
+    packageVersion: "0.2.0-next.11",
+    runtimePath: "C:\\Users\\test\\Hunsu\\runtime\\0.2.0-next.11",
     deploymentProfile: "preview"
   };
   const actionArguments = `"${input.cliPath}" daemon --runtime-path "${input.runtimePath}" --home "${input.hunsuHome}" --profile preview`;
@@ -323,6 +339,81 @@ test("Windows service install reports changes when the stable action contract ch
   if (workingDirectoryChanged.ok) assert.equal(workingDirectoryChanged.changed, true);
 });
 
+test("Windows service status fails closed for queued tasks and probe failures while distinguishing a missing task", async () => {
+  let taskResult = { exitCode: 0, stdout: "Queued\n", stderr: "" };
+  const manager = createWindowsTaskSchedulerServiceManager({
+    commandRunner: async () => taskResult,
+    requestAuthenticatedShutdown: async () => false,
+    probeHealth: async () => false
+  });
+
+  const queued = await manager.status();
+  assert.equal(queued.installed, true);
+  assert.equal(queued.managerState, "unknown");
+  assert.equal(queued.detail, "queued");
+
+  taskResult = { exitCode: 1, stdout: "", stderr: "transient query failure" };
+  const unavailable = await manager.status();
+  assert.equal(unavailable.installed, true);
+  assert.equal(unavailable.managerState, "unknown");
+  assert.equal(unavailable.detail, "scheduled task status unavailable");
+
+  taskResult = { exitCode: 0, stdout: "__HUNSU_TASK_NOT_FOUND__\n", stderr: "" };
+  const missing = await manager.status();
+  assert.equal(missing.installed, false);
+  assert.equal(missing.managerState, "stopped");
+  assert.equal(missing.detail, "task not registered");
+});
+
+test("Windows uninstall stops a healthy orphan when the scheduled task is already missing", async () => {
+  const events: string[] = [];
+  let healthy = true;
+  const manager = createWindowsTaskSchedulerServiceManager({
+    commandRunner: async command => {
+      const script = command.args.at(-1) ?? "";
+      if (script.includes("Get-ScheduledTask")) {
+        events.push("task:missing");
+        return { exitCode: 0, stdout: "__HUNSU_TASK_NOT_FOUND__\n", stderr: "" };
+      }
+      events.push(`unexpected:${script}`);
+      return { exitCode: 1, stdout: "", stderr: "task missing" };
+    },
+    requestAuthenticatedShutdown: async () => {
+      events.push("shutdown");
+      healthy = false;
+      return true;
+    },
+    probeHealth: async () => healthy,
+    sleep: async () => undefined,
+    stopTimeoutMs: 5,
+    pollIntervalMs: 5
+  });
+
+  const result = await manager.uninstall();
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.changed, true);
+  assert.equal(events.includes("shutdown"), true);
+  assert.equal(events.some(event => event.startsWith("unexpected:")), false);
+});
+
+test("Windows uninstall fails closed when a missing task has indeterminate Bridge liveness", async () => {
+  const manager = createWindowsTaskSchedulerServiceManager({
+    commandRunner: async () => ({
+      exitCode: 0,
+      stdout: "__HUNSU_TASK_NOT_FOUND__\n",
+      stderr: ""
+    }),
+    requestAuthenticatedShutdown: async () => true,
+    probeHealth: async () => {
+      throw new Error("probe unavailable");
+    }
+  });
+
+  const result = await manager.uninstall();
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "SERVICE_STATUS_UNAVAILABLE");
+});
+
 test("Windows stop fallback targets only the owned task and install input rejects injection", async () => {
   const commands: ServiceCommand[] = [];
   const manager = createWindowsTaskSchedulerServiceManager({
@@ -353,6 +444,97 @@ test("Windows stop fallback targets only the owned task and install input reject
   assert.equal(invalid.ok, false);
   if (!invalid.ok) assert.equal(invalid.code, "SERVICE_INSTALL_FAILED");
   assert.equal(commands.length, commandCountBeforeInvalidInstall);
+});
+
+test("Windows restart waits for the previous Task Scheduler process to exit and verifies authenticated readiness", async () => {
+  const events: string[] = [];
+  let taskState: "Running" | "Queued" | "Ready" = "Running";
+  let shutdownRequested = false;
+  let started = false;
+  let shutdownStateChecks = 0;
+  let startupHealthChecks = 0;
+  const manager = createWindowsTaskSchedulerServiceManager({
+    commandRunner: async command => {
+      const script = command.args.at(-1) ?? "";
+      if (script.includes("Get-ScheduledTask") && script.includes("ExpandProperty State")) {
+        if (shutdownRequested && !started) {
+          shutdownStateChecks += 1;
+          if (shutdownStateChecks === 1) {
+            events.push("task:query-error");
+            return { exitCode: 1, stdout: "", stderr: "transient query failure" };
+          }
+          taskState = shutdownStateChecks === 2 ? "Queued" : "Ready";
+        }
+        events.push(`task:${taskState.toLowerCase()}`);
+        return { exitCode: 0, stdout: `${taskState}\n`, stderr: "" };
+      }
+      if (script.includes("Start-ScheduledTask")) {
+        events.push("task:start");
+        taskState = "Running";
+        started = true;
+        return okCommand();
+      }
+      events.push(`command:${script}`);
+      return okCommand();
+    },
+    requestAuthenticatedShutdown: async () => {
+      events.push("shutdown");
+      shutdownRequested = true;
+      return true;
+    },
+    probeHealth: async () => {
+      if (!started) {
+        events.push("health:offline");
+        return false;
+      }
+      startupHealthChecks += 1;
+      const healthy = startupHealthChecks >= 2;
+      events.push(healthy ? "health:healthy" : "health:offline");
+      return healthy;
+    },
+    probeAuthenticatedStatus: async () => {
+      events.push("control:authenticated");
+      return { state: "authenticated" };
+    },
+    sleep: async () => undefined,
+    stopTimeoutMs: 20,
+    startTimeoutMs: 15,
+    pollIntervalMs: 5
+  });
+
+  const result = await manager.restart();
+  assert.equal(result.ok, true);
+  assert.ok(events.indexOf("task:query-error") < events.indexOf("task:queued"));
+  assert.ok(events.indexOf("task:queued") < events.indexOf("task:ready"));
+  assert.ok(events.indexOf("task:ready") < events.indexOf("task:start"));
+  assert.deepEqual(events.slice(-3), ["task:running", "health:healthy", "control:authenticated"]);
+  assert.equal(events.some(event => event.includes("Stop-ScheduledTask")), false);
+});
+
+test("Windows restart fails when Start-ScheduledTask succeeds without launching the daemon", async () => {
+  const commands: ServiceCommand[] = [];
+  const manager = createWindowsTaskSchedulerServiceManager({
+    commandRunner: async command => {
+      commands.push(command);
+      const script = command.args.at(-1) ?? "";
+      if (script.includes("Get-ScheduledTask")) {
+        return { exitCode: 0, stdout: "Ready\n", stderr: "" };
+      }
+      return okCommand();
+    },
+    requestAuthenticatedShutdown: async () => false,
+    probeHealth: async () => false,
+    probeAuthenticatedStatus: async () => ({ state: "unavailable" }),
+    sleep: async () => undefined,
+    stopTimeoutMs: 5,
+    startTimeoutMs: 10,
+    pollIntervalMs: 5
+  });
+
+  const result = await manager.restart();
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "SERVICE_START_FAILED");
+  assert.equal(commands.some(command => (command.args.at(-1) ?? "").includes("Start-ScheduledTask")), true);
 });
 
 test("platform-neutral selector refuses an unconfigured platform", () => {

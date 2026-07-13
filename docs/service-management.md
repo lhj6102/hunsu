@@ -31,8 +31,17 @@ health, authenticated status when available, installed version, and configured
 runtime path and deployment profile.
 
 Stop first requests authenticated /v1/control/shutdown and waits for health to
-disappear. If the daemon is unresponsive, the adapter stops only its exact
-owned task or unit. It never kills by process name, port, or unverified PID.
+disappear and for the owned task or unit to reach its stopped state. If the
+endpoint closes before the process exits, lifecycle handling keeps waiting; if
+the daemon is unresponsive or does not exit in time, the adapter stops only its
+exact owned task or unit. It never kills by process name, port, or unverified
+PID. Restart begins only after that stopped-state boundary, and reports success
+only after the manager is running and Bridge health plus authenticated control
+have recovered. Windows Task Scheduler query failures, unknown states, and a
+queued invocation fail closed; only a missing task, `Ready`, or `Disabled` is
+accepted as definitively non-running. A missing service definition does not by
+itself authorize runtime deletion: if Bridge health is still live, removal must
+complete authenticated shutdown and verify the endpoint offline first.
 
 ## Platform contracts
 

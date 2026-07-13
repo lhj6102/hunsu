@@ -46,6 +46,7 @@ export function createManagedBridgeService(
 ): BridgeServiceManager {
   const sleep = dependencies.sleep ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
   const stopTimeoutMs = Math.max(1, dependencies.stopTimeoutMs ?? 8_000);
+  const startTimeoutMs = Math.max(1, dependencies.startTimeoutMs ?? 10_000);
   const pollIntervalMs = Math.max(1, dependencies.pollIntervalMs ?? 100);
   let installedRuntime: InstalledRuntimeInfo | undefined;
 
@@ -83,13 +84,14 @@ export function createManagedBridgeService(
     }
 
     if (shutdownAccepted) {
-      const health = await waitForHealthDown(
+      const stopped = await waitForServiceStopped(
+        adapter,
         dependencies.probeHealth,
         sleep,
         stopTimeoutMs,
         pollIntervalMs
       );
-      if (health === "offline") {
+      if (serviceIsStopped(stopped)) {
         return success(adapter.manager, "Hunsu Bridge stopped through its authenticated control API.", true);
       }
     }
@@ -100,14 +102,18 @@ export function createManagedBridgeService(
       return failure(adapter.manager, "SERVICE_STOP_FAILED", "The owned Hunsu Bridge service could not be stopped.");
     }
 
-    const finalHealth = await waitForHealthDown(
+    const finalState = await waitForServiceStopped(
+      adapter,
       dependencies.probeHealth,
       sleep,
       stopTimeoutMs,
       pollIntervalMs
     );
-    if (finalHealth === "healthy") {
-      return failure(adapter.manager, "SERVICE_STOP_FAILED", "The owned Hunsu Bridge service stopped, but the Bridge endpoint remained healthy.");
+    if (finalState.managerState !== "stopped") {
+      return failure(adapter.manager, "SERVICE_STOP_FAILED", "The owned Hunsu Bridge service did not reach a stopped manager state.");
+    }
+    if (finalState.health !== "offline") {
+      return failure(adapter.manager, "SERVICE_STOP_FAILED", "The owned Hunsu Bridge service stopped, but the Bridge endpoint could not be verified offline.");
     }
     return success(adapter.manager, "Hunsu Bridge stopped through its OS user service manager.", true);
   };
@@ -132,7 +138,18 @@ export function createManagedBridgeService(
     async uninstall() {
       const current = await safeAdapterStatus(adapter);
       if (!current.installed) {
-        return success(adapter.manager, "Hunsu Bridge user service is not installed.", false);
+        const health = await probeHealthState(dependencies.probeHealth);
+        if (health === "unavailable") {
+          return failure(adapter.manager, "SERVICE_STATUS_UNAVAILABLE", "Hunsu Bridge liveness could not be verified before uninstall.");
+        }
+        if (health === "healthy") {
+          const stopped = await stop();
+          if (!stopped.ok) {
+            return failure(adapter.manager, "SERVICE_STOP_FAILED", "A running Hunsu Bridge must stop before runtime removal can continue.");
+          }
+          return success(adapter.manager, "The user service was not installed, but a remaining Hunsu Bridge process was stopped.", true);
+        }
+        return success(adapter.manager, "Hunsu Bridge user service is not installed and no Bridge endpoint is running.", false);
       }
       const stopped = await stop();
       if (!stopped.ok) {
@@ -163,7 +180,21 @@ export function createManagedBridgeService(
       if (!stopped.ok) {
         return stopped;
       }
-      return manager.start();
+      const started = await manager.start();
+      if (!started.ok) {
+        return started;
+      }
+      const ready = await waitForServiceReady(
+        adapter,
+        dependencies.probeHealth,
+        dependencies.probeAuthenticatedStatus,
+        sleep,
+        startTimeoutMs,
+        pollIntervalMs
+      );
+      return ready
+        ? success(adapter.manager, "Hunsu Bridge restarted and passed service health verification.", true)
+        : failure(adapter.manager, "SERVICE_START_FAILED", "The Hunsu Bridge user service did not become running, healthy, and authenticated after restart.");
     },
     status
   };
@@ -317,23 +348,63 @@ async function probeAuthenticationState(
   }
 }
 
-async function waitForHealthDown(
+type ServiceStopObservation = {
+  managerState: ServiceManagerState;
+  health: ServiceHealthState;
+};
+
+async function waitForServiceStopped(
+  adapter: BridgeServiceAdapter,
   probe: () => Promise<boolean>,
   sleep: (milliseconds: number) => Promise<void>,
   timeoutMs: number,
   intervalMs: number
-): Promise<ServiceHealthState> {
+): Promise<ServiceStopObservation> {
+  const attempts = Math.max(1, Math.ceil(timeoutMs / intervalMs));
+  let observation: ServiceStopObservation = { managerState: "unknown", health: "unavailable" };
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const [adapterStatus, health] = await Promise.all([
+      safeAdapterStatus(adapter),
+      probeHealthState(probe)
+    ]);
+    observation = { managerState: adapterStatus.state, health };
+    if (serviceIsStopped(observation)) return observation;
+    if (attempt + 1 < attempts) {
+      await sleep(intervalMs);
+    }
+  }
+  return observation;
+}
+
+function serviceIsStopped(observation: ServiceStopObservation): boolean {
+  return observation.managerState === "stopped" && observation.health === "offline";
+}
+
+async function waitForServiceReady(
+  adapter: BridgeServiceAdapter,
+  probeHealth: () => Promise<boolean>,
+  probeAuthenticatedStatus: (() => Promise<AuthenticatedServiceStatus>) | undefined,
+  sleep: (milliseconds: number) => Promise<void>,
+  timeoutMs: number,
+  intervalMs: number
+): Promise<boolean> {
   const attempts = Math.max(1, Math.ceil(timeoutMs / intervalMs));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const health = await probeHealthState(probe);
-    if (health !== "healthy") {
-      return health;
+    const [adapterStatus, health] = await Promise.all([
+      safeAdapterStatus(adapter),
+      probeHealthState(probeHealth)
+    ]);
+    if (adapterStatus.state === "running" && health === "healthy") {
+      if (!probeAuthenticatedStatus
+        || await probeAuthenticationState(probeAuthenticatedStatus) === "authenticated") {
+        return true;
+      }
     }
     if (attempt + 1 < attempts) {
       await sleep(intervalMs);
     }
   }
-  return "healthy";
+  return false;
 }
 
 function success(

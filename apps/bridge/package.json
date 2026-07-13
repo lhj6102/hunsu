@@ -1,6 +1,6 @@
 {
   "name": "@hunsu/bridge",
-  "version": "0.2.0-next.10",
+  "version": "0.2.0-next.11",
   "private": false,
   "description": "Headless Hunsu Bridge daemon, authenticated CLI, and local Web API.",
   "license": "Apache-2.0",

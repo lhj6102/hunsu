@@ -19,6 +19,7 @@ import type {
   BridgeServiceManager,
   ServiceStatus
 } from "../apps/bridge/src/service/types.ts";
+import { createWindowsTaskSchedulerServiceManager } from "../apps/bridge/src/service/windowsTaskScheduler.ts";
 import { resolveHunsuPaths, type HunsuPaths } from "../apps/bridge/src/state/paths.ts";
 import {
   HOME_OWNERSHIP_SCHEMA,
@@ -260,6 +261,113 @@ test("ordinary removal cleans a markerless next.0 runtime while preserving all u
     for (const preserved of [paths.configFile, paths.workspacesFile, paths.credentialsFile, paths.logsDirectory]) {
       assert.equal(await exists(preserved), true);
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary Windows removal waits for the owned scheduled task process before deleting runtime state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-owned-windows-exit-race-"));
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
+  const events: string[] = [];
+  let shutdownRequested = false;
+  let shutdownStateChecks = 0;
+  let taskState: "Running" | "Queued" | "Ready" = "Running";
+  try {
+    await writeCompleteOwnedHome(paths, { installationId: null, writeMarker: false });
+    const serviceManager = createWindowsTaskSchedulerServiceManager({
+      commandRunner: async command => {
+        const script = command.args.at(-1) ?? "";
+        if (script.includes("Get-ScheduledTask")) {
+          if (shutdownRequested && script.includes("ExpandProperty State")) {
+            shutdownStateChecks += 1;
+            if (shutdownStateChecks === 1) {
+              events.push("task:query-error");
+              return { exitCode: 1, stdout: "", stderr: "transient query failure" };
+            }
+            taskState = shutdownStateChecks === 2 ? "Queued" : "Ready";
+          }
+          events.push(`task:${taskState.toLowerCase()}`);
+          return { exitCode: 0, stdout: `${taskState}\n`, stderr: "" };
+        }
+        if (script.includes("Unregister-ScheduledTask")) {
+          assert.equal(taskState, "Ready", "the task must own no running daemon before it is unregistered");
+          events.push("task:unregister");
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (script.includes("Stop-ScheduledTask")) {
+          events.push("task:force-stop");
+          taskState = "Ready";
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      requestAuthenticatedShutdown: async () => {
+        events.push("shutdown");
+        shutdownRequested = true;
+        return true;
+      },
+      probeHealth: async () => false,
+      sleep: async () => undefined,
+      stopTimeoutMs: 20,
+      pollIntervalMs: 5
+    });
+
+    const result = await removeBridge({}, { paths, serviceManager });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.value.removedRuntime, true);
+    assert.ok(events.indexOf("task:query-error") < events.indexOf("task:queued"));
+    assert.ok(events.indexOf("task:queued") < events.indexOf("task:ready"));
+    assert.ok(events.indexOf("task:ready") < events.indexOf("task:unregister"));
+    assert.equal(events.includes("task:force-stop"), false);
+    assert.equal(await exists(paths.runtimeFile), false);
+    assert.equal(await exists(paths.runtimeDirectory), false);
+    assert.equal(await exists(paths.runtimeInstallFile), false);
+    for (const preserved of [paths.configFile, paths.workspacesFile, paths.credentialsFile, paths.logsDirectory]) {
+      assert.equal(await exists(preserved), true);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary Windows removal preserves runtime when a missing task leaves a healthy orphan that cannot shut down", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hunsu-missing-task-orphan-"));
+  const paths = resolveHunsuPaths({ home: join(root, "state") });
+  const events: string[] = [];
+  try {
+    await writeCompleteOwnedHome(paths, { installationId: null, writeMarker: false });
+    const serviceManager = createWindowsTaskSchedulerServiceManager({
+      commandRunner: async command => {
+        const script = command.args.at(-1) ?? "";
+        if (script.includes("Get-ScheduledTask")) {
+          events.push("task:missing");
+          return { exitCode: 0, stdout: "__HUNSU_TASK_NOT_FOUND__\n", stderr: "" };
+        }
+        if (script.includes("Stop-ScheduledTask")) {
+          events.push("task:stop-failed");
+          return { exitCode: 1, stdout: "", stderr: "task missing" };
+        }
+        return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+      },
+      requestAuthenticatedShutdown: async () => {
+        events.push("shutdown:rejected");
+        return false;
+      },
+      probeHealth: async () => true,
+      sleep: async () => undefined,
+      stopTimeoutMs: 5,
+      pollIntervalMs: 5
+    });
+
+    const result = await removeBridge({}, { paths, serviceManager });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "SERVICE_STOP_FAILED");
+    assert.deepEqual(events, ["task:missing", "shutdown:rejected", "task:stop-failed"]);
+    assert.equal(await exists(paths.runtimeFile), true);
+    assert.equal(await exists(paths.runtimeDirectory), true);
+    assert.equal(await exists(paths.runtimeInstallFile), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

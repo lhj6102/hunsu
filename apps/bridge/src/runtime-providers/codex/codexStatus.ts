@@ -443,19 +443,21 @@ function firstNonEmpty(env: Record<string, string | undefined>, keys: string[]):
 
 function accountStatus(account: unknown): CodexRuntimeStatus["auth"] {
   const object = isRecord(account) ? account : {};
-  if (object.requiresOpenaiAuth === true) {
+  const nestedAccount = isRecord(object.account) ? object.account : undefined;
+  if (object.requiresOpenaiAuth === true && !nestedAccount) {
     return { state: "not_authenticated", access: "unknown" };
   }
-  const method = authMethod(object);
+  const accountFields = nestedAccount ? { ...object, ...nestedAccount } : object;
+  const method = authMethod(accountFields);
   return {
     state: "authenticated",
     method,
     access: method === "api_key" || method === "access_token" ? "usage_based" : method === "chatgpt" ? "subscription" : "unknown",
     accountSummary: {
-      displayName: stringField(object, ["displayName", "name", "userName"]),
-      email: stringField(object, ["email", "userEmail"]),
-      workspaceName: stringField(object, ["workspaceName", "organizationName", "orgName"]),
-      planLabel: stringField(object, ["planLabel", "plan", "subscriptionPlan"])
+      displayName: stringField(accountFields, ["displayName", "name", "userName"]),
+      email: stringField(accountFields, ["email", "userEmail"]),
+      workspaceName: stringField(accountFields, ["workspaceName", "organizationName", "orgName"]),
+      planLabel: stringField(accountFields, ["planLabel", "plan", "planType", "subscriptionPlan"])
     }
   };
 }
