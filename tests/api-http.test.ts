@@ -226,6 +226,7 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("location"), null);
     assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("referrer-policy"), "same-origin");
     assert.match(response.headers.get("content-security-policy") ?? "", /form-action 'self'/u);
     const body = await response.text();
     assert.doesNotMatch(body, /<unsafe-client-state>/u);

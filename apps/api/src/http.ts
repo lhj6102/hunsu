@@ -480,7 +480,9 @@ function oauthConsentPage(input: { token: string; clientOrigin: string }): Respo
       "cache-control": "no-store",
       pragma: "no-cache",
       "content-security-policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-      "referrer-policy": "no-referrer",
+      // `no-referrer` masks a navigation POST's Origin as `null`.
+      // `same-origin` preserves the CSRF check and strips cross-origin referrers.
+      "referrer-policy": "same-origin",
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY"
     }
