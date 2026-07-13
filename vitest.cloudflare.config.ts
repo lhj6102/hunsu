@@ -13,6 +13,26 @@ export default defineConfig({
         configPath: "./wrangler.jsonc"
       },
       miniflare: {
+        outboundService(request) {
+          const url = new URL(request.url);
+          if (url.origin === "https://github-web.test" && url.pathname === "/login/oauth/access_token") {
+            return Response.json({ access_token: "github-user-token" });
+          }
+          if (url.href === "https://github-api.test/user") {
+            return Response.json({ id: 7, login: "octocat" });
+          }
+          if (url.href === "https://github-api.test/user/installations?per_page=100&page=1") {
+            return Response.json({
+              installations: [{ id: 17, account: { login: "acme", type: "Organization" } }]
+            });
+          }
+          if (url.href === "https://github-api.test/user/installations/17/repositories?per_page=100&page=1") {
+            return Response.json({
+              repositories: [{ id: 29, permissions: { pull: true, push: true, admin: false } }]
+            });
+          }
+          return new Response("Unexpected outbound request.", { status: 599 });
+        },
         bindings: {
           HUNSU_GITHUB_APP_ID: "123",
           HUNSU_GITHUB_CLIENT_ID: "test-github-client-id",
