@@ -53,6 +53,7 @@ test("GitHub REST transport uses installation authority and a non-forced CAS upd
   for (const call of calls) {
     const headers = new Headers(call.init.headers);
     assert.equal(headers.get("authorization"), "Bearer " + "test-installation-value");
+    assert.equal(headers.get("user-agent"), "hunsu-plugin-production");
     assert.ok(headers.get("x-github-api-version"));
   }
   const update = calls.find(call => (call.init.method ?? "GET") === "PATCH");

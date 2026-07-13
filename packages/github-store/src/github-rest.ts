@@ -11,6 +11,7 @@ import type {
 import { HUNSU_STATE_BRANCH } from "./types.ts";
 
 const GITHUB_API_VERSION = "2026-03-10";
+const GITHUB_USER_AGENT = "hunsu-plugin-production";
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -232,6 +233,7 @@ export class GitHubRestTransport implements GitHubTransport {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
+          "user-agent": GITHUB_USER_AGENT,
           "x-github-api-version": GITHUB_API_VERSION,
           ...init.headers
         }
