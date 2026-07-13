@@ -11,16 +11,23 @@
     "dev:web": "pnpm --filter @hunsu/web dev",
     "build": "turbo run build",
     "test": "node --conditions=development --test tests/*.test.ts",
+    "test:cloudflare": "vitest run --config vitest.cloudflare.config.ts",
     "typecheck": "tsc -p tsconfig.json && turbo run typecheck",
     "plugin:validate": "node scripts/validate-plugin.mjs",
+    "worker:types": "wrangler types apps/api/src/worker-configuration.d.ts",
+    "worker:types:check": "wrangler types apps/api/src/worker-configuration.d.ts --check",
+    "worker:dry-run": "wrangler deploy --dry-run --outdir .wrangler/bundle",
     "check": "pnpm run typecheck && pnpm run test && pnpm run plugin:validate"
   },
   "engines": {
     "node": ">=24.18"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.4",
     "@types/node": "^24.13.3",
     "turbo": "^2.6.1",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.110.0"
   }
 }

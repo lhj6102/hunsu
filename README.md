@@ -95,6 +95,8 @@ HUNSU_WEB_URL
 
 Optional endpoint settings are documented in [Local development](docs/local-development.md). Never commit these values.
 
+Production is delivered as one Cloudflare Worker serving Web, API, OAuth, and MCP on `plugin.hunsu.app`. See the [production delivery runbook](docs/deployment/plugin-production.md) for the protected environment contract, CI gate, deployment evidence, smoke tests, rollback, and manual external stops.
+
 ## Codex plugin
 
 The repository marketplace at `.agents/plugins/marketplace.json` exposes `plugins/hunsu`. The plugin bundles five focused skills and an OAuth-authenticated MCP server definition. It never holds permanent GitHub credentials and never mutates `hunsu/state` directly.

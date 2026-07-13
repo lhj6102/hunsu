@@ -78,7 +78,7 @@ export class HunsuHttpApp {
       const context = this.#sessions.authenticate(request);
       if (!context) return this.#beginGitHubAuth(`/oauth/authorize${url.search}`, true);
       if (context.installations.length === 0) return problem({ code: "forbidden", message: "Install the Hunsu GitHub App before authorizing the plugin.", status: 403, retryable: false });
-      const consent = this.#mcpOAuth.createConsentRequest(url, context, this.#webSessionToken(request));
+      const consent = await this.#mcpOAuth.createConsentRequest(url, context, this.#webSessionToken(request));
       return oauthConsentPage(consent);
     }
     if (request.method === "POST" && url.pathname === "/oauth/authorize") {
@@ -87,11 +87,11 @@ export class HunsuHttpApp {
       if (context.installations.length === 0) return problem({ code: "forbidden", message: "Install the Hunsu GitHub App before authorizing the plugin.", status: 403, retryable: false });
       this.#requireOAuthConsentMutation(request);
       const form = await readForm(request, 65_536);
-      return redirect(this.#mcpOAuth.decideConsent(form, context, this.#webSessionToken(request)));
+      return redirect(await this.#mcpOAuth.decideConsent(form, context, this.#webSessionToken(request)));
     }
     if (request.method === "POST" && url.pathname === "/oauth/token") {
       const form = await readForm(request, 65_536);
-      return json(this.#mcpOAuth.exchange(form), 200, { "cache-control": "no-store" });
+      return json(await this.#mcpOAuth.exchange(form), 200, { "cache-control": "no-store" });
     }
 
     if (request.method === "GET" && url.pathname === "/api/auth/github") {

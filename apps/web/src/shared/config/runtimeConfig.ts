@@ -1,6 +1,6 @@
 export const HUNSU_WEB_RUNTIME_CONFIG_SCHEMA = "hunsu.web-runtime-config.v3" as const;
 
-export const HUNSU_WEB_DEPLOY_TARGETS = ["local", "dev", "preview", "production"] as const;
+export const HUNSU_WEB_DEPLOY_TARGETS = ["local", "dev", "production"] as const;
 
 export type HunsuWebDeployTarget = typeof HUNSU_WEB_DEPLOY_TARGETS[number];
 

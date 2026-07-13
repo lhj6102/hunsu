@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   GitHubAppTokenProvider,
   GitHubOAuthClient,
+  InMemoryEphemeralStateStore,
   McpOAuthService,
   OAuthProtocolError,
   SessionManager,
@@ -76,8 +77,15 @@ test("signed Web sessions are HttpOnly, expiring, and tamper evident", () => {
   })), undefined);
 });
 
-test("MCP OAuth uses explicit consent, PKCE, process-bound one-time codes, and audience-bound bearer tokens", () => {
-  const oauth = new McpOAuthService({ baseUrl: "https://api.example.test", secret: sessionConfig.secret, now: () => Date.UTC(2026, 6, 13) });
+test("MCP OAuth uses explicit consent, PKCE, shared one-time state, and audience-bound bearer tokens", async () => {
+  const now = Date.UTC(2026, 6, 13);
+  const stateStore = new InMemoryEphemeralStateStore({ now: () => Math.floor(now / 1000) });
+  const oauth = new McpOAuthService({
+    baseUrl: "https://api.example.test",
+    secret: sessionConfig.secret,
+    stateStore,
+    now: () => now
+  });
   const registration = oauth.register({ redirect_uris: ["https://client.example.test/callback"] });
   const clientId = registration.client_id as string;
   assert.ok(clientId);
@@ -93,44 +101,44 @@ test("MCP OAuth uses explicit consent, PKCE, process-bound one-time codes, and a
   authorize.searchParams.set("code_challenge", challenge);
   authorize.searchParams.set("code_challenge_method", "S256");
   const sessionToken = "bound-web-session";
-  const consent = oauth.createConsentRequest(authorize, context, sessionToken);
+  const consent = await oauth.createConsentRequest(authorize, context, sessionToken);
   assert.equal(consent.clientOrigin, "https://client.example.test");
   assert.equal(new URL(authorize).searchParams.has("code"), false);
-  assert.throws(() => oauth.decideConsent(new URLSearchParams({
+  await assert.rejects(() => oauth.decideConsent(new URLSearchParams({
     decision: "approve",
     consent_request: `${consent.token}tampered`
   }), context, sessionToken), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_request");
-  const redirected = new URL(oauth.decideConsent(new URLSearchParams({
+  const restartedForConsent = new McpOAuthService({
+    baseUrl: "https://api.example.test",
+    secret: sessionConfig.secret,
+    stateStore,
+    now: () => now
+  });
+  const redirected = new URL(await restartedForConsent.decideConsent(new URLSearchParams({
     decision: "approve",
     consent_request: consent.token
   }), context, sessionToken));
   assert.equal(redirected.searchParams.get("state"), "client-state");
   const code = redirected.searchParams.get("code");
   assert.ok(code);
-  assert.throws(() => oauth.decideConsent(new URLSearchParams({
+  await assert.rejects(() => oauth.decideConsent(new URLSearchParams({
     decision: "approve",
     consent_request: consent.token
   }), context, sessionToken), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_request");
   const restartedBeforeExchange = new McpOAuthService({
     baseUrl: "https://api.example.test",
     secret: sessionConfig.secret,
-    now: () => Date.UTC(2026, 6, 13)
+    stateStore,
+    now: () => now
   });
-  assert.throws(() => restartedBeforeExchange.exchange(new URLSearchParams({
+  await assert.rejects(() => restartedBeforeExchange.exchange(new URLSearchParams({
     grant_type: "authorization_code",
     code,
     client_id: clientId,
     redirect_uri: "https://client.example.test/callback",
-    code_verifier: verifier
+    code_verifier: "too-short"
   })), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_grant");
-  assert.throws(() => oauth.exchange(new URLSearchParams({
-    grant_type: "authorization_code",
-    code,
-    client_id: clientId,
-    redirect_uri: "https://client.example.test/callback",
-    code_verifier: "x".repeat(43)
-  })), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_grant");
-  const token = oauth.exchange(new URLSearchParams({
+  const token = await restartedBeforeExchange.exchange(new URLSearchParams({
     grant_type: "authorization_code",
     code,
     client_id: clientId,
@@ -165,12 +173,13 @@ test("MCP OAuth uses explicit consent, PKCE, process-bound one-time codes, and a
   const restartedAfterExchange = new McpOAuthService({
     baseUrl: "https://api.example.test",
     secret: sessionConfig.secret,
-    now: () => Date.UTC(2026, 6, 13)
+    stateStore: new InMemoryEphemeralStateStore({ now: () => Math.floor(now / 1000) }),
+    now: () => now
   });
   assert.equal(restartedAfterExchange.authenticate(new Request("https://api.example.test/mcp", {
     headers: { authorization: `Bearer ${String(token.access_token)}` }
   }))?.user.id, "7");
-  assert.throws(() => oauth.exchange(new URLSearchParams({
+  await assert.rejects(() => oauth.exchange(new URLSearchParams({
     grant_type: "authorization_code",
     code,
     client_id: clientId,
@@ -181,7 +190,8 @@ test("MCP OAuth uses explicit consent, PKCE, process-bound one-time codes, and a
   const differentAudience = new McpOAuthService({
     baseUrl: "https://other-api.example.test",
     secret: sessionConfig.secret,
-    now: () => Date.UTC(2026, 6, 13)
+    stateStore: new InMemoryEphemeralStateStore({ now: () => Math.floor(now / 1000) }),
+    now: () => now
   });
   assert.equal(differentAudience.authenticate(new Request("https://other-api.example.test/mcp", {
     headers: { authorization: `Bearer ${String(token.access_token)}` }

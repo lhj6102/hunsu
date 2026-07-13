@@ -1,0 +1,65 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hunsu-plugin-production",
+  "main": "apps/api/src/cloudflare.ts",
+  "compatibility_date": "2026-07-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+
+  "assets": {
+    "directory": "./apps/web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api/*",
+      "/oauth/*",
+      "/.well-known/*",
+      "/mcp"
+    ]
+  },
+
+  "vars": {
+    "HUNSU_PUBLIC_API_URL": "https://plugin.hunsu.app",
+    "HUNSU_WEB_URL": "https://plugin.hunsu.app",
+    "HUNSU_GITHUB_APP_ID": "__HUNSU_PRODUCTION_ENVIRONMENT__",
+    "HUNSU_GITHUB_CLIENT_ID": "__HUNSU_PRODUCTION_ENVIRONMENT__",
+    "HUNSU_GITHUB_APP_SLUG": "__HUNSU_PRODUCTION_ENVIRONMENT__"
+  },
+
+  "secrets": {
+    "required": [
+      "HUNSU_GITHUB_CLIENT_SECRET",
+      "HUNSU_GITHUB_PRIVATE_KEY",
+      "HUNSU_GITHUB_WEBHOOK_SECRET",
+      "HUNSU_SESSION_SECRET"
+    ]
+  },
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EPHEMERAL_STATE",
+        "class_name": "HunsuEphemeralState"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["HunsuEphemeralState"]
+    }
+  ],
+
+  "routes": [
+    {
+      "pattern": "plugin.hunsu.app",
+      "custom_domain": true
+    }
+  ],
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

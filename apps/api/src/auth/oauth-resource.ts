@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AuthContext } from "../types.ts";
+import type { EphemeralStateStore } from "./ephemeral-store.ts";
 import { SignedTokenService } from "./session.ts";
 
 type JsonRecord = Record<string, unknown>;
@@ -7,14 +8,6 @@ type JsonRecord = Record<string, unknown>;
 export type OAuthConsentRequest = {
   token: string;
   clientOrigin: string;
-};
-
-type PendingAuthorizationCode = {
-  clientId: string;
-  redirectUri: string;
-  challenge: string;
-  context: AuthContext;
-  expiresAt: number;
 };
 
 export class OAuthProtocolError extends Error {
@@ -37,12 +30,17 @@ export class McpOAuthService {
   readonly #baseUrl: string;
   readonly #tokens: SignedTokenService;
   readonly #now: () => number;
-  readonly #pendingConsentRequests = new Map<string, number>();
-  readonly #authorizationCodes = new Map<string, PendingAuthorizationCode>();
+  readonly #stateStore: EphemeralStateStore;
 
-  constructor(input: { baseUrl: string; secret: string; now?: () => number }) {
+  constructor(input: {
+    baseUrl: string;
+    secret: string;
+    stateStore: EphemeralStateStore;
+    now?: () => number;
+  }) {
     this.#baseUrl = input.baseUrl.replace(/\/$/u, "");
     this.#now = input.now ?? (() => Date.now());
+    this.#stateStore = input.stateStore;
     this.#tokens = new SignedTokenService(input.secret, this.#now);
   }
 
@@ -94,7 +92,7 @@ export class McpOAuthService {
     };
   }
 
-  createConsentRequest(url: URL, context: AuthContext, sessionToken: string): OAuthConsentRequest {
+  async createConsentRequest(url: URL, context: AuthContext, sessionToken: string): Promise<OAuthConsentRequest> {
     if (!sessionToken || context.client !== "web") throw new OAuthProtocolError("invalid_request", "The Web session is missing or expired.", 401);
     if (url.searchParams.get("response_type") !== "code") throw new OAuthProtocolError("invalid_request", "Only response_type=code is supported.");
     const clientId = requiredParam(url, "client_id");
@@ -123,13 +121,11 @@ export class McpOAuthService {
       iat: now,
       exp: expiresAt
     });
-    this.#pruneExpired(now);
-    this.#pendingConsentRequests.set(jti, expiresAt);
-    trimMap(this.#pendingConsentRequests, 10_000);
+    await this.#stateStore.createConsent({ id: jti, expiresAt });
     return { token, clientOrigin: new URL(redirectUri).origin };
   }
 
-  decideConsent(input: URLSearchParams, context: AuthContext, sessionToken: string): string {
+  async decideConsent(input: URLSearchParams, context: AuthContext, sessionToken: string): Promise<string> {
     if (!sessionToken || context.client !== "web") throw new OAuthProtocolError("invalid_request", "The Web session is missing or expired.", 401);
     const decision = requiredForm(input, "decision");
     if (decision !== "approve" && decision !== "deny") {
@@ -138,7 +134,6 @@ export class McpOAuthService {
     const consentToken = requiredForm(input, "consent_request");
     const claims = this.#tokens.verify(consentToken, "oauth-consent");
     const now = seconds(this.#now);
-    this.#pruneExpired(now);
     if (!claims
       || typeof claims.jti !== "string"
       || typeof claims.clientId !== "string"
@@ -149,13 +144,14 @@ export class McpOAuthService {
       || (claims.state !== undefined && typeof claims.state !== "string")
       || claims.contextDigest !== authContextDigest(context)
       || !constantTextEqual(claims.sessionDigest, textDigest(sessionToken))
-      || !this.#pendingConsentRequests.has(claims.jti)
       || !this.#registeredRedirect(claims.clientId, claims.redirectUri)
     ) {
       throw new OAuthProtocolError("invalid_request", "The consent request is invalid, expired, already used, or belongs to another session.");
     }
 
-    this.#pendingConsentRequests.delete(claims.jti);
+    if (!await this.#stateStore.consumeConsent(claims.jti)) {
+      throw new OAuthProtocolError("invalid_request", "The consent request is invalid, expired, already used, or belongs to another session.");
+    }
     const redirect = new URL(claims.redirectUri);
     if (typeof claims.state === "string") redirect.searchParams.set("state", claims.state);
     if (decision === "deny") {
@@ -165,19 +161,18 @@ export class McpOAuthService {
     }
 
     const code = this.#tokens.nonce(32);
-    this.#authorizationCodes.set(code, {
+    await this.#stateStore.createAuthorizationCode(code, {
       clientId: claims.clientId,
       redirectUri: claims.redirectUri,
       challenge: claims.challenge,
       context: cloneAuthContext(context),
       expiresAt: now + 300
     });
-    trimMap(this.#authorizationCodes, 10_000);
     redirect.searchParams.set("code", code);
     return redirect.toString();
   }
 
-  exchange(input: URLSearchParams): JsonRecord {
+  async exchange(input: URLSearchParams): Promise<JsonRecord> {
     if (input.get("grant_type") !== "authorization_code") throw new OAuthProtocolError("unsupported_grant_type", "Only authorization_code is supported.");
     const code = requiredForm(input, "code");
     const clientId = requiredForm(input, "client_id");
@@ -185,8 +180,7 @@ export class McpOAuthService {
     const verifier = requiredForm(input, "code_verifier");
     if (!/^[A-Za-z0-9._~-]{43,128}$/u.test(verifier)) throw new OAuthProtocolError("invalid_grant", "The PKCE verifier is invalid.");
     const now = seconds(this.#now);
-    this.#pruneExpired(now);
-    const pending = this.#authorizationCodes.get(code);
+    const pending = await this.#stateStore.consumeAuthorizationCode(code);
     if (!pending
       || pending.clientId !== clientId
       || pending.redirectUri !== redirectUri
@@ -194,7 +188,6 @@ export class McpOAuthService {
     ) {
       throw new OAuthProtocolError("invalid_grant", "The authorization code is invalid, expired, or already used.");
     }
-    this.#authorizationCodes.delete(code);
     const accessToken = this.#tokens.issue({
       purpose: "mcp-access",
       context: { ...pending.context, client: "mcp" },
@@ -220,14 +213,6 @@ export class McpOAuthService {
     return Boolean(client && Array.isArray(client.redirectUris) && client.redirectUris.includes(redirectUri));
   }
 
-  #pruneExpired(now: number): void {
-    for (const [jti, expiresAt] of this.#pendingConsentRequests) {
-      if (expiresAt <= now) this.#pendingConsentRequests.delete(jti);
-    }
-    for (const [code, pending] of this.#authorizationCodes) {
-      if (pending.expiresAt <= now) this.#authorizationCodes.delete(code);
-    }
-  }
 }
 
 function requiredParam(url: URL, name: string): string {
@@ -347,14 +332,6 @@ function cloneAuthContext(context: AuthContext): AuthContext {
     ...(context.selectedInstallationId === undefined ? {} : { selectedInstallationId: context.selectedInstallationId }),
     client: context.client
   };
-}
-
-function trimMap<K, V>(values: Map<K, V>, maximum: number): void {
-  while (values.size > maximum) {
-    const oldest = values.keys().next().value as K | undefined;
-    if (oldest === undefined) return;
-    values.delete(oldest);
-  }
 }
 
 function seconds(now: () => number): number {

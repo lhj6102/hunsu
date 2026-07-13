@@ -5,6 +5,7 @@ import {
   GitHubWebhookProcessor,
   HunsuApplicationService,
   HunsuHttpApp,
+  InMemoryEphemeralStateStore,
   McpOAuthService,
   SessionManager,
   type AuthContext,
@@ -49,7 +50,8 @@ test("GitHub App login uses PKCE and binds the callback to both transient cookie
     cookieName: "hunsu_session",
     secure: true
   });
-  const mcpOAuth = new McpOAuthService({ baseUrl: API, secret: sessions.config.secret });
+  const stateStore = new InMemoryEphemeralStateStore();
+  const mcpOAuth = new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, stateStore });
   let authorization: { state: string; challenge: string } | undefined;
   let exchanged: { code: string; verifier: string } | undefined;
   const githubOAuth = {
@@ -71,7 +73,7 @@ test("GitHub App login uses PKCE and binds the callback to both transient cookie
     sessions,
     githubOAuth,
     mcpOAuth,
-    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service }),
+    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore }),
     publicApiUrl: API,
     webUrl: WEB,
     githubAppSlug: "hunsu-test"
@@ -118,7 +120,8 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
     cookieName: "hunsu_session",
     secure: true
   }, () => now);
-  const mcpOAuth = new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, now: () => now });
+  const stateStore = new InMemoryEphemeralStateStore({ now: () => Math.floor(now / 1000) });
+  const mcpOAuth = new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, stateStore, now: () => now });
   const app = new HunsuHttpApp({
     service,
     sessions,
@@ -127,7 +130,7 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
       authenticate: async () => ({ user: webContext.user, installations: [...webContext.installations] })
     } as unknown as GitHubOAuthClient,
     mcpOAuth,
-    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service }),
+    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore }),
     publicApiUrl: API,
     webUrl: WEB,
     githubAppSlug: "hunsu-test"
@@ -262,8 +265,9 @@ test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts
     cookieName: "hunsu_session",
     secure: true
   });
-  const mcpOAuth = new McpOAuthService({ baseUrl: API, secret: sessions.config.secret });
-  const webhooks = new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service });
+  const stateStore = new InMemoryEphemeralStateStore();
+  const mcpOAuth = new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, stateStore });
+  const webhooks = new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore });
   const githubOAuth = {
     authorizationUrl: () => "https://github.example.test/authorize",
     authenticate: async () => ({ user: webContext.user, installations: [...webContext.installations] })
@@ -325,7 +329,7 @@ test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts
   assert.equal(staleBody.error.code, "stale_state");
   assert.equal(staleBody.error.actualStateSha, createdBody.stateHeadSha);
 
-  const accessToken = issueMcpAccessToken(mcpOAuth, { ...webContext, client: "mcp" });
+  const accessToken = await issueMcpAccessToken(mcpOAuth, { ...webContext, client: "mcp" });
   const mcpUpdate = await app.handle(new Request(`${API}/mcp`, {
     method: "POST",
     headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
@@ -451,7 +455,7 @@ function consentRequest(cookie: string, body: URLSearchParams, origin = API): Re
   });
 }
 
-function issueMcpAccessToken(oauth: McpOAuthService, context: AuthContext): string {
+async function issueMcpAccessToken(oauth: McpOAuthService, context: AuthContext): Promise<string> {
   const registration = oauth.register({ redirect_uris: ["https://client.example.test/callback"] });
   const clientId = String(registration.client_id);
   const verifier = "v".repeat(43);
@@ -463,17 +467,17 @@ function issueMcpAccessToken(oauth: McpOAuthService, context: AuthContext): stri
   authorize.searchParams.set("code_challenge", challenge);
   authorize.searchParams.set("code_challenge_method", "S256");
   const sessionToken = "test-web-session";
-  const consent = oauth.createConsentRequest(authorize, { ...context, client: "web" }, sessionToken);
-  const code = new URL(oauth.decideConsent(new URLSearchParams({
+  const consent = await oauth.createConsentRequest(authorize, { ...context, client: "web" }, sessionToken);
+  const code = new URL(await oauth.decideConsent(new URLSearchParams({
     decision: "approve",
     consent_request: consent.token
   }), { ...context, client: "web" }, sessionToken)).searchParams.get("code");
   assert.ok(code);
-  return String(oauth.exchange(new URLSearchParams({
+  return String((await oauth.exchange(new URLSearchParams({
     grant_type: "authorization_code",
     code,
     client_id: clientId,
     redirect_uri: "https://client.example.test/callback",
     code_verifier: verifier
-  })).access_token);
+  }))).access_token);
 }

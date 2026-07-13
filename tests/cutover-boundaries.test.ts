@@ -25,6 +25,7 @@ test("the product cutover has one vocabulary and one operating model", () => {
   ];
   const files = searchableRoots.flatMap(directory => walk(join(root, directory)))
     .concat(["README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md", "PRIVACY.md", "package.json", "turbo.json"].map(file => join(root, file)))
+    .filter(file => !file.endsWith("worker-configuration.d.ts"))
     .filter(file => [".ts", ".tsx", ".js", ".mjs", ".json", ".md", ".yml", ".yaml"].includes(extname(file)) || file.endsWith("AGENTS.md"));
 
   const violations: string[] = [];
