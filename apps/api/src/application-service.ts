@@ -153,12 +153,14 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
         case "hunsu.runners.create_player": return await this.#createPlayerTool(input, context);
         case "hunsu.runners.create_team": return await this.#createTeamTool(input, context);
         case "hunsu.runners.update": return await this.#updateRunnerTool(input, context);
+        case "hunsu.runs.get": return await this.#getRunTool(input, context);
         case "hunsu.runs.start": return await this.#startRunTool(input, context);
         case "hunsu.runs.checkpoint": return await this.#checkpointRunTool(input, context);
         case "hunsu.runs.attach_evidence": return await this.#attachEvidenceTool(input, context);
         case "hunsu.runs.complete": return await this.#completeRunTool(input, context);
         case "hunsu.runs.fail": return await this.#failRunTool(input, context);
         case "hunsu.runs.cancel": return await this.#cancelRunTool(input, context);
+        case "hunsu.coach.get": return await this.#getCoachTool(input, context);
         case "hunsu.coach.review": return await this.#coachReviewTool(input, context);
         case "hunsu.coach.propose_change": return await this.#coachProposeChangeTool(input, context);
         case "hunsu.coach.propose_hunsu": return await this.#coachProposeHunsuTool(input, context);
@@ -634,6 +636,24 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const runnerId = requiredString(input, "runnerId");
     const runner = projected.value.find(item => item.id === runnerId);
     return runner ? apiOk({ data: runner, stateHeadSha: loaded.value.stateHeadSha }) : notFound(`Runner ${runnerId} was not found.`);
+  }
+
+  async #getRunTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
+    const loaded = await this.#loadToolProject(input, context, false);
+    if (!loaded.ok) return loaded;
+    const projected = runDetailProjection(
+      loaded.value.state,
+      requiredString(input, "projectId"),
+      requiredString(input, "runId")
+    );
+    return projected.ok ? apiOk({ data: projected.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
+  }
+
+  async #getCoachTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
+    const loaded = await this.#loadToolProject(input, context, false);
+    if (!loaded.ok) return loaded;
+    const projected = coachViewProjection(loaded.value.state, requiredString(input, "projectId"));
+    return projected.ok ? apiOk({ data: projected.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
   }
 
   async #createPlayerTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {

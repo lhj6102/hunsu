@@ -12,6 +12,8 @@ import { HUNSU_STATE_BRANCH } from "./types.ts";
 
 const GITHUB_API_VERSION = "2026-03-10";
 const GITHUB_USER_AGENT = "hunsu-plugin-production";
+const GRAPHQL_BLOB_BATCH_SIZE = 500;
+const MAX_STATE_BLOB_REQUESTS_PER_READ = 13;
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -110,18 +112,28 @@ export class GitHubRestTransport implements GitHubTransport {
     const entries = Array.isArray(tree.value.tree) ? tree.value.tree : undefined;
     if (!entries || tree.value.truncated === true) return invalidResponse("GitHub Hunsu state tree is missing entries or was truncated.");
 
+    const blobs: Array<{ path: string; sha: string; size?: number }> = [];
+    for (const entry of entries) {
+      if (!isRecord(entry) || entry.type !== "blob") continue;
+      if (typeof entry.path !== "string" || typeof entry.sha !== "string") {
+        return invalidResponse("GitHub Hunsu state tree contains an invalid blob entry.");
+      }
+      if (entry.size !== undefined && (!Number.isSafeInteger(entry.size) || (entry.size as number) < 0)) {
+        return invalidResponse(`GitHub Hunsu state blob ${entry.path} has an invalid size.`);
+      }
+      blobs.push({
+        path: `.hunsu/${entry.path}`,
+        sha: entry.sha,
+        ...(typeof entry.size === "number" ? { size: entry.size } : {})
+      });
+    }
+    const contents = await this.#blobs(repository, blobs);
+    if (!contents.ok) return contents;
     const files: Record<string, string> = {};
-    const blobs = entries.flatMap(entry => {
-      if (!isRecord(entry)
-        || entry.type !== "blob"
-        || typeof entry.path !== "string"
-        || typeof entry.sha !== "string") return [];
-      return [{ path: `.hunsu/${entry.path}`, sha: entry.sha }];
-    });
-    const contents = await Promise.all(blobs.map(async blob => ({ blob, result: await this.#blob(repository, blob.sha) })));
-    for (const { blob, result } of contents) {
-      if (!result.ok) return result;
-      files[blob.path] = result.value;
+    for (const blob of blobs) {
+      const content = contents.value.get(blob.sha);
+      if (content === undefined) return invalidResponse(`GitHub Hunsu state blob ${blob.sha} is missing content.`);
+      files[blob.path] = content;
     }
     return ok({ headSha, files });
   }
@@ -147,19 +159,12 @@ export class GitHubRestTransport implements GitHubTransport {
     const baseTree = readNestedString(parent.value, "tree", "sha");
     if (!baseTree) return invalidResponse("Parent commit is missing its tree SHA.");
 
-    const blobs = await Promise.all(input.updates.map(async update => ({
-      update,
-      result: await this.#request<Record<string, unknown>>(input.repository.installationId, `${repositoryPath(input.repository)}/git/blobs`, {
-        method: "POST",
-        body: JSON.stringify({ content: update.content, encoding: "utf-8" })
-      })
-    })));
-    const treeEntries: Array<{ path: string; mode: "100644"; type: "blob"; sha: string }> = [];
-    for (const { update, result } of blobs) {
-      if (!result.ok) return result;
-      if (typeof result.value.sha !== "string") return invalidResponse(`Created blob for ${update.path} is missing its SHA.`);
-      treeEntries.push({ path: update.path, mode: "100644", type: "blob", sha: result.value.sha });
-    }
+    const treeEntries = input.updates.map(update => ({
+      path: update.path,
+      mode: "100644" as const,
+      type: "blob" as const,
+      content: update.content
+    }));
 
     const tree = await this.#request<Record<string, unknown>>(input.repository.installationId, `${repositoryPath(input.repository)}/git/trees`, {
       method: "POST",
@@ -234,6 +239,81 @@ export class GitHubRestTransport implements GitHubTransport {
     return ok(Buffer.from(response.value.content.replace(/\s/gu, ""), "base64").toString("utf8"));
   }
 
+  async #blobs(
+    repository: RepositoryLocator,
+    blobs: readonly { sha: string; size?: number }[]
+  ): Promise<TransportResult<Map<string, string>>> {
+    const unique = new Map<string, { sha: string; size?: number }>();
+    for (const blob of blobs) {
+      const existing = unique.get(blob.sha);
+      if (existing?.size !== undefined && blob.size !== undefined && existing.size !== blob.size) {
+        return invalidResponse(`GitHub Hunsu state blob ${blob.sha} has conflicting sizes.`);
+      }
+      if (!existing || (existing.size === undefined && blob.size !== undefined)) unique.set(blob.sha, blob);
+    }
+
+    const contents = new Map<string, string>();
+    let fallbackCount = 0;
+    const values = [...unique.values()];
+    const batchCount = Math.ceil(values.length / GRAPHQL_BLOB_BATCH_SIZE);
+    if (batchCount > MAX_STATE_BLOB_REQUESTS_PER_READ) {
+      return invalidResponse(
+        `GitHub Hunsu state exceeds the supported limit of ${GRAPHQL_BLOB_BATCH_SIZE * MAX_STATE_BLOB_REQUESTS_PER_READ} unique blobs.`
+      );
+    }
+    const maxFallbackCount = MAX_STATE_BLOB_REQUESTS_PER_READ - batchCount;
+    for (let offset = 0; offset < values.length; offset += GRAPHQL_BLOB_BATCH_SIZE) {
+      const batch = values.slice(offset, offset + GRAPHQL_BLOB_BATCH_SIZE);
+      const response = await this.#request<Record<string, unknown>>(repository.installationId, "/graphql", {
+        method: "POST",
+        body: JSON.stringify(graphqlBlobRequest(repository, batch))
+      });
+      if (!response.ok) return response;
+      if (Array.isArray(response.value.errors) && response.value.errors.length > 0) {
+        return invalidResponse("GitHub GraphQL returned errors while reading Hunsu state blobs.");
+      }
+      const data = response.value.data;
+      if (!isRecord(data) || !isRecord(data.repository)) {
+        return invalidResponse("GitHub GraphQL blob response is missing the repository.");
+      }
+
+      for (let index = 0; index < batch.length; index += 1) {
+        const expected = batch[index];
+        const value = data.repository[`b${index}`];
+        if (!isRecord(value) || value.oid !== expected.sha) {
+          return invalidResponse(`GitHub GraphQL returned the wrong object for Hunsu state blob ${expected.sha}.`);
+        }
+        if (!Number.isSafeInteger(value.byteSize) || (value.byteSize as number) < 0) {
+          return invalidResponse(`GitHub GraphQL returned an invalid size for Hunsu state blob ${expected.sha}.`);
+        }
+        if (expected.size !== undefined && value.byteSize !== expected.size) {
+          return invalidResponse(`GitHub Hunsu state blob ${expected.sha} does not match its tree size.`);
+        }
+        if (value.isBinary !== false || typeof value.isTruncated !== "boolean") {
+          return invalidResponse(`GitHub Hunsu state blob ${expected.sha} is not complete UTF-8 text.`);
+        }
+
+        let content: string;
+        if (value.isTruncated || typeof value.text !== "string") {
+          fallbackCount += 1;
+          if (fallbackCount > maxFallbackCount) {
+            return invalidResponse("GitHub returned too many truncated Hunsu state blobs for the supported request budget.");
+          }
+          const fallback = await this.#blob(repository, expected.sha);
+          if (!fallback.ok) return fallback;
+          content = fallback.value;
+        } else {
+          content = value.text;
+        }
+        if (Buffer.byteLength(content, "utf8") !== value.byteSize) {
+          return invalidResponse(`GitHub Hunsu state blob ${expected.sha} content does not match its byte size.`);
+        }
+        contents.set(expected.sha, content);
+      }
+    }
+    return ok(contents);
+  }
+
   async #request<T>(
     installationId: number,
     path: string,
@@ -271,6 +351,34 @@ export class GitHubRestTransport implements GitHubTransport {
       return failure({ code: "network", message: error instanceof Error ? error.message : "GitHub request failed." });
     }
   }
+}
+
+function graphqlBlobRequest(
+  repository: RepositoryLocator,
+  blobs: readonly { sha: string }[]
+): { query: string; variables: Record<string, string> } {
+  const declarations = blobs.map((_, index) => `$oid${index}: GitObjectID!`).join(", ");
+  const selections = blobs.map((_, index) => `
+      b${index}: object(oid: $oid${index}) {
+        ... on Blob {
+          oid
+          byteSize
+          isBinary
+          isTruncated
+          text
+        }
+      }`).join("");
+  return {
+    query: `query ReadHunsuBlobs($owner: String!, $name: String!, ${declarations}) {
+  repository(owner: $owner, name: $name) {${selections}
+  }
+}`,
+    variables: {
+      owner: repository.owner,
+      name: repository.name,
+      ...Object.fromEntries(blobs.map((blob, index) => [`oid${index}`, blob.sha]))
+    }
+  };
 }
 
 function repositoryPath(repository: RepositoryLocator): string {

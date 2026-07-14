@@ -1,6 +1,6 @@
 {
   "name": "hunsu",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260714053118",
   "description": "Run GitHub-backed Hunsu Projects from Codex.",
   "author": {
     "name": "Hunsu"
@@ -8,7 +8,12 @@
   "homepage": "https://hunsu.app",
   "repository": "https://github.com/lhj6102/hunsu",
   "license": "Apache-2.0",
-  "keywords": ["project-management", "github", "codex", "divergence"],
+  "keywords": [
+    "project-management",
+    "github",
+    "codex",
+    "divergence"
+  ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Hunsu",
@@ -16,7 +21,11 @@
     "longDescription": "Create Projects and Goals, execute Player or Team Runs, attach evidence, request Coach review, and compare divergent alternatives.",
     "developerName": "Hunsu",
     "category": "Productivity",
-    "capabilities": ["Read", "Write", "Interactive"],
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
     "websiteURL": "https://hunsu.app",
     "defaultPrompt": [
       "Open the Hunsu Project for this repository.",

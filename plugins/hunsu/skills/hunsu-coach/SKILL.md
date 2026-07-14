@@ -5,7 +5,7 @@ description: Review Hunsu Project state and Run evidence, then propose Goal, Run
 
 # Hunsu Coach
 
-1. Load the Project, relevant Goals, Runs, evidence, existing proposals, and unresolved alternatives.
+1. Call `hunsu.coach.get` to load the current assessment, existing proposals, stalled Runs, and alternative recommendations. Load each relevant Run with `hunsu.runs.get` so the review uses its immutable snapshots, checkpoints, and evidence.
 2. Call `hunsu.coach.review` with an evidence-grounded assessment. Separate observed facts from recommendations.
 3. Use `hunsu.coach.propose_change` for a Goal or Runner change and `hunsu.coach.propose_hunsu` for deliberate divergence.
 4. Explain the tradeoff and the evidence behind each proposal. Before asking for confirmation, show the exact Goal patch fields, the current and proposed Runner assignment, or—when proposing Hunsu—the completed source Run and exact alternative Goal patch or Runner.

@@ -132,8 +132,12 @@ export type RunnerProjection =
       id: string;
       name: string;
       promptTemplate: string;
-      resources: Array<{ id: string; kind: "skill" | "plugin"; name: string; version?: string }>;
-      runtimePolicy: { network: "disabled" | "enabled"; approvals: "never" | "on_request" };
+      resources: ResourceProjection[];
+      runtimePolicy: {
+        filesystem: "read_only" | "worktree_write";
+        network: "disabled" | "enabled";
+        approvals: "never" | "on_request";
+      };
       goalCount: number;
       recentResults: RunSummaryProjection[];
     }
@@ -292,7 +296,7 @@ export type CoachProjection = {
   id: string;
   name: string;
   promptTemplate: string;
-  resources: Array<{ id: string; kind: "skill" | "plugin"; name: string; version?: string }>;
+  resources: ResourceProjection[];
   assessment: { summary: string; updatedAt: string };
   weakGoals: GoalSummaryProjection[];
   stalledRuns: RunSummaryProjection[];
@@ -300,6 +304,10 @@ export type CoachProjection = {
   comparisonRecommendations: CoachComparisonRecommendationProjection[];
   selectionRecommendations: CoachSelectionRecommendationProjection[];
 };
+
+export type ResourceProjection =
+  | { id: string; kind: "skill"; name: string; reference: string }
+  | { id: string; kind: "plugin"; name: string; reference: string };
 
 export type AlternativeComparisonProjection = {
   id: string;

@@ -231,18 +231,14 @@ export type GoalResponse = {
   stateHeadSha: string;
 };
 
-export type ResourceBinding = {
-  id: string;
-  kind: "skill" | "plugin" | "reference";
-  name: string;
-  version?: string;
-};
+export type ResourceBinding =
+  | { id: string; kind: "skill"; name: string; reference: string }
+  | { id: string; kind: "plugin"; name: string; reference: string };
 
 export type RuntimePolicy = {
-  model?: string;
-  reasoning?: string;
-  network: "disabled" | "restricted" | "enabled";
-  approvals: "never" | "on_request" | "always";
+  filesystem: "read_only" | "worktree_write";
+  network: "disabled" | "enabled";
+  approvals: "never" | "on_request";
 };
 
 export type Player = {

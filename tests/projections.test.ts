@@ -134,6 +134,24 @@ test("Goal and Run projections expose immutable snapshots, checkpoints, and evid
   assert.deepEqual(run.goalSnapshot.acceptanceCriteria, [fixture.criterion]);
   assert.deepEqual(run.goalSnapshot.constraints, [fixture.constraint]);
   assert.equal(run.runnerSnapshot.kind, "player");
+  if (run.runnerSnapshot.kind === "player") {
+    assert.deepEqual(run.runnerSnapshot.runtimePolicy, {
+      filesystem: "worktree_write",
+      network: "disabled",
+      approvals: "on_request"
+    });
+    assert.deepEqual(run.runnerSnapshot.resources, [{
+      id: "skill:typescript",
+      kind: "skill",
+      name: "typescript",
+      reference: "skill://typescript"
+    }, {
+      id: "plugin:eslint",
+      kind: "plugin",
+      name: "eslint",
+      reference: "1.2.3"
+    }]);
+  }
   assert.equal(run.instructions, fixture.player.promptTemplate);
   assert.equal(run.checkpoints.length, 1);
   assert.equal(run.checkpoints[0]?.commitSha, fixture.sourceResultSha);
@@ -160,12 +178,19 @@ test("Runner and Coach projections preserve closed Runner variants and proposal 
   assert.ok(player);
   assert.equal(player.kind, "player");
   if (player.kind === "player") {
+    assert.equal(player.runtimePolicy.filesystem, "worktree_write");
     assert.equal(player.runtimePolicy.network, "disabled");
     assert.equal(player.runtimePolicy.approvals, "on_request");
     assert.deepEqual(player.resources, [{
       id: "skill:typescript",
       kind: "skill",
-      name: "typescript"
+      name: "typescript",
+      reference: "skill://typescript"
+    }, {
+      id: "plugin:eslint",
+      kind: "plugin",
+      name: "eslint",
+      reference: "1.2.3"
     }]);
     assert.equal(player.goalCount, 1);
     assert.equal(player.recentResults.length, 2);
@@ -376,6 +401,10 @@ function buildFixture() {
       type: "skill",
       name: take(makeResourceName("typescript")),
       source: take(makeNonEmptyText("skill://typescript"))
+    }, {
+      type: "plugin",
+      name: take(makeResourceName("eslint")),
+      version: take(makeNonEmptyText("1.2.3"))
     }],
     runtimePolicy: { fileAccess: "project_write", network: "denied", approval: "user" },
     createdAt,
