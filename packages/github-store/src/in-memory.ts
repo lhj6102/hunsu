@@ -55,6 +55,11 @@ export class MemoryGitHubTransport implements GitHubTransport {
       .map(repository => structuredClone(repository)));
   }
 
+  async readBranchHead(repository: RepositoryLocator, branch: string): Promise<TransportResult<string | undefined>> {
+    const found = this.#repository(repository);
+    return found.ok ? ok(found.value.branches.get(branch)) : found;
+  }
+
   async readBranch(repository: RepositoryLocator, branch: string): Promise<TransportResult<BranchSnapshot | undefined>> {
     const found = this.#repository(repository);
     if (!found.ok) return found;

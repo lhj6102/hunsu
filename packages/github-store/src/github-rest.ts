@@ -69,6 +69,10 @@ export class GitHubRestTransport implements GitHubTransport {
     return this.#branchSnapshot(repository, branch, ref.value);
   }
 
+  async readBranchHead(repository: RepositoryLocator, branch: string): Promise<TransportResult<string | undefined>> {
+    return this.#reference(repository, branch);
+  }
+
   async createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<BranchSnapshot>> {
     const response = await this.#request<Record<string, unknown>>(repository.installationId, `${repositoryPath(repository)}/git/refs`, {
       method: "POST",
@@ -118,6 +122,7 @@ export class GitHubRestTransport implements GitHubTransport {
       if (typeof entry.path !== "string" || typeof entry.sha !== "string") {
         return invalidResponse("GitHub Hunsu state tree contains an invalid blob entry.");
       }
+      if (!isReconstructionInputPath(entry.path)) continue;
       if (entry.size !== undefined && (!Number.isSafeInteger(entry.size) || (entry.size as number) < 0)) {
         return invalidResponse(`GitHub Hunsu state blob ${entry.path} has an invalid size.`);
       }
@@ -387,6 +392,10 @@ function repositoryPath(repository: RepositoryLocator): string {
 
 function encodeRef(ref: string): string {
   return ref.split("/").map(encodeURIComponent).join("/");
+}
+
+function isReconstructionInputPath(path: string): boolean {
+  return /^projects\/[^/]+\/events\//u.test(path);
 }
 
 function decodeRepositoryGrant(input: unknown, installationId: number): TransportResult<RepositoryGrant> {

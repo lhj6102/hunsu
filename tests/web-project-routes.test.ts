@@ -6,7 +6,8 @@ import {
   parseAppRoute,
   projectPath,
   runnersPath,
-  runPath
+  runPath,
+  shouldFetchProjectList
 } from "../apps/web/src/app/routes.ts";
 import { safeHttpHref } from "../apps/web/src/shared/format.ts";
 import { alternativeDecisionRequest } from "../apps/web/src/shared/api/alternativeDecision.ts";
@@ -38,6 +39,19 @@ test("Web navigation exposes the six Project surfaces", () => {
     projectId: "project-a",
     runId: "run-c"
   });
+});
+
+test("only the Project list route enables the full Project-list request", () => {
+  assert.equal(shouldFetchProjectList(parseAppRoute({ pathname: "/projects" })), true);
+  for (const pathname of [
+    "/projects/project-a",
+    "/projects/project-a/goals/goal-b",
+    "/projects/project-a/runs/run-c",
+    "/projects/project-a/runners",
+    "/projects/project-a/coach"
+  ]) {
+    assert.equal(shouldFetchProjectList(parseAppRoute({ pathname })), false, pathname);
+  }
 });
 
 test("Project route builders encode identifiers and keep comparison within Goal detail", () => {

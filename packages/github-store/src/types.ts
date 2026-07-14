@@ -39,6 +39,7 @@ export type TransportResult<T> =
 
 export interface GitHubTransport {
   listInstallationRepositories(installationId: number): Promise<TransportResult<RepositoryGrant[]>>;
+  readBranchHead(repository: RepositoryLocator, branch: string): Promise<TransportResult<string | undefined>>;
   readBranch(repository: RepositoryLocator, branch: string): Promise<TransportResult<BranchSnapshot | undefined>>;
   createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<BranchSnapshot>>;
   commitFiles(input: {
@@ -125,3 +126,14 @@ export type ReconstructedProject<State> = {
   stateHeadSha: string;
   eventCount: number;
 };
+
+export type ReconstructedRepository<State> =
+  | {
+      kind: "state_branch_missing";
+      projects: readonly [];
+    }
+  | {
+      kind: "state_branch";
+      stateHeadSha: string;
+      projects: readonly ReconstructedProject<State>[];
+    };

@@ -9,6 +9,8 @@ const repository: RepositoryLocator = {
   name: "sample",
   defaultBranch: "main"
 };
+const eventPath = `projects/project-alpha/events/2026/07/${"1".repeat(32)}.json`;
+const eventFilePath = `.hunsu/${eventPath}`;
 
 test("GitHub REST transport uses installation authority and a non-forced CAS update", async () => {
   const parentSha = "a".repeat(40);
@@ -144,10 +146,10 @@ test("GitHub REST initializes state from the created ref response without reread
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "created-state-tree" }] });
       }
       if (url.endsWith("/git/trees/created-state-tree?recursive=1")) {
-        return json({ truncated: false, tree: [{ path: "reserved.json", type: "blob", sha: "reserved-blob" }] });
+        return json({ truncated: false, tree: [{ path: `projects/project-alpha/events/2026/07/${"1".repeat(32)}.json`, type: "blob", sha: "event-blob" }] });
       }
       if (url.endsWith("/graphql")) {
-        return graphqlBlobResponse(init, new Map([["reserved-blob", "reserved\n"]]));
+        return graphqlBlobResponse(init, new Map([["event-blob", "{}\n"]]));
       }
       return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
     }
@@ -157,7 +159,7 @@ test("GitHub REST initializes state from the created ref response without reread
     ok: true,
     value: {
       headSha: "a".repeat(40),
-      files: { ".hunsu/reserved.json": "reserved\n" }
+      files: { [`.hunsu/projects/project-alpha/events/2026/07/${"1".repeat(32)}.json`]: "{}\n" }
     }
   });
   assert.equal(calls.some(call => call.url.includes("/git/ref/")), false);
@@ -178,17 +180,71 @@ test("GitHub REST reads only the dedicated state subtree", async () => {
         { path: "src", type: "tree", sha: "source-tree" }
       ] });
       if (url.endsWith("/git/trees/state-tree?recursive=1")) return json({ truncated: false, tree: [
-        { path: "workspace.json", type: "blob", sha: "workspace-blob" }
+        { path: eventPath, type: "blob", sha: "event-blob" }
       ] });
       if (url.endsWith("/graphql")) {
-        return graphqlBlobResponse(init, new Map([["workspace-blob", "{}\n"]]));
+        return graphqlBlobResponse(init, new Map([["event-blob", "{}\n"]]));
       }
       return json({ message: `Unexpected ${url}` }, 500);
     }
   });
   const result = await transport.readBranch(repository, "hunsu/state");
-  assert.deepEqual(result, { ok: true, value: { headSha, files: { ".hunsu/workspace.json": "{}\n" } } });
+  assert.deepEqual(result, { ok: true, value: { headSha, files: { [eventFilePath]: "{}\n" } } });
   assert.equal(calls.some(url => url.includes("source-tree")), false);
+});
+
+test("GitHub REST fetches reconstruction inputs without downloading derived materializations", async () => {
+  const headSha = "d".repeat(40);
+  const eventContent = "{\"schema\":\"hunsu.project-event.v1\"}\n";
+  const derived = [
+    { path: "projects/project-alpha/project.json", sha: "project-blob" },
+    { path: "projects/project-alpha/coach.json", sha: "coach-blob" },
+    { path: "projects/project-alpha/goals/goal-one.json", sha: "goal-blob" },
+    { path: "projects/project-alpha/runners/player-one.json", sha: "runner-blob" },
+    { path: "projects/project-alpha/runs/run-one.json", sha: "run-blob" },
+    { path: "projects/project-alpha/snapshots/latest.json", sha: "snapshot-blob" }
+  ];
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.includes("/git/ref/heads/hunsu/state")) return json({ object: { sha: headSha } });
+      if (url.endsWith(`/git/commits/${headSha}`)) return json({ tree: { sha: "root-tree" } });
+      if (url.endsWith("/git/trees/root-tree")) {
+        return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
+      }
+      if (url.endsWith("/git/trees/state-tree?recursive=1")) {
+        return json({ truncated: false, tree: [
+          { path: "workspace.json", type: "blob", sha: "workspace-blob", size: 100 },
+          { path: eventPath, type: "blob", sha: "event-blob", size: Buffer.byteLength(eventContent, "utf8") },
+          ...derived.map(entry => ({ ...entry, type: "blob", size: 100 }))
+        ] });
+      }
+      if (url.endsWith("/graphql")) {
+        return graphqlBlobResponse(init, new Map([
+          ["event-blob", eventContent]
+        ]));
+      }
+      return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
+    }
+  });
+
+  assert.deepEqual(await transport.readBranch(repository, "hunsu/state"), {
+    ok: true,
+    value: {
+      headSha,
+      files: {
+        [`.hunsu/${eventPath}`]: eventContent
+      }
+    }
+  });
+  const requestedOids = calls
+    .filter(call => call.url.endsWith("/graphql"))
+    .flatMap(call => graphqlOidVariables((JSON.parse(String(call.init.body)) as { variables: Record<string, string> }).variables));
+  assert.deepEqual(requestedOids, ["event-blob"]);
+  assert.equal(derived.some(entry => requestedOids.includes(entry.sha)), false);
 });
 
 test("GitHub REST batches 501 unique state blob OIDs into two GraphQL requests and deduplicates a shared OID", async () => {
@@ -201,7 +257,8 @@ test("GitHub REST batches 501 unique state blob OIDs into two GraphQL requests a
     sha: fixture.sha,
     size: Buffer.byteLength(fixture.content, "utf8")
   }));
-  entries.push({ ...entries[0], path: "shared.json" });
+  const sharedPath = `projects/project-beta/events/2026/07/${"f".repeat(32)}.json`;
+  entries.push({ ...entries[0], path: sharedPath });
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const transport = new GitHubRestTransport({
     authorityProvider: async () => verifiedAuthority("test-installation-value"),
@@ -223,7 +280,7 @@ test("GitHub REST batches 501 unique state blob OIDs into two GraphQL requests a
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.value?.files[`.hunsu/${fixtures[500].path}`], fixtures[500].content);
-  assert.equal(result.value?.files[".hunsu/shared.json"], fixtures[0].content);
+  assert.equal(result.value?.files[`.hunsu/${sharedPath}`], fixtures[0].content);
   assert.equal(calls.filter(call => call.url.endsWith("/graphql")).length, 2);
   assert.equal(calls.some(call => call.url.includes("/git/blobs/")), false);
   const graphqlBodies = calls
@@ -286,22 +343,22 @@ for (const fallback of [
         }
         if (url.endsWith("/git/trees/state-tree?recursive=1")) {
           return json({ truncated: false, tree: [{
-            path: "workspace.json",
+            path: eventPath,
             type: "blob",
-            sha: "workspace-blob",
+            sha: "event-blob",
             size: Buffer.byteLength(content, "utf8")
           }] });
         }
         if (url.endsWith("/graphql")) {
           return json({ data: { repository: { b0: {
-            oid: "workspace-blob",
+            oid: "event-blob",
             byteSize: Buffer.byteLength(content, "utf8"),
             isBinary: false,
             isTruncated: fallback.isTruncated,
             text: fallback.text
           } } } });
         }
-        if (url.endsWith("/git/blobs/workspace-blob")) {
+        if (url.endsWith("/git/blobs/event-blob")) {
           restBlobReads += 1;
           return json({ encoding: "base64", content: Buffer.from(content, "utf8").toString("base64") });
         }
@@ -311,7 +368,7 @@ for (const fallback of [
 
     assert.deepEqual(await transport.readBranch(repository, "hunsu/state"), {
       ok: true,
-      value: { headSha, files: { ".hunsu/workspace.json": content } }
+      value: { headSha, files: { [eventFilePath]: content } }
     });
     assert.equal(restBlobReads, 1);
   });
@@ -379,17 +436,17 @@ const invalidGraphqlBlobResponses: ReadonlyArray<{
   },
   {
     name: "a binary blob",
-    payload: { data: { repository: { b0: { ...graphqlBlob("workspace-blob", "{}\n"), isBinary: true } } } },
+    payload: { data: { repository: { b0: { ...graphqlBlob("event-blob", "{}\n"), isBinary: true } } } },
     expectedMessage: /not complete UTF-8 text/u
   },
   {
     name: "a tree byte-size mismatch",
-    payload: { data: { repository: { b0: { ...graphqlBlob("workspace-blob", "{}\n"), byteSize: 4 } } } },
+    payload: { data: { repository: { b0: { ...graphqlBlob("event-blob", "{}\n"), byteSize: 4 } } } },
     expectedMessage: /does not match its tree size/u
   },
   {
     name: "a text byte-size mismatch",
-    payload: { data: { repository: { b0: { ...graphqlBlob("workspace-blob", "{}\n"), byteSize: 4 } } } },
+    payload: { data: { repository: { b0: { ...graphqlBlob("event-blob", "{}\n"), byteSize: 4 } } } },
     expectedMessage: /content does not match its byte size/u,
     treeSize: 4
   },
@@ -414,9 +471,9 @@ for (const scenario of invalidGraphqlBlobResponses) {
         }
         if (url.endsWith("/git/trees/state-tree?recursive=1")) {
           return json({ truncated: false, tree: [{
-            path: "workspace.json",
+            path: eventPath,
             type: "blob",
-            sha: "workspace-blob",
+            sha: "event-blob",
             size: scenario.treeSize ?? 3
           }] });
         }
@@ -521,6 +578,23 @@ test("GitHub REST keeps a 6001-blob completion-shaped sequence below the Workers
   assert.ok(githubRequests + installationTokenMintRequests < 50);
 });
 
+test("GitHub REST reads a branch head without downloading its commit or tree", async () => {
+  const headSha = "e".repeat(40);
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async (input, init = {}) => {
+      calls.push({ url: String(input), init });
+      return json({ object: { sha: headSha } });
+    }
+  });
+
+  assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), { ok: true, value: headSha });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/git\/ref\/heads\/hunsu\/state$/u);
+  assert.equal(calls[0].init.cache, "no-store");
+});
+
 test("GitHub REST resolves non-state branch heads without downloading trees", async () => {
   let calls = 0;
   const transport = new GitHubRestTransport({
@@ -576,7 +650,7 @@ function graphqlBlob(sha: string, content: string) {
 
 function stateBlobFixtures(count: number): Array<{ path: string; sha: string; content: string }> {
   return Array.from({ length: count }, (_, index) => ({
-    path: `events/event-${index}.json`,
+    path: `projects/project-alpha/events/2026/07/${index.toString(16).padStart(32, "0")}.json`,
     sha: index.toString(16).padStart(40, "0"),
     content: `{"index":${index}}\n`
   }));

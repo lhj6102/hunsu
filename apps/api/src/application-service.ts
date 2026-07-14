@@ -102,14 +102,65 @@ import {
 type JsonRecord = Record<string, unknown>;
 
 type CachedProject = {
-  repository: RepositoryLocator & { permissions?: { contents: "read" | "write" } };
+  repository: RepositoryLocator;
+  state: ProjectState;
+  stateHeadSha: string;
+  synchronizedAt: string;
+  cachedAt: number;
+  lastAccessedAt: number;
+  lastAccessOrder: number;
+  sizeBytes: number;
+};
+
+type AuthorizedProject = {
+  repository: RepositoryGrant;
   state: ProjectState;
   stateHeadSha: string;
   synchronizedAt: string;
   cachedAt: number;
 };
 
+type CachedRepositoryCatalog = {
+  repository: RepositoryLocator;
+  stateHeadSha: string | undefined;
+  projectIds: readonly string[];
+  synchronizedAt: string;
+  cachedAt: number;
+  lastAccessedAt: number;
+  lastAccessOrder: number;
+  sizeBytes: number;
+};
+
+type CacheGeneration = {
+  generation: number;
+  lastAccessedAt: number;
+  lastAccessOrder: number;
+};
+
+type CacheGenerationToken = {
+  repositoryKey: string;
+  generation: number;
+};
+
+export type ProjectionCachePolicy = {
+  idleTtlMs: number;
+  maxProjectEntries: number;
+  maxProjectBytes: number;
+  maxCatalogEntries: number;
+  maxCatalogBytes: number;
+  maxGenerationEntries: number;
+};
+
 const PROJECTION_CACHE_TTL_MS = 4_000;
+const UTF8_ENCODER = new TextEncoder();
+const DEFAULT_PROJECTION_CACHE_POLICY: ProjectionCachePolicy = {
+  idleTtlMs: 5 * 60_000,
+  maxProjectEntries: 128,
+  maxProjectBytes: 16 * 1024 * 1024,
+  maxCatalogEntries: 256,
+  maxCatalogBytes: 2 * 1024 * 1024,
+  maxGenerationEntries: 512
+};
 
 type MutationCommandFactory = (state: ProjectState, meta: CommandMetadata) => ProjectCommand;
 
@@ -118,13 +169,24 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   readonly #store: GitHubProjectStore<DomainEvent, ProjectState>;
   readonly #now: () => Date;
   readonly #cacheNow: () => number;
+  readonly #cachePolicy: ProjectionCachePolicy;
   readonly #cache = new Map<string, CachedProject>();
+  readonly #catalogCache = new Map<string, CachedRepositoryCatalog>();
+  readonly #cacheGenerations = new Map<string, CacheGeneration>();
+  #nextCacheGeneration = 1;
+  #nextCacheAccessOrder = 1;
 
-  constructor(input: { transport: GitHubTransport; now?: () => Date; cacheNow?: () => number }) {
+  constructor(input: {
+    transport: GitHubTransport;
+    now?: () => Date;
+    cacheNow?: () => number;
+    projectionCachePolicy?: Partial<ProjectionCachePolicy>;
+  }) {
     this.#transport = input.transport;
     this.#store = new GitHubProjectStore(input.transport, projectStateCodec);
     this.#now = input.now ?? (() => new Date());
     this.#cacheNow = input.cacheNow ?? (() => Date.now());
+    this.#cachePolicy = projectionCachePolicy(input.projectionCachePolicy);
   }
 
   async call(name: string, argumentsValue: JsonRecord, context: AuthContext): Promise<ToolResponse<unknown>> {
@@ -180,8 +242,8 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (!grants.ok) return grants;
     const synchronizedAt = this.#timestamp();
     const repositories = await Promise.all(grants.value.map(async repository => {
-      const state = await this.#transport.readBranch(repository, HUNSU_STATE_BRANCH);
-      const stateHeadSha = state.ok ? state.value?.headSha ?? "" : "";
+      const state = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
+      const stateHeadSha = state.ok ? state.value ?? "" : "";
       return {
         owner: repository.owner,
         name: repository.name,
@@ -198,7 +260,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   }
 
   async webProjects(context: AuthContext): Promise<ApiResult<{ projects: unknown[] }>> {
-    const loaded = await this.#loadAllProjects(context, true);
+    const loaded = await this.#loadAllProjects(context);
     if (!loaded.ok) return loaded;
     return apiOk({ projects: projectListProjection(loaded.value.map(entry => ({ state: entry.state, context: projectionContext(entry) }))) });
   }
@@ -240,26 +302,53 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
 
   dropProjectionCache(): void {
     this.#cache.clear();
+    this.#catalogCache.clear();
+    this.#cacheGenerations.clear();
   }
 
   invalidateRepository(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): void {
+    this.#advanceCacheGeneration(repository);
     for (const [key, entry] of this.#cache) {
       if (entry.repository.installationId === repository.installationId && entry.repository.repositoryId === repository.repositoryId) this.#cache.delete(key);
     }
+    this.#catalogCache.delete(repositoryCacheKey(repository));
   }
 
   invalidateInstallation(installationId: number): void {
     for (const [key, entry] of this.#cache) if (entry.repository.installationId === installationId) this.#cache.delete(key);
+    for (const [key, entry] of this.#catalogCache) if (entry.repository.installationId === installationId) this.#catalogCache.delete(key);
+    const prefix = `${installationId}:`;
+    for (const key of this.#cacheGenerations.keys()) if (key.startsWith(prefix)) this.#cacheGenerations.delete(key);
   }
 
   async reconcileRepository(repository: RepositoryLocator): Promise<ApiResult<{ projectCount: number }>> {
     this.invalidateRepository(repository);
+    const generation = this.#captureCacheGeneration(repository);
     const reconstructed = await this.#store.reconstructRepository(repository);
     if (!reconstructed.ok) return storeFailure(reconstructed.error);
+    const projects = reconstructed.value.projects;
     const synchronizedAt = this.#timestamp();
     const cachedAt = this.#cacheNow();
-    for (const item of reconstructed.value) this.#cache.set(cacheKey(repository, projectIdOf(item.state)), { repository, state: item.state, stateHeadSha: item.stateHeadSha, synchronizedAt, cachedAt });
-    return apiOk({ projectCount: reconstructed.value.length });
+    if (this.#cacheGenerationIsCurrent(generation)) {
+      this.invalidateRepository(repository);
+      for (const item of projects) {
+        this.#putCachedProject(
+          cacheKey(repository, projectIdOf(item.state)),
+          cachedProject(repository, item.state, item.stateHeadSha, synchronizedAt, cachedAt)
+        );
+      }
+      this.#putCachedCatalog(
+        repositoryCacheKey(repository),
+        cachedRepositoryCatalog(
+          repository,
+          reconstructed.value.kind === "state_branch" ? reconstructed.value.stateHeadSha : undefined,
+          projects.map(item => projectIdOf(item.state)),
+          synchronizedAt,
+          cachedAt
+        )
+      );
+    }
+    return apiOk({ projectCount: projects.length });
   }
 
   async webCreateProject(context: AuthContext, input: JsonRecord): Promise<ApiResult<MutationResult<{ projectId: string }>>> {
@@ -471,7 +560,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   async webRebuildProject(context: AuthContext, projectId: string): Promise<ApiResult<MutationResult<{ projectId: string }>>> {
     const located = await this.#findProject(context, projectId);
     if (!located.ok) return located;
-    this.#cache.delete(cacheKey(located.value.repository, projectId));
+    this.invalidateRepository(located.value.repository);
     const rebuilt = await this.#loadProject(located.value.repository, projectId, true);
     return rebuilt.ok
       ? apiOk({ value: { projectId }, stateHeadSha: rebuilt.value.stateHeadSha, synchronizedAt: rebuilt.value.synchronizedAt })
@@ -480,7 +569,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
 
   async #listProjectsTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown }>> {
     const installationId = optionalPositiveInteger(input, "installationId");
-    const loaded = await this.#loadAllProjects(context, true, installationId);
+    const loaded = await this.#loadAllProjects(context, false, installationId);
     if (!loaded.ok) return loaded;
     const filter = optionalString(input, "repository");
     const entries = filter ? loaded.value.filter(item => `${item.repository.owner}/${item.repository.name}` === filter) : loaded.value;
@@ -545,14 +634,34 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const repository = await this.#repositoryFromInput(context, record(input, "repository"), false);
     if (!repository.ok) return repository;
     this.invalidateRepository(repository.value);
+    const generation = this.#captureCacheGeneration(repository.value);
     const rebuilt = await this.#store.reconstructRepository(repository.value);
     if (!rebuilt.ok) return storeFailure(rebuilt.error);
+    const projects = rebuilt.value.projects;
     const synchronizedAt = this.#timestamp();
     const cachedAt = this.#cacheNow();
-    for (const item of rebuilt.value) this.#cache.set(cacheKey(repository.value, projectIdOf(item.state)), { repository: repository.value, state: item.state, stateHeadSha: item.stateHeadSha, synchronizedAt, cachedAt });
+    if (this.#cacheGenerationIsCurrent(generation)) {
+      this.invalidateRepository(repository.value);
+      for (const item of projects) {
+        this.#putCachedProject(
+          cacheKey(repository.value, projectIdOf(item.state)),
+          cachedProject(repository.value, item.state, item.stateHeadSha, synchronizedAt, cachedAt)
+        );
+      }
+      this.#putCachedCatalog(
+        repositoryCacheKey(repository.value),
+        cachedRepositoryCatalog(
+          repository.value,
+          rebuilt.value.kind === "state_branch" ? rebuilt.value.stateHeadSha : undefined,
+          projects.map(item => projectIdOf(item.state)),
+          synchronizedAt,
+          cachedAt
+        )
+      );
+    }
     const projectId = optionalString(input, "projectId");
-    const match = projectId ? rebuilt.value.find(item => projectIdOf(item.state) === projectId) : undefined;
-    return apiOk({ data: { projectCount: rebuilt.value.length, ...(projectId ? { projectId } : {}) }, ...(match ? { stateHeadSha: match.stateHeadSha } : {}) });
+    const match = projectId ? projects.find(item => projectIdOf(item.state) === projectId) : undefined;
+    return apiOk({ data: { projectCount: projects.length, ...(projectId ? { projectId } : {}) }, ...(match ? { stateHeadSha: match.stateHeadSha } : {}) });
   }
 
   async #listGoalsTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
@@ -1670,13 +1779,11 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     });
     if (!appended.ok) return storeFailure(appended.error);
     const synchronizedAt = this.#timestamp();
-    this.#cache.set(cacheKey(input.repository, input.projectId), {
-      repository: input.repository,
-      state: appended.value.state,
-      stateHeadSha: appended.value.stateHeadSha,
-      synchronizedAt,
-      cachedAt: this.#cacheNow()
-    });
+    this.invalidateRepository(input.repository);
+    this.#putCachedProject(
+      cacheKey(input.repository, input.projectId),
+      cachedProject(input.repository, appended.value.state, appended.value.stateHeadSha, synchronizedAt, this.#cacheNow())
+    );
     return apiOk({
       state: appended.value.state,
       stateHeadSha: appended.value.stateHeadSha,
@@ -1685,80 +1792,302 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     });
   }
 
-  async #loadToolProject(input: JsonRecord, context: AuthContext, requireWrite: boolean): Promise<ApiResult<CachedProject>> {
+  async #loadToolProject(input: JsonRecord, context: AuthContext, requireWrite: boolean): Promise<ApiResult<AuthorizedProject>> {
     const repository = await this.#repositoryFromInput(context, record(input, "repository"), requireWrite);
     return repository.ok ? this.#loadProject(repository.value, requiredString(input, "projectId")) : repository;
   }
 
-  async #loadProject(repository: RepositoryLocator, projectId: string, force = false): Promise<ApiResult<CachedProject>> {
+  async #loadProject(repository: RepositoryGrant, projectId: string, force = false): Promise<ApiResult<AuthorizedProject>> {
     const key = cacheKey(repository, projectId);
+    const cached = force ? undefined : this.#getCachedProject(key, this.#cacheNow());
     if (!force) {
-      const cached = this.#cache.get(key);
-      if (cached && this.#cacheNow() - cached.cachedAt < PROJECTION_CACHE_TTL_MS) return apiOk(cached);
+      if (cached && cacheIsFresh(cached, this.#cacheNow())) return apiOk(authorizeProject(cached, repository));
     }
+
+    let generation = this.#captureCacheGeneration(repository);
+    if (cached) {
+      const stateHead = await this.#stateHead(repository);
+      if (!stateHead.ok) return stateHead;
+      if (stateHead.value === cached.stateHeadSha) {
+        if (!this.#cacheGenerationIsCurrent(generation)) return apiOk(authorizeProject(cached, repository));
+        const cachedAt = this.#cacheNow();
+        const refreshed = { ...cached, synchronizedAt: this.#timestamp(), cachedAt };
+        this.#putCachedProject(key, refreshed);
+        return apiOk(authorizeProject(refreshed, repository));
+      }
+      if (this.#cacheGenerationIsCurrent(generation)) {
+        this.invalidateRepository(repository);
+        generation = this.#captureCacheGeneration(repository);
+      }
+    }
+
     const read = await this.#store.readProject(repository, projectId);
     if (!read.ok) return storeFailure(read.error);
-    const entry = {
-      repository,
-      state: read.value.state,
-      stateHeadSha: read.value.stateHeadSha,
-      synchronizedAt: this.#timestamp(),
-      cachedAt: this.#cacheNow()
-    };
-    this.#cache.set(key, entry);
-    return apiOk(entry);
+    const entry = cachedProject(repository, read.value.state, read.value.stateHeadSha, this.#timestamp(), this.#cacheNow());
+    if (this.#cacheGenerationIsCurrent(generation)) {
+      this.invalidateRepository(repository);
+      this.#putCachedProject(key, entry);
+    }
+    return apiOk(authorizeProject(entry, repository));
   }
 
-  async #loadAllProjects(context: AuthContext, force = false, installationId?: number): Promise<ApiResult<CachedProject[]>> {
+  async #loadAllProjects(context: AuthContext, force = false, installationId?: number): Promise<ApiResult<AuthorizedProject[]>> {
     const repositories = await this.#authorizedRepositories(context, installationId);
     if (!repositories.ok) return repositories;
-    const entries: CachedProject[] = [];
+    const entries: AuthorizedProject[] = [];
     for (const repository of repositories.value) {
-      if (force) this.invalidateRepository(repository);
-      const reconstructed = await this.#store.reconstructRepository(repository);
-      if (!reconstructed.ok) return storeFailure(reconstructed.error);
-      for (const item of reconstructed.value) {
-        const entry = {
-          repository,
-          state: item.state,
-          stateHeadSha: item.stateHeadSha,
-          synchronizedAt: this.#timestamp(),
-          cachedAt: this.#cacheNow()
-        };
-        this.#cache.set(cacheKey(repository, projectIdOf(item.state)), entry);
-        entries.push(entry);
-      }
+      const loaded = await this.#loadRepositoryProjects(repository, force);
+      if (!loaded.ok) return loaded;
+      entries.push(...loaded.value);
     }
     return apiOk(entries);
   }
 
-  async #findProject(context: AuthContext, projectId: string, requireWrite = false): Promise<ApiResult<CachedProject>> {
+  async #findProject(context: AuthContext, projectId: string, requireWrite = false): Promise<ApiResult<AuthorizedProject>> {
     asProjectId(projectId);
     const repositories = await this.#authorizedRepositories(context);
     if (!repositories.ok) return repositories;
-    const matches: Array<{ entry: CachedProject; grant: RepositoryGrant }> = [];
+    const matches: AuthorizedProject[] = [];
     for (const repository of repositories.value) {
-      const cached = this.#cache.get(cacheKey(repository, projectId));
-      if (cached && this.#cacheNow() - cached.cachedAt < PROJECTION_CACHE_TTL_MS) {
-        matches.push({ entry: cached, grant: repository });
-        continue;
+      const loaded = await this.#loadProject(repository, projectId);
+      if (!loaded.ok) {
+        if (loaded.error.code === "not_found") continue;
+        return loaded;
       }
-      const read = await this.#store.readProject(repository, projectId);
-      if (!read.ok) {
-        if (read.error.code === "state_not_found" || read.error.code === "project_not_found") continue;
-        return storeFailure(read.error);
-      }
-      const entry = { repository, state: read.value.state, stateHeadSha: read.value.stateHeadSha, synchronizedAt: this.#timestamp(), cachedAt: this.#cacheNow() };
-      this.#cache.set(cacheKey(repository, projectId), entry);
-      matches.push({ entry, grant: repository });
+      matches.push(loaded.value);
     }
     if (matches.length === 0) return notFound(`Project ${projectId} was not found.`);
     if (matches.length > 1) return conflict(`Project id ${projectId} is ambiguous across the authorized repositories.`);
     const match = matches[0];
-    if (requireWrite && match.grant.permissions.contents !== "write") {
+    if (requireWrite && match.repository.permissions.contents !== "write") {
       return forbidden("The user's repository access does not allow Hunsu state writes.");
     }
-    return apiOk({ ...match.entry, repository: match.grant });
+    return apiOk(match);
+  }
+
+  async #loadRepositoryProjects(repository: RepositoryGrant, force: boolean): Promise<ApiResult<AuthorizedProject[]>> {
+    const key = repositoryCacheKey(repository);
+    const cached = force ? undefined : this.#getCachedCatalog(key, this.#cacheNow());
+    if (cached && cacheIsFresh(cached, this.#cacheNow())) {
+      const entries = this.#projectsFromCatalog(cached, repository);
+      if (entries) return apiOk(entries);
+    }
+
+    const generation = this.#captureCacheGeneration(repository);
+    let observedHead: string | undefined;
+    if (!force) {
+      const stateHead = await this.#stateHead(repository);
+      if (!stateHead.ok) return stateHead;
+      observedHead = stateHead.value;
+      if (cached && cached.stateHeadSha === observedHead && this.#cacheGenerationIsCurrent(generation)) {
+        const synchronizedAt = this.#timestamp();
+        const cachedAt = this.#cacheNow();
+        const refreshed = { ...cached, synchronizedAt, cachedAt };
+        const entries = this.#projectsFromCatalog(refreshed, repository, { synchronizedAt, cachedAt });
+        if (entries) {
+          this.#putCachedCatalog(key, refreshed);
+          return apiOk(entries);
+        }
+      }
+      if (observedHead === undefined) {
+        if (this.#cacheGenerationIsCurrent(generation)) {
+          this.invalidateRepository(repository);
+          const cachedAt = this.#cacheNow();
+          this.#putCachedCatalog(
+            key,
+            cachedRepositoryCatalog(repository, undefined, [], this.#timestamp(), cachedAt)
+          );
+        }
+        return apiOk([]);
+      }
+    }
+
+    const reconstructed = await this.#store.reconstructRepository(repository);
+    if (!reconstructed.ok) return storeFailure(reconstructed.error);
+    const projects = reconstructed.value.projects;
+    const synchronizedAt = this.#timestamp();
+    const cachedAt = this.#cacheNow();
+    const loaded: AuthorizedProject[] = [];
+    const entries: Array<{ key: string; entry: CachedProject }> = [];
+    for (const item of projects) {
+      const entry = cachedProject(repository, item.state, item.stateHeadSha, synchronizedAt, cachedAt);
+      entries.push({ key: cacheKey(repository, projectIdOf(item.state)), entry });
+      loaded.push(authorizeProject(entry, repository));
+    }
+    if (this.#cacheGenerationIsCurrent(generation)) {
+      this.invalidateRepository(repository);
+      for (const item of entries) this.#putCachedProject(item.key, item.entry);
+      this.#putCachedCatalog(
+        key,
+        cachedRepositoryCatalog(
+          repository,
+          reconstructed.value.kind === "state_branch" ? reconstructed.value.stateHeadSha : undefined,
+          projects.map(item => projectIdOf(item.state)),
+          synchronizedAt,
+          cachedAt
+        )
+      );
+    }
+    return apiOk(loaded);
+  }
+
+  #getCachedProject(key: string, now: number): CachedProject | undefined {
+    this.#pruneProjectionCaches(now);
+    const entry = this.#cache.get(key);
+    if (!entry) return undefined;
+    entry.lastAccessedAt = now;
+    entry.lastAccessOrder = this.#cacheAccessOrder();
+    return entry;
+  }
+
+  #putCachedProject(key: string, entry: CachedProject): void {
+    const now = this.#cacheNow();
+    this.#pruneProjectionCaches(now);
+    if (entry.sizeBytes > this.#cachePolicy.maxProjectBytes) {
+      this.#cache.delete(key);
+      return;
+    }
+    entry.lastAccessedAt = now;
+    entry.lastAccessOrder = this.#cacheAccessOrder();
+    this.#cache.set(key, entry);
+    this.#enforceProjectCacheBounds();
+  }
+
+  #getCachedCatalog(key: string, now: number): CachedRepositoryCatalog | undefined {
+    this.#pruneProjectionCaches(now);
+    const entry = this.#catalogCache.get(key);
+    if (!entry) return undefined;
+    entry.lastAccessedAt = now;
+    entry.lastAccessOrder = this.#cacheAccessOrder();
+    return entry;
+  }
+
+  #putCachedCatalog(key: string, entry: CachedRepositoryCatalog): void {
+    const now = this.#cacheNow();
+    this.#pruneProjectionCaches(now);
+    if (entry.sizeBytes > this.#cachePolicy.maxCatalogBytes) {
+      this.#catalogCache.delete(key);
+      return;
+    }
+    entry.lastAccessedAt = now;
+    entry.lastAccessOrder = this.#cacheAccessOrder();
+    this.#catalogCache.set(key, entry);
+    this.#enforceCatalogCacheBounds();
+  }
+
+  #projectsFromCatalog(
+    catalog: CachedRepositoryCatalog,
+    repository: RepositoryGrant,
+    refresh?: { synchronizedAt: string; cachedAt: number }
+  ): AuthorizedProject[] | undefined {
+    const entries: AuthorizedProject[] = [];
+    for (const projectId of catalog.projectIds) {
+      const key = cacheKey(repository, projectId);
+      const cached = this.#getCachedProject(key, this.#cacheNow());
+      if (!cached || cached.stateHeadSha !== catalog.stateHeadSha) return undefined;
+      const entry = refresh ? { ...cached, ...refresh } : cached;
+      if (refresh) this.#putCachedProject(key, entry);
+      entries.push(authorizeProject(entry, repository));
+    }
+    return entries;
+  }
+
+  #captureCacheGeneration(
+    repository: Pick<RepositoryLocator, "installationId" | "repositoryId">
+  ): CacheGenerationToken {
+    const now = this.#cacheNow();
+    this.#pruneCacheGenerations(now);
+    const repositoryKey = repositoryCacheKey(repository);
+    const current = this.#cacheGenerations.get(repositoryKey);
+    const generation = current?.generation ?? this.#cacheGeneration();
+    this.#cacheGenerations.set(repositoryKey, {
+      generation,
+      lastAccessedAt: now,
+      lastAccessOrder: this.#cacheAccessOrder()
+    });
+    this.#enforceGenerationCacheBounds();
+    return { repositoryKey, generation };
+  }
+
+  #advanceCacheGeneration(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): void {
+    const now = this.#cacheNow();
+    this.#pruneCacheGenerations(now);
+    this.#cacheGenerations.set(repositoryCacheKey(repository), {
+      generation: this.#cacheGeneration(),
+      lastAccessedAt: now,
+      lastAccessOrder: this.#cacheAccessOrder()
+    });
+    this.#enforceGenerationCacheBounds();
+  }
+
+  #cacheGenerationIsCurrent(token: CacheGenerationToken): boolean {
+    return this.#cacheGenerations.get(token.repositoryKey)?.generation === token.generation;
+  }
+
+  #pruneProjectionCaches(now: number): void {
+    for (const [key, entry] of this.#cache) {
+      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#cache.delete(key);
+    }
+    for (const [key, entry] of this.#catalogCache) {
+      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#catalogCache.delete(key);
+    }
+    this.#enforceProjectCacheBounds();
+    this.#enforceCatalogCacheBounds();
+  }
+
+  #pruneCacheGenerations(now: number): void {
+    for (const [key, entry] of this.#cacheGenerations) {
+      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#cacheGenerations.delete(key);
+    }
+    this.#enforceGenerationCacheBounds();
+  }
+
+  #enforceProjectCacheBounds(): void {
+    let totalBytes = 0;
+    for (const entry of this.#cache.values()) totalBytes += entry.sizeBytes;
+    if (this.#cache.size <= this.#cachePolicy.maxProjectEntries && totalBytes <= this.#cachePolicy.maxProjectBytes) return;
+    const candidates = sortedCacheEntries(this.#cache);
+    for (const [key, entry] of candidates) {
+      if (this.#cache.size <= this.#cachePolicy.maxProjectEntries && totalBytes <= this.#cachePolicy.maxProjectBytes) break;
+      if (this.#cache.delete(key)) totalBytes -= entry.sizeBytes;
+    }
+  }
+
+  #enforceCatalogCacheBounds(): void {
+    let totalBytes = 0;
+    for (const entry of this.#catalogCache.values()) totalBytes += entry.sizeBytes;
+    if (this.#catalogCache.size <= this.#cachePolicy.maxCatalogEntries && totalBytes <= this.#cachePolicy.maxCatalogBytes) return;
+    const candidates = sortedCacheEntries(this.#catalogCache);
+    for (const [key, entry] of candidates) {
+      if (this.#catalogCache.size <= this.#cachePolicy.maxCatalogEntries && totalBytes <= this.#cachePolicy.maxCatalogBytes) break;
+      if (this.#catalogCache.delete(key)) totalBytes -= entry.sizeBytes;
+    }
+  }
+
+  #enforceGenerationCacheBounds(): void {
+    if (this.#cacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) return;
+    const candidates = sortedCacheEntries(this.#cacheGenerations);
+    for (const [key] of candidates) {
+      if (this.#cacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) break;
+      this.#cacheGenerations.delete(key);
+    }
+  }
+
+  #cacheGeneration(): number {
+    const generation = this.#nextCacheGeneration;
+    this.#nextCacheGeneration += 1;
+    return generation;
+  }
+
+  #cacheAccessOrder(): number {
+    const order = this.#nextCacheAccessOrder;
+    this.#nextCacheAccessOrder += 1;
+    return order;
+  }
+
+  async #stateHead(repository: RepositoryLocator): Promise<ApiResult<string | undefined>> {
+    const result = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
+    return result.ok ? apiOk(result.value) : transportFailure(result.error.message, result.error.code === "forbidden" ? 403 : 503);
   }
 
   async #authorizedRepositories(context: AuthContext, requestedInstallationId?: number): Promise<ApiResult<RepositoryGrant[]>> {
@@ -2034,10 +2363,102 @@ function cacheKey(repository: Pick<RepositoryLocator, "installationId" | "reposi
   return `${repository.installationId}:${repository.repositoryId}:${projectId}`;
 }
 
-function projectionContext(entry: Pick<CachedProject, "repository" | "stateHeadSha" | "synchronizedAt">): ProjectionContext {
+function repositoryCacheKey(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): string {
+  return `${repository.installationId}:${repository.repositoryId}`;
+}
+
+function repositoryLocator(repository: RepositoryLocator): RepositoryLocator {
+  return {
+    installationId: repository.installationId,
+    repositoryId: repository.repositoryId,
+    owner: repository.owner,
+    name: repository.name,
+    defaultBranch: repository.defaultBranch
+  };
+}
+
+function cachedProject(
+  repository: RepositoryLocator,
+  state: ProjectState,
+  stateHeadSha: string,
+  synchronizedAt: string,
+  cachedAt: number
+): CachedProject {
+  const locator = repositoryLocator(repository);
+  return {
+    repository: locator,
+    state,
+    stateHeadSha,
+    synchronizedAt,
+    cachedAt,
+    lastAccessedAt: cachedAt,
+    lastAccessOrder: 0,
+    sizeBytes: encodedCacheSize({ repository: locator, state, stateHeadSha, synchronizedAt })
+  };
+}
+
+function cachedRepositoryCatalog(
+  repository: RepositoryLocator,
+  stateHeadSha: string | undefined,
+  projectIds: readonly string[],
+  synchronizedAt: string,
+  cachedAt: number
+): CachedRepositoryCatalog {
+  const locator = repositoryLocator(repository);
+  return {
+    repository: locator,
+    stateHeadSha,
+    projectIds: [...projectIds],
+    synchronizedAt,
+    cachedAt,
+    lastAccessedAt: cachedAt,
+    lastAccessOrder: 0,
+    sizeBytes: encodedCacheSize({ repository: locator, stateHeadSha, projectIds, synchronizedAt })
+  };
+}
+
+function authorizeProject(entry: CachedProject, repository: RepositoryGrant): AuthorizedProject {
+  return {
+    repository,
+    state: entry.state,
+    stateHeadSha: entry.stateHeadSha,
+    synchronizedAt: entry.synchronizedAt,
+    cachedAt: entry.cachedAt
+  };
+}
+
+function cacheIsFresh(entry: Pick<CachedProject, "cachedAt">, now: number): boolean {
+  const age = now - entry.cachedAt;
+  return age >= 0 && age < PROJECTION_CACHE_TTL_MS;
+}
+
+function projectionCachePolicy(overrides: Partial<ProjectionCachePolicy> | undefined): ProjectionCachePolicy {
+  const policy = { ...DEFAULT_PROJECTION_CACHE_POLICY, ...overrides };
+  for (const [name, value] of Object.entries(policy)) {
+    if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${name} must be a positive safe integer.`);
+  }
+  return policy;
+}
+
+function encodedCacheSize(value: unknown): number {
+  const serialized = JSON.stringify(value);
+  return serialized === undefined ? 0 : UTF8_ENCODER.encode(serialized).byteLength;
+}
+
+function cacheEntryIsIdle(lastAccessedAt: number, now: number, idleTtlMs: number): boolean {
+  const idleFor = now - lastAccessedAt;
+  return idleFor < 0 || idleFor >= idleTtlMs;
+}
+
+function sortedCacheEntries<T extends { lastAccessOrder: number }>(cache: Map<string, T>): Array<[string, T]> {
+  return [...cache.entries()].sort(([leftKey, left], [rightKey, right]) =>
+    left.lastAccessOrder - right.lastAccessOrder || (leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0));
+}
+
+function projectionContext(entry: Pick<AuthorizedProject, "repository" | "stateHeadSha" | "synchronizedAt">): ProjectionContext {
   return {
     health: {
-      repositoryAccess: entry.repository.permissions?.contents === "read" ? "read_only" : "healthy",
+      repositoryAccess: entry.repository.permissions.contents === "read" ? "read_only" : "healthy",
       stateRef: "healthy",
       stateRefName: HUNSU_STATE_BRANCH,
       stateHeadSha: entry.stateHeadSha,

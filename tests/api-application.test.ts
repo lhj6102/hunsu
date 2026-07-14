@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { HunsuApplicationService, type AuthContext } from "../apps/api/src/index.ts";
-import { MemoryGitHubTransport, type RepositoryGrant } from "../packages/github-store/src/index.ts";
+import {
+  HUNSU_STATE_BRANCH,
+  MemoryGitHubTransport,
+  type BranchSnapshot,
+  type RepositoryGrant,
+  type RepositoryLocator,
+  type TransportResult
+} from "../packages/github-store/src/index.ts";
 
 const INITIAL_SHA = "1".repeat(40);
 
@@ -790,7 +797,7 @@ test("repository authorization preserves multi-installation ambiguity checks", a
 });
 
 test("bounded projection polling recovers a missed webhook across API instances", async () => {
-  const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
   let cacheNow = 0;
   let tick = 0;
   const writer = new HunsuApplicationService({
@@ -829,10 +836,323 @@ test("bounded projection polling recovers a missed webhook across API instances"
   assert.equal((stillCached.value.project as { title: string }).title, "Before polling");
 
   cacheNow = 4_001;
+  const stateReadsBeforeChange = transport.stateBranchReads;
+  const headReadsBeforeChange = transport.stateHeadReads;
   const refreshed = await reader.webProject(webAuth, "project-polling");
   if (!refreshed.ok) assert.fail(refreshed.error.message);
   assert.equal((refreshed.value.project as { title: string }).title, "After polling");
   assert.notEqual(refreshed.value.stateHeadSha, first.value.stateHeadSha);
+  assert.equal(transport.stateHeadReads, headReadsBeforeChange + 1);
+  assert.equal(transport.stateBranchReads, stateReadsBeforeChange + 1);
+
+  cacheNow = 8_002;
+  const stateReadsBeforeUnchangedValidation = transport.stateBranchReads;
+  const headReadsBeforeUnchangedValidation = transport.stateHeadReads;
+  const unchanged = await reader.webProject(webAuth, "project-polling");
+  if (!unchanged.ok) assert.fail(unchanged.error.message);
+  assert.equal((unchanged.value.project as { title: string }).title, "After polling");
+  assert.equal(transport.stateHeadReads, headReadsBeforeUnchangedValidation + 1);
+  assert.equal(transport.stateBranchReads, stateReadsBeforeUnchangedValidation);
+});
+
+test("repository project listing caches an empty repository within the bounded polling window", async () => {
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  let cacheNow = 0;
+  const service = new HunsuApplicationService({ transport, cacheNow: () => cacheNow });
+  const webAuth = { ...auth, client: "web" as const };
+
+  assert.deepEqual(await service.webProjects(webAuth), { ok: true, value: { projects: [] } });
+  assert.equal(transport.stateHeadReads, 1);
+  assert.equal(transport.stateBranchReads, 0);
+
+  assert.deepEqual(await service.webProjects(webAuth), { ok: true, value: { projects: [] } });
+  assert.equal(transport.stateHeadReads, 1);
+  assert.equal(transport.stateBranchReads, 0);
+
+  cacheNow = 4_001;
+  assert.deepEqual(await service.webProjects(webAuth), { ok: true, value: { projects: [] } });
+  assert.equal(transport.stateHeadReads, 2);
+  assert.equal(transport.stateBranchReads, 0);
+});
+
+test("repository project listing reuses populated projections after an unchanged ref-only check", async () => {
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  let cacheNow = 0;
+  const service = new HunsuApplicationService({ transport, cacheNow: () => cacheNow });
+  await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-catalog",
+    title: "Cached catalog",
+    objective: "Reuse exact-head Project projections across list requests",
+    baseRef: "main",
+    coachId: "coach-catalog",
+    idempotencyKey: "project-catalog-create"
+  });
+  transport.stateHeadReads = 0;
+  transport.stateBranchReads = 0;
+  const webAuth = { ...auth, client: "web" as const };
+
+  const first = await service.webProjects(webAuth);
+  if (!first.ok) assert.fail(first.error.message);
+  assert.equal(first.value.projects.length, 1);
+  assert.equal(transport.stateHeadReads, 1);
+  assert.equal(transport.stateBranchReads, 1);
+
+  const second = await service.webProjects(webAuth);
+  if (!second.ok) assert.fail(second.error.message);
+  assert.equal(second.value.projects.length, 1);
+  assert.equal(transport.stateHeadReads, 1);
+  assert.equal(transport.stateBranchReads, 1);
+
+  cacheNow = 4_001;
+  const validated = await service.webProjects(webAuth);
+  if (!validated.ok) assert.fail(validated.error.message);
+  assert.equal(validated.value.projects.length, 1);
+  assert.equal(transport.stateHeadReads, 2);
+  assert.equal(transport.stateBranchReads, 1);
+});
+
+test("projection caches use ref-only validation before idle eviction forces reconstruction", async () => {
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  let cacheNow = 0;
+  const service = new HunsuApplicationService({
+    transport,
+    cacheNow: () => cacheNow,
+    projectionCachePolicy: { idleTtlMs: 10_000 }
+  });
+  await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-idle",
+    title: "Idle cache",
+    objective: "Bound projection residency independently from polling freshness",
+    baseRef: "main",
+    coachId: "coach-idle",
+    idempotencyKey: "project-idle-create"
+  });
+  const webAuth = { ...auth, client: "web" as const };
+  const primed = await service.webProjects(webAuth);
+  if (!primed.ok) assert.fail(primed.error.message);
+  transport.stateHeadReads = 0;
+  transport.stateBranchReads = 0;
+
+  cacheNow = 4_001;
+  const validated = await service.webProjects(webAuth);
+  if (!validated.ok) assert.fail(validated.error.message);
+  assert.equal(validated.value.projects.length, 1);
+  assert.equal(transport.stateHeadReads, 1);
+  assert.equal(transport.stateBranchReads, 0);
+
+  cacheNow = 14_001;
+  const reconstructed = await service.webProjects(webAuth);
+  if (!reconstructed.ok) assert.fail(reconstructed.error.message);
+  assert.equal(reconstructed.value.projects.length, 1);
+  assert.equal(transport.stateHeadReads, 2);
+  assert.equal(transport.stateBranchReads, 1);
+});
+
+test("Project projection capacity evicts the deterministic least-recently-used entry", async () => {
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({
+    transport,
+    projectionCachePolicy: { maxProjectEntries: 1 }
+  });
+  const projectA = await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-capacity-a",
+    title: "Capacity A",
+    objective: "Be the first projection inserted into a bounded cache",
+    baseRef: "main",
+    coachId: "coach-capacity-a",
+    idempotencyKey: "project-capacity-a-create"
+  });
+  await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-capacity-b",
+    title: "Capacity B",
+    objective: "Be the newest projection retained by a bounded cache",
+    baseRef: "main",
+    coachId: "coach-capacity-b",
+    idempotencyKey: "project-capacity-b-create",
+    expectedStateSha: projectA.stateHeadSha
+  });
+  const webAuth = { ...auth, client: "web" as const };
+  const listed = await service.webProjects(webAuth);
+  if (!listed.ok) assert.fail(listed.error.message);
+  assert.equal(listed.value.projects.length, 2);
+  const readsAfterListing = transport.stateBranchReads;
+
+  const newest = await service.webProject(webAuth, "project-capacity-b");
+  if (!newest.ok) assert.fail(newest.error.message);
+  assert.equal((newest.value.project as { title: string }).title, "Capacity B");
+  assert.equal(transport.stateBranchReads, readsAfterListing);
+
+  const evicted = await service.webProject(webAuth, "project-capacity-a");
+  if (!evicted.ok) assert.fail(evicted.error.message);
+  assert.equal((evicted.value.project as { title: string }).title, "Capacity A");
+  assert.equal(transport.stateBranchReads, readsAfterListing + 1);
+});
+
+test("oversize Project and repository catalog projections are not retained", async () => {
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({
+    transport,
+    projectionCachePolicy: { maxProjectBytes: 1, maxCatalogBytes: 1 }
+  });
+  await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-oversize",
+    title: "Oversize projection",
+    objective: "Prove byte limits prevent unbounded isolate memory retention",
+    baseRef: "main",
+    coachId: "coach-oversize",
+    idempotencyKey: "project-oversize-create"
+  });
+  transport.stateHeadReads = 0;
+  transport.stateBranchReads = 0;
+  const webAuth = { ...auth, client: "web" as const };
+
+  const first = await service.webProjects(webAuth);
+  if (!first.ok) assert.fail(first.error.message);
+  const second = await service.webProjects(webAuth);
+  if (!second.ok) assert.fail(second.error.message);
+  assert.equal(first.value.projects.length, 1);
+  assert.equal(second.value.projects.length, 1);
+  assert.equal(transport.stateHeadReads, 2);
+  assert.equal(transport.stateBranchReads, 2);
+});
+
+test("repository catalog capacity remains bounded across authorized repositories", async () => {
+  const secondRepository: RepositoryGrant = {
+    ...repository,
+    repositoryId: 30,
+    name: "product-two"
+  };
+  const transport = new CountingMemoryGitHubTransport([
+    { repository, initialSha: INITIAL_SHA },
+    { repository: secondRepository, initialSha: INITIAL_SHA }
+  ]);
+  const service = new HunsuApplicationService({
+    transport,
+    projectionCachePolicy: { maxCatalogEntries: 1 }
+  });
+  const webAuth: AuthContext = {
+    ...auth,
+    client: "web",
+    installations: [{
+      ...auth.installations[0],
+      repositories: [
+        { repositoryId: repository.repositoryId, permissions: { contents: "write" } },
+        { repositoryId: secondRepository.repositoryId, permissions: { contents: "write" } }
+      ]
+    }]
+  };
+
+  assert.deepEqual(await service.webProjects(webAuth), { ok: true, value: { projects: [] } });
+  assert.equal(transport.stateHeadReads, 2);
+  assert.deepEqual(await service.webProjects(webAuth), { ok: true, value: { projects: [] } });
+  assert.equal(transport.stateHeadReads, 4);
+});
+
+test("a deferred stale Project read cannot overwrite the cache published by a mutation", async () => {
+  const transport = new DeferredStateReadMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const created = await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-generation-race",
+    title: "Before mutation",
+    objective: "Reject stale asynchronous cache publication",
+    baseRef: "main",
+    coachId: "coach-generation-race",
+    idempotencyKey: "project-generation-race-create"
+  });
+  service.dropProjectionCache();
+  const deferred = transport.deferNextStateBranchRead();
+  const webAuth = { ...auth, client: "web" as const };
+  const staleRead = service.webProject(webAuth, "project-generation-race");
+  await deferred.captured;
+
+  await mutation(service, "hunsu.projects.update", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-generation-race",
+    title: "After mutation",
+    idempotencyKey: "project-generation-race-update",
+    expectedStateSha: created.stateHeadSha
+  });
+  deferred.release();
+  const stale = await staleRead;
+  if (!stale.ok) assert.fail(stale.error.message);
+  assert.equal((stale.value.project as { title: string }).title, "Before mutation");
+
+  const readsBeforeCurrent = transport.stateBranchReads;
+  const current = await service.webProject(webAuth, "project-generation-race");
+  if (!current.ok) assert.fail(current.error.message);
+  assert.equal((current.value.project as { title: string }).title, "After mutation");
+  assert.equal(transport.stateBranchReads, readsBeforeCurrent);
+});
+
+for (const invalidation of ["dropProjectionCache", "invalidateInstallation"] as const) {
+  test(`${invalidation} prevents a deferred Project read from repopulating invalidated cache state`, async () => {
+    const transport = new DeferredStateReadMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+    const service = new HunsuApplicationService({ transport });
+    await mutation(service, "hunsu.projects.create", {
+      repository: { owner: repository.owner, name: repository.name },
+      projectId: "project-invalidation-race",
+      title: "Invalidation race",
+      objective: "Keep invalidation authoritative over an older asynchronous read",
+      baseRef: "main",
+      coachId: "coach-invalidation-race",
+      idempotencyKey: "project-invalidation-race-create"
+    });
+    service.dropProjectionCache();
+    const deferred = transport.deferNextStateBranchRead();
+    const webAuth = { ...auth, client: "web" as const };
+    const staleRead = service.webProject(webAuth, "project-invalidation-race");
+    await deferred.captured;
+
+    if (invalidation === "dropProjectionCache") service.dropProjectionCache();
+    else service.invalidateInstallation(repository.installationId);
+    deferred.release();
+    const stale = await staleRead;
+    if (!stale.ok) assert.fail(stale.error.message);
+
+    const readsBeforeReload = transport.stateBranchReads;
+    const reloaded = await service.webProject(webAuth, "project-invalidation-race");
+    if (!reloaded.ok) assert.fail(reloaded.error.message);
+    assert.equal(transport.stateBranchReads, readsBeforeReload + 1);
+  });
+}
+
+test("an exact empty reconstruction cannot cache a newer state head with no Projects", async () => {
+  const transport = new DeferredStateReadMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const stateBranch = await transport.createBranch(repository, HUNSU_STATE_BRANCH, INITIAL_SHA);
+  assert.equal(stateBranch.ok, true);
+  if (!stateBranch.ok) return;
+  let cacheNow = 0;
+  const reader = new HunsuApplicationService({ transport, cacheNow: () => cacheNow });
+  const writer = new HunsuApplicationService({ transport });
+  const deferred = transport.deferNextStateBranchRead();
+  const webAuth = { ...auth, client: "web" as const };
+  const oldSnapshot = reader.webProjects(webAuth);
+  await deferred.captured;
+
+  await mutation(writer, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-exact-snapshot",
+    title: "Exact snapshot",
+    objective: "Keep repository Projects paired with the head that produced them",
+    baseRef: "main",
+    coachId: "coach-exact-snapshot",
+    idempotencyKey: "project-exact-snapshot-create",
+    expectedStateSha: stateBranch.value.headSha
+  });
+  deferred.release();
+  assert.deepEqual(await oldSnapshot, { ok: true, value: { projects: [] } });
+
+  cacheNow = 4_001;
+  const refreshed = await reader.webProjects(webAuth);
+  if (!refreshed.ok) assert.fail(refreshed.error.message);
+  assert.equal(refreshed.value.projects.length, 1);
+  assert.equal((refreshed.value.projects[0] as { title: string }).title, "Exact snapshot");
 });
 
 async function mutation(service: HunsuApplicationService, name: string, input: Record<string, unknown>) {
@@ -840,6 +1160,44 @@ async function mutation(service: HunsuApplicationService, name: string, input: R
   if (!response.ok) assert.fail(response.error.message);
   assert.ok(response.stateHeadSha);
   return { data: response.data, stateHeadSha: response.stateHeadSha };
+}
+
+class CountingMemoryGitHubTransport extends MemoryGitHubTransport {
+  stateHeadReads = 0;
+  stateBranchReads = 0;
+
+  override async readBranchHead(repository: RepositoryLocator, branch: string): Promise<TransportResult<string | undefined>> {
+    if (branch === HUNSU_STATE_BRANCH) this.stateHeadReads += 1;
+    return super.readBranchHead(repository, branch);
+  }
+
+  override async readBranch(repository: RepositoryLocator, branch: string): Promise<TransportResult<BranchSnapshot | undefined>> {
+    if (branch === HUNSU_STATE_BRANCH) this.stateBranchReads += 1;
+    return super.readBranch(repository, branch);
+  }
+}
+
+class DeferredStateReadMemoryGitHubTransport extends CountingMemoryGitHubTransport {
+  #deferred: { captured: () => void; released: Promise<void> } | undefined;
+
+  deferNextStateBranchRead(): { captured: Promise<void>; release: () => void } {
+    let markCaptured!: () => void;
+    let release!: () => void;
+    const captured = new Promise<void>(resolve => { markCaptured = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    this.#deferred = { captured: markCaptured, released };
+    return { captured, release };
+  }
+
+  override async readBranch(repository: RepositoryLocator, branch: string): Promise<TransportResult<BranchSnapshot | undefined>> {
+    const deferred = branch === HUNSU_STATE_BRANCH ? this.#deferred : undefined;
+    if (!deferred) return super.readBranch(repository, branch);
+    this.#deferred = undefined;
+    const snapshot = await super.readBranch(repository, branch);
+    deferred.captured();
+    await deferred.released;
+    return snapshot;
+  }
 }
 
 async function parityHarness() {
