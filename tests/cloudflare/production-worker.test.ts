@@ -1,5 +1,6 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { SessionManager } from "../../apps/api/src/auth/session.ts";
 
 const ORIGIN = "https://plugin.hunsu.app";
 
@@ -25,6 +26,20 @@ describe("plugin.hunsu.app Worker", () => {
     expect(source).toMatch(/apiBaseUrl\s*:\s*""/u);
   });
 
+  it("serves Vite fingerprinted assets with immutable browser caching", async () => {
+    const spaResponse = await fetchWorker("/");
+    const html = await spaResponse.text();
+    const assetPaths = [...html.matchAll(/(?:href|src)="(\/assets\/[^"]+\.(?:css|js))"/gu)]
+      .map(match => match[1]);
+
+    expect(assetPaths.length).toBeGreaterThan(0);
+    for (const assetPath of assetPaths) {
+      const response = await fetchWorker(assetPath);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    }
+  });
+
   it("returns the anonymous Web session contract as JSON", async () => {
     const response = await fetchWorker("/api/session");
 
@@ -37,6 +52,42 @@ describe("plugin.hunsu.app Worker", () => {
         connectUrl: "/api/auth/github"
       }
     });
+  });
+
+  it("reuses one isolate runtime and installation authority across dynamic requests", async () => {
+    const sessions = new SessionManager({
+      secret: "test-session-secret-that-is-at-least-thirty-two-bytes",
+      ttlSeconds: 3_600,
+      cookieName: "hunsu_session",
+      secure: true
+    });
+    const { token } = sessions.issue({
+      user: { id: "runtime-reuse-user", login: "runtime-reuse-user" },
+      installations: [{
+        id: 99,
+        accountLogin: "acme",
+        accountType: "organization",
+        repositories: [{ repositoryId: 199, permissions: { contents: "write" } }]
+      }],
+      selectedInstallationId: 99
+    });
+    const init = { headers: { cookie: `hunsu_session=${encodeURIComponent(token)}` } };
+
+    const first = await fetchWorker("/api/repositories", init);
+    const second = await fetchWorker("/api/repositories", init);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    for (const response of [first, second]) {
+      expect(await response.json()).toMatchObject({
+        repositories: [{
+          installationId: 99,
+          owner: "acme",
+          name: "runtime-reuse",
+          stateHeadSha: ""
+        }]
+      });
+    }
   });
 
   it("publishes same-origin OAuth resource and authorization-server metadata", async () => {

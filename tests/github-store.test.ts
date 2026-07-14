@@ -129,6 +129,110 @@ test("GitHub state writes are append-only, idempotent, and reconstruct from even
   if (reconstructed.ok) assert.deepEqual(reconstructed.value.state, { projectId: "project-alpha", title: "Alpha" });
 });
 
+test("repository reconstruction distinguishes a missing state branch from an exact empty snapshot", async () => {
+  const memory = new MemoryGitHubTransport([{ repository, initialSha: baseSha }]);
+  const store = new GitHubProjectStore(memory, codec);
+
+  const missing = await store.reconstructRepository(repository);
+  assert.deepEqual(missing, { ok: true, value: { kind: "state_branch_missing", projects: [] } });
+
+  const created = await memory.createBranch(repository, HUNSU_STATE_BRANCH, baseSha);
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+  const empty = await store.reconstructRepository(repository);
+  assert.deepEqual(empty, {
+    ok: true,
+    value: { kind: "state_branch", stateHeadSha: created.value.headSha, projects: [] }
+  });
+});
+
+test("Project discovery and append work when state reads contain only event files", async () => {
+  const memory = new MemoryGitHubTransport([{ repository, initialSha: baseSha }]);
+  const seedStore = new GitHubProjectStore(memory, codec);
+  const alpha = await seedStore.append({
+    repository,
+    projectId: "project-alpha",
+    baseSha,
+    idempotencyKey: "create-project-alpha-for-filtered-read",
+    occurredAt: "2026-07-13T00:00:00.000Z",
+    actor: { kind: "user", id: "user-1" },
+    command: { type: "CreateProject", title: "Alpha" },
+    decide: () => ({ ok: true, value: [{ type: "ProjectCreated", projectId: "project-alpha", title: "Alpha" }] })
+  });
+  assert.equal(alpha.ok, true);
+  if (!alpha.ok) return;
+  const beta = await seedStore.append({
+    repository,
+    projectId: "project-beta",
+    baseSha,
+    expectedHeadSha: alpha.value.stateHeadSha,
+    idempotencyKey: "create-project-beta-for-filtered-read",
+    occurredAt: "2026-07-13T00:01:00.000Z",
+    actor: { kind: "user", id: "user-1" },
+    command: { type: "CreateProject", title: "Beta" },
+    decide: () => ({ ok: true, value: [{ type: "ProjectCreated", projectId: "project-beta", title: "Beta" }] })
+  });
+  assert.equal(beta.ok, true);
+  if (!beta.ok) return;
+
+  const eventOnlyTransport: GitHubTransport = {
+    listInstallationRepositories: installationId => memory.listInstallationRepositories(installationId),
+    readBranchHead: (target, branch) => memory.readBranchHead(target, branch),
+    readBranch: async (target, branch) => {
+      const result = await memory.readBranch(target, branch);
+      if (!result.ok || !result.value || branch !== HUNSU_STATE_BRANCH) return result;
+      return {
+        ok: true,
+        value: {
+          headSha: result.value.headSha,
+          files: Object.fromEntries(Object.entries(result.value.files).filter(([path]) => path.includes("/events/")))
+        }
+      };
+    },
+    createBranch: (target, branch, fromSha) => memory.createBranch(target, branch, fromSha),
+    commitFiles: input => memory.commitFiles(input),
+    compareCommits: (target, base, head) => memory.compareCommits(target, base, head),
+    commitExists: (target, sha) => memory.commitExists(target, sha)
+  };
+  const store = new GitHubProjectStore(eventOnlyTransport, codec);
+  const discovered = await store.reconstructRepository(repository);
+  assert.equal(discovered.ok, true);
+  if (!discovered.ok) return;
+  assert.equal(discovered.value.kind, "state_branch");
+  assert.deepEqual(discovered.value.projects.map(project => project.state), [
+    { projectId: "project-alpha", title: "Alpha" },
+    { projectId: "project-beta", title: "Beta" }
+  ]);
+
+  const renamed = await store.append({
+    repository,
+    projectId: "project-alpha",
+    baseSha,
+    expectedHeadSha: beta.value.stateHeadSha,
+    idempotencyKey: "rename-project-alpha-from-filtered-read",
+    occurredAt: "2026-07-13T00:02:00.000Z",
+    actor: { kind: "user", id: "user-1" },
+    command: { type: "RenameProject", title: "Alpha renamed" },
+    decide: state => state?.title === "Alpha"
+      ? { ok: true, value: [{ type: "ProjectRenamed", projectId: "project-alpha", title: "Alpha renamed" }] }
+      : { ok: false, error: { code: "invalid_event", message: "filtered read did not reconstruct Alpha" } }
+  });
+  assert.equal(renamed.ok, true);
+  if (!renamed.ok) return;
+
+  const branch = await memory.readBranch(repository, HUNSU_STATE_BRANCH);
+  assert.equal(branch.ok, true);
+  if (!branch.ok || !branch.value) return;
+  const workspace: unknown = JSON.parse(branch.value.files[".hunsu/workspace.json"]);
+  assert.ok(isRecord(workspace));
+  assert.deepEqual(workspace.projectIds, ["project-alpha", "project-beta"]);
+  assert.deepEqual(JSON.parse(branch.value.files[".hunsu/projects/project-alpha/project.json"]), {
+    schema: "hunsu.project.v1",
+    projectId: "project-alpha",
+    title: "Alpha renamed"
+  });
+});
+
 test("fresh state initialization uses the authoritative created snapshot without a ref reread", async () => {
   const inheritedState = await storedProjectFiles();
   const memory = new MemoryGitHubTransport([{
@@ -139,6 +243,7 @@ test("fresh state initialization uses the authoritative created snapshot without
   let stateReads = 0;
   const transport: GitHubTransport = {
     listInstallationRepositories: installationId => memory.listInstallationRepositories(installationId),
+    readBranchHead: (target, branch) => memory.readBranchHead(target, branch),
     readBranch: async (target, branch) => {
       if (branch === HUNSU_STATE_BRANCH) {
         stateReads += 1;
@@ -181,6 +286,7 @@ test("an invisible concurrent state initialization fails retryably without decid
   const delays: number[] = [];
   const transport: GitHubTransport = {
     listInstallationRepositories: installationId => memory.listInstallationRepositories(installationId),
+    readBranchHead: async () => ({ ok: true, value: undefined }),
     readBranch: async () => ({ ok: true, value: undefined }),
     createBranch: async () => ({
       ok: false,
@@ -240,6 +346,7 @@ test("a concurrent state creator is observed through bounded retries before the 
   const delays: number[] = [];
   const transport: GitHubTransport = {
     listInstallationRepositories: installationId => memory.listInstallationRepositories(installationId),
+    readBranchHead: (target, branch) => memory.readBranchHead(target, branch),
     readBranch: async (target, branch) => {
       if (branch === HUNSU_STATE_BRANCH) {
         stateReads += 1;

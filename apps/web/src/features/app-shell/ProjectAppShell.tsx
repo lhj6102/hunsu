@@ -6,6 +6,7 @@ import {
   projectPath,
   pushAppPath,
   runnersPath,
+  shouldFetchProjectList,
   type AppRoute
 } from "@/app/routes";
 import { fetchProjects, PROJECT_LIST_QUERY_KEY } from "@/shared/api/projectApi";
@@ -27,13 +28,16 @@ export function ProjectAppShell({
 }) {
   const [collapsed, setCollapsed] = useState(() => window.innerWidth < 920);
   const projectId = "projectId" in route ? route.projectId : undefined;
+  const projectListEnabled = shouldFetchProjectList(route);
   const projectsQuery = useQuery({
     queryKey: PROJECT_LIST_QUERY_KEY,
     queryFn: ({ signal }) => fetchProjects(signal),
+    enabled: projectListEnabled,
     refetchInterval: 15_000,
     refetchIntervalInBackground: false
   });
   const projects = projectsQuery.data?.projects ?? [];
+  const projectListLoaded = projectsQuery.data !== undefined;
   const currentProject = useMemo(
     () => projects.find(project => project.id === projectId),
     [projectId, projects]
@@ -111,11 +115,14 @@ export function ProjectAppShell({
           {!collapsed ? (
             <div className="mb-2 flex items-center justify-between gap-2 px-2">
               <p className="text-[11px] font-semibold uppercase tracking-normal text-muted-foreground">Recent projects</p>
-              <Badge variant={projectsQuery.isError ? "destructive" : "outline"}>{projects.length}</Badge>
+              <Badge variant={projectsQuery.isError ? "destructive" : "outline"}>{projectListLoaded ? projects.length : "—"}</Badge>
             </div>
           ) : null}
           <ScrollArea className={cn("min-h-0 flex-1", !collapsed && "pr-1")}>
             <div className={cn("grid gap-1", collapsed && "justify-items-center")}>
+              {!collapsed && !projectListEnabled && !projectListLoaded ? (
+                <p className="px-2 py-1 text-[11px] leading-4 text-muted-foreground">Open Projects to browse recent work.</p>
+              ) : null}
               {projects.slice(0, 10).map(project => (
                 <button
                   key={project.id}

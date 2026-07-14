@@ -272,6 +272,110 @@ test("GitHub App installation tokens are short-lived and cached without exposing
   assert.equal(calls, 2);
 });
 
+test("GitHub App installation token cache uses deterministic least-recently-used eviction", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  let now = Date.UTC(2026, 6, 13);
+  let calls = 0;
+  const provider = new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    apiBaseUrl: "https://github-api.example.test",
+    now: () => now,
+    cacheMaxEntries: 2,
+    fetch: async (input) => {
+      calls += 1;
+      const match = /\/app\/installations\/(\d+)\/access_tokens$/u.exec(String(input));
+      assert.ok(match);
+      return jsonResponse({
+        token: `installation-${match[1]}-mint-${calls}`,
+        expires_at: new Date(now + 3_600_000).toISOString(),
+        permissions: { contents: "write" }
+      }, 201);
+    }
+  });
+
+  assert.equal((await provider.getAuthority(17)).token, "installation-17-mint-1");
+  now += 1_000;
+  assert.equal((await provider.getAuthority(18)).token, "installation-18-mint-2");
+  now += 1_000;
+  assert.equal((await provider.getAuthority(17)).token, "installation-17-mint-1");
+  now += 1_000;
+  assert.equal((await provider.getAuthority(19)).token, "installation-19-mint-3");
+
+  assert.equal((await provider.getAuthority(17)).token, "installation-17-mint-1");
+  assert.equal(calls, 3);
+  assert.equal((await provider.getAuthority(18)).token, "installation-18-mint-4");
+  assert.equal(calls, 4);
+});
+
+test("GitHub App installation token cache preserves newly minted entries during a same-timestamp burst", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const now = Date.UTC(2026, 6, 13);
+  let calls = 0;
+  const provider = new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    apiBaseUrl: "https://github-api.example.test",
+    now: () => now,
+    cacheMaxEntries: 2,
+    fetch: async (input) => {
+      calls += 1;
+      const match = /\/app\/installations\/(\d+)\/access_tokens$/u.exec(String(input));
+      assert.ok(match);
+      return jsonResponse({
+        token: `installation-${match[1]}-mint-${calls}`,
+        expires_at: new Date(now + 3_600_000).toISOString(),
+        permissions: { contents: "write" }
+      }, 201);
+    }
+  });
+
+  assert.equal((await provider.getAuthority(18)).token, "installation-18-mint-1");
+  assert.equal((await provider.getAuthority(19)).token, "installation-19-mint-2");
+  assert.equal((await provider.getAuthority(17)).token, "installation-17-mint-3");
+
+  assert.equal((await provider.getAuthority(17)).token, "installation-17-mint-3");
+  assert.equal((await provider.getAuthority(19)).token, "installation-19-mint-2");
+  assert.equal(calls, 3);
+  assert.equal((await provider.getAuthority(18)).token, "installation-18-mint-4");
+  assert.equal(calls, 4);
+});
+
+test("GitHub App installation token cache prunes unusable entries before capacity eviction", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  let now = Date.UTC(2026, 6, 13);
+  let calls = 0;
+  const provider = new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    apiBaseUrl: "https://github-api.example.test",
+    now: () => now,
+    cacheMaxEntries: 2,
+    fetch: async (input) => {
+      calls += 1;
+      const match = /\/app\/installations\/(\d+)\/access_tokens$/u.exec(String(input));
+      assert.ok(match);
+      const installationId = Number(match[1]);
+      return jsonResponse({
+        token: `installation-${installationId}-mint-${calls}`,
+        expires_at: new Date(now + (installationId === 18 ? 120_000 : 3_600_000)).toISOString(),
+        permissions: { contents: "write" }
+      }, 201);
+    }
+  });
+
+  assert.equal((await provider.getAuthority(17)).token, "installation-17-mint-1");
+  now += 1_000;
+  assert.equal((await provider.getAuthority(18)).token, "installation-18-mint-2");
+  now += 61_000;
+  assert.equal((await provider.getAuthority(19)).token, "installation-19-mint-3");
+
+  assert.equal((await provider.getAuthority(17)).token, "installation-17-mint-1");
+  assert.equal(calls, 3);
+  assert.equal((await provider.getAuthority(18)).token, "installation-18-mint-4");
+  assert.equal(calls, 4);
+});
+
 test("GitHub App installation tokens fail closed without Contents write permission", async () => {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const now = Date.UTC(2026, 6, 13);

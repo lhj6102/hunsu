@@ -6,6 +6,7 @@ import type {
   GitHubTransport,
   ProjectStateCodec,
   ReconstructedProject,
+  ReconstructedRepository,
   RepositoryLocator,
   StateActor,
   StoreError,
@@ -44,10 +45,10 @@ export class GitHubProjectStore<Event, State> {
     return this.#reconstructProject(branch.value, repository, projectId);
   }
 
-  async reconstructRepository(repository: RepositoryLocator): Promise<StoreResult<ReconstructedProject<State>[]>> {
+  async reconstructRepository(repository: RepositoryLocator): Promise<StoreResult<ReconstructedRepository<State>>> {
     const branch = await this.#transport.readBranch(repository, HUNSU_STATE_BRANCH);
     if (!branch.ok) return transportFailure(branch.error);
-    if (!branch.value) return ok([]);
+    if (!branch.value) return ok({ kind: "state_branch_missing", projects: [] });
     const projectIds = projectIdsFromFiles(branch.value.files);
     const projects: ReconstructedProject<State>[] = [];
     for (const projectId of projectIds) {
@@ -55,7 +56,7 @@ export class GitHubProjectStore<Event, State> {
       if (!project.ok) return project;
       projects.push(project.value);
     }
-    return ok(projects);
+    return ok({ kind: "state_branch", stateHeadSha: branch.value.headSha, projects });
   }
 
   async append(command: AppendProjectCommand<Event, State>): Promise<StoreResult<AppendProjectResult<State>>> {

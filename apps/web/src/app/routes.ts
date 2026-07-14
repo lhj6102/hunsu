@@ -6,6 +6,10 @@ export type AppRoute =
   | { kind: "coach"; projectId: string }
   | { kind: "run"; projectId: string; runId: string };
 
+export function shouldFetchProjectList(route: AppRoute): boolean {
+  return route.kind === "projects";
+}
+
 export function parseAppRoute(location: Pick<Location, "pathname">): AppRoute {
   const parts = location.pathname.split("/").filter(Boolean).map(decodeURIComponent);
   if (parts.length === 1 && parts[0] === "projects") {

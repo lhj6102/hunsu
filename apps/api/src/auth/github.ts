@@ -8,6 +8,14 @@ type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<
 
 const GITHUB_API_VERSION = "2026-03-10";
 const GITHUB_USER_AGENT = "hunsu-plugin-production";
+const INSTALLATION_TOKEN_REFRESH_SKEW_SECONDS = 60;
+const INSTALLATION_TOKEN_CACHE_MAX_ENTRIES = 128;
+
+type CachedInstallationAuthority = {
+  authority: ContentsWriteInstallationAuthority;
+  expiresAt: number;
+  lastUsedOrder: number;
+};
 
 export class GitHubAppTokenProvider {
   readonly #appId: number;
@@ -15,7 +23,9 @@ export class GitHubAppTokenProvider {
   readonly #fetch: FetchLike;
   readonly #apiBaseUrl: string;
   readonly #now: () => number;
-  readonly #cache = new Map<number, { authority: ContentsWriteInstallationAuthority; expiresAt: number }>();
+  readonly #cacheMaxEntries: number;
+  readonly #cache = new Map<number, CachedInstallationAuthority>();
+  #cacheAccessOrder = 0;
 
   constructor(input: {
     appId: number;
@@ -23,6 +33,7 @@ export class GitHubAppTokenProvider {
     fetch?: FetchLike;
     apiBaseUrl?: string;
     now?: () => number;
+    cacheMaxEntries?: number;
   }) {
     this.#appId = input.appId;
     this.#privateKey = input.privateKey;
@@ -32,13 +43,22 @@ export class GitHubAppTokenProvider {
       : (request, init) => globalThis.fetch(request, init);
     this.#apiBaseUrl = (input.apiBaseUrl ?? "https://api.github.com").replace(/\/$/u, "");
     this.#now = input.now ?? (() => Date.now());
+    const cacheMaxEntries = input.cacheMaxEntries ?? INSTALLATION_TOKEN_CACHE_MAX_ENTRIES;
+    if (!Number.isSafeInteger(cacheMaxEntries) || cacheMaxEntries <= 0) {
+      throw new Error("GitHub installation token cache capacity must be a positive safe integer.");
+    }
+    this.#cacheMaxEntries = cacheMaxEntries;
   }
 
   getAuthority = async (installationId: number): Promise<ContentsWriteInstallationAuthority> => {
     if (!Number.isSafeInteger(installationId) || installationId <= 0) throw new Error("Invalid GitHub installation id.");
     const now = Math.floor(this.#now() / 1000);
+    this.#pruneTokenCache(now);
     const cached = this.#cache.get(installationId);
-    if (cached && cached.expiresAt - 60 > now) return cached.authority;
+    if (cached) {
+      cached.lastUsedOrder = this.#nextCacheAccessOrder();
+      return cached.authority;
+    }
 
     const response = await this.#fetch(`${this.#apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
       method: "POST",
@@ -68,12 +88,42 @@ export class GitHubAppTokenProvider {
       token: body.token,
       permissions: { contents: "write" }
     };
-    this.#cache.set(installationId, { authority, expiresAt });
+    this.#cache.set(installationId, {
+      authority,
+      expiresAt,
+      lastUsedOrder: this.#nextCacheAccessOrder()
+    });
+    this.#pruneTokenCache(now);
     return authority;
   };
 
   invalidate(installationId: number): void {
     this.#cache.delete(installationId);
+  }
+
+  #pruneTokenCache(now: number): void {
+    for (const [installationId, cached] of this.#cache) {
+      if (cached.expiresAt - INSTALLATION_TOKEN_REFRESH_SKEW_SECONDS <= now) {
+        this.#cache.delete(installationId);
+      }
+    }
+    while (this.#cache.size > this.#cacheMaxEntries) {
+      let oldest: { installationId: number; lastUsedOrder: number } | undefined;
+      for (const [installationId, cached] of this.#cache) {
+        if (!oldest
+          || cached.lastUsedOrder < oldest.lastUsedOrder
+          || (cached.lastUsedOrder === oldest.lastUsedOrder && installationId < oldest.installationId)) {
+          oldest = { installationId, lastUsedOrder: cached.lastUsedOrder };
+        }
+      }
+      if (!oldest) return;
+      this.#cache.delete(oldest.installationId);
+    }
+  }
+
+  #nextCacheAccessOrder(): number {
+    this.#cacheAccessOrder += 1;
+    return this.#cacheAccessOrder;
   }
 
   #appJwt(now: number): string {
