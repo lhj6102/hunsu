@@ -1,8 +1,8 @@
 {
   "name": "@hunsu/core",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": false,
-  "description": "Pure Hunsu command decisions, state transitions, and invariant checks.",
+  "description": "Pure Hunsu Commit Node decisions, state transitions, and graph invariant checks.",
   "license": "Apache-2.0",
   "type": "module",
   "exports": {

@@ -124,3 +124,56 @@ select {
     var(--apple-canvas-alt);
   color: var(--apple-ink);
 }
+
+.event-filter-input {
+  height: 2.25rem;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 0.625rem;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 0 0.75rem;
+  color: var(--apple-ink);
+  font-size: 0.6875rem;
+  outline: none;
+}
+
+.event-filter-input:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 24%, transparent);
+}
+
+.react-flow__controls {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 8px 22px rgba(29, 29, 31, 0.08);
+}
+
+.react-flow__controls-button {
+  border-color: var(--border) !important;
+  background: transparent !important;
+}
+
+.react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.88) !important;
+}
+
+.react-flow__node:focus-visible {
+  border-radius: 0.8125rem;
+  outline: 3px solid color-mix(in srgb, var(--ring) 28%, transparent);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -10,7 +10,7 @@ const repository: RepositoryLocator = {
   defaultBranch: "main"
 };
 const eventPath = `projects/project-alpha/events/2026/07/${"1".repeat(32)}.json`;
-const eventFilePath = `.hunsu/${eventPath}`;
+const eventFilePath = `.hunsu/v2/${eventPath}`;
 
 test("GitHub REST transport uses installation authority and a non-forced CAS update", async () => {
   const parentSha = "a".repeat(40);
@@ -46,7 +46,7 @@ test("GitHub REST transport uses installation authority and a non-forced CAS upd
     branch: "hunsu/state",
     expectedHeadSha: parentSha,
     message: "Hunsu state mutation",
-    updates: [{ path: ".hunsu/workspace.json", content: "{}\n" }]
+    updates: [{ path: ".hunsu/v2/workspace.json", content: "{}\n" }]
   });
   assert.deepEqual(committed, { ok: true, value: resultSha });
   assert.equal(tokenRequests, calls.length);
@@ -66,7 +66,7 @@ test("GitHub REST transport uses installation authority and a non-forced CAS upd
   assert.deepEqual(treeBody, {
     base_tree: "tree-parent",
     tree: [{
-      path: ".hunsu/workspace.json",
+      path: ".hunsu/v2/workspace.json",
       mode: "100644",
       type: "blob",
       content: "{}\n"
@@ -94,7 +94,7 @@ test("GitHub REST transport rejects a stale head before creating a tree", async 
     branch: "hunsu/state",
     expectedHeadSha: "a".repeat(40),
     message: "stale",
-    updates: [{ path: ".hunsu/workspace.json", content: "{}\n" }]
+    updates: [{ path: ".hunsu/v2/workspace.json", content: "{}\n" }]
   });
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error.code, "conflict");
@@ -492,6 +492,261 @@ test("GitHub REST invalidates a rejected installation token and retries once", a
   ]);
 });
 
+test("GitHub REST reads and creates immutable managed Node tags", async () => {
+  const nodeSha = "b".repeat(40);
+  const ref = `refs/tags/hunsu/node/project-alpha/${nodeSha}`;
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if ((init.method ?? "GET") === "GET" && url.endsWith(`/git/ref/tags/hunsu/node/project-alpha/${nodeSha}`)) {
+        return json({ ref, object: { sha: nodeSha } });
+      }
+      if (init.method === "POST" && url.endsWith("/git/refs")) {
+        return json({ ref, object: { sha: nodeSha } }, 201);
+      }
+      return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
+    }
+  });
+
+  assert.deepEqual(await transport.readRef(repository, ref), { ok: true, value: nodeSha });
+  assert.deepEqual(await transport.createRef(repository, ref, nodeSha), { ok: true, value: nodeSha });
+  const read = calls[0];
+  assert.equal(read.init.cache, "no-store");
+  const create = calls[1];
+  assert.equal(create.init.method, "POST");
+  assert.deepEqual(JSON.parse(String(create.init.body)), { ref, sha: nodeSha });
+});
+
+test("GitHub REST batches managed Node anchor verification by paginated ref connection", async () => {
+  const projectId = "project-alpha";
+  const prefix = `refs/tags/hunsu/node/${projectId}/`;
+  const commits = Array.from({ length: 201 }, (_, index) => {
+    const nodeSha = (index + 1).toString(16).padStart(40, "0");
+    return {
+      prefix: "refs/tags/",
+      name: `hunsu/node/${projectId}/${nodeSha}`,
+      target: {
+        __typename: "Commit",
+        oid: nodeSha,
+        message: `Node ${index + 1}\n\nManaged by Hunsu.`,
+        tree: { oid: (index + 1001).toString(16).padStart(40, "0") }
+      }
+    };
+  });
+  const bodies: Array<Record<string, unknown>> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async (_input, init = {}) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const variables = body.variables as Record<string, unknown>;
+      const after = variables.after;
+      const offset = after === null ? 0 : Number(String(after).replace("cursor-", ""));
+      const nodes = commits.slice(offset, offset + 100);
+      const next = offset + nodes.length;
+      return json({
+        data: {
+          repository: {
+            refs: {
+              nodes,
+              pageInfo: {
+                hasNextPage: next < commits.length,
+                endCursor: next < commits.length ? `cursor-${next}` : null
+              }
+            }
+          }
+        }
+      });
+    }
+  });
+
+  const result = await transport.listManagedNodeAnchors(repository, projectId);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.value.length, 201);
+  assert.equal(bodies.length, 3, "201 Nodes require three GraphQL requests, not 402 per-Node REST calls");
+  assert.deepEqual(bodies.map(body => (body.variables as Record<string, unknown>).after), [null, "cursor-100", "cursor-200"]);
+  assert.equal((bodies[0]!.variables as Record<string, unknown>).refPrefix, prefix);
+  assert.match(String(bodies[0]!.query), /refs\(refPrefix: \$refPrefix/u);
+  assert.deepEqual(result.value[0], {
+    managedRef: `${commits[0]!.prefix}${commits[0]!.name}`,
+    nodeSha: commits[0]!.target.oid,
+    treeSha: commits[0]!.target.tree.oid,
+    commitMessage: commits[0]!.target.message
+  });
+});
+
+test("GitHub REST verifies only requested managed Node anchors in bounded exact batches", async () => {
+  const projectId = "project-alpha";
+  const nodeShas = Array.from({ length: 101 }, (_, index) => (index + 1).toString(16).padStart(40, "0"));
+  const bodies: Array<{ query: string; variables: Record<string, string> }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async (_input, init = {}) => {
+      const body = JSON.parse(String(init.body)) as { query: string; variables: Record<string, string> };
+      bodies.push(body);
+      const refs = Object.entries(body.variables).filter(([key]) => /^ref\d+$/u.test(key));
+      return json({ data: { repository: Object.fromEntries(refs.map(([key, ref]) => {
+        const nodeSha = ref.split("/").at(-1)!;
+        return [key.replace("ref", "r"), {
+          target: {
+            __typename: "Commit", oid: nodeSha, message: `Node ${nodeSha.slice(-4)}`,
+            tree: { oid: `${nodeSha.slice(0, 39)}f` }
+          }
+        }];
+      })) } });
+    }
+  });
+
+  const result = await transport.readManagedNodeAnchors(repository, projectId, nodeShas);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.value.length, 101);
+  assert.equal(bodies.length, 3);
+  assert.deepEqual(bodies.map(body => Object.keys(body.variables).filter(key => /^ref\d+$/u.test(key)).length), [50, 50, 1]);
+  assert.equal(bodies.every(body => body.query.includes("ref(qualifiedName:") && !body.query.includes("refs(refPrefix:")), true);
+  assert.deepEqual(result.value.map(anchor => anchor.nodeSha), nodeShas);
+});
+
+test("GitHub REST rejects unmanaged refs and mismatched managed-ref creation responses", async () => {
+  const nodeSha = "b".repeat(40);
+  const ref = `refs/tags/hunsu/node/project-alpha/${nodeSha}`;
+  let calls = 0;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async () => {
+      calls += 1;
+      return json({
+        ref: `refs/tags/hunsu/node/project-beta/${nodeSha}`,
+        object: { sha: nodeSha }
+      }, 201);
+    }
+  });
+
+  const unmanagedRead = await transport.readRef(repository, "refs/tags/release/v1");
+  assert.equal(unmanagedRead.ok, false);
+  if (!unmanagedRead.ok) assert.equal(unmanagedRead.error.code, "invalid_response");
+  const invalidSha = await transport.createRef(repository, ref, "not-a-full-sha");
+  assert.equal(invalidSha.ok, false);
+  if (!invalidSha.ok) assert.equal(invalidSha.error.code, "invalid_response");
+  assert.equal(calls, 0);
+
+  const mismatched = await transport.createRef(repository, ref, nodeSha);
+  assert.equal(mismatched.ok, false);
+  if (!mismatched.ok) {
+    assert.equal(mismatched.error.code, "invalid_response");
+    assert.match(mismatched.error.message, /unexpected ref or commit SHA/u);
+  }
+  assert.equal(calls, 1);
+});
+
+test("GitHub REST reads full commit structure and maps a missing commit to undefined", async () => {
+  const commitSha = "c".repeat(40);
+  const treeSha = "d".repeat(40);
+  const parentSha = "a".repeat(40);
+  let missing = false;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async input => missing
+      ? json({ message: "Not Found" }, 404)
+      : json({ sha: commitSha, tree: { sha: treeSha }, parents: [{ sha: parentSha }], message: "Run result\n\nEvidence complete." })
+  });
+
+  assert.deepEqual(await transport.readCommit(repository, commitSha), {
+    ok: true,
+    value: { sha: commitSha, treeSha, parentShas: [parentSha], message: "Run result\n\nEvidence complete." }
+  });
+  missing = true;
+  assert.deepEqual(await transport.readCommit(repository, commitSha), { ok: true, value: undefined });
+});
+
+test("GitHub REST creates deterministic Coaching-compatible commits", async () => {
+  const sourceSha = "a".repeat(40);
+  const treeSha = "b".repeat(40);
+  const coachingSha = "c".repeat(40);
+  const timestamp = "2026-07-15T01:02:03.000Z";
+  const message = `Hunsu coaching project-alpha/proposal-one\n\nNode-Plan-Digest: ${"d".repeat(64)}`;
+  const bodies: unknown[] = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async (_input, init = {}) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return json({ sha: coachingSha, tree: { sha: treeSha }, parents: [{ sha: sourceSha }], message }, 201);
+    }
+  });
+  const input = { repository, parentSha: sourceSha, treeSha, message, timestamp };
+
+  const expected = {
+    ok: true as const,
+    value: { sha: coachingSha, treeSha, parentShas: [sourceSha], message }
+  };
+  assert.deepEqual(await transport.createCommit(input), expected);
+  assert.deepEqual(await transport.createCommit(input), expected);
+  assert.equal(bodies.length, 2);
+  assert.deepEqual(bodies[0], {
+    message,
+    tree: treeSha,
+    parents: [sourceSha],
+    author: { name: "Hunsu", email: "noreply@hunsu.app", date: timestamp },
+    committer: { name: "Hunsu", email: "noreply@hunsu.app", date: timestamp }
+  });
+  assert.deepEqual(bodies[1], bodies[0]);
+});
+
+test("GitHub REST rejects malformed commit inputs and responses", async () => {
+  const sourceSha = "a".repeat(40);
+  const treeSha = "b".repeat(40);
+  let calls = 0;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async () => {
+      calls += 1;
+      return json({ sha: "c".repeat(40), tree: { sha: treeSha }, parents: [], message: "Coaching" }, 201);
+    }
+  });
+
+  const invalid = await transport.createCommit({
+    repository,
+    parentSha: sourceSha,
+    treeSha,
+    message: "Coaching",
+    timestamp: "2026-07-15T01:02:03Z"
+  });
+  assert.equal(invalid.ok, false);
+  if (!invalid.ok) assert.equal(invalid.error.code, "invalid_response");
+  assert.equal(calls, 0);
+
+  const malformed = await transport.readCommit(repository, sourceSha);
+  assert.equal(malformed.ok, false);
+  if (!malformed.ok) {
+    assert.equal(malformed.error.code, "invalid_response");
+    assert.match(malformed.error.message, /invalid SHA/u);
+  }
+  assert.equal(calls, 1);
+
+  const mismatchedCreated = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async () => json({
+      sha: "c".repeat(40),
+      tree: { sha: treeSha },
+      parents: [{ sha: sourceSha }],
+      message: "Unexpected message"
+    }, 201)
+  });
+  const mismatched = await mismatchedCreated.createCommit({
+    repository,
+    parentSha: sourceSha,
+    treeSha,
+    message: "Coaching",
+    timestamp: "2026-07-15T01:02:03.000Z"
+  });
+  assert.equal(mismatched.ok, false);
+  if (!mismatched.ok) assert.match(mismatched.error.message, /exactly match/u);
+});
+
 test("GitHub REST initializes state from the created ref response without rereading the ref", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const transport = new GitHubRestTransport({
@@ -500,7 +755,7 @@ test("GitHub REST initializes state from the created ref response without reread
       const url = String(input);
       calls.push({ url, init });
       if (init.method === "POST" && url.endsWith("/git/refs")) {
-        return json({ object: { sha: "a".repeat(40) } }, 201);
+        return json({ ref: "refs/heads/hunsu/state", object: { sha: "a".repeat(40) } }, 201);
       }
       if (url.endsWith(`/git/commits/${"a".repeat(40)}`)) {
         return json({ tree: { sha: "created-root-tree" } });
@@ -508,7 +763,10 @@ test("GitHub REST initializes state from the created ref response without reread
       if (url.endsWith("/git/trees/created-root-tree")) {
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "created-state-tree" }] });
       }
-      if (url.endsWith("/git/trees/created-state-tree?recursive=1")) {
+      if (url.endsWith("/git/trees/created-state-tree")) {
+        return json({ tree: [{ path: "v2", type: "tree", sha: "created-v2-tree" }] });
+      }
+      if (url.endsWith("/git/trees/created-v2-tree?recursive=1")) {
         return json({ truncated: false, tree: [{ path: `projects/project-alpha/events/2026/07/${"1".repeat(32)}.json`, type: "blob", sha: "event-blob" }] });
       }
       if (url.endsWith("/graphql")) {
@@ -522,10 +780,26 @@ test("GitHub REST initializes state from the created ref response without reread
     ok: true,
     value: {
       headSha: "a".repeat(40),
-      files: { [`.hunsu/projects/project-alpha/events/2026/07/${"1".repeat(32)}.json`]: "{}\n" }
+      files: { [`.hunsu/v2/projects/project-alpha/events/2026/07/${"1".repeat(32)}.json`]: "{}\n" }
     }
   });
   assert.equal(calls.some(call => call.url.includes("/git/ref/")), false);
+});
+
+test("GitHub REST rejects a created branch response with the wrong ref or base SHA", async () => {
+  const baseSha = "a".repeat(40);
+  let calls = 0;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async () => {
+      calls += 1;
+      return json({ ref: "refs/heads/hunsu/run/wrong", object: { sha: "b".repeat(40) } }, 201);
+    }
+  });
+  const created = await transport.createBranch(repository, "hunsu/run/project/base/run", baseSha);
+  assert.equal(created.ok, false);
+  if (!created.ok) assert.match(created.error.message, /unexpected ref or base commit/u);
+  assert.equal(calls, 1, "a mismatched create response must fail before any tree read");
 });
 
 test("GitHub REST reads only the dedicated state subtree", async () => {
@@ -542,7 +816,11 @@ test("GitHub REST reads only the dedicated state subtree", async () => {
         { path: ".hunsu", type: "tree", sha: "state-tree" },
         { path: "src", type: "tree", sha: "source-tree" }
       ] });
-      if (url.endsWith("/git/trees/state-tree?recursive=1")) return json({ truncated: false, tree: [
+      if (url.endsWith("/git/trees/state-tree")) return json({ tree: [
+        { path: "v2", type: "tree", sha: "v2-tree" },
+        { path: "legacy", type: "tree", sha: "v1-tree" }
+      ] });
+      if (url.endsWith("/git/trees/v2-tree?recursive=1")) return json({ truncated: false, tree: [
         { path: eventPath, type: "blob", sha: "event-blob" }
       ] });
       if (url.endsWith("/graphql")) {
@@ -554,17 +832,44 @@ test("GitHub REST reads only the dedicated state subtree", async () => {
   const result = await transport.readBranch(repository, "hunsu/state");
   assert.deepEqual(result, { ok: true, value: { headSha, files: { [eventFilePath]: "{}\n" } } });
   assert.equal(calls.some(url => url.includes("source-tree")), false);
+  assert.equal(calls.some(url => url.includes("v1-tree")), false);
 });
+
+for (const scenario of ["repository root", "Hunsu state root"] as const) {
+  test(`GitHub REST rejects a truncated ${scenario} before treating v2 state as absent`, async () => {
+    const headSha = "d".repeat(40);
+    const transport = new GitHubRestTransport({
+      authorityProvider: async () => verifiedAuthority("test-installation-value"),
+      fetch: async input => {
+        const url = String(input);
+        if (url.includes("/git/ref/heads/hunsu/state")) return json({ object: { sha: headSha } });
+        if (url.endsWith(`/git/commits/${headSha}`)) return json({ tree: { sha: "root-tree" } });
+        if (url.endsWith("/git/trees/root-tree")) {
+          return scenario === "repository root"
+            ? json({ truncated: true, tree: [] })
+            : json({ truncated: false, tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
+        }
+        if (url.endsWith("/git/trees/state-tree")) return json({ truncated: true, tree: [] });
+        return json({ message: `Unexpected ${url}` }, 500);
+      }
+    });
+
+    const result = await transport.readBranch(repository, "hunsu/state");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "invalid_response");
+      assert.match(result.error.message, /truncated/u);
+    }
+  });
+}
 
 test("GitHub REST fetches reconstruction inputs without downloading derived materializations", async () => {
   const headSha = "d".repeat(40);
-  const eventContent = "{\"schema\":\"hunsu.project-event.v1\"}\n";
+  const eventContent = "{\"schema\":\"hunsu.project-event.v2\"}\n";
   const derived = [
     { path: "projects/project-alpha/project.json", sha: "project-blob" },
-    { path: "projects/project-alpha/coach.json", sha: "coach-blob" },
-    { path: "projects/project-alpha/goals/goal-one.json", sha: "goal-blob" },
-    { path: "projects/project-alpha/runners/player-one.json", sha: "runner-blob" },
-    { path: "projects/project-alpha/runs/run-one.json", sha: "run-blob" },
+    { path: `projects/project-alpha/nodes/${"a".repeat(40)}/node.hunsu`, sha: "node-blob" },
+    { path: "projects/project-alpha/graph/latest.json", sha: "graph-blob" },
     { path: "projects/project-alpha/snapshots/latest.json", sha: "snapshot-blob" }
   ];
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -578,7 +883,10 @@ test("GitHub REST fetches reconstruction inputs without downloading derived mate
       if (url.endsWith("/git/trees/root-tree")) {
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
       }
-      if (url.endsWith("/git/trees/state-tree?recursive=1")) {
+      if (url.endsWith("/git/trees/state-tree")) {
+        return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+      }
+      if (url.endsWith("/git/trees/v2-tree?recursive=1")) {
         return json({ truncated: false, tree: [
           { path: "workspace.json", type: "blob", sha: "workspace-blob", size: 100 },
           { path: eventPath, type: "blob", sha: "event-blob", size: Buffer.byteLength(eventContent, "utf8") },
@@ -599,7 +907,7 @@ test("GitHub REST fetches reconstruction inputs without downloading derived mate
     value: {
       headSha,
       files: {
-        [`.hunsu/${eventPath}`]: eventContent
+        [`.hunsu/v2/${eventPath}`]: eventContent
       }
     }
   });
@@ -608,6 +916,319 @@ test("GitHub REST fetches reconstruction inputs without downloading derived mate
     .flatMap(call => graphqlOidVariables((JSON.parse(String(call.init.body)) as { variables: Record<string, string> }).variables));
   assert.deepEqual(requestedOids, ["event-blob"]);
   assert.equal(derived.some(entry => requestedOids.includes(entry.sha)), false);
+});
+
+test("exact-head dashboard reads fetch only requested read models or the selected Node payload", async () => {
+  const headSha = "e".repeat(40);
+  const selectedNodeSha = "a".repeat(40);
+  const siblingNodeSha = "b".repeat(40);
+  const projectRoot = ".hunsu/v2/projects/project-alpha";
+  const fixtures = [
+    { path: ".hunsu/v2/workspace.json", sha: "1".repeat(40), content: "workspace\n" },
+    { path: `${projectRoot}/project.json`, sha: "2".repeat(40), content: "catalog alpha\n" },
+    { path: ".hunsu/v2/projects/project-beta/project.json", sha: "3".repeat(40), content: "catalog beta\n" },
+    { path: `${projectRoot}/graph/latest.json`, sha: "4".repeat(40), content: "graph\n" },
+    { path: `${projectRoot}/snapshots/latest.json`, sha: "5".repeat(40), content: "activity\n" },
+    { path: `${projectRoot}/indexes/events/latest.json`, sha: "6".repeat(40), content: "event index\n" },
+    { path: `${projectRoot}/events/2026/07/${"1".repeat(32)}.json`, sha: "7".repeat(40), content: "raw event\n" },
+    { path: `${projectRoot}/nodes/${selectedNodeSha}/node.hunsu`, sha: "8".repeat(40), content: "selected node\n" },
+    { path: `${projectRoot}/nodes/${siblingNodeSha}/node.hunsu`, sha: "9".repeat(40), content: "sibling node\n" }
+  ];
+  const fixtureByPath = new Map(fixtures.map(fixture => [fixture.path, fixture]));
+  const contents = new Map(fixtures.map(fixture => [fixture.sha, fixture.content]));
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async (input, init = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/graphql")) {
+        const body = JSON.parse(String(init.body)) as { query: string };
+        return body.query.includes("ResolveExactHunsuState")
+          ? graphqlExactStateResponse(init, headSha, fixtureByPath)
+          : graphqlBlobResponse(init, contents);
+      }
+      return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
+    }
+  });
+
+  const reads = [
+    {
+      selections: [
+        { kind: "workspace" },
+        { kind: "project_read_model", projectId: "project-alpha", model: "catalog" },
+        { kind: "project_read_model", projectId: "project-beta", model: "catalog" }
+      ] as const,
+      expectedPaths: [
+        ".hunsu/v2/projects/project-alpha/project.json",
+        ".hunsu/v2/projects/project-beta/project.json",
+        ".hunsu/v2/workspace.json"
+      ],
+      expectedOids: ["1".repeat(40), "2".repeat(40), "3".repeat(40)]
+    },
+    {
+      selections: [{ kind: "project_read_model", projectId: "project-alpha", model: "graph" }] as const,
+      expectedPaths: [`${projectRoot}/graph/latest.json`],
+      expectedOids: ["4".repeat(40)]
+    },
+    {
+      selections: [{ kind: "project_read_model", projectId: "project-alpha", model: "event_index" }] as const,
+      expectedPaths: [`${projectRoot}/indexes/events/latest.json`],
+      expectedOids: ["6".repeat(40)]
+    },
+    {
+      selections: [{ kind: "node_payload", projectId: "project-alpha", nodeSha: selectedNodeSha }] as const,
+      expectedPaths: [`${projectRoot}/nodes/${selectedNodeSha}/node.hunsu`],
+      expectedOids: ["8".repeat(40)]
+    }
+  ];
+
+  for (const read of reads) {
+    const start = calls.length;
+    const result = await transport.readStateFilesAtHead(repository, headSha, read.selections);
+    assert.equal(result.ok, true);
+    if (!result.ok) continue;
+    assert.equal(result.value.stateHeadSha, headSha);
+    assert.equal(result.value.v2State, "present");
+    assert.deepEqual(Object.keys(result.value.files).sort(), [...read.expectedPaths].sort());
+    const readCalls = calls.slice(start);
+    const requestedOids = readCalls
+      .filter(call => call.url.endsWith("/graphql"))
+      .flatMap(call => graphqlOidVariables((JSON.parse(String(call.init.body)) as { variables: Record<string, string> }).variables));
+    assert.deepEqual(requestedOids.sort(), [...read.expectedOids].sort());
+    const requestedPaths = readCalls
+      .filter(call => call.url.endsWith("/graphql"))
+      .flatMap(call => graphqlExpressionPaths((JSON.parse(String(call.init.body)) as { variables: Record<string, string> }).variables, headSha));
+    assert.deepEqual(requestedPaths.sort(), [...read.expectedPaths].sort());
+    assert.equal(readCalls.some(call => call.url.includes("/git/trees/")), false);
+    assert.equal(readCalls.some(call => call.url.includes("/git/commits/")), false);
+    assert.equal(readCalls.some(call => call.url.includes("/git/ref/")), false);
+    assert.equal(requestedOids.includes("7".repeat(40)), false);
+    assert.equal(requestedOids.includes("9".repeat(40)), false);
+  }
+});
+
+test("exact-head reads distinguish a v1-only state commit from corrupt v2 state", async () => {
+  const headSha = "c".repeat(40);
+  const v1Calls: Array<{ url: string; init: RequestInit }> = [];
+  const v1Only = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async (input, init = {}) => {
+      v1Calls.push({ url: String(input), init });
+      return json({ data: { repository: {
+        head: { __typename: "Commit", oid: headSha },
+        v2: null,
+        b0: null
+      } } });
+    }
+  });
+
+  assert.deepEqual(await v1Only.readStateFilesAtHead(repository, headSha, [{ kind: "workspace" }]), {
+    ok: true,
+    value: { stateHeadSha: headSha, v2State: "absent", files: {} }
+  });
+  const derived = await v1Only.readStateFilesAtHead(repository, headSha, [{
+    kind: "project_read_model",
+    projectId: "project-alpha",
+    model: "graph"
+  }]);
+  assert.equal(derived.ok, false);
+  if (!derived.ok) assert.equal(derived.error.code, "not_found");
+  assert.equal(v1Calls.length, 2);
+  assert.equal(v1Calls.some(call => call.url.includes("/git/trees/")), false);
+
+  let corruptCalls = 0;
+  const corruptV2 = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async () => {
+      corruptCalls += 1;
+      return json({ data: { repository: {
+        head: { __typename: "Commit", oid: headSha },
+        v2: { __typename: "Tree", oid: "d".repeat(40) },
+        b0: null
+      } } });
+    }
+  });
+  const corrupt = await corruptV2.readStateFilesAtHead(repository, headSha, [{ kind: "workspace" }]);
+  assert.equal(corrupt.ok, false);
+  if (!corrupt.ok) assert.equal(corrupt.error.code, "not_found");
+  assert.equal(corruptCalls, 1);
+});
+
+for (const scenario of [
+  {
+    name: "a missing exact head",
+    repositoryData: { head: null, v2: null, b0: null },
+    code: "not_found"
+  },
+  {
+    name: "a mismatched exact head OID",
+    repositoryData: {
+      head: { __typename: "Commit", oid: "d".repeat(40) },
+      v2: { __typename: "Tree", oid: "a".repeat(40) },
+      b0: null
+    },
+    code: "invalid_response"
+  },
+  {
+    name: "a non-commit exact head",
+    repositoryData: {
+      head: { __typename: "Blob", oid: "c".repeat(40) },
+      v2: { __typename: "Tree", oid: "a".repeat(40) },
+      b0: null
+    },
+    code: "invalid_response"
+  },
+  {
+    name: "a non-tree v2 root",
+    repositoryData: {
+      head: { __typename: "Commit", oid: "c".repeat(40) },
+      v2: { __typename: "Blob", oid: "a".repeat(40) },
+      b0: null
+    },
+    code: "invalid_response"
+  },
+  {
+    name: "a non-blob selected path",
+    repositoryData: {
+      head: { __typename: "Commit", oid: "c".repeat(40) },
+      v2: { __typename: "Tree", oid: "a".repeat(40) },
+      b0: { __typename: "Tree", oid: "b".repeat(40) }
+    },
+    code: "invalid_response"
+  }
+] as const) {
+  test(`exact-head reads reject ${scenario.name}`, async () => {
+    const headSha = "c".repeat(40);
+    let calls = 0;
+    const transport = new GitHubRestTransport({
+      authorityProvider: async () => verifiedAuthority("test-installation-value"),
+      fetch: async () => {
+        calls += 1;
+        return json({ data: { repository: scenario.repositoryData } });
+      }
+    });
+    const result = await transport.readStateFilesAtHead(repository, headSha, [{ kind: "workspace" }]);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, scenario.code);
+    assert.equal(calls, 1);
+  });
+}
+
+test("exact-head reads reject oversized metadata before requesting blob content or REST fallback", async () => {
+  const headSha = "c".repeat(40);
+  const nodeSha = "b".repeat(40);
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async (input, init = {}) => {
+      calls.push({ url: String(input), init });
+      return json({ data: { repository: {
+        head: { __typename: "Commit", oid: headSha },
+        v2: { __typename: "Tree", oid: "a".repeat(40) },
+        b0: {
+          __typename: "Blob",
+          oid: "d".repeat(40),
+          byteSize: 2 * 1024 * 1024 + 1,
+          isBinary: false
+        }
+      } } });
+    }
+  });
+  const result = await transport.readStateFilesAtHead(repository, headSha, [{
+    kind: "node_payload",
+    projectId: "project-alpha",
+    nodeSha
+  }]);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "invalid_response");
+    assert.match(result.error.message, /exceeds its/u);
+  }
+  assert.equal(calls.length, 1);
+  assert.equal(calls.some(call => call.url.includes("/git/blobs/")), false);
+  const query = (JSON.parse(String(calls[0].init.body)) as { query: string }).query;
+  assert.match(query, /ResolveExactHunsuState/u);
+  assert.doesNotMatch(query, /ReadHunsuBlobs/u);
+});
+
+test("exact-head reads single-flight and cache immutable selections without sharing mutable snapshots", async () => {
+  const headSha = "c".repeat(40);
+  const path = ".hunsu/v2/workspace.json";
+  const content = "workspace current\n";
+  const fixture = { sha: "d".repeat(40), content };
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async (input, init = {}) => {
+      calls.push({ url: String(input), init });
+      const body = JSON.parse(String(init.body)) as { query: string };
+      return body.query.includes("ResolveExactHunsuState")
+        ? graphqlExactStateResponse(init, headSha, new Map([[path, fixture]]))
+        : graphqlBlobResponse(init, new Map([[fixture.sha, fixture.content]]));
+    }
+  });
+  const selection = [{ kind: "workspace" }] as const;
+  const concurrent = await Promise.all([
+    transport.readStateFilesAtHead(repository, headSha, selection),
+    transport.readStateFilesAtHead(repository, headSha, selection),
+    transport.readStateFilesAtHead(repository, headSha, selection)
+  ]);
+  assert.equal(concurrent.every(result => result.ok), true);
+  assert.equal(calls.length, 2);
+  const first = concurrent[0];
+  if (first.ok) (first.value.files as Record<string, string>)[path] = "mutated\n";
+  const cached = await transport.readStateFilesAtHead(repository, headSha, selection);
+  assert.equal(cached.ok, true);
+  if (cached.ok) assert.equal(cached.value.files[path], content);
+  assert.equal(calls.length, 2);
+});
+
+test("exact-head reads bound truncated-blob REST fallback to four objects", async () => {
+  const headSha = "c".repeat(40);
+  const fixtures = Array.from({ length: 5 }, (_, index) => ({
+    path: `.hunsu/v2/projects/project-${index}/project.json`,
+    sha: (index + 1).toString(16).repeat(40),
+    content: `catalog ${index}\n`
+  }));
+  const fixtureByPath = new Map(fixtures.map(fixture => [fixture.path, fixture]));
+  const contentByOid = new Map(fixtures.map(fixture => [fixture.sha, fixture.content]));
+  let restReads = 0;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    fetch: async (input, init = {}) => {
+      const url = String(input);
+      if (url.endsWith("/graphql")) {
+        const body = JSON.parse(String(init.body)) as { query: string; variables: Record<string, string> };
+        if (body.query.includes("ResolveExactHunsuState")) return graphqlExactStateResponse(init, headSha, fixtureByPath);
+        const oids = graphqlOidVariables(body.variables);
+        return json({ data: { repository: Object.fromEntries(oids.map((oid, index) => [
+          `b${index}`,
+          { ...graphqlBlob(oid, contentByOid.get(oid) ?? ""), text: null }
+        ])) } });
+      }
+      const oid = url.match(/\/git\/blobs\/([0-9a-f]{40})$/u)?.[1];
+      if (oid) {
+        restReads += 1;
+        const content = contentByOid.get(oid) ?? "";
+        return json({
+          sha: oid,
+          size: Buffer.byteLength(content, "utf8"),
+          encoding: "base64",
+          content: Buffer.from(content, "utf8").toString("base64")
+        });
+      }
+      return json({ message: `Unexpected ${url}` }, 500);
+    }
+  });
+  const result = await transport.readStateFilesAtHead(repository, headSha, fixtures.map((_, index) => ({
+    kind: "project_read_model" as const,
+    projectId: `project-${index}`,
+    model: "catalog" as const
+  })));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.error.message, /too many truncated/u);
+  assert.equal(restReads, 4);
 });
 
 test("GitHub REST batches 501 unique state blob OIDs into two GraphQL requests and deduplicates a shared OID", async () => {
@@ -633,7 +1254,8 @@ test("GitHub REST batches 501 unique state blob OIDs into two GraphQL requests a
       if (url.endsWith("/git/trees/root-tree")) {
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
       }
-      if (url.endsWith("/git/trees/state-tree?recursive=1")) return json({ truncated: false, tree: entries });
+      if (url.endsWith("/git/trees/state-tree")) return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+      if (url.endsWith("/git/trees/v2-tree?recursive=1")) return json({ truncated: false, tree: entries });
       if (url.endsWith("/graphql")) return graphqlBlobResponse(init, contents);
       return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
     }
@@ -642,8 +1264,8 @@ test("GitHub REST batches 501 unique state blob OIDs into two GraphQL requests a
   const result = await transport.readBranch(repository, "hunsu/state");
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.value?.files[`.hunsu/${fixtures[500].path}`], fixtures[500].content);
-  assert.equal(result.value?.files[`.hunsu/${sharedPath}`], fixtures[0].content);
+  assert.equal(result.value?.files[`.hunsu/v2/${fixtures[500].path}`], fixtures[500].content);
+  assert.equal(result.value?.files[`.hunsu/v2/${sharedPath}`], fixtures[0].content);
   assert.equal(calls.filter(call => call.url.endsWith("/graphql")).length, 2);
   assert.equal(calls.some(call => call.url.includes("/git/blobs/")), false);
   const graphqlBodies = calls
@@ -672,7 +1294,8 @@ test("GitHub REST rejects state above the explicit Free-plan blob budget before 
       if (url.endsWith("/git/trees/root-tree")) {
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
       }
-      if (url.endsWith("/git/trees/state-tree?recursive=1")) return json({ truncated: false, tree: entries });
+      if (url.endsWith("/git/trees/state-tree")) return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+      if (url.endsWith("/git/trees/v2-tree?recursive=1")) return json({ truncated: false, tree: entries });
       if (url.endsWith("/graphql")) graphqlRequests += 1;
       return json({ message: `Unexpected ${url}` }, 500);
     }
@@ -704,7 +1327,10 @@ for (const fallback of [
         if (url.endsWith("/git/trees/root-tree")) {
           return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
         }
-        if (url.endsWith("/git/trees/state-tree?recursive=1")) {
+        if (url.endsWith("/git/trees/state-tree")) {
+          return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+        }
+        if (url.endsWith("/git/trees/v2-tree?recursive=1")) {
           return json({ truncated: false, tree: [{
             path: eventPath,
             type: "blob",
@@ -714,6 +1340,7 @@ for (const fallback of [
         }
         if (url.endsWith("/graphql")) {
           return json({ data: { repository: { b0: {
+            __typename: "Blob",
             oid: "event-blob",
             byteSize: Buffer.byteLength(content, "utf8"),
             isBinary: false,
@@ -723,7 +1350,12 @@ for (const fallback of [
         }
         if (url.endsWith("/git/blobs/event-blob")) {
           restBlobReads += 1;
-          return json({ encoding: "base64", content: Buffer.from(content, "utf8").toString("base64") });
+          return json({
+            sha: "event-blob",
+            size: Buffer.byteLength(content, "utf8"),
+            encoding: "base64",
+            content: Buffer.from(content, "utf8").toString("base64")
+          });
         }
         return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
       }
@@ -751,7 +1383,10 @@ test("GitHub REST allocates four REST fallbacks when a small state read has requ
       if (url.endsWith("/git/trees/root-tree")) {
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
       }
-      if (url.endsWith("/git/trees/state-tree?recursive=1")) {
+      if (url.endsWith("/git/trees/state-tree")) {
+        return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+      }
+      if (url.endsWith("/git/trees/v2-tree?recursive=1")) {
         return json({ truncated: false, tree: fixtures.map(fixture => ({
           path: fixture.path,
           type: "blob",
@@ -769,7 +1404,13 @@ test("GitHub REST allocates four REST fallbacks when a small state read has requ
       const restSha = url.match(/\/git\/blobs\/([0-9a-f]{40})$/u)?.[1];
       if (restSha) {
         restBlobReads += 1;
-        return json({ encoding: "base64", content: Buffer.from(contents.get(restSha) ?? "", "utf8").toString("base64") });
+        const content = contents.get(restSha) ?? "";
+        return json({
+          sha: restSha,
+          size: Buffer.byteLength(content, "utf8"),
+          encoding: "base64",
+          content: Buffer.from(content, "utf8").toString("base64")
+        });
       }
       return json({ message: `Unexpected ${init.method ?? "GET"} ${url}` }, 500);
     }
@@ -833,7 +1474,10 @@ test("GitHub REST recognizes a successful-status GraphQL rate-limit response", a
       if (url.endsWith("/git/trees/root-tree")) {
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
       }
-      if (url.endsWith("/git/trees/state-tree?recursive=1")) {
+      if (url.endsWith("/git/trees/state-tree")) {
+        return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+      }
+      if (url.endsWith("/git/trees/v2-tree?recursive=1")) {
         return json({ truncated: false, tree: [{
           path: eventPath,
           type: "blob",
@@ -878,7 +1522,10 @@ for (const scenario of invalidGraphqlBlobResponses) {
         if (url.endsWith("/git/trees/root-tree")) {
           return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
         }
-        if (url.endsWith("/git/trees/state-tree?recursive=1")) {
+        if (url.endsWith("/git/trees/state-tree")) {
+          return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+        }
+        if (url.endsWith("/git/trees/v2-tree?recursive=1")) {
           return json({ truncated: false, tree: [{
             path: eventPath,
             type: "blob",
@@ -937,7 +1584,10 @@ test("GitHub REST keeps a 6001-blob completion-shaped sequence below the Workers
       if (method === "GET" && url.endsWith("/git/trees/root-tree")) {
         return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
       }
-      if (method === "GET" && url.endsWith("/git/trees/state-tree?recursive=1")) {
+      if (method === "GET" && url.endsWith("/git/trees/state-tree")) {
+        return json({ tree: [{ path: "v2", type: "tree", sha: "v2-tree" }] });
+      }
+      if (method === "GET" && url.endsWith("/git/trees/v2-tree?recursive=1")) {
         return json({ truncated: false, tree: entries });
       }
       if (method === "POST" && url.endsWith("/graphql")) return graphqlBlobResponse(init, contents);
@@ -974,7 +1624,7 @@ test("GitHub REST keeps a 6001-blob completion-shaped sequence below the Workers
     expectedHeadSha: headSha,
     message: "Complete Hunsu Run",
     updates: Array.from({ length: 8 }, (_, index) => ({
-      path: `.hunsu/events/event-${index}.json`,
+      path: `.hunsu/v2/projects/project/events/2026/07/event-${index}.json`,
       content: `{"event":${index}}\n`
     }))
   }), { ok: true, value: committedSha });
@@ -983,7 +1633,7 @@ test("GitHub REST keeps a 6001-blob completion-shaped sequence below the Workers
   const installationTokenMintRequests = 1;
   assert.equal(calls.filter(call => call.url.endsWith("/graphql")).length, 26);
   assert.equal(calls.some(call => call.url.endsWith("/git/blobs")), false);
-  assert.equal(githubRequests, 45);
+  assert.equal(githubRequests, 47);
   assert.ok(githubRequests + installationTokenMintRequests < 50);
 });
 
@@ -1042,6 +1692,45 @@ function graphqlBlobResponse(init: RequestInit, contents: ReadonlyMap<string, st
   return json({ data: { repository } });
 }
 
+function graphqlExactStateResponse(
+  init: RequestInit,
+  headSha: string,
+  fixtures: ReadonlyMap<string, { readonly sha: string; readonly content: string }>
+): Response {
+  const body = JSON.parse(String(init.body)) as { variables: Record<string, string> };
+  const repository: Record<string, unknown> = {
+    head: { __typename: "Commit", oid: headSha },
+    v2: { __typename: "Tree", oid: "f".repeat(40) }
+  };
+  const expressions = Object.entries(body.variables)
+    .filter(([key]) => /^expr\d+$/u.test(key))
+    .sort(([left], [right]) => Number(left.slice(4)) - Number(right.slice(4)));
+  for (let index = 0; index < expressions.length; index += 1) {
+    const expression = expressions[index][1];
+    const path = expression.slice(`${headSha}:`.length);
+    const fixture = fixtures.get(path);
+    repository[`b${index}`] = fixture === undefined
+      ? null
+      : {
+          __typename: "Blob",
+          oid: fixture.sha,
+          byteSize: Buffer.byteLength(fixture.content, "utf8"),
+          isBinary: false
+        };
+  }
+  return json({ data: { repository } });
+}
+
+function graphqlExpressionPaths(variables: Record<string, string>, headSha: string): string[] {
+  return Object.entries(variables)
+    .filter(([key]) => /^expr\d+$/u.test(key))
+    .sort(([left], [right]) => Number(left.slice(4)) - Number(right.slice(4)))
+    .map(([, expression]) => {
+      assert.ok(expression.startsWith(`${headSha}:`));
+      return expression.slice(`${headSha}:`.length);
+    });
+}
+
 function graphqlOidVariables(variables: Record<string, string>): string[] {
   return Object.entries(variables)
     .filter(([key]) => /^oid\d+$/u.test(key))
@@ -1051,6 +1740,7 @@ function graphqlOidVariables(variables: Record<string, string>): string[] {
 
 function graphqlBlob(sha: string, content: string) {
   return {
+    __typename: "Blob",
     oid: sha,
     byteSize: Buffer.byteLength(content, "utf8"),
     isBinary: false,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   GitHubWebhookProcessor,
@@ -232,6 +232,61 @@ test("rate-limited API responses expose an exact Retry-After boundary", async ()
   });
 });
 
+test("REST mutation boundaries reject unsupported top-level lifecycle fields", async () => {
+  const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const sessions = new SessionManager({
+    secret: "test-session-secret-that-is-at-least-thirty-two-bytes",
+    ttlSeconds: 3600,
+    cookieName: "hunsu_session",
+    secure: true
+  });
+  const stateStore = new InMemoryEphemeralStateStore();
+  const app = new HunsuHttpApp({
+    service,
+    sessions,
+    githubOAuth: {
+      authorizationUrl: () => "https://github.example.test/authorize",
+      authenticate: async () => ({ ok: true, value: { user: webContext.user, installations: [...webContext.installations] } })
+    } as unknown as GitHubOAuthClient,
+    mcpOAuth: new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, stateStore }),
+    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore }),
+    publicApiUrl: API,
+    webUrl: WEB,
+    githubAppSlug: "hunsu-test"
+  });
+  const issued = sessions.issue({
+    user: webContext.user,
+    installations: webContext.installations,
+    selectedInstallationId: 17
+  });
+  const cookie = `hunsu_session=${encodeURIComponent(issued.token)}`;
+  const nodeSha = "a".repeat(40);
+  const routes = [
+    "/api/projects",
+    `/api/projects/project-v2/nodes/${nodeSha}/runs`,
+    "/api/projects/project-v2/runs/run-1/complete",
+    `/api/projects/project-v2/nodes/${nodeSha}/coaching/proposals`,
+    "/api/projects/project-v2/coaching/proposals/proposal-1/confirm",
+    "/api/projects/project-v2/comparisons",
+    "/api/projects/project-v2/decisions/select",
+    "/api/projects/project-v2/decisions/reject"
+  ];
+
+  for (const [index, path] of routes.entries()) {
+    const idempotencyKey = `strict-input-${index}`;
+    const response = await app.handle(jsonRequest(`${API}${path}`, {
+      expectedStateSha: "b".repeat(40),
+      idempotencyKey,
+      unsupportedLifecycleField: true
+    }, { cookie, origin: WEB, "idempotency-key": idempotencyKey }));
+    assert.equal(response.status, 400, path);
+    const body = await response.json() as { error: { code: string; message: string } };
+    assert.equal(body.error.code, "invalid_request", path);
+    assert.match(body.error.message, /unsupportedLifecycleField/u, path);
+  }
+});
+
 test("OAuth authorization requires an explicit, same-session, single-use consent POST", async () => {
   let now = Date.UTC(2026, 6, 13, 1, 0, 0);
   const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
@@ -371,22 +426,35 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
   assert.equal(deniedRedirect.searchParams.has("code"), false);
 });
 
-test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts, and webhook reconciliation", async () => {
-  const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
-  let tick = 0;
-  const service = new HunsuApplicationService({ transport, now: () => new Date(Date.UTC(2026, 6, 13, 2, 0, tick++)) });
-  const projectCreated = await service.call("hunsu.projects.create", {
-    repository: { owner: "acme", name: "product" },
-    projectId: "project-http",
-    title: "HTTP Project",
-    objective: "Exercise both API surfaces",
-    baseRef: "main",
-    coachId: "coach-http",
-    idempotencyKey: "project-http-create"
-  }, { ...webContext, client: "mcp" });
-  assert.equal(projectCreated.ok, true);
-  if (!projectCreated.ok || !projectCreated.stateHeadSha) throw new Error("Project setup failed.");
-
+test("HTTP exposes only the Commit Node v2 REST surface", async () => {
+  const calls: Array<{ name: string; args: readonly unknown[] }> = [];
+  const record = (name: string) => async (...args: readonly unknown[]) => {
+    calls.push({ name, args });
+    return { ok: true as const, value: { route: name } };
+  };
+  const service = {
+    sessionRepositories: record("sessionRepositories"),
+    webProjects: record("webProjects"),
+    webProjectContext: record("webProjectContext"),
+    webGraph: record("webGraph"),
+    webNode: record("webNode"),
+    webEvents: record("webEvents"),
+    webEvent: record("webEvent"),
+    webRun: record("webRun"),
+    webCreateProject: record("webCreateProject"),
+    webStartRun: record("webStartRun"),
+    webCheckpointRun: record("webCheckpointRun"),
+    webAttachRunEvidence: record("webAttachRunEvidence"),
+    webCompleteRun: record("webCompleteRun"),
+    webFailRun: record("webFailRun"),
+    webCancelRun: record("webCancelRun"),
+    webCreateCoachingProposal: record("webCreateCoachingProposal"),
+    webConfirmCoachingProposal: record("webConfirmCoachingProposal"),
+    webRejectCoachingProposal: record("webRejectCoachingProposal"),
+    webCompareAlternatives: record("webCompareAlternatives"),
+    webSelectAlternative: record("webSelectAlternative"),
+    webRejectAlternative: record("webRejectAlternative")
+  } as unknown as HunsuApplicationService;
   const sessions = new SessionManager({
     secret: "test-session-secret-that-is-at-least-thirty-two-bytes",
     ttlSeconds: 3600,
@@ -395,7 +463,9 @@ test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts
   });
   const stateStore = new InMemoryEphemeralStateStore();
   const mcpOAuth = new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, stateStore });
-  const webhooks = new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore });
+  const webhooks = {
+    process: async () => ({ ok: true as const, value: { accepted: true, duplicate: false, signal: "state_ref_changed" } })
+  } as unknown as GitHubWebhookProcessor;
   const githubOAuth = {
     authorizationUrl: () => "https://github.example.test/authorize",
     authenticate: async () => ({ ok: true, value: { user: webContext.user, installations: [...webContext.installations] } })
@@ -417,75 +487,138 @@ test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts
   assert.equal(sessionResponse.status, 200);
   assert.equal((await sessionResponse.json() as { authenticated: boolean }).authenticated, true);
 
-  const forbiddenMutation = await app.handle(jsonRequest(`${API}/api/projects/project-http/goals`, {
-    title: "No origin",
-    desiredOutcome: "Rejected",
-    acceptanceCriteria: ["Never stored"],
-    constraints: [],
-    priority: "normal",
-    expectedStateSha: projectCreated.stateHeadSha,
-    idempotencyKey: "goal-no-origin"
+  const nodeSha = "a".repeat(40);
+  const readRoutes: ReadonlyArray<{
+    path: string;
+    name: string;
+    args: readonly unknown[];
+  }> = [
+    { path: "/api/repositories", name: "sessionRepositories", args: [] },
+    { path: "/api/projects", name: "webProjects", args: [] },
+    { path: "/api/projects/project-v2/context", name: "webProjectContext", args: ["project-v2"] },
+    {
+      path: "/api/projects/project-v2/graph?limit=12&cursor=graph-cursor",
+      name: "webGraph",
+      args: ["project-v2", { limit: 12, cursor: "graph-cursor" }]
+    },
+    { path: `/api/projects/project-v2/nodes/${nodeSha}`, name: "webNode", args: ["project-v2", nodeSha] },
+    {
+      path: `/api/projects/project-v2/events?limit=25&type=RunCompleted&nodeSha=${nodeSha}&actor=user-7&from=2026-07-01T00%3A00%3A00.000Z&to=2026-07-15T00%3A00%3A00.000Z&search=evidence`,
+      name: "webEvents",
+      args: ["project-v2", {
+        limit: 25,
+        type: "RunCompleted",
+        nodeSha,
+        actor: "user-7",
+        from: "2026-07-01T00:00:00.000Z",
+        to: "2026-07-15T00:00:00.000Z",
+        search: "evidence"
+      }]
+    },
+    { path: "/api/projects/project-v2/events/event-1", name: "webEvent", args: ["project-v2", "event-1"] },
+    { path: "/api/projects/project-v2/runs/run-1", name: "webRun", args: ["project-v2", "run-1"] }
+  ];
+  for (const route of readRoutes) {
+    const before = calls.length;
+    const response = await app.handle(new Request(`${API}${route.path}`, { headers: { cookie } }));
+    assert.equal(response.status, 200, route.path);
+    assert.equal(calls.length, before + 1, route.path);
+    const call = calls.at(-1);
+    assert.equal(call?.name, route.name);
+    assert.deepEqual(call?.args.slice(1), route.args);
+  }
+
+  const mutationRoutes: ReadonlyArray<{ path: string; name: string; status: number; args: readonly unknown[] }> = [
+    { path: "/api/projects", name: "webCreateProject", status: 201, args: [] },
+    { path: `/api/projects/project-v2/nodes/${nodeSha}/runs`, name: "webStartRun", status: 201, args: ["project-v2", nodeSha] },
+    { path: "/api/projects/project-v2/runs/run-1/checkpoints", name: "webCheckpointRun", status: 201, args: ["project-v2", "run-1"] },
+    { path: "/api/projects/project-v2/runs/run-1/evidence", name: "webAttachRunEvidence", status: 201, args: ["project-v2", "run-1"] },
+    { path: "/api/projects/project-v2/runs/run-1/complete", name: "webCompleteRun", status: 200, args: ["project-v2", "run-1"] },
+    { path: "/api/projects/project-v2/runs/run-2/fail", name: "webFailRun", status: 200, args: ["project-v2", "run-2"] },
+    { path: "/api/projects/project-v2/runs/run-3/cancel", name: "webCancelRun", status: 200, args: ["project-v2", "run-3"] },
+    {
+      path: `/api/projects/project-v2/nodes/${nodeSha}/coaching/proposals`,
+      name: "webCreateCoachingProposal",
+      status: 201,
+      args: ["project-v2", nodeSha]
+    },
+    {
+      path: "/api/projects/project-v2/coaching/proposals/proposal-1/confirm",
+      name: "webConfirmCoachingProposal",
+      status: 200,
+      args: ["project-v2", "proposal-1"]
+    },
+    {
+      path: "/api/projects/project-v2/coaching/proposals/proposal-2/reject",
+      name: "webRejectCoachingProposal",
+      status: 200,
+      args: ["project-v2", "proposal-2"]
+    },
+    { path: "/api/projects/project-v2/comparisons", name: "webCompareAlternatives", status: 201, args: ["project-v2"] },
+    { path: "/api/projects/project-v2/decisions/select", name: "webSelectAlternative", status: 200, args: ["project-v2"] },
+    { path: "/api/projects/project-v2/decisions/reject", name: "webRejectAlternative", status: 200, args: ["project-v2"] }
+  ];
+  for (const [index, route] of mutationRoutes.entries()) {
+    const body = { marker: route.name, expectedStateSha: "b".repeat(40), idempotencyKey: `mutation-${index}` };
+    const before = calls.length;
+    const response = await app.handle(jsonRequest(`${API}${route.path}`, body, {
+      cookie,
+      origin: WEB,
+      "idempotency-key": `mutation-${index}`
+    }));
+    assert.equal(response.status, route.status, route.path);
+    assert.equal(calls.length, before + 1, route.path);
+    const call = calls.at(-1);
+    assert.equal(call?.name, route.name);
+    assert.deepEqual(call?.args.slice(1, -1), route.args);
+    assert.deepEqual(call?.args.at(-1), body);
+  }
+
+  const forbiddenMutation = await app.handle(jsonRequest(`${API}/api/projects/project-v2/decisions/select`, {
+    expectedStateSha: "b".repeat(40),
+    idempotencyKey: "missing-origin"
   }, { cookie }));
   assert.equal(forbiddenMutation.status, 403);
 
-  const wrongContentType = await app.handle(new Request(`${API}/api/projects/project-http/goals`, {
+  const wrongContentType = await app.handle(new Request(`${API}/api/projects/project-v2/comparisons`, {
     method: "POST",
     headers: { cookie, origin: WEB, "content-type": "text/plain", "idempotency-key": "wrong-type" },
     body: "not json"
   }));
   assert.equal(wrongContentType.status, 400);
 
-  const goalCreated = await app.handle(jsonRequest(`${API}/api/projects/project-http/goals`, {
-    title: "Shared command boundary",
-    desiredOutcome: "REST and MCP observe the same Goal",
-    acceptanceCriteria: ["Both surfaces project the update"],
-    constraints: [],
-    priority: "high",
-    expectedStateSha: projectCreated.stateHeadSha,
-    idempotencyKey: "goal-http-create"
-  }, { cookie, origin: WEB, "idempotency-key": "goal-http-create" }));
-  assert.equal(goalCreated.status, 201);
-  const createdBody = await goalCreated.json() as { value: { goalId: string }; stateHeadSha: string };
+  const mismatchedKey = await app.handle(jsonRequest(`${API}/api/projects/project-v2/comparisons`, {
+    expectedStateSha: "b".repeat(40),
+    idempotencyKey: "body-key"
+  }, { cookie, origin: WEB, "idempotency-key": "header-key" }));
+  assert.equal(mismatchedKey.status, 400);
+  const missingExpectedState = await app.handle(jsonRequest(`${API}/api/projects/project-v2/comparisons`, {
+    idempotencyKey: "missing-state"
+  }, { cookie, origin: WEB }));
+  assert.equal(missingExpectedState.status, 400);
 
-  const stale = await app.handle(jsonRequest(`${API}/api/projects/project-http/goals/${createdBody.value.goalId}`, {
-    title: "Stale update",
-    expectedStateSha: "2".repeat(40),
-    idempotencyKey: "goal-stale"
-  }, { cookie, origin: WEB } , "PATCH"));
-  assert.equal(stale.status, 412);
-  const staleBody = await stale.json() as { error: { code: string; actualStateSha?: string } };
-  assert.equal(staleBody.error.code, "stale_state");
-  assert.equal(staleBody.error.actualStateSha, createdBody.stateHeadSha);
+  const invalidGraphLimit = await app.handle(new Request(`${API}/api/projects/project-v2/graph?limit=301`, { headers: { cookie } }));
+  assert.equal(invalidGraphLimit.status, 400);
+  const repeatedCursor = await app.handle(new Request(`${API}/api/projects/project-v2/events?cursor=1&cursor=2`, { headers: { cookie } }));
+  assert.equal(repeatedCursor.status, 400);
+  const unknownFilter = await app.handle(new Request(`${API}/api/projects/project-v2/events?rawPayload=true`, { headers: { cookie } }));
+  assert.equal(unknownFilter.status, 400);
 
-  const accessToken = await issueMcpAccessToken(mcpOAuth, { ...webContext, client: "mcp" });
-  const mcpUpdate = await app.handle(new Request(`${API}/mcp`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: {
-        name: "hunsu.goals.update",
-        arguments: {
-          repository: { installationId: 17, repositoryId: 29, owner: "acme", name: "product", defaultBranch: "main" },
-          projectId: "project-http",
-          goalId: createdBody.value.goalId,
-          desiredOutcome: "REST creation and MCP mutation share one event model",
-          idempotencyKey: "goal-mcp-update",
-          expectedStateSha: createdBody.stateHeadSha
-        }
-      }
-    })
-  }));
-  assert.equal(mcpUpdate.status, 200);
-  const rpc = await mcpUpdate.json() as { result: { structuredContent: { ok: boolean; stateHeadSha: string } } };
-  assert.equal(rpc.result.structuredContent.ok, true);
-
-  const goalRead = await app.handle(new Request(`${API}/api/projects/project-http/goals/${createdBody.value.goalId}`, { headers: { cookie } }));
-  assert.equal(goalRead.status, 200);
-  const goalReadBody = await goalRead.json() as { goal: { desiredOutcome: string } };
-  assert.equal(goalReadBody.goal.desiredOutcome, "REST creation and MCP mutation share one event model");
+  for (const legacy of [
+    { path: "/api/projects/project-v2", method: "GET" },
+    { path: "/api/projects/project-v2/goals", method: "POST" },
+    { path: "/api/projects/project-v2/goals/goal-1", method: "PATCH" },
+    { path: "/api/projects/project-v2/runners", method: "GET" },
+    { path: "/api/projects/project-v2/coach", method: "GET" },
+    { path: "/api/projects/project-v2/coach/review", method: "POST" },
+    { path: "/api/projects/project-v2/rebuild", method: "POST" }
+  ]) {
+    const response = await app.handle(new Request(`${API}${legacy.path}`, {
+      method: legacy.method,
+      headers: { cookie, origin: WEB }
+    }));
+    assert.equal(response.status, 404, legacy.path);
+  }
 
   const unauthenticatedMcp = await app.handle(new Request(`${API}/mcp`, {
     method: "POST",
@@ -495,75 +628,25 @@ test("HTTP boundary keeps REST and MCP on one service with auth, CSRF, conflicts
   assert.equal(unauthenticatedMcp.status, 401);
   assert.match(unauthenticatedMcp.headers.get("www-authenticate") ?? "", /oauth-protected-resource/u);
 
-  const branch = await transport.readBranch(repository, "hunsu/state");
-  assert.equal(branch.ok, true);
-  if (!branch.ok || !branch.value) throw new Error("State branch missing.");
-  const payload = JSON.stringify({
-    ref: "refs/heads/hunsu/state",
-    before: projectCreated.stateHeadSha,
-    after: branch.value.headSha,
-    installation: { id: 17 },
-    repository: { id: 29, name: "product", default_branch: "main", owner: { login: "acme" } }
-  });
-  const signature = `sha256=${createHmac("sha256", WEBHOOK_SECRET).update(payload).digest("hex")}`;
-  const webhookRequest = () => new Request(`${API}/api/github/webhooks`, {
+  const webhook = await app.handle(new Request(`${API}/api/github/webhooks`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-hub-signature-256": signature,
-      "x-github-delivery": "delivery-one",
+      "x-hub-signature-256": "sha256=test",
+      "x-github-delivery": "delivery-v2",
       "x-github-event": "push"
     },
-    body: payload
-  });
-  const webhook = await app.handle(webhookRequest());
+    body: "{}"
+  }));
   assert.equal(webhook.status, 202);
-  assert.equal((await webhook.json() as { duplicate: boolean }).duplicate, false);
-  const duplicate = await app.handle(webhookRequest());
-  assert.equal((await duplicate.json() as { duplicate: boolean }).duplicate, true);
+  assert.equal((await webhook.json() as { accepted: boolean }).accepted, true);
 
-  const pluginCreate = await app.handle(new Request(`${API}/mcp`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: {
-        name: "hunsu.projects.create",
-        arguments: {
-          repository: { owner: "acme", name: "product" },
-          projectId: "project-plugin",
-          title: "Plugin-discovered Project",
-          objective: "Create without hidden numeric repository identifiers",
-          baseRef: "main",
-          coachId: "coach-plugin",
-          idempotencyKey: "plugin-owner-only-create"
-        }
-      }
-    })
+  const preflight = await app.handle(new Request(`${API}/api/projects/project-v2/graph`, {
+    method: "OPTIONS",
+    headers: { origin: WEB }
   }));
-  assert.equal(pluginCreate.status, 200);
-  const pluginCreateBody = await pluginCreate.json() as { result: { structuredContent: { ok: boolean } } };
-  assert.equal(pluginCreateBody.result.structuredContent.ok, true);
-
-  const pluginList = await app.handle(new Request(`${API}/mcp`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: { name: "hunsu.projects.list", arguments: {} }
-    })
-  }));
-  const pluginListBody = await pluginList.json() as { result: { structuredContent: { ok: boolean; data: { projects: unknown[] } } } };
-  assert.equal(pluginListBody.result.structuredContent.ok, true);
-  assert.equal(pluginListBody.result.structuredContent.data.projects.length, 2);
-
-  const ownerOnlyProjects = await service.call("hunsu.projects.list", {}, { ...webContext, client: "mcp" });
-  if (!ownerOnlyProjects.ok) assert.fail(ownerOnlyProjects.error.message);
-  assert.equal((ownerOnlyProjects.data as { projects: unknown[] }).projects.length, 2);
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-methods"), "GET, POST, OPTIONS");
 });
 
 function jsonRequest(url: string, body: unknown, headers: Record<string, string>, method = "POST"): Request {
@@ -693,31 +776,4 @@ function consentRequest(cookie: string, body: URLSearchParams, origin = API): Re
     },
     body
   });
-}
-
-async function issueMcpAccessToken(oauth: McpOAuthService, context: AuthContext): Promise<string> {
-  const registration = oauth.register({ redirect_uris: ["https://client.example.test/callback"] });
-  const clientId = String(registration.client_id);
-  const verifier = "v".repeat(43);
-  const challenge = createHash("sha256").update(verifier, "ascii").digest("base64url");
-  const authorize = new URL(`${API}/oauth/authorize`);
-  authorize.searchParams.set("response_type", "code");
-  authorize.searchParams.set("client_id", clientId);
-  authorize.searchParams.set("redirect_uri", "https://client.example.test/callback");
-  authorize.searchParams.set("code_challenge", challenge);
-  authorize.searchParams.set("code_challenge_method", "S256");
-  const sessionToken = "test-web-session";
-  const consent = await oauth.createConsentRequest(authorize, { ...context, client: "web" }, sessionToken);
-  const code = new URL(await oauth.decideConsent(new URLSearchParams({
-    decision: "approve",
-    consent_request: consent.token
-  }), { ...context, client: "web" }, sessionToken)).searchParams.get("code");
-  assert.ok(code);
-  return String((await oauth.exchange(new URLSearchParams({
-    grant_type: "authorization_code",
-    code,
-    client_id: clientId,
-    redirect_uri: "https://client.example.test/callback",
-    code_verifier: verifier
-  }))).access_token);
 }

@@ -6,6 +6,7 @@ import { defineConfig } from "vitest/config";
 const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], {
   encoding: "utf8"
 }).trim();
+const runtimeReuseDefaultHead = "9".repeat(40);
 const { privateKey: workerPrivateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const workerPrivateKeyPem = workerPrivateKey.export({ type: "pkcs8", format: "pem" }).toString();
 let runtimeReuseTokenRequests = 0;
@@ -62,6 +63,12 @@ export default defineConfig({
             && url.href === "https://api.github.com/repos/acme/runtime-reuse/git/ref/heads/hunsu/state"
           ) {
             return Response.json({ message: "Not Found" }, { status: 404 });
+          }
+          if (
+            request.method === "GET"
+            && url.href === "https://api.github.com/repos/acme/runtime-reuse/git/ref/heads/main"
+          ) {
+            return Response.json({ object: { sha: runtimeReuseDefaultHead } });
           }
           if (
             request.method === "POST"

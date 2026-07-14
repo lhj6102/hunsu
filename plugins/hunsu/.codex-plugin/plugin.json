@@ -1,7 +1,7 @@
 {
   "name": "hunsu",
-  "version": "0.1.0+codex.20260714083052",
-  "description": "Run GitHub-backed Hunsu Projects from Codex.",
+  "version": "0.2.0+codex.20260714182321",
+  "description": "Run GitHub-backed Hunsu Commit Node Projects from Codex.",
   "author": {
     "name": "Hunsu"
   },
@@ -17,8 +17,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Hunsu",
-    "shortDescription": "Execute GitHub-backed Goals with Codex.",
-    "longDescription": "Create Projects and Goals, execute Player or Team Runs, attach evidence, request Coach review, and compare divergent alternatives.",
+    "shortDescription": "Execute Commit Node Goals with Codex.",
+    "longDescription": "Bootstrap Commit Node Projects, execute one Node-owned Goal through any registered Runner type, attach evidence, confirm Coaching transitions, and compare sibling futures.",
     "developerName": "Hunsu",
     "category": "Productivity",
     "capabilities": [
@@ -29,8 +29,8 @@
     "websiteURL": "https://hunsu.app",
     "defaultPrompt": [
       "Open the Hunsu Project for this repository.",
-      "Start a Player Run for the active Goal.",
-      "Compare the current Hunsu alternatives."
+      "Start a Run for one Goal on the selected Node.",
+      "Compare completed sibling Node alternatives."
     ]
   },
   "mcpServers": "./.mcp.json",

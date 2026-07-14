@@ -61,7 +61,7 @@ Invalid entries appear in a separate `Invalid:` list with the same heading and f
 
 ## CI contract
 
-[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs for pull requests to `main` and pushes to `main`. Its required check is `CI / validate`. It uses Node.js 24.18.0 and pnpm 10.30.2, installs the frozen lockfile, runs `pnpm check` and `pnpm build`, validates the generated Worker environment types plus the Plugin and production contracts, writes a credential-free test-SHA runtime overlay, dry-runs the Worker bundle, verifies that the Node server entrypoint is absent, and runs the Cloudflare adapter and OAuth Durable Object suite.
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs for pull requests to `main` and pushes to `main`. Its required check is `CI / validate`. It uses Node.js 24.18.0 and pnpm 10.30.2, installs the frozen lockfile, runs `pnpm check` and `pnpm build`, installs the lockfile-pinned Playwright Chromium runtime, runs the Dashboard browser and accessibility contracts, validates the generated Worker environment types plus the Plugin and production contracts, writes a credential-free test-SHA runtime overlay, dry-runs the Worker bundle, verifies that the Node server entrypoint is absent, and runs the Cloudflare adapter and OAuth Durable Object suite.
 
 CI has only `contents: read`. It does not reference `hunsu-production`, receive Cloudflare or GitHub App credentials, call a mutating Wrangler command, create GitHub Project state, or modify `hunsu/state`.
 
@@ -71,6 +71,8 @@ Useful local commands are:
 pnpm install --frozen-lockfile
 pnpm check
 pnpm build
+pnpm exec playwright install chromium
+pnpm run test:browser
 node scripts/deployment/validate-production-contract.mjs
 node scripts/deployment/write-web-runtime-config.mjs --source-sha 0123456789abcdef0123456789abcdef01234567
 mkdir -p .artifacts

@@ -21,7 +21,6 @@ const mcpPath = resolve(pluginRoot, ".mcp.json");
 const marketplacePath = resolve(repoRoot, ".agents/plugins/marketplace.json");
 const expectedSkills = [
   "hunsu-project",
-  "hunsu-goal",
   "hunsu-run",
   "hunsu-coach",
   "hunsu-diverge"
@@ -55,7 +54,7 @@ if (errors.length > 0) {
   console.error("Hunsu plugin validation failed with " + errors.length + " issue(s).");
   process.exitCode = 1;
 } else {
-  console.log("Hunsu plugin validation passed: manifest, marketplace, MCP OAuth, and five skills.");
+  console.log("Hunsu plugin validation passed: manifest, marketplace, MCP OAuth, and four v2 skills.");
 }
 
 function validateManifest(value) {
@@ -190,7 +189,7 @@ function validateSkills() {
     .sort();
   const expected = [...expectedSkills].sort();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    issue("Plugin must contain exactly the five expected Hunsu skill directories.");
+    issue("Plugin must contain exactly the four expected Hunsu v2 skill directories.");
   }
 
   for (const skillName of expectedSkills) {

@@ -1,76 +1,86 @@
-# GitHub-backed Project architecture
+# GitHub-backed Commit Node architecture
 
 ## Durable state
 
-Each repository that contains Hunsu Projects has an application-managed branch:
+Each repository with Hunsu Projects has one application-managed branch:
 
 ```text
 refs/heads/hunsu/state
 ```
 
-The branch stores only non-secret product state:
+The v2 runtime reads only the breaking v2 root:
 
 ```text
-.hunsu/
+.hunsu/v2/
   workspace.json
   projects/<project-id>/
     project.json
-    coach.json
-    goals/<goal-id>.json
-    runners/<runner-id>.json
-    runs/<run-id>.json
     events/<year>/<month>/<event-id>.json
+    indexes/events/latest.json
+    indexes/events/shards/<shard>.json
+    indexes/events/by-domain/<event-id>.json
+    nodes/<full-sha>/node.hunsu
+    graph/latest.json
+    graph/pages/<page>.json
+    graph/nodes/<full-sha>.json
     snapshots/latest.json
+    snapshots/nodes/<full-sha>.json
+    snapshots/runs/<run-id>.json
 ```
 
-Event files are authoritative and append-only. The other files are deterministic materializations that can be deleted and regenerated. User source branches do not receive routine product metadata.
+Event files are authoritative and append-only. Every other file is a deterministic materialization. `project.json`, `graph/latest.json`, `snapshots/latest.json`, and `indexes/events/latest.json` are compact manifests; bounded pages and key-addressed shards live beneath them. Read-model materializations are strict, digest-bound deterministic gzip/base64 envelopes tied to an exact event-log checkpoint; they never contain a complete Node Plan or Runner payload. Existing v1 paths remain untouched but are not decoded, projected, migrated, or dual-written.
+
+`node.hunsu` is an ASCII envelope containing deterministic gzip plus base64 of the full canonical Node payload: Project id, commit SHA, tree SHA, and Node Plan. The envelope records schema, codec, decoded and encoded size, and decoded SHA-256 digest. Encoding provides opacity and compactness, not confidentiality.
+
+## Node identity and reachability
+
+A Node is identified by `(ProjectId, full commit SHA)`. Every registered Node is anchored by an immutable lightweight tag:
+
+```text
+refs/tags/hunsu/node/<project-id>/<full-sha>
+```
+
+Root and Run-result Nodes reuse verified repository commits. Confirmed Coaching creates a deterministic metadata-only child commit with the source as its sole parent and the exact same tree. Managed tags and Run branches never move main or a user source branch.
+
+Every non-root Node has one structural parent. The state rejects a second incoming edge, self-edge, cycle, missing source, reused result SHA, or mismatched payload digest. Comparison and decisions decorate sibling Nodes without creating convergence edges.
 
 ## Mutation protocol
 
-Every mutation carries an idempotency key and an expected state-head SHA. The store:
+Every mutation carries an idempotency key and expected state-head SHA. The store:
 
 1. reads the exact `hunsu/state` head;
-2. rejects a mismatched expected head with a structured stale-state error;
-3. replays authoritative events and validates the command in core;
+2. rejects a mismatched expected head with a typed stale-state error;
+3. replays authoritative v2 events and validates the command in core;
 4. derives deterministic event identifiers from the idempotency key and command digest;
-5. rejects reuse of a key with a different command digest;
-6. writes new event blobs plus regenerated materializations in one tree;
-7. creates a commit whose parent is the expected head;
-8. advances the ref with a non-forced fast-forward update.
+5. rejects reuse of a key with another command digest;
+6. writes new events and regenerated materializations in one tree;
+7. creates a commit whose parent is the expected state head;
+8. advances `hunsu/state` through a non-forced fast-forward update.
 
-Only one of two sibling commits can advance the ref. A rejected update is a compare-and-swap conflict, never a reason to force the branch.
+Node commit/ref preparation happens before the state CAS. A CAS failure leaves an unregistered managed ref that is invisible to Graph reconstruction. Repeating the same operation verifies and reuses that commit/ref; it never creates a second Node.
 
-Stored event envelopes include schema version, event ID, command digest, hashed idempotency key, repository and Project identity, previous state SHA, sequence, actor, timestamp, and the typed domain event. Secrets and raw credentials are rejected before serialization.
+Repository discovery exposes the exact CAS base needed for bootstrap. If `hunsu/state` does not exist, `expectedStateSha` is the current full default-branch head from which the store will create it. If the branch exists but has no `.hunsu/v2` root, v2 reports the repository as uninitialized and uses that existing state head without decoding or migrating v1 content. Once v2 exists, the current state head is both the reconstruction head and the next expected mutation head.
 
 ## Reconstruction and projections
 
-Reconstruction reads event files from the exact state head, validates ordering and command identity, replays them through core, and regenerates snapshots and disposable query projections. Rebuild does not trust an application database or cached snapshot.
+Each `node.hunsu` encodes the full canonical Node payload—Project id, commit SHA, tree SHA, and Node Plan—using deterministic gzip and base64. Binding the Plan to its Git identities prevents copying a valid Plan envelope onto another Node.
 
-A repository may contain several Projects. The Project Index scans only the intersection of repositories granted to the GitHub App installation and repositories the authenticated user can access. User read/write permission is overlaid on the App grant, and missing or corrupt state is reported explicitly.
+Reconstruction reads v2 events from one exact state head, validates envelope ordering and command identity, replays them through core, and regenerates Node payloads and disposable projections. It never trusts an application database or cached snapshot.
 
-Web projections are cacheable and disposable. GitHub state-ref webhooks invalidate them without eagerly reconstructing the repository, while a four-second cache bound lets normal Web polling recover delayed or missed deliveries across API instances. The raw repository grants for one GitHub App installation may be cached for up to sixty seconds and are invalidated by installation or repository-grant webhooks; the authenticated user's current repository permissions are still intersected on every request. GitHub requests are serialized per installation within an API isolate. A primary or secondary rate-limit response establishes an in-memory cooldown for the exact provider retry boundary, while transient or forbidden installation-token failures use short bounded cooldowns to suppress queued retries. Deleting either cache never deletes Project data.
+Ordinary Project, Graph, Node, Event, and Run reads never replay the event stream. They resolve the exact state head, read `workspace.json` first, and request only `project.json`, a bounded Graph/Event page, or one Node/Run shard at that commit. A missing or invalid v2 materialization is an integrity error; explicit rebuild is the recovery boundary, not a silent replay fallback. Project discovery verifies only the root anchor, Graph cards report topology/materialization integrity, and a selected Node verifies its exact managed tag and commit through a bounded batched boundary.
+
+Graph summary queries do not decode every Node payload. `graph/latest.json` binds deterministic pages of at most 300 Nodes; each structural edge is stored with its target page so a continuation reconnects to its already loaded parent. Graph cursors are bound to the exact state head. A Graph response's `integrity: valid` means its checkpoint, manifest, page digests, and single-parent topology are valid. Project discovery verifies the root managed ref, while selecting a Node additionally verifies that Node's exact managed ref and commit before returning its payload.
+
+Events use append-stable chronological shards of at most 256 entries and scan at most four shards per filtered request. A continuation is returned even when a bounded filtered scan finds fewer than 50 matches, and the cursor is bound to the exact state head. Event detail resolves a key-addressed locator, reads exactly one authoritative Event file, strictly decodes its envelope, and cross-checks its path and indexed metadata.
+
+Node and Run detail reads use `snapshots/nodes/<sha>.json` and `snapshots/runs/<run-id>.json`; they never download a Project-lifetime activity array. Exact-head files and decoded manifests are cached by repository and state SHA; GitHub state-ref webhooks invalidate caches and bounded polling recovers missed deliveries without bypassing provider cooldowns.
 
 ## Run branches and verification
 
-Every Run uses:
+Every Run starts from the source Node SHA and uses exactly one Goal plus the Node's Runner value. The API creates the managed Run branch and returns `RunContract v2`. Completion is accepted only when repository identity, branch existence, result existence, ancestry, branch reachability, non-self result, and immutable evidence all verify.
 
-```text
-hunsu/run/<project-id>/<goal-id>/<run-id>
-```
-
-Run start creates the branch at the recorded full base SHA and returns an immutable contract containing Goal and Runner snapshots. Completion is accepted only when the API confirms all of the following:
-
-- repository identity matches the Project;
-- the expected Run branch still exists;
-- the reported full result SHA exists;
-- the result descends from the recorded base SHA;
-- the result is reachable from the expected Run branch;
-- evidence contains immutable references rather than local paths.
-
-The plugin cannot make a Run complete by assertion alone.
+An active, failed, or canceled Run creates no structural edge. A completed Run atomically records its terminal event, result Node, Run edge, and evidence. The result Node inherits the source Runner and all Goals except the consumed Goal.
 
 ## Authentication and secrets
 
-The service exchanges a short-lived, Contents-write-scoped GitHub App installation token for authorized operations. GitHub App login uses state binding and PKCE, then retains only the user's repository grants in a signed, secure, HttpOnly, SameSite session. MCP uses OAuth with explicit consent and PKCE. Webhook handlers verify the raw request body with the configured HMAC secret and deduplicate delivery identifiers.
-
-Private keys, client secrets, webhook secrets, session secrets, OAuth tokens, installation tokens, and Codex credentials live only in secret storage or short-lived memory. They are never written to GitHub state, evidence, runtime configuration, logs, or plugin files.
+The service uses short-lived Contents-write GitHub App installation tokens. GitHub login and MCP OAuth retain only scoped grants in secure sessions. Private keys, client secrets, webhook secrets, OAuth tokens, installation tokens, Codex credentials, and mutable local paths never enter Node payloads, Events, logs, or plugin files.

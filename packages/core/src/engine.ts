@@ -1,46 +1,47 @@
 import {
+  MAX_NODE_PAYLOAD_DECODED_BYTES,
+  MAX_NODE_PAYLOAD_ENCODED_BYTES,
+  NODE_PLAN_SCHEMA,
+  canonicalUtf8ByteLength,
+  computeGoalDigest,
+  computeNodePayloadDigest,
+  computeNodePlanDigest,
+  computeRunnerDigest,
   err,
+  managedNodeRef,
+  nodePayloadFor,
   ok,
   runBranchName,
-  type ActiveGoal,
-  type AcceptedCoachProposalDecision,
   type AlternativeComparison,
-  type AtLeastTwo,
-  type Coach,
-  type CoachProposal,
-  type CoachReview,
+  type CoachingChildNode,
+  type CoachingProposal,
+  type CoachingProposalDecision,
   type CommandMetadata,
   type CompletedRun,
   type DomainActor,
   type DomainEvent,
+  type EventId,
   type EventMetadata,
   type EvidenceRef,
-  type Goal,
-  type GoalBase,
-  type GoalPatch,
-  type GoalSnapshot,
-  type HunsuDivergence,
-  type PausedGoal,
-  type Player,
-  type PlayerSnapshot,
+  type GitCommitSha,
+  type GoalDigest,
+  type Node,
+  type NodePayload,
+  type NodePayloadEnvelope,
+  type NodePlan,
+  type NonEmptyArray,
   type ProcessedCommand,
   type Project,
   type ProjectCommand,
-  type ProjectPatch,
   type ProjectState,
   type RejectionDecision,
-  type RejectedCoachProposalDecision,
   type Result,
+  type RootNode,
   type Run,
   type RunCheckpoint,
-  type Runner,
-  type RunnerSnapshot,
+  type RunChildNode,
   type RunningRun,
   type SelectionDecision,
-  type Team,
-  type TeamPlayerSnapshot,
-  type TeamSnapshot,
-  type TerminalRun,
   type VerifiedRunResult
 } from "@hunsu/protocol";
 
@@ -59,28 +60,36 @@ export type ProjectDomainError = {
   readonly message: string;
 };
 
+export type NodePayloadVerificationError = {
+  readonly message: string;
+};
+
+export type ProjectIntegrityBoundary = {
+  readonly verifyNodePayload: (
+    expected: NodePayload,
+    envelope: NodePayloadEnvelope
+  ) => Result<true, NodePayloadVerificationError>;
+};
+
 export type CommandDecision =
-  | { readonly type: "accepted"; readonly event: DomainEvent }
-  | { readonly type: "reused"; readonly eventId: ProjectCommand["meta"]["eventId"] };
+  | { readonly type: "accepted"; readonly events: NonEmptyArray<DomainEvent> }
+  | { readonly type: "reused"; readonly eventIds: NonEmptyArray<EventId> };
 
 export type CommandApplication = {
   readonly state: ProjectState;
   readonly emittedEvents: readonly DomainEvent[];
-  readonly reusedEventIds: readonly ProjectCommand["meta"]["eventId"][];
+  readonly reusedEventIds: readonly EventId[];
 };
 
 export function emptyProjectState(): ProjectState {
   return {
     projects: [],
-    goals: [],
-    runners: [],
-    coaches: [],
+    nodes: [],
     runs: [],
     evidence: [],
     coachReviews: [],
-    coachProposals: [],
-    coachProposalDecisions: [],
-    divergences: [],
+    coachingProposals: [],
+    coachingProposalDecisions: [],
     comparisons: [],
     decisions: [],
     processedCommands: []
@@ -89,80 +98,35 @@ export function emptyProjectState(): ProjectState {
 
 export function decideProjectCommand(
   state: ProjectState,
-  command: ProjectCommand
+  command: ProjectCommand,
+  integrity: ProjectIntegrityBoundary
 ): Result<CommandDecision, ProjectDomainError> {
   const retry = decideRetry(state, command.meta);
   if (!retry.ok) return retry;
-  if (retry.value) return ok(retry.value);
+  if (retry.value !== undefined) return ok(retry.value);
   const meta = eventMetadata(command.meta);
 
   switch (command.type) {
     case "CreateProject": {
-      const valid = validateNewProject(state, command.project, command.coach);
+      const valid = validateProjectCreation(state, command.project, command.rootNode, command.payload, command.meta.actor, integrity);
+      if (!valid.ok) return valid;
+      const additional = validateAdditionalEventId(state, command.meta.eventId, command.rootNodeEventId);
+      if (!additional.ok) return additional;
+      return accepted(
+        { type: "ProjectCreated", meta, project: command.project },
+        {
+          type: "RootNodeRegistered",
+          meta: eventMetadata(command.meta, command.rootNodeEventId),
+          node: command.rootNode,
+          payload: command.payload
+        }
+      );
+    }
+    case "RebuildProjectMaterializations": {
+      const valid = validateProjectRebuild(state, command.projectId, command.meta.actor);
       return valid.ok
-        ? accepted({ type: "ProjectCreated", meta, project: command.project, coach: command.coach })
+        ? accepted({ type: "ProjectMaterializationsRebuilt", meta, projectId: command.projectId })
         : valid;
-    }
-    case "UpdateProject": {
-      const project = findProject(state, command.projectId);
-      if (!project.ok) return project;
-      if (!hasKeys(command.patch)) return failure("INVARIANT_VIOLATION", "Project update must change at least one field");
-      return accepted({ type: "ProjectUpdated", meta, projectId: command.projectId, patch: command.patch });
-    }
-    case "CreateGoal": {
-      const valid = validateNewGoal(state, command.goal);
-      return valid.ok ? accepted({ type: "GoalCreated", meta, goal: command.goal }) : valid;
-    }
-    case "UpdateGoal": {
-      const goal = findGoal(state, command.goalId);
-      if (!goal.ok) return goal;
-      if (goal.value.status === "completed") return invalidTransition("Goal", command.goalId, goal.value.status);
-      if (!hasKeys(command.patch)) return failure("INVARIANT_VIOLATION", "Goal update must change at least one field");
-      const changed = applyGoalPatch(goal.value, command.patch, command.meta.requestedAt);
-      const relation = validateGoalRelation(state, changed);
-      if (!relation.ok) return relation;
-      const assignment = validateGoalAssignment(state, changed);
-      return assignment.ok ? accepted({ type: "GoalUpdated", meta, goalId: command.goalId, patch: command.patch }) : assignment;
-    }
-    case "PauseGoal": {
-      const goal = findGoal(state, command.goalId);
-      if (!goal.ok) return goal;
-      return goal.value.status === "active"
-        ? accepted({ type: "GoalPaused", meta, goalId: command.goalId, reason: command.reason })
-        : invalidTransition("Goal", command.goalId, goal.value.status);
-    }
-    case "ResumeGoal": {
-      const goal = findGoal(state, command.goalId);
-      if (!goal.ok) return goal;
-      return goal.value.status === "paused"
-        ? accepted({ type: "GoalResumed", meta, goalId: command.goalId })
-        : invalidTransition("Goal", command.goalId, goal.value.status);
-    }
-    case "CompleteGoal": {
-      const valid = validateGoalCompletion(state, command.goalId, command.selectedRunId);
-      return valid.ok
-        ? accepted({ type: "GoalCompleted", meta, goalId: command.goalId, selectedRunId: command.selectedRunId })
-        : valid;
-    }
-    case "CreatePlayer": {
-      const valid = validateNewPlayer(state, command.player);
-      return valid.ok ? accepted({ type: "PlayerCreated", meta, player: command.player }) : valid;
-    }
-    case "UpdatePlayer": {
-      const valid = validatePlayerUpdate(state, command.player);
-      return valid.ok ? accepted({ type: "PlayerUpdated", meta, player: command.player }) : valid;
-    }
-    case "CreateTeam": {
-      const valid = validateNewTeam(state, command.team);
-      return valid.ok ? accepted({ type: "TeamCreated", meta, team: command.team }) : valid;
-    }
-    case "UpdateTeam": {
-      const valid = validateTeamUpdate(state, command.team);
-      return valid.ok ? accepted({ type: "TeamUpdated", meta, team: command.team }) : valid;
-    }
-    case "UpdateCoach": {
-      const valid = validateCoachUpdate(state, command.coach);
-      return valid.ok ? accepted({ type: "CoachUpdated", meta, coach: command.coach }) : valid;
     }
     case "StartRun": {
       const run = buildRunningRun(state, command);
@@ -177,8 +141,19 @@ export function decideProjectCommand(
       return valid.ok ? accepted({ type: "RunEvidenceAttached", meta, evidence: command.evidence }) : valid;
     }
     case "CompleteRun": {
-      const valid = validateRunResult(state, command.result);
-      return valid.ok ? accepted({ type: "RunCompleted", meta, result: command.result }) : valid;
+      const valid = validateRunCompletion(state, command.result, command.node, command.payload, command.meta.requestedAt, integrity);
+      if (!valid.ok) return valid;
+      const additional = validateAdditionalEventId(state, command.meta.eventId, command.nodeEventId);
+      if (!additional.ok) return additional;
+      return accepted(
+        { type: "RunCompleted", meta, result: command.result },
+        {
+          type: "RunChildNodeRegistered",
+          meta: eventMetadata(command.meta, command.nodeEventId),
+          node: command.node,
+          payload: command.payload
+        }
+      );
     }
     case "FailRun": {
       const run = findRunningRun(state, command.runId);
@@ -192,21 +167,28 @@ export function decideProjectCommand(
       const valid = validateCoachReview(state, command.review, command.meta.actor);
       return valid.ok ? accepted({ type: "CoachReviewRecorded", meta, review: command.review }) : valid;
     }
-    case "RecordCoachProposal": {
-      const valid = validateCoachProposal(state, command.proposal, command.meta.actor);
-      return valid.ok ? accepted({ type: "CoachProposalRecorded", meta, proposal: command.proposal }) : valid;
+    case "RecordCoachingProposal": {
+      const valid = validateCoachingProposalCommand(state, command.proposal, command.meta);
+      return valid.ok ? accepted({ type: "CoachingProposalRecorded", meta, proposal: command.proposal }) : valid;
     }
-    case "AcceptCoachProposal": {
-      const decision = buildCoachProposalAcceptance(state, command);
-      return decision.ok ? accepted({ type: "CoachProposalAccepted", meta, decision: decision.value }) : decision;
+    case "ConfirmCoachingProposal": {
+      const built = buildCoachingConfirmation(state, command, integrity);
+      if (!built.ok) return built;
+      const additional = validateAdditionalEventId(state, command.meta.eventId, command.nodeEventId);
+      if (!additional.ok) return additional;
+      return accepted(
+        { type: "CoachingProposalConfirmed", meta, decision: built.value },
+        {
+          type: "CoachingChildNodeRegistered",
+          meta: eventMetadata(command.meta, command.nodeEventId),
+          node: command.node,
+          payload: command.payload
+        }
+      );
     }
-    case "RejectCoachProposal": {
-      const decision = buildCoachProposalRejection(state, command);
-      return decision.ok ? accepted({ type: "CoachProposalRejected", meta, decision: decision.value }) : decision;
-    }
-    case "ConfirmHunsu": {
-      const divergence = buildDivergence(state, command);
-      return divergence.ok ? accepted({ type: "HunsuConfirmed", meta, divergence: divergence.value }) : divergence;
+    case "RejectCoachingProposal": {
+      const decision = buildCoachingRejection(state, command);
+      return decision.ok ? accepted({ type: "CoachingProposalRejected", meta, decision: decision.value }) : decision;
     }
     case "CompareAlternatives": {
       const comparison = buildComparison(state, command);
@@ -225,184 +207,325 @@ export function decideProjectCommand(
 
 export function applyProjectCommand(
   state: ProjectState,
-  command: ProjectCommand
+  command: ProjectCommand,
+  integrity: ProjectIntegrityBoundary
 ): Result<CommandApplication, ProjectDomainError> {
-  const decision = decideProjectCommand(state, command);
+  const decision = decideProjectCommand(state, command, integrity);
   if (!decision.ok) return decision;
   if (decision.value.type === "reused") {
-    return ok({ state, emittedEvents: [], reusedEventIds: [decision.value.eventId] });
+    return ok({ state, emittedEvents: [], reusedEventIds: decision.value.eventIds });
   }
-  const applied = applyDomainEvent(state, decision.value.event);
-  return applied.ok
-    ? ok({ state: applied.value, emittedEvents: [decision.value.event], reusedEventIds: [] })
-    : applied;
+  let next = state;
+  for (const event of decision.value.events) {
+    const applied = applyDomainEvent(next, event, integrity);
+    if (!applied.ok) return applied;
+    next = applied.value;
+  }
+  return ok({ state: next, emittedEvents: decision.value.events, reusedEventIds: [] });
 }
 
 export function applyDomainEvent(
   state: ProjectState,
-  event: DomainEvent
+  event: DomainEvent,
+  integrity: ProjectIntegrityBoundary
 ): Result<ProjectState, ProjectDomainError> {
-  const command = commandFromEvent(event);
-  const decision = decideProjectCommand(state, command);
-  if (!decision.ok) return decision;
-  if (decision.value.type !== "accepted") {
-    return failure("INVALID_EVENT", "Event reuses an idempotency record already present in the stream");
+  const eventIdentity = validateEventIdentity(state, event.meta);
+  if (!eventIdentity.ok) return eventIdentity;
+  switch (event.type) {
+    case "ProjectCreated": {
+      const valid = validateProjectEvent(state, event.project, event.meta.actor);
+      return valid.ok ? ok(finish({ ...state, projects: [...state.projects, event.project] }, event.meta)) : asInvalidEvent(valid);
+    }
+    case "ProjectMaterializationsRebuilt": {
+      const valid = validateProjectRebuild(state, event.projectId, event.meta.actor);
+      return valid.ok ? ok(finish(state, event.meta)) : asInvalidEvent(valid);
+    }
+    case "RootNodeRegistered": {
+      if (event.meta.actor.type !== "user") return invalidEvent("Root Node registration requires explicit user confirmation");
+      const project = findProject(state, event.node.projectId);
+      if (!project.ok) return project;
+      if (project.value.rootNodeSha !== event.node.commitSha) {
+        return invalidEvent("Root Node does not match the Project root SHA");
+      }
+      const valid = validateNewNode(state, event.node, event.payload, event.meta.recordedAt, integrity);
+      return valid.ok ? ok(finish({ ...state, nodes: [...state.nodes, event.node] }, event.meta)) : asInvalidEvent(valid);
+    }
+    case "RunStarted": {
+      const valid = validateRunningRunEvent(state, event.run);
+      return valid.ok ? ok(finish({ ...state, runs: [...state.runs, event.run] }, event.meta)) : asInvalidEvent(valid);
+    }
+    case "RunCheckpointed": {
+      const valid = validateCheckpoint(state, event.checkpoint);
+      if (!valid.ok) return asInvalidEvent(valid);
+      return ok(finish({ ...state, runs: replaceRun(state.runs, event.checkpoint.runId, run => ({
+        ...run,
+        checkpoints: [...run.checkpoints, event.checkpoint]
+      })) }, event.meta));
+    }
+    case "RunEvidenceAttached": {
+      const valid = validateEvidence(state, event.evidence);
+      if (!valid.ok) return asInvalidEvent(valid);
+      return ok(finish({
+        ...state,
+        evidence: [...state.evidence, event.evidence],
+        runs: replaceRun(state.runs, event.evidence.runId, run => ({ ...run, evidenceIds: [...run.evidenceIds, event.evidence.id] }))
+      }, event.meta));
+    }
+    case "RunCompleted": {
+      const valid = validateVerifiedRunResult(state, event.result);
+      if (!valid.ok) return asInvalidEvent(valid);
+      return ok(finish({ ...state, runs: replaceRun(state.runs, event.result.runId, run => ({
+        ...run,
+        status: "completed",
+        resultNodeSha: event.result.resultSha,
+        verifiedAt: event.result.verifiedAt,
+        completedAt: event.meta.recordedAt
+      })) }, event.meta));
+    }
+    case "RunChildNodeRegistered": {
+      const run = findCompletedRun(state, event.node.runId);
+      if (!run.ok) return asInvalidEvent(run);
+      const valid = validateRunChildNode(state, run.value, event.node, event.payload, event.meta.recordedAt, integrity);
+      return valid.ok ? ok(finish({ ...state, nodes: [...state.nodes, event.node] }, event.meta)) : asInvalidEvent(valid);
+    }
+    case "RunFailed": {
+      const run = findRunningRun(state, event.runId);
+      if (!run.ok) return asInvalidEvent(run);
+      return ok(finish({ ...state, runs: replaceRun(state.runs, event.runId, item => ({
+        ...item,
+        status: "failed",
+        failedAt: event.meta.recordedAt,
+        failureReason: event.reason
+      })) }, event.meta));
+    }
+    case "RunCanceled": {
+      const run = findRunningRun(state, event.runId);
+      if (!run.ok) return asInvalidEvent(run);
+      return ok(finish({ ...state, runs: replaceRun(state.runs, event.runId, item => ({
+        ...item,
+        status: "canceled",
+        canceledAt: event.meta.recordedAt,
+        cancellationReason: event.reason
+      })) }, event.meta));
+    }
+    case "CoachReviewRecorded": {
+      const valid = validateCoachReview(state, event.review, event.meta.actor);
+      return valid.ok
+        ? ok(finish({ ...state, coachReviews: [...state.coachReviews, event.review] }, event.meta))
+        : asInvalidEvent(valid);
+    }
+    case "CoachingProposalRecorded": {
+      const valid = validateCoachingProposal(state, event.proposal, event.meta.actor);
+      return valid.ok
+        ? ok(finish({ ...state, coachingProposals: [...state.coachingProposals, event.proposal] }, event.meta))
+        : asInvalidEvent(valid);
+    }
+    case "CoachingProposalConfirmed": {
+      const proposal = findOpenCoachingProposal(state, event.decision.proposalId, event.meta.actor);
+      if (!proposal.ok) return asInvalidEvent(proposal);
+      const decisionId = validateDecisionId(state, event.decision.id);
+      if (!decisionId.ok) return asInvalidEvent(decisionId);
+      return ok(finish({
+        ...state,
+        coachingProposalDecisions: [...state.coachingProposalDecisions, event.decision]
+      }, event.meta));
+    }
+    case "CoachingChildNodeRegistered": {
+      const valid = validateCoachingChildEvent(state, event.node, event.payload, event.meta.recordedAt, integrity);
+      return valid.ok ? ok(finish({ ...state, nodes: [...state.nodes, event.node] }, event.meta)) : asInvalidEvent(valid);
+    }
+    case "CoachingProposalRejected": {
+      const proposal = findOpenCoachingProposal(state, event.decision.proposalId, event.meta.actor);
+      if (!proposal.ok) return asInvalidEvent(proposal);
+      const decisionId = validateDecisionId(state, event.decision.id);
+      if (!decisionId.ok) return asInvalidEvent(decisionId);
+      return ok(finish({
+        ...state,
+        coachingProposalDecisions: [...state.coachingProposalDecisions, event.decision]
+      }, event.meta));
+    }
+    case "AlternativesCompared": {
+      const valid = validateComparison(state, event.comparison);
+      return valid.ok
+        ? ok(finish({ ...state, comparisons: [...state.comparisons, event.comparison] }, event.meta))
+        : asInvalidEvent(valid);
+    }
+    case "AlternativeSelected": {
+      const valid = validateSelectionDecision(state, event.decision, event.meta.actor);
+      return valid.ok ? ok(finish({ ...state, decisions: [...state.decisions, event.decision] }, event.meta)) : asInvalidEvent(valid);
+    }
+    case "AlternativesRejected": {
+      const valid = validateRejectionDecision(state, event.decision, event.meta.actor);
+      return valid.ok ? ok(finish({ ...state, decisions: [...state.decisions, event.decision] }, event.meta)) : asInvalidEvent(valid);
+    }
   }
-  if (canonicalJson(decision.value.event) !== canonicalJson(event)) {
-    return failure("INVALID_EVENT", "Event payload does not match the domain decision for its command metadata");
-  }
-  return ok(recordProcessed(projectAcceptedEvent(state, event), event.meta));
 }
 
-export function replayDomainEvents(events: readonly DomainEvent[]): Result<ProjectState, ProjectDomainError> {
+export function replayDomainEvents(
+  events: readonly DomainEvent[],
+  integrity: ProjectIntegrityBoundary
+): Result<ProjectState, ProjectDomainError> {
+  const batches = validateDomainEventBatches(events);
+  if (!batches.ok) return batches;
   let state = emptyProjectState();
-  for (let index = 0; index < events.length; index += 1) {
-    const applied = applyDomainEvent(state, events[index]);
-    if (!applied.ok) {
-      return failure(applied.error.code, "Event " + index + ": " + applied.error.message);
-    }
+  for (const event of events) {
+    const applied = applyDomainEvent(state, event, integrity);
+    if (!applied.ok) return applied;
     state = applied.value;
   }
   return ok(state);
 }
 
-export function validateRunnerGraph(
-  state: ProjectState,
-  team: Team
-): Result<Team, ProjectDomainError> {
-  const project = findProject(state, team.projectId);
-  if (!project.ok) return project;
-  if (team.players.length === 0) return failure("INVARIANT_VIOLATION", "Team must contain at least one Player");
-  const ids = new Set<string>();
-  const orders = new Set<number>();
-  for (const slot of team.players) {
-    if (ids.has(slot.playerId)) return failure("INVARIANT_VIOLATION", "Team contains duplicate Player " + slot.playerId);
-    if (orders.has(slot.order)) return failure("INVARIANT_VIOLATION", "Team contains duplicate Player order " + slot.order);
-    ids.add(slot.playerId);
-    orders.add(slot.order);
-    const runner = state.runners.find(candidate => candidate.id === slot.playerId);
-    if (!runner) return failure("NOT_FOUND", "Team references unknown Player " + slot.playerId);
-    if (runner.kind !== "player") return failure("INVARIANT_VIOLATION", "Team slots may reference only Players");
-    if (runner.projectId !== team.projectId) return failure("INVARIANT_VIOLATION", "Team and Player must belong to the same Project");
+function validateDomainEventBatches(events: readonly DomainEvent[]): Result<void, ProjectDomainError> {
+  const closed = new Set<string>();
+  const eventIds = new Set<EventId>();
+  let current: DomainEvent[] = [];
+
+  const closeCurrent = (): Result<void, ProjectDomainError> => {
+    if (current.length === 0) return ok(undefined);
+    const types = current.map(event => event.type);
+    const validPair = (types[0] === "ProjectCreated" && types[1] === "RootNodeRegistered")
+      || (types[0] === "RunCompleted" && types[1] === "RunChildNodeRegistered")
+      || (types[0] === "CoachingProposalConfirmed" && types[1] === "CoachingChildNodeRegistered");
+    const requiresPair = types.some(type => type === "ProjectCreated"
+      || type === "RootNodeRegistered"
+      || type === "RunCompleted"
+      || type === "RunChildNodeRegistered"
+      || type === "CoachingProposalConfirmed"
+      || type === "CoachingChildNodeRegistered");
+    if ((current.length === 2 && !validPair) || current.length > 2 || (current.length === 1 && requiresPair)) {
+      return invalidEvent(`Command event batch is incomplete or invalid: ${types.join(", ")}`);
+    }
+    closed.add(current[0]!.meta.idempotencyKey);
+    return ok(undefined);
+  };
+
+  for (const event of events) {
+    if (eventIds.has(event.meta.eventId)) return invalidEvent(`Event ${event.meta.eventId} appears more than once`);
+    eventIds.add(event.meta.eventId);
+    const first = current[0];
+    if (first && event.meta.idempotencyKey !== first.meta.idempotencyKey) {
+      const closedBatch = closeCurrent();
+      if (!closedBatch.ok) return closedBatch;
+      current = [];
+    }
+    if (closed.has(event.meta.idempotencyKey)) return invalidEvent("A command event batch cannot be split by another command");
+    const batchFirst = current[0];
+    if (batchFirst && (event.meta.fingerprint !== batchFirst.meta.fingerprint
+      || event.meta.recordedAt !== batchFirst.meta.recordedAt
+      || !sameDomainActor(event.meta.actor, batchFirst.meta.actor)
+    )) {
+      return invalidEvent("Events in one command batch must share fingerprint, actor, and timestamp");
+    }
+    current.push(event);
   }
-  return ok(team);
+  return closeCurrent();
 }
 
-function decideRetry(
-  state: ProjectState,
-  meta: CommandMetadata
-): Result<CommandDecision | undefined, ProjectDomainError> {
-  const prior = state.processedCommands.find(record => record.idempotencyKey === meta.idempotencyKey);
-  if (prior) {
-    return prior.fingerprint === meta.fingerprint && prior.eventId === meta.eventId
-      ? ok({ type: "reused", eventId: prior.eventId })
-      : failure("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with a different command fingerprint or event ID");
-  }
-  if (state.processedCommands.some(record => record.eventId === meta.eventId)) {
-    return failure("DUPLICATE_ID", "Event ID already exists: " + meta.eventId);
-  }
-  return ok(undefined);
+function sameDomainActor(left: DomainActor, right: DomainActor): boolean {
+  if (left.type !== right.type) return false;
+  if (left.type === "system" && right.type === "system") return true;
+  return left.type !== "system" && right.type !== "system" && left.id === right.id;
 }
 
-function validateNewProject(state: ProjectState, project: Project, coach: Coach): Result<void, ProjectDomainError> {
-  if (state.projects.some(candidate => candidate.id === project.id)) return duplicate("Project", project.id);
-  if (state.coaches.some(candidate => candidate.id === coach.id)) return duplicate("Coach", coach.id);
-  if (project.coachId !== coach.id || coach.projectId !== project.id) {
-    return failure("INVARIANT_VIOLATION", "Project and Coach identities do not match");
+export function inheritRunChildPlan(
+  source: Node,
+  consumedGoalDigest: GoalDigest
+): Result<NodePlan, ProjectDomainError> {
+  const matches = source.plan.nextGoals.filter(goal => computeGoalDigest(goal) === consumedGoalDigest);
+  if (matches.length !== 1) {
+    return failure("INVARIANT_VIOLATION", "A Run must digest exactly one Goal from its source Node");
   }
-  if (project.goalIds.length > 0 || project.runnerIds.length > 0) {
-    return failure("INVARIANT_VIOLATION", "A new Project must start without Goal or Runner references");
-  }
-  return ok(undefined);
+  return ok({
+    schema: NODE_PLAN_SCHEMA,
+    nextGoals: source.plan.nextGoals.filter(goal => computeGoalDigest(goal) !== consumedGoalDigest),
+    how: source.plan.how
+  });
 }
 
-function validateNewGoal(state: ProjectState, goal: ActiveGoal): Result<void, ProjectDomainError> {
-  const project = findProject(state, goal.projectId);
-  if (!project.ok) return project;
-  if (state.goals.some(candidate => candidate.id === goal.id)) return duplicate("Goal", goal.id);
-  const relation = validateGoalRelation(state, goal);
-  return relation.ok ? validateGoalAssignment(state, goal) : relation;
-}
-
-function validateGoalAssignment(state: ProjectState, goal: Goal): Result<void, ProjectDomainError> {
-  if (goal.assignment.type === "unassigned") return ok(undefined);
-  const runner = findRunner(state, goal.assignment.runnerId);
-  if (!runner.ok) return runner;
-  return runner.value.projectId === goal.projectId
-    ? ok(undefined)
-    : failure("INVARIANT_VIOLATION", "Assigned Runner must belong to the Goal Project");
-}
-
-function validateGoalRelation(state: ProjectState, goal: Goal): Result<void, ProjectDomainError> {
-  if (goal.relation.type === "root") return ok(undefined);
-  const ids = goal.relation.type === "child" ? [goal.relation.parentGoalId] : [...goal.relation.goalIds];
-  if (new Set(ids).size !== ids.length) return failure("INVARIANT_VIOLATION", "Goal relation contains duplicate Goal IDs");
-  for (const id of ids) {
-    if (id === goal.id) return failure("INVARIANT_VIOLATION", "Goal cannot relate to itself");
-    const related = findGoal(state, id);
-    if (!related.ok) return related;
-    if (related.value.projectId !== goal.projectId) return failure("INVARIANT_VIOLATION", "Related Goals must belong to the same Project");
-  }
-  return ok(undefined);
-}
-
-function validateGoalCompletion(state: ProjectState, goalId: Goal["id"], runId: Run["id"]): Result<void, ProjectDomainError> {
-  const goal = findGoal(state, goalId);
-  if (!goal.ok) return goal;
-  if (goal.value.status === "completed") return invalidTransition("Goal", goalId, goal.value.status);
-  const run = findRun(state, runId);
-  if (!run.ok) return run;
-  if (run.value.status !== "completed") return failure("INVALID_TRANSITION", "Goal can be completed only with a completed Run");
-  if (run.value.goalId !== goalId || run.value.projectId !== goal.value.projectId) {
-    return failure("INVARIANT_VIOLATION", "Selected Run does not belong to the Goal");
-  }
-  const openDivergences = state.divergences.filter(item => item.goalId === goalId && item.alternativeRunIds.length > 0);
-  for (const divergence of openDivergences) {
-    const comparisonIds = state.comparisons.filter(item => item.divergenceId === divergence.id).map(item => item.id);
-    const selected = state.decisions.find((item): item is SelectionDecision => item.type === "selection" && comparisonIds.includes(item.comparisonId));
-    if (!selected || selected.selectedRunId !== runId) {
-      return failure("USER_CONFIRMATION_REQUIRED", "Goal alternatives require a user-confirmed selection before completion");
+export function validateNodeGraph(state: ProjectState): Result<true, ProjectDomainError> {
+  for (const project of state.projects) {
+    const nodes = state.nodes.filter(node => node.projectId === project.id);
+    const shas = nodes.map(node => node.commitSha);
+    if (new Set(shas).size !== shas.length) {
+      return failure("INVARIANT_VIOLATION", `Project ${project.id} contains duplicate Node SHAs`);
+    }
+    const roots = nodes.filter((node): node is RootNode => node.type === "root");
+    if (roots.length !== 1 || roots[0]!.commitSha !== project.rootNodeSha) {
+      return failure("INVARIANT_VIOLATION", `Project ${project.id} must contain exactly its declared root Node`);
+    }
+    for (const node of nodes) {
+      if (node.type === "root") continue;
+      if (node.parentSha === node.commitSha) return failure("INVARIANT_VIOLATION", "Node cannot be its own parent");
+      const parent = nodes.find(candidate => candidate.commitSha === node.parentSha);
+      if (!parent) return failure("INVARIANT_VIOLATION", `Node ${node.commitSha} has no parent in its Project`);
+      const visited = new Set<GitCommitSha>([node.commitSha]);
+      let cursor: Node = parent;
+      while (cursor.type !== "root") {
+        if (visited.has(cursor.commitSha)) return failure("INVARIANT_VIOLATION", "Node Graph contains a cycle");
+        visited.add(cursor.commitSha);
+        const parentSha = cursor.parentSha;
+        const next = nodes.find(candidate => candidate.commitSha === parentSha);
+        if (!next) return failure("INVARIANT_VIOLATION", `Node ${cursor.commitSha} has no parent in its Project`);
+        cursor = next;
+      }
     }
   }
-  return ok(undefined);
+  return ok(true);
 }
 
-function validateNewPlayer(state: ProjectState, player: Player): Result<void, ProjectDomainError> {
-  const project = findProject(state, player.projectId);
-  if (!project.ok) return project;
-  return state.runners.some(candidate => candidate.id === player.id) ? duplicate("Runner", player.id) : ok(undefined);
+export function unresolvedDivergenceCount(state: ProjectState, projectId: Project["id"]): number {
+  const children = state.nodes.filter((node): node is RunChildNode => node.projectId === projectId && node.type === "run_child");
+  const parents = new Set(children.map(node => node.parentSha));
+  let unresolved = 0;
+  for (const parentSha of parents) {
+    const siblings = children.filter(node => node.parentSha === parentSha);
+    if (siblings.length < 2) continue;
+    const selected = new Set(state.decisions.flatMap(decision => decision.type === "selection" && decision.projectId === projectId ? [decision.selectedNodeSha] : []));
+    const rejected = new Set(state.decisions.flatMap(decision => decision.type === "rejection" && decision.projectId === projectId ? decision.rejectedNodeShas : []));
+    const selectedSiblings = siblings.filter(node => selected.has(node.commitSha) && !rejected.has(node.commitSha));
+    const allRejected = siblings.every(node => rejected.has(node.commitSha));
+    const oneSelected = selectedSiblings.length === 1
+      && siblings.every(node => node.commitSha === selectedSiblings[0]!.commitSha || rejected.has(node.commitSha));
+    const fullyDisposed = allRejected || oneSelected;
+    if (!fullyDisposed) unresolved += 1;
+  }
+  return unresolved;
 }
 
-function validatePlayerUpdate(state: ProjectState, player: Player): Result<void, ProjectDomainError> {
-  const current = findRunner(state, player.id);
-  if (!current.ok) return current;
-  if (current.value.kind !== "player") return failure("INVARIANT_VIOLATION", "Runner kind cannot change during update");
-  return current.value.projectId === player.projectId
-    ? ok(undefined)
-    : failure("INVARIANT_VIOLATION", "Runner cannot move between Projects");
+function validateProjectCreation(
+  state: ProjectState,
+  project: Project,
+  rootNode: RootNode,
+  payload: NodePayloadEnvelope,
+  actor: DomainActor,
+  integrity: ProjectIntegrityBoundary
+): Result<void, ProjectDomainError> {
+  const projectValid = validateProjectEvent(state, project, actor);
+  if (!projectValid.ok) return projectValid;
+  if (rootNode.projectId !== project.id || rootNode.commitSha !== project.rootNodeSha) {
+    return failure("INVARIANT_VIOLATION", "Root Node must match the new Project and its declared root SHA");
+  }
+  if (rootNode.type !== "root") return failure("INVARIANT_VIOLATION", "Project initialization requires a root Node");
+  return validateNodeContent(rootNode, payload, rootNode.registeredAt, integrity);
 }
 
-function validateNewTeam(state: ProjectState, team: Team): Result<void, ProjectDomainError> {
-  if (state.runners.some(candidate => candidate.id === team.id)) return duplicate("Runner", team.id);
-  return mapVoid(validateRunnerGraph(state, team));
+function validateProjectEvent(state: ProjectState, project: Project, actor: DomainActor): Result<void, ProjectDomainError> {
+  if (actor.type !== "user") return failure("USER_CONFIRMATION_REQUIRED", "Project initialization requires explicit user confirmation");
+  return state.projects.some(candidate => candidate.id === project.id)
+    ? duplicate("Project", project.id)
+    : ok(undefined);
 }
 
-function validateTeamUpdate(state: ProjectState, team: Team): Result<void, ProjectDomainError> {
-  const current = findRunner(state, team.id);
-  if (!current.ok) return current;
-  if (current.value.kind !== "team") return failure("INVARIANT_VIOLATION", "Runner kind cannot change during update");
-  if (current.value.projectId !== team.projectId) return failure("INVARIANT_VIOLATION", "Runner cannot move between Projects");
-  return mapVoid(validateRunnerGraph(state, team));
-}
-
-function validateCoachUpdate(state: ProjectState, coach: Coach): Result<void, ProjectDomainError> {
-  const current = state.coaches.find(candidate => candidate.id === coach.id);
-  if (!current) return notFound("Coach", coach.id);
-  if (current.projectId !== coach.projectId) return failure("INVARIANT_VIOLATION", "Coach cannot move between Projects");
-  const project = findProject(state, coach.projectId);
-  return project.ok && project.value.coachId === coach.id
-    ? ok(undefined)
-    : failure("INVARIANT_VIOLATION", "Coach is not selected by the Project");
+function validateProjectRebuild(
+  state: ProjectState,
+  projectId: Project["id"],
+  actor: DomainActor
+): Result<void, ProjectDomainError> {
+  if (actor.type !== "user") {
+    return failure("USER_CONFIRMATION_REQUIRED", "Project materialization rebuild requires explicit user confirmation");
+  }
+  return mapVoid(findProject(state, projectId));
 }
 
 function buildRunningRun(
@@ -412,52 +535,50 @@ function buildRunningRun(
   if (state.runs.some(run => run.id === command.runId)) return duplicate("Run", command.runId);
   const project = findProject(state, command.projectId);
   if (!project.ok) return project;
-  const goal = findGoal(state, command.goalId);
-  if (!goal.ok) return goal;
-  if (goal.value.projectId !== command.projectId) return failure("INVARIANT_VIOLATION", "Goal does not belong to the Project");
-  if (goal.value.status !== "active") return invalidTransition("Goal", goal.value.id, goal.value.status);
-  const runner = findRunner(state, command.runnerId);
-  if (!runner.ok) return runner;
-  if (runner.value.projectId !== command.projectId) return failure("INVARIANT_VIOLATION", "Runner does not belong to the Project");
-  if (goal.value.assignment.type === "assigned" && goal.value.assignment.runnerId !== command.runnerId) {
-    return failure("INVARIANT_VIOLATION", "Run must use the Runner assigned to the Goal");
+  const source = findNode(state, command.projectId, command.sourceNodeSha);
+  if (!source.ok) return source;
+  if (isRejectedNode(state, command.projectId, source.value.commitSha)) {
+    return failure("INVALID_TRANSITION", "Rejected Nodes cannot start new Runs");
   }
-  if (command.branch !== runBranchName(command.projectId, command.goalId, command.runId)) {
-    return failure("INVARIANT_VIOLATION", "Run branch does not match the required Hunsu namespace");
-  }
-  let sourceRun: Run | undefined;
-  if (command.origin.type === "hunsu_alternative") {
-    const origin = command.origin;
-    const divergence = state.divergences.find(item => item.id === origin.divergenceId);
-    if (!divergence) return notFound("Hunsu divergence", origin.divergenceId);
-    if (divergence.sourceRunId !== origin.sourceRunId || divergence.projectId !== command.projectId || divergence.goalId !== command.goalId) {
-      return failure("INVARIANT_VIOLATION", "Alternative Run does not match its Hunsu divergence");
-    }
-    if (divergence.baseSha !== command.baseSha) return failure("INVARIANT_VIOLATION", "Sibling alternatives must share the same base SHA");
-    sourceRun = state.runs.find(item => item.id === origin.sourceRunId);
-    if (!sourceRun) return notFound("Run", origin.sourceRunId);
-  }
-  const runnerSnapshot = captureRunnerSnapshot(state, runner.value, command.meta.requestedAt);
-  if (!runnerSnapshot.ok) return runnerSnapshot;
-  const goalSnapshot = captureGoalSnapshot(goal.value, command.meta.requestedAt);
-  if (sourceRun && sameGoalDefinition(goalSnapshot, sourceRun.goalSnapshot) && sameRunnerDefinition(runnerSnapshot.value, sourceRun.runnerSnapshot)) {
-    return failure("INVARIANT_VIOLATION", "A Hunsu alternative must change the Goal or Runner from its source Run");
+  const goal = source.value.plan.nextGoals.filter(item => computeGoalDigest(item) === command.goalDigest);
+  if (goal.length !== 1) return failure("INVARIANT_VIOLATION", "A Run must select exactly one Goal digest from its source Node");
+  if (command.branch !== runBranchName(command.projectId, command.sourceNodeSha, command.runId)) {
+    return failure("INVARIANT_VIOLATION", "Run branch does not match the required Node-scoped Hunsu namespace");
   }
   return ok({
     id: command.runId,
     projectId: command.projectId,
-    goalId: command.goalId,
-    runnerId: command.runnerId,
-    baseSha: command.baseSha,
+    sourceNodeSha: command.sourceNodeSha,
+    goal: goal[0]!,
+    goalDigest: command.goalDigest,
+    runner: source.value.plan.how,
+    runnerDigest: computeRunnerDigest(source.value.plan.how),
     branch: command.branch,
-    origin: command.origin,
-    goalSnapshot,
-    runnerSnapshot: runnerSnapshot.value,
     checkpoints: [],
     evidenceIds: [],
     startedAt: command.meta.requestedAt,
     status: "running"
   });
+}
+
+function validateRunningRunEvent(state: ProjectState, run: RunningRun): Result<void, ProjectDomainError> {
+  if (state.runs.some(candidate => candidate.id === run.id)) return duplicate("Run", run.id);
+  const source = findNode(state, run.projectId, run.sourceNodeSha);
+  if (!source.ok) return source;
+  if (isRejectedNode(state, run.projectId, source.value.commitSha)) return failure("INVALID_TRANSITION", "Rejected Nodes cannot start new Runs");
+  const goals = source.value.plan.nextGoals.filter(goal => computeGoalDigest(goal) === run.goalDigest);
+  if (goals.length !== 1 || computeGoalDigest(run.goal) !== run.goalDigest) {
+    return failure("INVARIANT_VIOLATION", "Run must contain exactly one Goal from its source Node");
+  }
+  if (computeRunnerDigest(run.runner) !== run.runnerDigest || run.runnerDigest !== computeRunnerDigest(source.value.plan.how)) {
+    return failure("INVARIANT_VIOLATION", "Run must snapshot the source Node Runner Value exactly");
+  }
+  if (run.branch !== runBranchName(run.projectId, run.sourceNodeSha, run.id)) {
+    return failure("INVARIANT_VIOLATION", "Run branch does not match the required Node-scoped Hunsu namespace");
+  }
+  return run.checkpoints.length === 0 && run.evidenceIds.length === 0
+    ? ok(undefined)
+    : failure("INVARIANT_VIOLATION", "A newly started Run cannot contain checkpoints or evidence");
 }
 
 function validateCheckpoint(state: ProjectState, checkpoint: RunCheckpoint): Result<void, ProjectDomainError> {
@@ -472,480 +593,419 @@ function validateEvidence(state: ProjectState, evidence: EvidenceRef): Result<vo
   if (state.evidence.some(item => item.id === evidence.id)) return duplicate("Evidence", evidence.id);
   const run = findRunningRun(state, evidence.runId);
   if (!run.ok) return run;
-  if (run.value.projectId !== evidence.projectId) {
-    return failure("INVARIANT_VIOLATION", "Evidence and Run must belong to the same Project");
-  }
-  if (evidence.criterion !== undefined && !run.value.goalSnapshot.acceptanceCriteria.includes(evidence.criterion)) {
-    return failure("INVARIANT_VIOLATION", "Evidence criterion must belong to the Run Goal snapshot");
+  if (run.value.projectId !== evidence.projectId) return failure("INVARIANT_VIOLATION", "Evidence and Run must belong to the same Project");
+  if (evidence.target.type === "criterion" && !run.value.goal.acceptanceCriteria.includes(evidence.target.criterion)) {
+    return failure("INVARIANT_VIOLATION", "Evidence criterion must belong to the Run's single Goal snapshot");
   }
   return ok(undefined);
 }
 
-function validateRunResult(state: ProjectState, result: VerifiedRunResult): Result<void, ProjectDomainError> {
+function validateVerifiedRunResult(state: ProjectState, result: VerifiedRunResult): Result<RunningRun, ProjectDomainError> {
   const run = findRunningRun(state, result.runId);
   if (!run.ok) return run;
-  if (run.value.branch !== result.branch) {
-    return failure("INVARIANT_VIOLATION", "Verified result branch does not match the Run branch");
-  }
-  const coveredCriteria = new Set(
-    state.evidence
-      .filter(evidence => evidence.runId === run.value.id && run.value.evidenceIds.includes(evidence.id))
-      .flatMap(evidence => evidence.criterion === undefined ? [] : [evidence.criterion])
-  );
-  const missingCriteria = run.value.goalSnapshot.acceptanceCriteria.filter(criterion => !coveredCriteria.has(criterion));
-  return missingCriteria.length === 0
-    ? ok(undefined)
-    : failure(
-        "INVARIANT_VIOLATION",
-        `Completed Run evidence must cover every Goal acceptance criterion; missing: ${missingCriteria.join("; ")}`
-      );
+  if (run.value.branch !== result.branch) return failure("INVARIANT_VIOLATION", "Verified result branch does not match the Run branch");
+  if (run.value.sourceNodeSha === result.resultSha) return failure("INVARIANT_VIOLATION", "Run result SHA must differ from its source Node SHA");
+  const covered = new Set(state.evidence
+    .filter(item => item.runId === run.value.id && run.value.evidenceIds.includes(item.id) && item.target.type === "criterion")
+    .map(item => item.target.type === "criterion" ? item.target.criterion : undefined));
+  const missing = run.value.goal.acceptanceCriteria.filter(criterion => !covered.has(criterion));
+  return missing.length === 0
+    ? run
+    : failure("INVARIANT_VIOLATION", `Completed Run evidence must cover every acceptance criterion; missing: ${missing.join("; ")}`);
 }
 
-function validateCoachReview(state: ProjectState, review: CoachReview, actor: DomainActor): Result<void, ProjectDomainError> {
+function validateRunCompletion(
+  state: ProjectState,
+  result: VerifiedRunResult,
+  node: RunChildNode,
+  payload: NodePayloadEnvelope,
+  recordedAt: RunningRun["startedAt"],
+  integrity: ProjectIntegrityBoundary
+): Result<void, ProjectDomainError> {
+  const run = validateVerifiedRunResult(state, result);
+  if (!run.ok) return run;
+  if (node.commitSha !== result.resultSha) return failure("INVARIANT_VIOLATION", "Run child Node SHA must equal the verified result SHA");
+  return validateRunChildNode(state, run.value, node, payload, recordedAt, integrity);
+}
+
+function validateRunChildNode(
+  state: ProjectState,
+  run: RunningRun | CompletedRun,
+  node: RunChildNode,
+  payload: NodePayloadEnvelope,
+  recordedAt: RunningRun["startedAt"],
+  integrity: ProjectIntegrityBoundary
+): Result<void, ProjectDomainError> {
+  if (run.status === "completed" && run.resultNodeSha !== node.commitSha) {
+    return failure("INVARIANT_VIOLATION", "Registered Run child does not match its completed Run result");
+  }
+  if (node.projectId !== run.projectId || node.parentSha !== run.sourceNodeSha || node.runId !== run.id || node.consumedGoalDigest !== run.goalDigest) {
+    return failure("INVARIANT_VIOLATION", "Run child Node must bind to its Run, source Node, and one consumed Goal");
+  }
+  const source = findNode(state, run.projectId, run.sourceNodeSha);
+  if (!source.ok) return source;
+  const inherited = inheritRunChildPlan(source.value, run.goalDigest);
+  if (!inherited.ok) return inherited;
+  if (computeNodePlanDigest(node.plan) !== computeNodePlanDigest(inherited.value)) {
+    return failure("INVARIANT_VIOLATION", "Run child plan must inherit the Runner and remove only the consumed Goal");
+  }
+  return validateNewNode(state, node, payload, recordedAt, integrity);
+}
+
+function validateCoachReview(state: ProjectState, review: ProjectState["coachReviews"][number], actor: DomainActor): Result<void, ProjectDomainError> {
+  if (actor.type !== "coach") return failure("INVARIANT_VIOLATION", "Coach reviews must be authored by a Coach actor");
   if (state.coachReviews.some(item => item.id === review.id)) return duplicate("Coach review", review.id);
-  const coach = validateCoachActor(state, review.projectId, review.coachId, actor);
-  if (!coach.ok) return coach;
-  return validateReviewTarget(state, review);
+  const project = findProject(state, review.projectId);
+  if (!project.ok) return project;
+  if (review.target.type === "node") return mapVoid(findNode(state, review.projectId, review.target.nodeSha));
+  if (review.target.type === "run") {
+    const run = findRun(state, review.target.runId);
+    return run.ok && run.value.projectId === review.projectId ? ok(undefined) : run.ok ? failure("INVARIANT_VIOLATION", "Review target belongs to another Project") : run;
+  }
+  const comparisonId = review.target.comparisonId;
+  const comparison = state.comparisons.find(item => item.id === comparisonId);
+  if (!comparison) return notFound("Comparison", comparisonId);
+  return comparison.projectId === review.projectId ? ok(undefined) : failure("INVARIANT_VIOLATION", "Review target belongs to another Project");
 }
 
-function validateReviewTarget(state: ProjectState, review: CoachReview): Result<void, ProjectDomainError> {
-  switch (review.target.type) {
-    case "project":
-      return review.target.projectId === review.projectId ? mapVoid(findProject(state, review.target.projectId)) : failure("INVARIANT_VIOLATION", "Review target belongs to another Project");
-    case "goal": {
-      const goal = findGoal(state, review.target.goalId);
-      return goal.ok && goal.value.projectId === review.projectId ? ok(undefined) : goal.ok ? failure("INVARIANT_VIOLATION", "Review target belongs to another Project") : goal;
-    }
-    case "run": {
-      const run = findRun(state, review.target.runId);
-      return run.ok && run.value.projectId === review.projectId ? ok(undefined) : run.ok ? failure("INVARIANT_VIOLATION", "Review target belongs to another Project") : run;
-    }
-    case "comparison": {
-      const comparisonId = review.target.comparisonId;
-      const comparison = state.comparisons.find(item => item.id === comparisonId);
-      if (!comparison) return notFound("Comparison", comparisonId);
-      return comparison.projectId === review.projectId ? ok(undefined) : failure("INVARIANT_VIOLATION", "Review target belongs to another Project");
-    }
+function validateCoachingProposal(state: ProjectState, proposal: CoachingProposal, actor: DomainActor): Result<void, ProjectDomainError> {
+  if (actor.type !== "coach") return failure("INVARIANT_VIOLATION", "Coaching proposals must be authored by a Coach actor");
+  if (state.coachingProposals.some(item => item.id === proposal.id)) return duplicate("Coaching proposal", proposal.id);
+  const source = findNode(state, proposal.projectId, proposal.sourceNodeSha);
+  if (!source.ok) return source;
+  if (isRejectedNode(state, proposal.projectId, source.value.commitSha)) return failure("INVALID_TRANSITION", "Rejected Nodes cannot be coached");
+  if (source.value.payloadDigest !== proposal.sourcePayloadDigest
+    || computeNodePayloadDigest(nodePayloadFor(source.value)) !== proposal.sourcePayloadDigest
+  ) {
+    return failure("INVARIANT_VIOLATION", "Coaching proposal source payload digest does not match the source Node");
   }
+  if (source.value.planDigest !== proposal.sourcePlanDigest || computeNodePlanDigest(source.value.plan) !== proposal.sourcePlanDigest) {
+    return failure("INVARIANT_VIOLATION", "Coaching proposal source digest does not match the source Node plan");
+  }
+  const proposed = validatePlan(proposal.proposedPlan);
+  if (!proposed.ok) return proposed;
+  if (computeNodePlanDigest(proposal.proposedPlan) !== proposal.proposedPlanDigest) {
+    return failure("INVARIANT_VIOLATION", "Coaching proposal digest does not match its proposed plan");
+  }
+  return proposal.proposedPlanDigest === proposal.sourcePlanDigest
+    ? failure("INVARIANT_VIOLATION", "Coaching proposal must change the Node plan")
+    : ok(undefined);
 }
 
-function validateCoachProposal(state: ProjectState, proposal: CoachProposal, actor: DomainActor): Result<void, ProjectDomainError> {
-  if (state.coachProposals.some(item => item.id === proposal.id)) return duplicate("Coach proposal", proposal.id);
-  const coach = validateCoachActor(state, proposal.projectId, proposal.coachId, actor);
-  if (!coach.ok) return coach;
-  const goal = findGoal(state, proposal.goalId);
-  if (!goal.ok) return goal;
-  if (goal.value.projectId !== proposal.projectId) return failure("INVARIANT_VIOLATION", "Proposal Goal belongs to another Project");
-  if (proposal.type === "goal_change") {
-    if (!hasKeys(proposal.change)) return failure("INVARIANT_VIOLATION", "Goal change proposal must change at least one field");
-    return validateGoalRelation(state, applyGoalPatch(goal.value, proposal.change, proposal.proposedAt));
-  }
-  if (proposal.type === "runner_change") {
-    const runner = findRunner(state, proposal.runnerId);
-    return runner.ok && runner.value.projectId === proposal.projectId ? ok(undefined) : runner.ok ? failure("INVARIANT_VIOLATION", "Proposed Runner belongs to another Project") : runner;
-  }
-  const run = findRun(state, proposal.sourceRunId);
-  if (!run.ok) return run;
-  if (run.value.projectId !== proposal.projectId || run.value.goalId !== proposal.goalId) {
-    return failure("INVARIANT_VIOLATION", "Proposed source Run does not match the Goal");
-  }
-  if (run.value.status !== "completed") {
-    return failure("INVALID_TRANSITION", "A Hunsu proposal requires a completed source Run");
-  }
-  if (goal.value.status === "completed") return invalidTransition("Goal", goal.value.id, goal.value.status);
-  if (proposal.alternative.type === "goal_change") {
-    if (!hasKeys(proposal.alternative.change)) return failure("INVARIANT_VIOLATION", "Hunsu Goal change must change at least one field");
-    const changed = applyGoalPatch(goal.value, proposal.alternative.change, proposal.proposedAt);
-    const relation = validateGoalRelation(state, changed);
-    return relation.ok ? validateGoalAssignment(state, changed) : relation;
-  }
-  const runner = findRunner(state, proposal.alternative.runnerId);
-  return runner.ok && runner.value.projectId === proposal.projectId
-    ? ok(undefined)
-    : runner.ok ? failure("INVARIANT_VIOLATION", "Alternative Runner belongs to another Project") : runner;
-}
-
-function buildCoachProposalAcceptance(
+function validateCoachingProposalCommand(
   state: ProjectState,
-  command: Extract<ProjectCommand, { type: "AcceptCoachProposal" }>
-): Result<AcceptedCoachProposalDecision, ProjectDomainError> {
-  const proposal = findOpenCoachProposal(state, command.proposalId, command.meta.actor);
+  proposal: CoachingProposal,
+  meta: CommandMetadata
+): Result<void, ProjectDomainError> {
+  if (proposal.expectedStateSha !== meta.expectedStateSha) {
+    return failure("INVARIANT_VIOLATION", "Coaching proposal expected state SHA must match its command CAS boundary");
+  }
+  return validateCoachingProposal(state, proposal, meta.actor);
+}
+
+function buildCoachingConfirmation(
+  state: ProjectState,
+  command: Extract<ProjectCommand, { type: "ConfirmCoachingProposal" }>,
+  integrity: ProjectIntegrityBoundary
+): Result<Extract<CoachingProposalDecision, { status: "confirmed" }>, ProjectDomainError> {
+  const proposal = findOpenCoachingProposal(state, command.proposalId, command.meta.actor);
   if (!proposal.ok) return proposal;
-
-  if (proposal.value.type === "hunsu") {
-    if (command.application.type !== "hunsu") {
-      return failure("INVARIANT_VIOLATION", "A Hunsu proposal requires a Hunsu acceptance application");
-    }
-    const divergence = buildDivergence(state, {
-      type: "ConfirmHunsu",
-      meta: command.meta,
-      divergenceId: command.application.divergenceId,
-      projectId: proposal.value.projectId,
-      goalId: proposal.value.goalId,
-      sourceRunId: proposal.value.sourceRunId,
-      basis: { type: "coach_proposal", proposalId: proposal.value.id }
-    });
-    if (!divergence.ok) return divergence;
-    const current = findGoal(state, proposal.value.goalId);
-    if (!current.ok) return current;
-    if (current.value.status === "completed") return invalidTransition("Goal", current.value.id, current.value.status);
-    const goal = proposal.value.alternative.type === "goal_change"
-      ? applyGoalPatch(current.value, proposal.value.alternative.change, command.meta.requestedAt)
-      : applyGoalPatch(
-          current.value,
-          { assignment: { type: "assigned", runnerId: proposal.value.alternative.runnerId } },
-          command.meta.requestedAt
-        );
-    const relation = validateGoalRelation(state, goal);
-    if (!relation.ok) return relation;
-    const assignment = validateGoalAssignment(state, goal);
-    return assignment.ok
-      ? ok({
-          status: "accepted",
-          id: command.meta.eventId,
-          proposalId: proposal.value.id,
-          reason: command.reason,
-          decidedAt: command.meta.requestedAt,
-          application: { type: "hunsu", divergence: divergence.value, goal }
-        })
-      : assignment;
-  }
-
-  if (command.application.type !== "apply_change") {
-    return failure("INVARIANT_VIOLATION", "Only a Hunsu proposal can create a divergence");
-  }
-  const current = findGoal(state, proposal.value.goalId);
-  if (!current.ok) return current;
-  if (current.value.status === "completed") return invalidTransition("Goal", current.value.id, current.value.status);
-
-  if (proposal.value.type === "goal_change") {
-    const goal = applyGoalPatch(current.value, proposal.value.change, command.meta.requestedAt);
-    const relation = validateGoalRelation(state, goal);
-    if (!relation.ok) return relation;
-    const assignment = validateGoalAssignment(state, goal);
-    return assignment.ok
-      ? ok({
-          status: "accepted",
-          id: command.meta.eventId,
-          proposalId: proposal.value.id,
-          reason: command.reason,
-          decidedAt: command.meta.requestedAt,
-          application: { type: "goal_change", goal }
-        })
-      : assignment;
-  }
-
-  const goal = applyGoalPatch(
-    current.value,
-    { assignment: { type: "assigned", runnerId: proposal.value.runnerId } },
-    command.meta.requestedAt
-  );
-  const assignment = validateGoalAssignment(state, goal);
-  return assignment.ok
-    ? ok({
-        status: "accepted",
-        id: command.meta.eventId,
-        proposalId: proposal.value.id,
-        reason: command.reason,
-        decidedAt: command.meta.requestedAt,
-        application: { type: "runner_change", goal }
-      })
-    : assignment;
-}
-
-function buildCoachProposalRejection(
-  state: ProjectState,
-  command: Extract<ProjectCommand, { type: "RejectCoachProposal" }>
-): Result<RejectedCoachProposalDecision, ProjectDomainError> {
-  const proposal = findOpenCoachProposal(state, command.proposalId, command.meta.actor);
-  return proposal.ok
-    ? ok({
-        status: "rejected",
-        id: command.meta.eventId,
-        proposalId: proposal.value.id,
-        reason: command.reason,
-        decidedAt: command.meta.requestedAt
-      })
-    : proposal;
-}
-
-function findOpenCoachProposal(
-  state: ProjectState,
-  proposalId: CoachProposal["id"],
-  actor: DomainActor
-): Result<CoachProposal, ProjectDomainError> {
-  if (actor.type !== "user") {
-    return failure("USER_CONFIRMATION_REQUIRED", "Coach proposal decisions require explicit user confirmation");
-  }
-  const proposal = state.coachProposals.find(item => item.id === proposalId);
-  if (!proposal) return notFound("Coach proposal", proposalId);
-  if (state.coachProposalDecisions.some(item => item.proposalId === proposalId)
-    || state.divergences.some(item => item.basis.type === "coach_proposal" && item.basis.proposalId === proposalId)) {
-    return failure("INVALID_TRANSITION", "Coach proposal already has a recorded disposition");
-  }
-  return ok(proposal);
-}
-
-function buildDivergence(
-  state: ProjectState,
-  command: Extract<ProjectCommand, { type: "ConfirmHunsu" }>
-): Result<HunsuDivergence, ProjectDomainError> {
-  if (command.meta.actor.type !== "user") return failure("USER_CONFIRMATION_REQUIRED", "Hunsu requires explicit user confirmation");
-  if (state.divergences.some(item => item.id === command.divergenceId)) return duplicate("Hunsu divergence", command.divergenceId);
-  const run = findRun(state, command.sourceRunId);
-  if (!run.ok) return run;
-  if (run.value.status !== "completed") return failure("INVALID_TRANSITION", "Hunsu requires a completed source Run");
-  if (run.value.projectId !== command.projectId || run.value.goalId !== command.goalId) {
-    return failure("INVARIANT_VIOLATION", "Hunsu source Run does not match the Project and Goal");
-  }
-  if (command.basis.type === "coach_proposal") {
-    const proposalId = command.basis.proposalId;
-    const proposal = state.coachProposals.find(item => item.id === proposalId);
-    if (!proposal) return notFound("Coach proposal", proposalId);
-    if (proposal.type !== "hunsu" || proposal.projectId !== command.projectId || proposal.goalId !== command.goalId || proposal.sourceRunId !== command.sourceRunId) {
-      return failure("INVARIANT_VIOLATION", "Coach proposal does not match the confirmed Hunsu");
-    }
-  }
+  const decision = validateDecisionId(state, command.decisionId);
+  if (!decision.ok) return decision;
+  const node = validateCoachingChild(state, proposal.value, command.node, command.payload, command.meta.requestedAt, integrity);
+  if (!node.ok) return node;
   return ok({
-    id: command.divergenceId,
-    projectId: command.projectId,
-    goalId: command.goalId,
-    sourceRunId: command.sourceRunId,
-    baseSha: run.value.baseSha,
-    basis: command.basis,
-    alternativeRunIds: [],
-    confirmedAt: command.meta.requestedAt
+    status: "confirmed",
+    id: command.decisionId,
+    proposalId: command.proposalId,
+    childNodeSha: command.node.commitSha,
+    reason: command.reason,
+    decidedAt: command.meta.requestedAt
   });
 }
 
-function buildComparison(
+function buildCoachingRejection(
   state: ProjectState,
-  command: Extract<ProjectCommand, { type: "CompareAlternatives" }>
-): Result<AlternativeComparison, ProjectDomainError> {
+  command: Extract<ProjectCommand, { type: "RejectCoachingProposal" }>
+): Result<Extract<CoachingProposalDecision, { status: "rejected" }>, ProjectDomainError> {
+  const proposal = findOpenCoachingProposal(state, command.proposalId, command.meta.actor);
+  if (!proposal.ok) return proposal;
+  const decision = validateDecisionId(state, command.decisionId);
+  if (!decision.ok) return decision;
+  return ok({
+    status: "rejected",
+    id: command.decisionId,
+    proposalId: command.proposalId,
+    reason: command.reason,
+    decidedAt: command.meta.requestedAt
+  });
+}
+
+function validateCoachingChildEvent(
+  state: ProjectState,
+  node: CoachingChildNode,
+  payload: NodePayloadEnvelope,
+  recordedAt: EventMetadata["recordedAt"],
+  integrity: ProjectIntegrityBoundary
+): Result<void, ProjectDomainError> {
+  const proposal = state.coachingProposals.find(item => item.id === node.proposalId);
+  if (!proposal) return notFound("Coaching proposal", node.proposalId);
+  const decision = state.coachingProposalDecisions.find(item => item.proposalId === node.proposalId);
+  if (!decision || decision.status !== "confirmed" || decision.childNodeSha !== node.commitSha) {
+    return failure("INVALID_TRANSITION", "Coaching child registration requires its confirmed proposal decision");
+  }
+  return validateCoachingChild(state, proposal, node, payload, recordedAt, integrity);
+}
+
+function validateCoachingChild(
+  state: ProjectState,
+  proposal: CoachingProposal,
+  node: CoachingChildNode,
+  payload: NodePayloadEnvelope,
+  recordedAt: EventMetadata["recordedAt"],
+  integrity: ProjectIntegrityBoundary
+): Result<void, ProjectDomainError> {
+  const source = findNode(state, proposal.projectId, proposal.sourceNodeSha);
+  if (!source.ok) return source;
+  if (node.projectId !== proposal.projectId || node.parentSha !== proposal.sourceNodeSha || node.proposalId !== proposal.id) {
+    return failure("INVARIANT_VIOLATION", "Coaching child Node must bind to the confirmed proposal and source Node");
+  }
+  if (node.treeSha !== source.value.treeSha) {
+    return failure("INVARIANT_VIOLATION", "Coaching child commit must preserve the source tree SHA");
+  }
+  if (computeNodePlanDigest(node.plan) !== proposal.proposedPlanDigest) {
+    return failure("INVARIANT_VIOLATION", "Coaching child plan must exactly match the confirmed proposal");
+  }
+  return validateNewNode(state, node, payload, recordedAt, integrity);
+}
+
+function findOpenCoachingProposal(state: ProjectState, proposalId: CoachingProposal["id"], actor: DomainActor): Result<CoachingProposal, ProjectDomainError> {
+  if (actor.type !== "user") return failure("USER_CONFIRMATION_REQUIRED", "Coaching proposal disposition requires explicit user confirmation");
+  const proposal = state.coachingProposals.find(item => item.id === proposalId);
+  if (!proposal) return notFound("Coaching proposal", proposalId);
+  return state.coachingProposalDecisions.some(item => item.proposalId === proposalId)
+    ? failure("INVALID_TRANSITION", "Coaching proposal already has a disposition")
+    : ok(proposal);
+}
+
+function buildComparison(state: ProjectState, command: Extract<ProjectCommand, { type: "CompareAlternatives" }>): Result<AlternativeComparison, ProjectDomainError> {
   if (state.comparisons.some(item => item.id === command.comparisonId)) return duplicate("Comparison", command.comparisonId);
-  const divergence = state.divergences.find(item => item.id === command.divergenceId);
-  if (!divergence) return notFound("Hunsu divergence", command.divergenceId);
-  if (command.runIds.length < 2 || new Set(command.runIds).size !== command.runIds.length) {
-    return failure("INVARIANT_VIOLATION", "Comparison requires at least two unique Runs");
+  const nodes = command.nodeShas.map(sha => findNode(state, command.projectId, sha));
+  const failureResult = nodes.find(item => !item.ok);
+  if (failureResult && !failureResult.ok) return failureResult;
+  const values = nodes.flatMap(item => item.ok ? [item.value] : []);
+  if (new Set(values.map(node => node.commitSha)).size !== values.length) return failure("INVARIANT_VIOLATION", "Comparison Node SHAs must be unique");
+  if (!values.every((node): node is RunChildNode => node.type === "run_child")) {
+    return failure("INVARIANT_VIOLATION", "Only completed Run child Nodes can be compared as alternatives");
   }
-  if (!command.runIds.includes(divergence.sourceRunId) || !command.runIds.some(id => divergence.alternativeRunIds.includes(id))) {
-    return failure("INVARIANT_VIOLATION", "Comparison must include the source Run and at least one sibling alternative");
-  }
-  const siblingRunIds = new Set([divergence.sourceRunId, ...divergence.alternativeRunIds]);
-  if (command.runIds.some(id => !siblingRunIds.has(id))) {
-    return failure("INVARIANT_VIOLATION", "Comparison Runs must all belong to the selected Hunsu divergence");
-  }
-  const comparedRuns: CompletedRun[] = [];
-  for (const id of command.runIds) {
-    const run = findRun(state, id);
+  const parentNodeSha = values[0]!.parentSha;
+  if (!values.every(node => node.parentSha === parentNodeSha)) return failure("INVARIANT_VIOLATION", "Compared alternatives must be sibling Nodes with one shared parent");
+  for (const node of values) {
+    const run = findCompletedRun(state, node.runId);
     if (!run.ok) return run;
-    if (run.value.status !== "completed") return failure("INVALID_TRANSITION", "Only completed Runs can be compared");
-    if (run.value.projectId !== divergence.projectId || run.value.goalId !== divergence.goalId || run.value.baseSha !== divergence.baseSha) {
-      return failure("INVARIANT_VIOLATION", "Compared Runs must be same-base siblings for one Goal");
-    }
-    comparedRuns.push(run.value);
-  }
-  const requiredCriteria = [...new Set(comparedRuns.flatMap(run => run.goalSnapshot.acceptanceCriteria))];
-  const findingCriteria = command.findings.map(finding => finding.criterion);
-  if (findingCriteria.length !== requiredCriteria.length || new Set(findingCriteria).size !== findingCriteria.length) {
-    return failure("INVARIANT_VIOLATION", "Comparison must contain exactly one finding for every acceptance criterion in the compared Run snapshots");
-  }
-  if (findingCriteria.some(criterion => !requiredCriteria.includes(criterion))) {
-    return failure("INVARIANT_VIOLATION", "Comparison finding criterion must belong to a compared Run Goal snapshot");
   }
   for (const finding of command.findings) {
-    const summarizedRunIds = finding.summaries.map(item => item.runId);
-    if (finding.summaries.length !== command.runIds.length || new Set(summarizedRunIds).size !== summarizedRunIds.length) {
-      return failure("INVARIANT_VIOLATION", "Every comparison finding must contain exactly one summary for each compared Run");
-    }
-    if (command.runIds.some(runId => !summarizedRunIds.includes(runId))) {
-      return failure("INVARIANT_VIOLATION", "Every comparison finding must summarize every compared Run");
+    const summaryShas = finding.summaries.map(item => item.nodeSha);
+    if (new Set(summaryShas).size !== summaryShas.length || summaryShas.some(sha => !command.nodeShas.includes(sha))) {
+      return failure("INVARIANT_VIOLATION", "Comparison findings may summarize each compared Node at most once");
     }
   }
   return ok({
     id: command.comparisonId,
-    projectId: divergence.projectId,
-    goalId: divergence.goalId,
-    divergenceId: divergence.id,
-    baseSha: divergence.baseSha,
-    runIds: command.runIds,
+    projectId: command.projectId,
+    parentNodeSha,
+    nodeShas: command.nodeShas,
     findings: command.findings,
     summary: command.summary,
     recordedAt: command.meta.requestedAt
   });
 }
 
-function buildSelection(
-  state: ProjectState,
-  command: Extract<ProjectCommand, { type: "SelectAlternative" }>
-): Result<SelectionDecision, ProjectDomainError> {
-  if (command.meta.actor.type !== "user") return failure("USER_CONFIRMATION_REQUIRED", "Alternative selection requires explicit user confirmation");
-  if (state.decisions.some(item => item.id === command.decisionId)) return duplicate("Decision", command.decisionId);
-  const comparison = state.comparisons.find(item => item.id === command.comparisonId);
-  if (!comparison) return notFound("Comparison", command.comparisonId);
-  if (!comparison.runIds.includes(command.selectedRunId)) return failure("INVARIANT_VIOLATION", "Selected Run is not part of the comparison");
-  if (state.decisions.some(item => item.type === "selection" && item.comparisonId === command.comparisonId)) {
-    return failure("INVALID_TRANSITION", "Comparison already has a selected alternative");
+function validateComparison(state: ProjectState, comparison: AlternativeComparison): Result<void, ProjectDomainError> {
+  if (state.comparisons.some(item => item.id === comparison.id)) return duplicate("Comparison", comparison.id);
+  if (new Set(comparison.nodeShas).size !== comparison.nodeShas.length) {
+    return failure("INVARIANT_VIOLATION", "Comparison Node SHAs must be unique");
   }
-  if (rejectedRunIds(state, command.comparisonId).has(command.selectedRunId)) {
-    return failure("INVALID_TRANSITION", "A rejected Run cannot be selected");
+  const nodes = comparison.nodeShas.map(sha => findNode(state, comparison.projectId, sha));
+  const missing = nodes.find(item => !item.ok);
+  if (missing && !missing.ok) return missing;
+  const values = nodes.flatMap(item => item.ok ? [item.value] : []);
+  if (!values.every((node): node is RunChildNode => node.type === "run_child" && node.parentSha === comparison.parentNodeSha)) {
+    return failure("INVARIANT_VIOLATION", "Comparison must contain completed sibling Run Nodes under its declared parent");
   }
-  return ok({
+  for (const node of values) {
+    const run = findCompletedRun(state, node.runId);
+    if (!run.ok) return run;
+  }
+  for (const finding of comparison.findings) {
+    const summaryShas = finding.summaries.map(item => item.nodeSha);
+    if (new Set(summaryShas).size !== summaryShas.length || summaryShas.some(sha => !comparison.nodeShas.includes(sha))) {
+      return failure("INVARIANT_VIOLATION", "Comparison findings may summarize each compared Node at most once");
+    }
+  }
+  return ok(undefined);
+}
+
+function buildSelection(state: ProjectState, command: Extract<ProjectCommand, { type: "SelectAlternative" }>): Result<SelectionDecision, ProjectDomainError> {
+  const decision: SelectionDecision = {
     type: "selection",
     id: command.decisionId,
+    projectId: command.projectId,
     comparisonId: command.comparisonId,
-    selectedRunId: command.selectedRunId,
-    rejectedRunIds: comparison.runIds.filter(id => id !== command.selectedRunId),
+    selectedNodeSha: command.selectedNodeSha,
     rationale: command.rationale,
     decidedAt: command.meta.requestedAt
-  });
+  };
+  const valid = validateSelectionDecision(state, decision, command.meta.actor);
+  return valid.ok ? ok(decision) : valid;
 }
 
-function buildRejection(
-  state: ProjectState,
-  command: Extract<ProjectCommand, { type: "RejectAlternatives" }>
-): Result<RejectionDecision, ProjectDomainError> {
-  if (command.meta.actor.type !== "user") return failure("USER_CONFIRMATION_REQUIRED", "Alternative rejection requires explicit user confirmation");
-  if (state.decisions.some(item => item.id === command.decisionId)) return duplicate("Decision", command.decisionId);
-  const comparison = state.comparisons.find(item => item.id === command.comparisonId);
-  if (!comparison) return notFound("Comparison", command.comparisonId);
-  if (state.decisions.some(item => item.type === "selection" && item.comparisonId === command.comparisonId)) {
-    return failure("INVALID_TRANSITION", "Selected comparison alternatives cannot be rejected later");
-  }
-  if (new Set(command.rejectedRunIds).size !== command.rejectedRunIds.length || command.rejectedRunIds.some(id => !comparison.runIds.includes(id))) {
-    return failure("INVARIANT_VIOLATION", "Rejected Runs must be unique entries in the comparison");
-  }
-  const prior = rejectedRunIds(state, command.comparisonId);
-  if (command.rejectedRunIds.some(id => prior.has(id))) return failure("INVALID_TRANSITION", "Run was already rejected");
-  return ok({
+function validateSelectionDecision(state: ProjectState, decision: SelectionDecision, actor: DomainActor): Result<void, ProjectDomainError> {
+  if (actor.type !== "user") return failure("USER_CONFIRMATION_REQUIRED", "Alternative selection requires explicit user confirmation");
+  const id = validateDecisionId(state, decision.id);
+  if (!id.ok) return id;
+  const comparison = state.comparisons.find(item => item.projectId === decision.projectId && item.id === decision.comparisonId);
+  if (!comparison) return notFound("Comparison", decision.comparisonId);
+  if (!comparison.nodeShas.includes(decision.selectedNodeSha)) return failure("INVARIANT_VIOLATION", "Selected Node was not part of the comparison");
+  if (isRejectedNode(state, decision.projectId, decision.selectedNodeSha)) return failure("INVALID_TRANSITION", "Rejected Node cannot be selected");
+  const siblingSelections = state.decisions.filter((item): item is SelectionDecision => item.type === "selection" && item.projectId === decision.projectId).filter(item => {
+    const prior = state.comparisons.find(comparisonItem => comparisonItem.projectId === decision.projectId && comparisonItem.id === item.comparisonId);
+    return prior?.parentNodeSha === comparison.parentNodeSha;
+  });
+  return siblingSelections.length === 0
+    ? ok(undefined)
+    : failure("INVALID_TRANSITION", "Sibling alternatives already have a selected future");
+}
+
+function buildRejection(state: ProjectState, command: Extract<ProjectCommand, { type: "RejectAlternatives" }>): Result<RejectionDecision, ProjectDomainError> {
+  const decision: RejectionDecision = {
     type: "rejection",
     id: command.decisionId,
+    projectId: command.projectId,
     comparisonId: command.comparisonId,
-    rejectedRunIds: command.rejectedRunIds,
+    rejectedNodeShas: command.rejectedNodeShas,
     rationale: command.rationale,
     decidedAt: command.meta.requestedAt
-  });
+  };
+  const valid = validateRejectionDecision(state, decision, command.meta.actor);
+  return valid.ok ? ok(decision) : valid;
 }
 
-function validateCoachActor(
+function validateRejectionDecision(state: ProjectState, decision: RejectionDecision, actor: DomainActor): Result<void, ProjectDomainError> {
+  if (actor.type !== "user") return failure("USER_CONFIRMATION_REQUIRED", "Alternative rejection requires explicit user confirmation");
+  const id = validateDecisionId(state, decision.id);
+  if (!id.ok) return id;
+  const comparison = state.comparisons.find(item => item.projectId === decision.projectId && item.id === decision.comparisonId);
+  if (!comparison) return notFound("Comparison", decision.comparisonId);
+  if (new Set(decision.rejectedNodeShas).size !== decision.rejectedNodeShas.length) return failure("INVARIANT_VIOLATION", "Rejected Node SHAs must be unique");
+  if (decision.rejectedNodeShas.some(sha => !comparison.nodeShas.includes(sha))) return failure("INVARIANT_VIOLATION", "Rejected Node was not part of the comparison");
+  const selected = new Set(state.decisions.flatMap(item => item.type === "selection" && item.projectId === decision.projectId ? [item.selectedNodeSha] : []));
+  if (decision.rejectedNodeShas.some(sha => selected.has(sha))) return failure("INVALID_TRANSITION", "Selected Node cannot be rejected");
+  if (decision.rejectedNodeShas.some(sha => isRejectedNode(state, decision.projectId, sha))) return failure("INVALID_TRANSITION", "Node is already rejected");
+  return ok(undefined);
+}
+
+function validateNewNode(
   state: ProjectState,
-  projectId: Project["id"],
-  coachId: Coach["id"],
-  actor: DomainActor
+  node: Node,
+  payload: NodePayloadEnvelope,
+  recordedAt: EventMetadata["recordedAt"],
+  integrity: ProjectIntegrityBoundary
 ): Result<void, ProjectDomainError> {
-  const project = findProject(state, projectId);
+  const project = findProject(state, node.projectId);
   if (!project.ok) return project;
-  if (project.value.coachId !== coachId || !state.coaches.some(coach => coach.id === coachId && coach.projectId === projectId)) {
-    return failure("INVARIANT_VIOLATION", "Coach is not selected by the Project");
+  if (state.nodes.some(candidate => candidate.projectId === node.projectId && candidate.commitSha === node.commitSha)) return duplicate("Node", node.commitSha);
+  if (node.type === "root") {
+    if (state.nodes.some(candidate => candidate.projectId === node.projectId && candidate.type === "root")) return failure("INVARIANT_VIOLATION", "Project already has a root Node");
+    if (node.commitSha !== project.value.rootNodeSha) return failure("INVARIANT_VIOLATION", "Root Node must match the Project root SHA");
+  } else {
+    if (node.parentSha === node.commitSha) return failure("INVARIANT_VIOLATION", "Node cannot be its own parent");
+    const parent = findNode(state, node.projectId, node.parentSha);
+    if (!parent.ok) return parent;
   }
-  return actor.type === "coach" && actor.coachId === coachId
-    ? ok(undefined)
-    : failure("INVARIANT_VIOLATION", "Coach record must be authored by its Coach");
+  return validateNodeContent(node, payload, recordedAt, integrity);
 }
 
-function captureGoalSnapshot(goal: Goal, capturedAt: GoalSnapshot["capturedAt"]): GoalSnapshot {
-  return {
-    id: goal.id,
-    projectId: goal.projectId,
-    title: goal.title,
-    desiredOutcome: goal.desiredOutcome,
-    acceptanceCriteria: [...goal.acceptanceCriteria] as GoalSnapshot["acceptanceCriteria"],
-    constraints: [...goal.constraints],
-    priority: goal.priority,
-    assignment: cloneGoalAssignment(goal.assignment),
-    relation: cloneGoalRelation(goal.relation),
-    capturedAt
-  };
+function validateNodeContent(
+  node: Node,
+  payload: NodePayloadEnvelope,
+  recordedAt: EventMetadata["recordedAt"],
+  integrity: ProjectIntegrityBoundary
+): Result<void, ProjectDomainError> {
+  const plan = validatePlan(node.plan);
+  if (!plan.ok) return plan;
+  if (node.planDigest !== computeNodePlanDigest(node.plan)) return failure("INVARIANT_VIOLATION", "Node plan digest does not match its canonical plan");
+  if (node.managedRef !== managedNodeRef(node.projectId, node.commitSha)) return failure("INVARIANT_VIOLATION", "Node managed ref does not match its Project and commit SHA");
+  if (node.registeredAt !== recordedAt) return failure("INVARIANT_VIOLATION", "Node registration timestamp must match its registration event");
+  const decoded = nodePayloadFor(node);
+  const digest = computeNodePayloadDigest(decoded);
+  if (node.payloadDigest !== digest || payload.digest !== digest) return failure("INVARIANT_VIOLATION", "Node payload digest does not match its canonical decoded payload");
+  const decodedSize = canonicalUtf8ByteLength(decoded);
+  if (payload.decodedSize !== decodedSize || decodedSize > MAX_NODE_PAYLOAD_DECODED_BYTES) return failure("INVARIANT_VIOLATION", "Node payload decoded size is invalid");
+  if (payload.encodedSize !== payload.data.length || payload.encodedSize > MAX_NODE_PAYLOAD_ENCODED_BYTES) return failure("INVARIANT_VIOLATION", "Node payload encoded size is invalid");
+  const verified = integrity.verifyNodePayload(decoded, payload);
+  if (!verified.ok) return failure("INVARIANT_VIOLATION", `Node payload envelope verification failed: ${verified.error.message}`);
+  return ok(undefined);
 }
 
-function captureRunnerSnapshot(
-  state: ProjectState,
-  runner: Runner,
-  capturedAt: PlayerSnapshot["capturedAt"]
-): Result<RunnerSnapshot, ProjectDomainError> {
-  if (runner.kind === "player") return ok(capturePlayerSnapshot(runner, capturedAt));
-  const valid = validateRunnerGraph(state, runner);
-  if (!valid.ok) return valid;
-  const players: TeamPlayerSnapshot[] = runner.players.map(slot => {
-    const player = state.runners.find(candidate => candidate.id === slot.playerId && candidate.kind === "player") as Player;
-    return { slot: { ...slot }, player: capturePlayerSnapshot(player, capturedAt) };
-  });
-  return ok({
-    kind: "team",
-    id: runner.id,
-    projectId: runner.projectId,
-    strategy: { ...runner.strategy },
-    players: players as unknown as TeamSnapshot["players"],
-    capturedAt
-  });
+function validatePlan(plan: NodePlan): Result<void, ProjectDomainError> {
+  if (plan.schema !== NODE_PLAN_SCHEMA) return failure("INVARIANT_VIOLATION", "Node plan schema must be hunsu.node-plan.v1");
+  const keys = plan.nextGoals.map(goal => goal.key);
+  if (new Set(keys).size !== keys.length) return failure("INVARIANT_VIOLATION", "Node Goal keys must be unique");
+  const digests = plan.nextGoals.map(computeGoalDigest);
+  if (new Set(digests).size !== digests.length) return failure("INVARIANT_VIOLATION", "Node Goal digests must be unique");
+  for (const goal of plan.nextGoals) {
+    if (goal.acceptanceCriteria.length === 0 || new Set(goal.acceptanceCriteria).size !== goal.acceptanceCriteria.length) {
+      return failure("INVARIANT_VIOLATION", "Every Goal must contain unique non-empty acceptance criteria");
+    }
+  }
+  return ok(undefined);
 }
 
-function capturePlayerSnapshot(player: Player, capturedAt: PlayerSnapshot["capturedAt"]): PlayerSnapshot {
-  return {
-    kind: "player",
-    id: player.id,
-    projectId: player.projectId,
-    promptTemplate: player.promptTemplate,
-    resources: player.resources.map(resource => ({ ...resource })),
-    runtimePolicy: { ...player.runtimePolicy },
-    capturedAt
-  };
+function validateDecisionId(state: ProjectState, id: CoachingProposalDecision["id"] | ProjectState["decisions"][number]["id"]): Result<void, ProjectDomainError> {
+  return state.coachingProposalDecisions.some(item => item.id === id) || state.decisions.some(item => item.id === id)
+    ? duplicate("Decision", id)
+    : ok(undefined);
 }
 
-function sameGoalDefinition(left: GoalSnapshot, right: GoalSnapshot): boolean {
-  return JSON.stringify({
-    id: left.id,
-    projectId: left.projectId,
-    title: left.title,
-    desiredOutcome: left.desiredOutcome,
-    acceptanceCriteria: left.acceptanceCriteria,
-    constraints: left.constraints,
-    priority: left.priority,
-    assignment: left.assignment,
-    relation: left.relation
-  }) === JSON.stringify({
-    id: right.id,
-    projectId: right.projectId,
-    title: right.title,
-    desiredOutcome: right.desiredOutcome,
-    acceptanceCriteria: right.acceptanceCriteria,
-    constraints: right.constraints,
-    priority: right.priority,
-    assignment: right.assignment,
-    relation: right.relation
-  });
+function validateAdditionalEventId(state: ProjectState, primary: EventId, additional: EventId): Result<void, ProjectDomainError> {
+  if (primary === additional || state.processedCommands.some(item => item.eventIds.includes(additional))) return duplicate("Event", additional);
+  return ok(undefined);
 }
 
-function sameRunnerDefinition(left: RunnerSnapshot, right: RunnerSnapshot): boolean {
-  return JSON.stringify(runnerDefinition(left)) === JSON.stringify(runnerDefinition(right));
+function validateEventIdentity(state: ProjectState, meta: EventMetadata): Result<void, ProjectDomainError> {
+  if (state.processedCommands.some(item => item.eventIds.includes(meta.eventId))) return invalidEvent(`Event ${meta.eventId} was already applied`);
+  const processed = state.processedCommands.find(item => item.idempotencyKey === meta.idempotencyKey);
+  return processed && processed.fingerprint !== meta.fingerprint
+    ? invalidEvent("Events sharing an idempotency key must share the same fingerprint")
+    : ok(undefined);
 }
 
-function runnerDefinition(snapshot: RunnerSnapshot): unknown {
-  if (snapshot.kind === "player") {
-    return {
-      kind: snapshot.kind,
-      id: snapshot.id,
-      projectId: snapshot.projectId,
-      promptTemplate: snapshot.promptTemplate,
-      resources: snapshot.resources,
-      runtimePolicy: snapshot.runtimePolicy
-    };
+function decideRetry(state: ProjectState, meta: CommandMetadata): Result<CommandDecision | undefined, ProjectDomainError> {
+  const processed = state.processedCommands.find(item => item.idempotencyKey === meta.idempotencyKey);
+  if (!processed) return ok(undefined);
+  return processed.fingerprint === meta.fingerprint
+    ? ok({ type: "reused", eventIds: processed.eventIds })
+    : failure("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with another command fingerprint");
+}
+
+function finish(state: ProjectState, meta: EventMetadata): ProjectState {
+  const existing = state.processedCommands.find(item => item.idempotencyKey === meta.idempotencyKey);
+  if (!existing) {
+    const processed: ProcessedCommand = { idempotencyKey: meta.idempotencyKey, fingerprint: meta.fingerprint, eventIds: [meta.eventId] };
+    return { ...state, processedCommands: [...state.processedCommands, processed] };
   }
   return {
-    kind: snapshot.kind,
-    id: snapshot.id,
-    projectId: snapshot.projectId,
-    strategy: snapshot.strategy,
-    players: snapshot.players.map(item => ({
-      slot: item.slot,
-      player: runnerDefinition(item.player)
-    }))
+    ...state,
+    processedCommands: state.processedCommands.map(item => item.idempotencyKey === meta.idempotencyKey
+      ? { ...item, eventIds: [...item.eventIds, meta.eventId] as NonEmptyArray<EventId> }
+      : item)
   };
 }
 
-function eventMetadata(meta: CommandMetadata): EventMetadata {
+function eventMetadata(meta: CommandMetadata, eventId = meta.eventId): EventMetadata {
   return {
-    eventId: meta.eventId,
+    eventId,
     idempotencyKey: meta.idempotencyKey,
     fingerprint: meta.fingerprint,
     actor: meta.actor,
@@ -953,316 +1013,71 @@ function eventMetadata(meta: CommandMetadata): EventMetadata {
   };
 }
 
-function commandMetadata(meta: EventMetadata): CommandMetadata {
-  return {
-    eventId: meta.eventId,
-    idempotencyKey: meta.idempotencyKey,
-    fingerprint: meta.fingerprint,
-    actor: meta.actor,
-    requestedAt: meta.recordedAt
-  };
-}
-
-function commandFromEvent(event: DomainEvent): ProjectCommand {
-  const meta = commandMetadata(event.meta);
-  switch (event.type) {
-    case "ProjectCreated": return { type: "CreateProject", meta, project: event.project, coach: event.coach };
-    case "ProjectUpdated": return { type: "UpdateProject", meta, projectId: event.projectId, patch: event.patch };
-    case "GoalCreated": return { type: "CreateGoal", meta, goal: event.goal };
-    case "GoalUpdated": return { type: "UpdateGoal", meta, goalId: event.goalId, patch: event.patch };
-    case "GoalPaused": return { type: "PauseGoal", meta, goalId: event.goalId, reason: event.reason };
-    case "GoalResumed": return { type: "ResumeGoal", meta, goalId: event.goalId };
-    case "GoalCompleted": return { type: "CompleteGoal", meta, goalId: event.goalId, selectedRunId: event.selectedRunId };
-    case "PlayerCreated": return { type: "CreatePlayer", meta, player: event.player };
-    case "PlayerUpdated": return { type: "UpdatePlayer", meta, player: event.player };
-    case "TeamCreated": return { type: "CreateTeam", meta, team: event.team };
-    case "TeamUpdated": return { type: "UpdateTeam", meta, team: event.team };
-    case "CoachUpdated": return { type: "UpdateCoach", meta, coach: event.coach };
-    case "RunStarted": return {
-      type: "StartRun", meta, runId: event.run.id, projectId: event.run.projectId, goalId: event.run.goalId,
-      runnerId: event.run.runnerId, baseSha: event.run.baseSha, branch: event.run.branch, origin: event.run.origin
-    };
-    case "RunCheckpointed": return { type: "CheckpointRun", meta, checkpoint: event.checkpoint };
-    case "RunEvidenceAttached": return { type: "AttachRunEvidence", meta, evidence: event.evidence };
-    case "RunCompleted": return { type: "CompleteRun", meta, result: event.result };
-    case "RunFailed": return { type: "FailRun", meta, runId: event.runId, reason: event.reason };
-    case "RunCanceled": return { type: "CancelRun", meta, runId: event.runId, reason: event.reason };
-    case "CoachReviewRecorded": return { type: "RecordCoachReview", meta, review: event.review };
-    case "CoachProposalRecorded": return { type: "RecordCoachProposal", meta, proposal: event.proposal };
-    case "CoachProposalAccepted": return {
-      type: "AcceptCoachProposal",
-      meta,
-      proposalId: event.decision.proposalId,
-      reason: event.decision.reason,
-      application: event.decision.application.type === "hunsu"
-        ? { type: "hunsu", divergenceId: event.decision.application.divergence.id }
-        : { type: "apply_change" }
-    };
-    case "CoachProposalRejected": return {
-      type: "RejectCoachProposal",
-      meta,
-      proposalId: event.decision.proposalId,
-      reason: event.decision.reason
-    };
-    case "HunsuConfirmed": return {
-      type: "ConfirmHunsu", meta, divergenceId: event.divergence.id, projectId: event.divergence.projectId,
-      goalId: event.divergence.goalId, sourceRunId: event.divergence.sourceRunId, basis: event.divergence.basis
-    };
-    case "AlternativesCompared": return {
-      type: "CompareAlternatives", meta, comparisonId: event.comparison.id, divergenceId: event.comparison.divergenceId,
-      runIds: event.comparison.runIds, findings: event.comparison.findings, summary: event.comparison.summary
-    };
-    case "AlternativeSelected": return {
-      type: "SelectAlternative", meta, decisionId: event.decision.id, comparisonId: event.decision.comparisonId,
-      selectedRunId: event.decision.selectedRunId, rationale: event.decision.rationale
-    };
-    case "AlternativesRejected": return {
-      type: "RejectAlternatives", meta, decisionId: event.decision.id, comparisonId: event.decision.comparisonId,
-      rejectedRunIds: event.decision.rejectedRunIds, rationale: event.decision.rationale
-    };
-  }
-}
-
-function projectAcceptedEvent(state: ProjectState, event: DomainEvent): ProjectState {
-  switch (event.type) {
-    case "ProjectCreated":
-      return { ...state, projects: [...state.projects, event.project], coaches: [...state.coaches, event.coach] };
-    case "ProjectUpdated":
-      return { ...state, projects: state.projects.map(project => project.id === event.projectId ? { ...project, ...event.patch, updatedAt: event.meta.recordedAt } : project) };
-    case "GoalCreated":
-      return {
-        ...state,
-        goals: [...state.goals, event.goal],
-        projects: state.projects.map(project => project.id === event.goal.projectId ? { ...project, goalIds: [...project.goalIds, event.goal.id], updatedAt: event.meta.recordedAt } : project)
-      };
-    case "GoalUpdated":
-      return { ...state, goals: state.goals.map(goal => goal.id === event.goalId ? applyGoalPatch(goal, event.patch, event.meta.recordedAt) : goal) };
-    case "GoalPaused":
-      return { ...state, goals: state.goals.map(goal => goal.id === event.goalId ? { ...goalBase(goal), status: "paused", pausedAt: event.meta.recordedAt, pauseReason: event.reason } : goal) };
-    case "GoalResumed":
-      return { ...state, goals: state.goals.map(goal => goal.id === event.goalId ? { ...goalBase(goal), status: "active", updatedAt: event.meta.recordedAt } : goal) };
-    case "GoalCompleted":
-      return { ...state, goals: state.goals.map(goal => goal.id === event.goalId ? { ...goalBase(goal), status: "completed", completedAt: event.meta.recordedAt, selectedRunId: event.selectedRunId, updatedAt: event.meta.recordedAt } : goal) };
-    case "PlayerCreated":
-      return addRunner(state, event.player, event.meta.recordedAt);
-    case "TeamCreated":
-      return addRunner(state, event.team, event.meta.recordedAt);
-    case "PlayerUpdated":
-      return { ...state, runners: state.runners.map(runner => runner.id === event.player.id ? event.player : runner) };
-    case "TeamUpdated":
-      return { ...state, runners: state.runners.map(runner => runner.id === event.team.id ? event.team : runner) };
-    case "CoachUpdated":
-      return { ...state, coaches: state.coaches.map(coach => coach.id === event.coach.id ? event.coach : coach) };
-    case "RunStarted": {
-      const next = { ...state, runs: [...state.runs, event.run] };
-      if (event.run.origin.type !== "hunsu_alternative") return next;
-      const divergenceId = event.run.origin.divergenceId;
-      return {
-        ...next,
-        divergences: next.divergences.map(item => item.id === divergenceId
-          ? { ...item, alternativeRunIds: [...item.alternativeRunIds, event.run.id] }
-          : item)
-      };
-    }
-    case "RunCheckpointed":
-      return { ...state, runs: state.runs.map(run => run.id === event.checkpoint.runId ? { ...run, checkpoints: [...run.checkpoints, event.checkpoint] } : run) };
-    case "RunEvidenceAttached":
-      return {
-        ...state,
-        evidence: [...state.evidence, event.evidence],
-        runs: state.runs.map(run => run.id === event.evidence.runId ? { ...run, evidenceIds: [...run.evidenceIds, event.evidence.id] } : run)
-      };
-    case "RunCompleted":
-      return { ...state, runs: state.runs.map(run => run.id === event.result.runId ? completedRun(run, event.result, event.meta.recordedAt) : run) };
-    case "RunFailed":
-      return { ...state, runs: state.runs.map(run => run.id === event.runId ? { ...runBase(run), status: "failed", failedAt: event.meta.recordedAt, failureReason: event.reason } : run) };
-    case "RunCanceled":
-      return { ...state, runs: state.runs.map(run => run.id === event.runId ? { ...runBase(run), status: "canceled", canceledAt: event.meta.recordedAt, cancellationReason: event.reason } : run) };
-    case "CoachReviewRecorded":
-      return { ...state, coachReviews: [...state.coachReviews, event.review] };
-    case "CoachProposalRecorded":
-      return { ...state, coachProposals: [...state.coachProposals, event.proposal] };
-    case "CoachProposalAccepted": {
-      const next = {
-        ...state,
-        coachProposalDecisions: [...state.coachProposalDecisions, event.decision]
-      };
-      if (event.decision.application.type === "hunsu") {
-        const application = event.decision.application;
-        return {
-          ...next,
-          divergences: [...next.divergences, application.divergence],
-          goals: next.goals.map(candidate => candidate.id === application.goal.id ? application.goal : candidate)
-        };
-      }
-      const goal = event.decision.application.goal;
-      return { ...next, goals: next.goals.map(candidate => candidate.id === goal.id ? goal : candidate) };
-    }
-    case "CoachProposalRejected":
-      return { ...state, coachProposalDecisions: [...state.coachProposalDecisions, event.decision] };
-    case "HunsuConfirmed":
-      return { ...state, divergences: [...state.divergences, event.divergence] };
-    case "AlternativesCompared":
-      return { ...state, comparisons: [...state.comparisons, event.comparison] };
-    case "AlternativeSelected":
-      return { ...state, decisions: [...state.decisions, event.decision] };
-    case "AlternativesRejected":
-      return { ...state, decisions: [...state.decisions, event.decision] };
-  }
-}
-
-function addRunner(state: ProjectState, runner: Runner, at: Project["updatedAt"]): ProjectState {
-  return {
-    ...state,
-    runners: [...state.runners, runner],
-    projects: state.projects.map(project => project.id === runner.projectId
-      ? { ...project, runnerIds: [...project.runnerIds, runner.id], updatedAt: at }
-      : project)
-  };
-}
-
-function completedRun(run: Run, result: VerifiedRunResult, at: CompletedRun["completedAt"]): CompletedRun {
-  return {
-    ...runBase(run),
-    status: "completed",
-    resultSha: result.resultSha,
-    verifiedAt: result.verifiedAt,
-    completedAt: at
-  };
-}
-
-function goalBase(goal: Goal): GoalBase {
-  return {
-    id: goal.id,
-    projectId: goal.projectId,
-    title: goal.title,
-    desiredOutcome: goal.desiredOutcome,
-    acceptanceCriteria: goal.acceptanceCriteria,
-    constraints: goal.constraints,
-    priority: goal.priority,
-    assignment: goal.assignment,
-    relation: goal.relation,
-    createdAt: goal.createdAt,
-    updatedAt: goal.updatedAt
-  };
-}
-
-function applyGoalPatch(goal: ActiveGoal | PausedGoal, patch: GoalPatch, at: Goal["updatedAt"]): ActiveGoal | PausedGoal;
-function applyGoalPatch(goal: Goal, patch: GoalPatch, at: Goal["updatedAt"]): Goal;
-function applyGoalPatch(goal: Goal, patch: GoalPatch, at: Goal["updatedAt"]): Goal {
-  const base = { ...goalBase(goal), ...patch, updatedAt: at };
-  if (goal.status === "active") return { ...base, status: "active" };
-  if (goal.status === "paused") return { ...base, status: "paused", pausedAt: goal.pausedAt, pauseReason: goal.pauseReason };
-  return { ...base, status: "completed", completedAt: goal.completedAt, selectedRunId: goal.selectedRunId };
-}
-
-function runBase(run: Run): import("@hunsu/protocol").RunBase {
-  return {
-    id: run.id,
-    projectId: run.projectId,
-    goalId: run.goalId,
-    runnerId: run.runnerId,
-    baseSha: run.baseSha,
-    branch: run.branch,
-    origin: run.origin,
-    goalSnapshot: run.goalSnapshot,
-    runnerSnapshot: run.runnerSnapshot,
-    checkpoints: run.checkpoints,
-    evidenceIds: run.evidenceIds,
-    startedAt: run.startedAt
-  };
-}
-
-function recordProcessed(state: ProjectState, meta: EventMetadata): ProjectState {
-  const processed: ProcessedCommand = {
-    idempotencyKey: meta.idempotencyKey,
-    fingerprint: meta.fingerprint,
-    eventId: meta.eventId
-  };
-  return { ...state, processedCommands: [...state.processedCommands, processed] };
-}
-
-function cloneGoalRelation(relation: GoalBase["relation"]): GoalBase["relation"] {
-  if (relation.type === "root") return { type: "root" };
-  if (relation.type === "child") return { type: "child", parentGoalId: relation.parentGoalId };
-  return { type: "related", goalIds: [...relation.goalIds] as NonNullable<GoalBase["relation"] & { type: "related" }>["goalIds"] };
-}
-
-function cloneGoalAssignment(assignment: GoalBase["assignment"]): GoalBase["assignment"] {
-  return assignment.type === "assigned"
-    ? { type: "assigned", runnerId: assignment.runnerId }
-    : { type: "unassigned" };
-}
-
-function rejectedRunIds(state: ProjectState, comparisonId: import("@hunsu/protocol").ComparisonId): Set<Run["id"]> {
-  return new Set(state.decisions
-    .filter((item): item is RejectionDecision => item.type === "rejection" && item.comparisonId === comparisonId)
-    .flatMap(item => [...item.rejectedRunIds]));
+function accepted(first: DomainEvent, ...rest: DomainEvent[]): Result<CommandDecision, never> {
+  return ok({ type: "accepted", events: [first, ...rest] });
 }
 
 function findProject(state: ProjectState, id: Project["id"]): Result<Project, ProjectDomainError> {
-  const value = state.projects.find(item => item.id === id);
-  return value ? ok(value) : notFound("Project", id);
+  const project = state.projects.find(item => item.id === id);
+  return project ? ok(project) : notFound("Project", id);
 }
 
-function findGoal(state: ProjectState, id: Goal["id"]): Result<Goal, ProjectDomainError> {
-  const value = state.goals.find(item => item.id === id);
-  return value ? ok(value) : notFound("Goal", id);
-}
-
-function findRunner(state: ProjectState, id: Runner["id"]): Result<Runner, ProjectDomainError> {
-  const value = state.runners.find(item => item.id === id);
-  return value ? ok(value) : notFound("Runner", id);
+function findNode(state: ProjectState, projectId: Project["id"], sha: GitCommitSha): Result<Node, ProjectDomainError> {
+  const node = state.nodes.find(item => item.projectId === projectId && item.commitSha === sha);
+  return node ? ok(node) : notFound("Node", `${projectId}/${sha}`);
 }
 
 function findRun(state: ProjectState, id: Run["id"]): Result<Run, ProjectDomainError> {
-  const value = state.runs.find(item => item.id === id);
-  return value ? ok(value) : notFound("Run", id);
+  const run = state.runs.find(item => item.id === id);
+  return run ? ok(run) : notFound("Run", id);
 }
 
 function findRunningRun(state: ProjectState, id: Run["id"]): Result<RunningRun, ProjectDomainError> {
   const run = findRun(state, id);
   if (!run.ok) return run;
-  return run.value.status === "running" ? ok(run.value) : invalidTransition("Run", id, run.value.status);
+  return run.value.status === "running"
+    ? ok(run.value)
+    : failure("INVALID_TRANSITION", `Run ${id} is ${run.value.status}`);
 }
 
-function accepted(event: DomainEvent): Result<CommandDecision, ProjectDomainError> {
-  return ok({ type: "accepted", event });
+function findCompletedRun(state: ProjectState, id: Run["id"]): Result<CompletedRun, ProjectDomainError> {
+  const run = findRun(state, id);
+  if (!run.ok) return run;
+  return run.value.status === "completed"
+    ? ok(run.value)
+    : failure("INVALID_TRANSITION", `Run ${id} is ${run.value.status}`);
 }
 
-function duplicate(kind: string, id: unknown): Result<never, ProjectDomainError> {
-  return failure("DUPLICATE_ID", kind + " ID already exists: " + String(id));
+function replaceRun(runs: readonly Run[], id: Run["id"], replace: (run: RunningRun) => Run): readonly Run[] {
+  return runs.map(run => run.id === id && run.status === "running" ? replace(run) : run);
 }
 
-function notFound(kind: string, id: unknown): Result<never, ProjectDomainError> {
-  return failure("NOT_FOUND", kind + " was not found: " + String(id));
-}
-
-function invalidTransition(kind: string, id: unknown, status: string): Result<never, ProjectDomainError> {
-  return failure("INVALID_TRANSITION", kind + " " + String(id) + " cannot transition from " + status);
-}
-
-function failure(code: ProjectDomainErrorCode, message: string): Result<never, ProjectDomainError> {
-  return err({ type: "ProjectDomainError", code, message });
+function isRejectedNode(state: ProjectState, projectId: Project["id"], sha: GitCommitSha): boolean {
+  return state.decisions.some(decision => decision.type === "rejection"
+    && decision.projectId === projectId
+    && decision.rejectedNodeShas.includes(sha));
 }
 
 function mapVoid<T>(result: Result<T, ProjectDomainError>): Result<void, ProjectDomainError> {
   return result.ok ? ok(undefined) : result;
 }
 
-function hasKeys(value: object): boolean {
-  return Object.keys(value).length > 0;
+function asInvalidEvent<T>(result: Result<T, ProjectDomainError>): Result<never, ProjectDomainError> {
+  return result.ok ? invalidEvent("Unexpected valid event result") : invalidEvent(result.error.message);
 }
 
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(sortJson(value));
+function duplicate(kind: string, id: string): Result<never, ProjectDomainError> {
+  return failure("DUPLICATE_ID", `${kind} ${id} already exists`);
 }
 
-function sortJson(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortJson);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-    .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
-    .map(([key, item]) => [key, sortJson(item)]));
+function notFound(kind: string, id: string): Result<never, ProjectDomainError> {
+  return failure("NOT_FOUND", `${kind} ${id} was not found`);
+}
+
+function invalidEvent(message: string): Result<never, ProjectDomainError> {
+  return failure("INVALID_EVENT", message);
+}
+
+function failure(code: ProjectDomainErrorCode, message: string): Result<never, ProjectDomainError> {
+  return err({ type: "ProjectDomainError", code, message });
 }

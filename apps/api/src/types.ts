@@ -38,7 +38,9 @@ export type ApiErrorCode =
   | "stale_state"
   | "stale_base"
   | "result_unreachable"
+  | "integrity_error"
   | "confirmation_required"
+  | "unsupported_protocol_version"
   | "temporarily_unavailable";
 
 export type ApiError = {
@@ -67,6 +69,25 @@ export type MutationResult<T> = {
   stateHeadSha: string;
   synchronizedAt: string;
 };
+
+export type RepositoryV2InitializationState =
+  | {
+      readonly status: "uninitialized";
+      readonly expectedStateSource: "default_branch_head";
+      readonly expectedStateSha: string;
+    }
+  | {
+      readonly status: "uninitialized";
+      readonly expectedStateSource: "state_branch_head";
+      readonly stateHeadSha: string;
+      readonly expectedStateSha: string;
+    }
+  | {
+      readonly status: "initialized";
+      readonly expectedStateSource: "state_branch_head";
+      readonly stateHeadSha: string;
+      readonly expectedStateSha: string;
+    };
 
 export function apiOk<T>(value: T): ApiResult<T> {
   return { ok: true, value };

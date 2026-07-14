@@ -2,39 +2,50 @@
 
 ## Package
 
-The repository marketplace exposes `plugins/hunsu`. Its required manifest is `plugins/hunsu/.codex-plugin/plugin.json`; `.mcp.json` binds the authenticated streamable-HTTP service; bundled skills cover Project, Goal, Run, Coach, and divergence workflows.
+The repository marketplace exposes `plugins/hunsu`. Its required manifest is `.codex-plugin/plugin.json`; `.mcp.json` binds the authenticated streamable-HTTP service. Bundled skills cover Project bootstrap, Node-scoped Runs, Coaching transitions, Events inspection, and sibling comparison/decisions.
 
-The plugin includes the valid `.app.json` scaffold required by the transition structure, but its `apps` map is intentionally empty because no registry-issued Hunsu app ID exists. The working authenticated integration is the direct MCP server binding; the repository never invents an external connector identity.
+The plugin authenticates through MCP OAuth, stores no permanent GitHub credential, and never writes `hunsu/state` directly.
 
-The plugin authenticates through MCP OAuth. It stores no permanent GitHub credential and never writes `hunsu/state` directly.
+## Project bootstrap context
+
+`hunsu.projects.list` returns each authorized repository's v2 initialization status and an exact `expectedStateSha`. When `hunsu/state` is absent, that SHA is the current full default-branch head because the first CAS mutation creates the state branch from it. When `hunsu/state` exists without `.hunsu/v2`, the repository is still v2-uninitialized and the expected SHA is the existing state-branch head. No v1 file is decoded or migrated. For an initialized repository, Project context returns the current state head as both `stateHeadSha` and `repositoryState.expectedStateSha`.
+
+Project initialization still requires an independently verified full root commit SHA, one exact initial Node Plan, a fresh logical idempotency key, the returned expected state SHA, and separate explicit user confirmation.
 
 ## Run handshake
 
 ```text
-plugin calls hunsu.runs.start
-  -> API validates Project, Goal, Runner, base SHA, and idempotency
-  -> API creates the Run branch
-  -> API appends RunStarted to GitHub state
-  -> plugin receives immutable RunContract
-  -> Codex verifies repository, base SHA, branch, and tool policy
+plugin calls hunsu.runs.start(sourceNodeSha, goalDigest)
+  -> API resolves exactly one Goal and the source Node's Runner value
+  -> API verifies Node integrity and creates the Run branch at sourceNodeSha
+  -> API appends RunStarted
+  -> plugin receives immutable RunContract v2
+  -> Codex verifies repository, source SHA, branch, Runner contract, and tool policy
   -> Codex performs work, checkpoints, commits, and pushes
-  -> plugin reports the full result SHA and evidence
-  -> API verifies branch reachability and base ancestry
-  -> API appends the terminal event
-  -> webhook/polling refreshes Web projections
+  -> plugin reports the full result SHA and criterion-linked evidence
+  -> API verifies non-self ancestry and branch reachability
+  -> API appends RunCompleted, the Run child Node, edge, and evidence atomically
+  -> webhook/polling refreshes Graph and Events projections
 ```
 
-`RunContract` contains the Project and Run identifiers, immutable Goal and Runner snapshots, repository owner/name, base SHA, Run branch, instructions, criteria, constraints, required evidence, and tool policy. A later Goal or Runner edit cannot change an active contract.
+`RunContract v2` contains the Project and Run identifiers, source Node SHA, exactly one immutable Goal value, the full immutable Runner value, repository owner/name, Run branch, resolved instructions, criteria, constraints, required evidence, tool policy, and lease. The caller cannot override the source SHA or Runner.
+
+## Coaching handshake
+
+The Coach records a complete proposed Node Plan bound to the source SHA, source payload digest, proposed digest, and observed state head. Recording the proposal changes no Graph state. After separate explicit confirmation, the API verifies or creates the deterministic same-tree child commit and managed tag, then appends the confirmed Coaching child through state CAS.
 
 ## Recovery
 
-- Stale state head: reload the Project and reconcile the intended mutation; never overwrite the state ref.
-- Stale base SHA: stop before editing and ask whether to start a new Run.
-- Interrupted work: resume from the last recorded checkpoint and the existing Run branch.
+- Stale state head: reload Graph context and reconcile the intended mutation; never overwrite the state ref.
+- Stale or rejected Node: stop before editing and request a new source choice.
+- Interrupted work: resume from the last checkpoint and existing Run branch.
 - Push failure: keep the Run active and report the Git error; never claim completion.
 - Result verification failure: inspect repository, branch, full SHA, and ancestry, then push the intended commit or fail the Run with evidence.
-- Lost webhook: reconciliation and bounded Web polling rebuild the same projection from GitHub.
+- Prepared Coaching ref with failed CAS: retry the same confirmation key and reuse the deterministic commit/ref.
+- Lost webhook: bounded polling reconstructs the same projection from GitHub.
 
 ## Decision safety
 
-Coach tools may record reviews and proposals. They cannot confirm a Hunsu operation or select/reject an alternative. The divergence skill displays the proposed difference, requires explicit user confirmation, starts each sibling from the same base SHA, and records a comparison before a user-authorized selection.
+Coach tools may record reviews, transition proposals, and comparisons. They cannot confirm a transition or apply selection/rejection. A comparison is advisory. Selection and rejection are independent user-confirmed mutations, operate on sibling result Nodes, and never create a merge edge.
+
+The v2 plugin exposes no Goal or Runner directory tools and accepts no v1 aliases.

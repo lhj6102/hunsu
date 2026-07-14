@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { SessionManager } from "../../apps/api/src/auth/session.ts";
 
 const ORIGIN = "https://plugin.hunsu.app";
+const RUNTIME_REUSE_DEFAULT_HEAD = "9".repeat(40);
 
 describe("plugin.hunsu.app Worker", () => {
   it.each(["/", "/projects"])("serves the Hunsu SPA at %s", async path => {
@@ -84,7 +85,11 @@ describe("plugin.hunsu.app Worker", () => {
           installationId: 99,
           owner: "acme",
           name: "runtime-reuse",
-          stateHeadSha: ""
+          state: {
+            status: "uninitialized",
+            expectedStateSource: "default_branch_head",
+            expectedStateSha: RUNTIME_REUSE_DEFAULT_HEAD
+          }
         }]
       });
     }

@@ -17,7 +17,12 @@ function sortValue(value: unknown): unknown {
     const output: Record<string, unknown> = {};
     for (const key of Object.keys(input).sort()) {
       if (input[key] !== undefined) {
-        output[key] = sortValue(input[key]);
+        Object.defineProperty(output, key, {
+          value: sortValue(input[key]),
+          enumerable: true,
+          configurable: true,
+          writable: true
+        });
       }
     }
     return output;

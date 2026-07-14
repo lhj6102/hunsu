@@ -64,6 +64,12 @@ jobs:
       - name: Build all production packages and applications
         run: pnpm build
 
+      - name: Install the pinned Playwright Chromium runtime
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run Dashboard browser and accessibility contracts
+        run: pnpm run test:browser
+
       - name: Validate production and Plugin contracts
         run: |
           pnpm run plugin:validate

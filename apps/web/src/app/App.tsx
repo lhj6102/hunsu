@@ -1,17 +1,15 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { parseAppRoute, replaceAppPath, type AppRoute } from "@/app/routes";
+import { canonicalPathForRoute, parseAppRoute, replaceAppPath, type AppRoute } from "@/app/routes";
 import { ProjectAppShell } from "@/features/app-shell/ProjectAppShell";
 import { GitHubConnectionScreen } from "@/features/auth/GitHubConnectionScreen";
-import { CoachScreen } from "@/features/coach/CoachScreen";
-import { GoalDetailScreen } from "@/features/goals/GoalDetailScreen";
 import { ProjectListScreen } from "@/features/projects/ProjectListScreen";
-import { ProjectOverviewScreen } from "@/features/projects/ProjectOverviewScreen";
-import { RunDetailScreen } from "@/features/runs/RunDetailScreen";
-import { RunnerDirectoryScreen } from "@/features/runners/RunnerDirectoryScreen";
 import { apiErrorMessage } from "@/shared/api/client";
 import { fetchSession } from "@/shared/api/projectApi";
 import { PageError, PageLoading } from "@/shared/ui/page-state";
+
+const NodeGraphScreen = lazy(() => import("@/features/node-graph/NodeGraphScreen").then(module => ({ default: module.NodeGraphScreen })));
+const EventsScreen = lazy(() => import("@/features/events/EventsScreen").then(module => ({ default: module.EventsScreen })));
 
 export function App() {
   const [route, setRoute] = useState<AppRoute>(() => parseAppRoute(window.location));
@@ -23,13 +21,18 @@ export function App() {
   });
 
   useEffect(() => {
-    if (window.location.pathname === "/" || !window.location.pathname.startsWith("/projects")) {
-      replaceAppPath("/projects");
-    }
     const onPopState = () => setRoute(parseAppRoute(window.location));
     window.addEventListener("popstate", onPopState);
+    if (window.location.pathname === "/") {
+      replaceAppPath("/projects");
+    }
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
+
+  useEffect(() => {
+    const canonicalPath = canonicalPathForRoute(route);
+    if (canonicalPath && canonicalPath !== window.location.pathname) replaceAppPath(canonicalPath);
+  }, [route]);
 
   if (sessionQuery.isLoading) {
     return <main className="apple-page min-h-screen"><PageLoading label="Connecting to Hunsu…" /></main>;
@@ -41,13 +44,17 @@ export function App() {
       </main>
     );
   }
+
   const session = sessionQuery.data;
   if (!session || !session.authenticated || !session.github.connected) {
     return <GitHubConnectionScreen session={session} onRefresh={() => void sessionQuery.refetch()} />;
   }
+
   return (
     <ProjectAppShell route={route} session={session}>
-      <RouteScreen route={route} />
+      <Suspense fallback={<PageLoading label="Loading Project view…" />}>
+        <RouteScreen route={route} />
+      </Suspense>
     </ProjectAppShell>
   );
 }
@@ -56,15 +63,24 @@ function RouteScreen({ route }: { route: AppRoute }) {
   switch (route.kind) {
     case "projects":
       return <ProjectListScreen />;
-    case "project":
-      return <ProjectOverviewScreen projectId={route.projectId} />;
-    case "goal":
-      return <GoalDetailScreen projectId={route.projectId} goalId={route.goalId} />;
-    case "runners":
-      return <RunnerDirectoryScreen projectId={route.projectId} />;
-    case "coach":
-      return <CoachScreen projectId={route.projectId} />;
-    case "run":
-      return <RunDetailScreen projectId={route.projectId} runId={route.runId} />;
+    case "graph":
+      return <NodeGraphScreen projectId={route.projectId} selectedNodeSha={route.nodeSha} />;
+    case "events":
+      return <EventsScreen projectId={route.projectId} selectedEventId={route.eventId} />;
+    case "not_found":
+      return <NotFoundScreen />;
   }
+}
+
+function NotFoundScreen() {
+  return (
+    <main className="apple-page flex min-h-screen items-center justify-center px-6">
+      <div className="max-w-md text-center">
+        <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Not found</p>
+        <h1 className="mt-3 text-2xl font-semibold">This Hunsu view does not exist.</h1>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">Legacy Goal, Runner, Coach, and Run routes are not available in the Commit Node Graph protocol.</p>
+        <button type="button" className="mt-5 text-sm font-semibold text-[color:var(--apple-blue)]" onClick={() => replaceAppPath("/projects")}>Open Projects</button>
+      </div>
+    </main>
+  );
 }

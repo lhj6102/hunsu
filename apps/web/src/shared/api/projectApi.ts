@@ -1,125 +1,84 @@
-import { getApi, patchApi, postApi } from "@/shared/api/client";
-import { alternativeDecisionRequest } from "@/shared/api/alternativeDecision";
-import { PROJECT_QUERY_ROOT } from "@/shared/api/polling";
+import { getApi, postApi } from "@/shared/api/client";
+import { eventDateBound } from "@/features/events/eventFilters";
+import {
+  decodeEventDetail,
+  decodeEvents,
+  decodeNodeDetail,
+  decodeProjectGraph,
+  decodeProjectList,
+  decodeStartRun,
+  unwrapPresentation
+} from "@/shared/api/v2Decoders";
 import type {
-  CoachResponse,
-  GoalResponse,
-  MutationResponse,
+  EventDetailResponse,
+  EventsResponse,
+  NodeDetailResponse,
+  ProjectGraphResponse,
   ProjectListResponse,
-  ProjectResponse,
-  RepositoryListResponse,
-  RunResponse,
-  RunnerListResponse,
-  SessionResponse
+  SessionResponse,
+  StartRunResponse
 } from "@/shared/api/types";
 
-export const PROJECT_LIST_QUERY_KEY = PROJECT_QUERY_ROOT;
+export const PROJECT_LIST_QUERY_KEY = ["projects", "v2"] as const;
 
 export function fetchSession(signal?: AbortSignal): Promise<SessionResponse> {
   return getApi<SessionResponse>("/api/session", signal);
 }
 
-export function fetchRepositories(signal?: AbortSignal): Promise<RepositoryListResponse> {
-  return getApi<RepositoryListResponse>("/api/repositories", signal);
+export async function fetchProjects(signal?: AbortSignal): Promise<ProjectListResponse> {
+  return unwrapPresentation(decodeProjectList(await getApi<unknown>("/api/projects", signal)));
 }
 
-export function fetchProjects(signal?: AbortSignal): Promise<ProjectListResponse> {
-  return getApi<ProjectListResponse>("/api/projects", signal);
+export async function fetchProjectGraph(
+  projectId: string,
+  cursor: string | null,
+  signal?: AbortSignal
+): Promise<ProjectGraphResponse> {
+  const query = new URLSearchParams({ limit: "300" });
+  if (cursor !== null) query.set("cursor", cursor);
+  const value = await getApi<unknown>(`${projectApiPath(projectId)}/graph?${query.toString()}`, signal);
+  return unwrapPresentation(decodeProjectGraph(value));
 }
 
-export function createProject(body: {
-  repository: { owner: string; name: string };
-  title: string;
-  objective: string;
-  baseRef: string;
+export async function fetchNode(projectId: string, nodeSha: string, signal?: AbortSignal): Promise<NodeDetailResponse> {
+  const value = await getApi<unknown>(`${projectApiPath(projectId)}/nodes/${encodeURIComponent(nodeSha)}`, signal);
+  return unwrapPresentation(decodeNodeDetail(value));
+}
+
+export async function startNodeRun(projectId: string, nodeSha: string, body: {
+  goalDigest: string;
+  runId: string;
   expectedStateSha: string;
   idempotencyKey: string;
-}): Promise<MutationResponse<{ projectId: string }>> {
-  return postApi("/api/projects", body);
+}): Promise<StartRunResponse> {
+  const value = await postApi<unknown>(`${projectApiPath(projectId)}/nodes/${encodeURIComponent(nodeSha)}/runs`, body);
+  return unwrapPresentation(decodeStartRun(value));
 }
 
-export function fetchProject(projectId: string, signal?: AbortSignal): Promise<ProjectResponse> {
-  return getApi<ProjectResponse>(projectPath(projectId), signal);
+export type EventQuery = {
+  cursor: string | null;
+  type: string | null;
+  nodeSha: string | null;
+  actor: string | null;
+  from: string | null;
+  to: string | null;
+  search: string | null;
+};
+
+export async function fetchEvents(projectId: string, options: EventQuery, signal?: AbortSignal): Promise<EventsResponse> {
+  const query = new URLSearchParams({ limit: "50" });
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== null) query.set(key, key === "from" || key === "to" ? eventDateBound(value, key) : value);
+  }
+  const response = await getApi<unknown>(`${projectApiPath(projectId)}/events?${query.toString()}`, signal);
+  return unwrapPresentation(decodeEvents(response));
 }
 
-export function createGoal(projectId: string, body: {
-  title: string;
-  desiredOutcome: string;
-  acceptanceCriteria: string[];
-  constraints: string[];
-  priority: "low" | "normal" | "high" | "urgent";
-  runnerId?: string;
-  expectedStateSha: string;
-  idempotencyKey: string;
-}): Promise<MutationResponse<{ goalId: string }>> {
-  return postApi(`${projectPath(projectId)}/goals`, body);
+export async function fetchEvent(projectId: string, eventId: string, signal?: AbortSignal): Promise<EventDetailResponse> {
+  const value = await getApi<unknown>(`${projectApiPath(projectId)}/events/${encodeURIComponent(eventId)}`, signal);
+  return unwrapPresentation(decodeEventDetail(value));
 }
 
-export function fetchGoal(projectId: string, goalId: string, signal?: AbortSignal): Promise<GoalResponse> {
-  return getApi<GoalResponse>(`${projectPath(projectId)}/goals/${encodeURIComponent(goalId)}`, signal);
-}
-
-export function updateGoal(projectId: string, goalId: string, body: Record<string, unknown>): Promise<MutationResponse<{ goalId: string }>> {
-  return patchApi(`${projectPath(projectId)}/goals/${encodeURIComponent(goalId)}`, body);
-}
-
-export function requestHunsu(projectId: string, goalId: string, body: {
-  sourceRunId: string;
-  summary?: string;
-  expectedStateSha: string;
-  idempotencyKey: string;
-}): Promise<MutationResponse<{ alternativeId: string }>> {
-  return postApi(`${projectPath(projectId)}/goals/${encodeURIComponent(goalId)}/hunsu`, body);
-}
-
-export function selectAlternative(projectId: string, goalId: string, runId: string, comparisonId: string, expectedStateSha: string, idempotencyKey: string): Promise<MutationResponse<{ decisionId: string }>> {
-  return postApi(
-    `${projectPath(projectId)}/goals/${encodeURIComponent(goalId)}/alternatives/${encodeURIComponent(runId)}/select`,
-    alternativeDecisionRequest(comparisonId, expectedStateSha, idempotencyKey)
-  );
-}
-
-export function rejectAlternative(projectId: string, goalId: string, runId: string, comparisonId: string, expectedStateSha: string, idempotencyKey: string): Promise<MutationResponse<{ decisionId: string }>> {
-  return postApi(
-    `${projectPath(projectId)}/goals/${encodeURIComponent(goalId)}/alternatives/${encodeURIComponent(runId)}/reject`,
-    alternativeDecisionRequest(comparisonId, expectedStateSha, idempotencyKey)
-  );
-}
-
-export function fetchRunners(projectId: string, signal?: AbortSignal): Promise<RunnerListResponse> {
-  return getApi<RunnerListResponse>(`${projectPath(projectId)}/runners`, signal);
-}
-
-export function fetchRun(projectId: string, runId: string, signal?: AbortSignal): Promise<RunResponse> {
-  return getApi<RunResponse>(`${projectPath(projectId)}/runs/${encodeURIComponent(runId)}`, signal);
-}
-
-export function fetchCoach(projectId: string, signal?: AbortSignal): Promise<CoachResponse> {
-  return getApi<CoachResponse>(`${projectPath(projectId)}/coach`, signal);
-}
-
-export function requestCoachReview(projectId: string, expectedStateSha: string, idempotencyKey: string): Promise<MutationResponse<{ reviewId: string }>> {
-  return postApi(`${projectPath(projectId)}/coach/review`, { expectedStateSha, idempotencyKey });
-}
-
-export function confirmCoachProposal(projectId: string, proposalId: string, expectedStateSha: string, idempotencyKey: string): Promise<MutationResponse<{ proposalId: string }>> {
-  return postApi(
-    `${projectPath(projectId)}/coach/proposals/${encodeURIComponent(proposalId)}/confirm`,
-    { expectedStateSha, idempotencyKey }
-  );
-}
-
-export function rejectCoachProposal(projectId: string, proposalId: string, expectedStateSha: string, idempotencyKey: string): Promise<MutationResponse<{ proposalId: string }>> {
-  return postApi(
-    `${projectPath(projectId)}/coach/proposals/${encodeURIComponent(proposalId)}/reject`,
-    { expectedStateSha, idempotencyKey }
-  );
-}
-
-export function rebuildProject(projectId: string, expectedStateSha: string, idempotencyKey: string): Promise<MutationResponse<{ projectId: string }>> {
-  return postApi(`${projectPath(projectId)}/rebuild`, { expectedStateSha, idempotencyKey });
-}
-
-function projectPath(projectId: string): string {
+function projectApiPath(projectId: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}`;
 }

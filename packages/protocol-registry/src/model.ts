@@ -1,18 +1,18 @@
 import type {
-  CoachPolicy,
-  NonEmptyText,
-  PositiveInteger,
-  PromptTemplate,
-  ResourceName,
+  CanonicalJsonValue,
   Result,
-  RuntimePolicy
+  RunnerTypeIntegrity,
+  RunnerTypeLock,
+  RunnerValueTypeDecoder,
+  RunnerValueTypeRegistry
 } from "@hunsu/protocol";
 
 declare const registryBrand: unique symbol;
 
-export const REGISTRY_DEFINITION_SCHEMA = "hunsu.registry-definition.v1" as const;
-export const REGISTRY_SNAPSHOT_SCHEMA = "hunsu.registry-snapshot.v1" as const;
-export const REGISTRY_INTEGRITY_PREFIX = "hunsu-json-c14n-v1+sha256:" as const;
+export const REGISTRY_DEFINITION_SCHEMA = "hunsu.registry-definition.v2" as const;
+export const REGISTRY_SNAPSHOT_SCHEMA = "hunsu.registry-snapshot.v2" as const;
+export const REGISTRY_INTEGRITY_PREFIX = "hunsu-registry-definition-v2:sha256:" as const;
+export const RUNNER_TYPE_INTEGRITY_PREFIX = "hunsu-runner-type-v1:sha256:" as const;
 
 export type RegistryOrigin = string & { readonly [registryBrand]: "RegistryOrigin" };
 export type RegistryKey = string & { readonly [registryBrand]: "RegistryKey" };
@@ -20,16 +20,16 @@ export type RegistryVersion = string & { readonly [registryBrand]: "RegistryVers
 export type RegistryIntegrity = `${typeof REGISTRY_INTEGRITY_PREFIX}${string}` & {
   readonly [registryBrand]: "RegistryIntegrity";
 };
+export type DefinitionIntegrity = RegistryIntegrity | RunnerTypeIntegrity;
 
-export type DefinitionKind = "player" | "team" | "coach" | "skill" | "resource";
-export type RunnerDefinitionKind = "player" | "team";
+export type DefinitionKind = "runner_type" | "coach" | "skill" | "resource";
 
 export type DefinitionLock<Kind extends DefinitionKind = DefinitionKind> = {
   readonly origin: RegistryOrigin;
   readonly kind: Kind;
   readonly key: RegistryKey;
   readonly version: RegistryVersion;
-  readonly integrity: RegistryIntegrity;
+  readonly integrity: DefinitionIntegrity;
 };
 
 type DefinitionHeader<Kind extends DefinitionKind> = {
@@ -39,45 +39,72 @@ type DefinitionHeader<Kind extends DefinitionKind> = {
   readonly version: RegistryVersion;
 };
 
-export type PlayerDefinition = DefinitionHeader<"player"> & {
-  readonly player: {
-    readonly promptTemplate: PromptTemplate;
-    readonly resources: readonly DefinitionLock<"skill" | "resource">[];
-    readonly runtimePolicy: RuntimePolicy;
+export type RunnerValueSchema =
+  | {
+      readonly type: "object";
+      readonly properties: Readonly<Record<string, RunnerValueSchema>>;
+      readonly required: readonly string[];
+      readonly additionalProperties: false;
+    }
+  | {
+      readonly type: "array";
+      readonly items: RunnerValueSchema;
+      readonly minItems: number;
+      readonly maxItems: number;
+      readonly uniqueItems: boolean;
+    }
+  | {
+      readonly type: "string";
+      readonly minLength: number;
+      readonly maxLength: number;
+    }
+  | {
+      readonly type: "string_enum";
+      readonly values: readonly [string, ...string[]];
+    }
+  | {
+      readonly type: "integer";
+      readonly minimum: number;
+      readonly maximum: number;
+    }
+  | {
+      readonly type: "number";
+      readonly minimum: number;
+      readonly maximum: number;
+    }
+  | { readonly type: "boolean" }
+  | { readonly type: "null" };
+
+export type RunnerExecutorContract = {
+  readonly schema: "hunsu.runner-executor.v1";
+  readonly resource: DefinitionLock<"resource">;
+  readonly entrypoint: string;
+};
+
+export type RunnerTypeDefinition = DefinitionHeader<"runner_type"> & {
+  readonly runnerType: {
+    readonly displayName: string;
+    readonly valueSchema: RunnerValueSchema;
+    readonly executor: RunnerExecutorContract;
   };
 };
-
-export type TeamPlayerDefinition = {
-  readonly player: DefinitionLock<"player">;
-  readonly role: NonEmptyText;
-  readonly order: PositiveInteger;
-};
-
-export type TeamDefinition = DefinitionHeader<"team"> & {
-  readonly team: {
-    readonly strategy: {
-      readonly mode: "sequence" | "parallel" | "coordinated";
-      readonly promptTemplate: PromptTemplate;
-      readonly maxRounds: PositiveInteger;
-    };
-    readonly players: readonly [TeamPlayerDefinition, ...TeamPlayerDefinition[]];
-  };
-};
-
-export type RunnerDefinition = PlayerDefinition | TeamDefinition;
 
 export type CoachDefinition = DefinitionHeader<"coach"> & {
   readonly coach: {
-    readonly promptTemplate: PromptTemplate;
+    readonly promptTemplate: string;
     readonly resources: readonly DefinitionLock<"skill" | "resource">[];
-    readonly policy: CoachPolicy;
+    readonly policy: {
+      readonly transitions: "propose_only";
+      readonly selection: "user_only";
+      readonly rejection: "user_only";
+    };
   };
 };
 
 export type SkillDefinition = DefinitionHeader<"skill"> & {
   readonly skill: {
-    readonly name: ResourceName;
-    readonly instructions: NonEmptyText;
+    readonly name: string;
+    readonly instructions: string;
     readonly resources: readonly DefinitionLock<"resource">[];
   };
 };
@@ -85,20 +112,20 @@ export type SkillDefinition = DefinitionHeader<"skill"> & {
 export type RegisteredResource =
   | {
       readonly type: "skill";
-      readonly name: ResourceName;
-      readonly source: NonEmptyText;
+      readonly name: string;
+      readonly source: string;
     }
   | {
       readonly type: "plugin";
-      readonly name: ResourceName;
-      readonly version: NonEmptyText;
+      readonly name: string;
+      readonly version: string;
     };
 
 export type ResourceDefinition = DefinitionHeader<"resource"> & {
   readonly resource: RegisteredResource;
 };
 
-export type RegistryDefinition = RunnerDefinition | CoachDefinition | SkillDefinition | ResourceDefinition;
+export type RegistryDefinition = RunnerTypeDefinition | CoachDefinition | SkillDefinition | ResourceDefinition;
 
 export type RegistryEntry = {
   readonly lock: DefinitionLock;
@@ -119,8 +146,8 @@ export type RegistryDecodeError = {
 export type RegistryIntegrityError = {
   readonly type: "RegistryIntegrityError";
   readonly path: string;
-  readonly expected: RegistryIntegrity;
-  readonly actual: RegistryIntegrity;
+  readonly expected: DefinitionIntegrity;
+  readonly actual: DefinitionIntegrity;
 };
 
 export type RegistryIdentityError = {
@@ -135,17 +162,17 @@ export type RegistryResolutionError = {
   readonly message: string;
 };
 
-export type TeamMembershipError = {
-  readonly type: "TeamMembershipError";
-  readonly path: string;
-  readonly message: string;
-};
-
 export type RegistryError =
   | RegistryDecodeError
   | RegistryIntegrityError
   | RegistryIdentityError
-  | RegistryResolutionError
-  | TeamMembershipError;
+  | RegistryResolutionError;
 
 export type RegistryResult<Value> = Result<Value, RegistryError>;
+
+export type ResolvedRunnerType = {
+  readonly lock: RunnerTypeLock;
+  readonly definition: RunnerTypeDefinition;
+};
+
+export type { CanonicalJsonValue, RunnerTypeLock, RunnerValueTypeDecoder, RunnerValueTypeRegistry };
