@@ -55,11 +55,7 @@ export class GitHubWebhookProcessor {
 
     try {
       if (normalized.value.kind === "state_ref_changed") {
-        const reconciled = await this.#service.reconcileRepository(normalized.value.repository);
-        if (!reconciled.ok) {
-          await this.#releaseDelivery(deliveryId, leaseExpiresAt);
-          return reconciled;
-        }
+        this.#service.invalidateRepository(normalized.value.repository);
       } else if (normalized.value.kind === "installation_changed") {
         this.#service.invalidateInstallation(normalized.value.installationId);
       } else if (normalized.value.kind === "repository_grant_changed") {

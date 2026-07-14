@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GitHubRestTransport, type RepositoryLocator } from "../packages/github-store/src/index.ts";
+import { GitHubAuthorityError, GitHubRestTransport, type RepositoryLocator } from "../packages/github-store/src/index.ts";
 
 const repository: RepositoryLocator = {
   installationId: 19,
@@ -127,6 +127,369 @@ test("GitHub REST uses verified installation authority instead of user-oriented 
     ok: true,
     value: [{ ...repository, private: true, permissions: { contents: "write" } }]
   });
+});
+
+test("GitHub REST preserves primary and secondary rate-limit retry boundaries", async t => {
+  const now = Date.UTC(2026, 6, 14, 8, 0, 0);
+  const scenarios = [
+    {
+      name: "primary reset",
+      status: 429,
+      message: "API rate limit exceeded for installation ID 19.",
+      headers: {
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": String(Math.floor(now / 1_000) + 125),
+        "x-github-request-id": "RATE:PRIMARY"
+      },
+      retryAfterSeconds: 125,
+      requestId: "RATE:PRIMARY"
+    },
+    {
+      name: "secondary retry-after",
+      status: 403,
+      message: "You have exceeded a secondary rate limit.",
+      headers: { "retry-after": "73", "x-ratelimit-remaining": "4999" },
+      retryAfterSeconds: 73,
+      requestId: undefined
+    },
+    {
+      name: "secondary fallback",
+      status: 403,
+      message: "Secondary rate limit exceeded.",
+      headers: {},
+      retryAfterSeconds: 60,
+      requestId: undefined
+    },
+    {
+      name: "primary fallback without reset header",
+      status: 403,
+      message: "API rate limit exceeded for installation ID 19.",
+      headers: { "x-ratelimit-remaining": "0" },
+      retryAfterSeconds: 60,
+      requestId: undefined
+    },
+    {
+      name: "bare 429 fallback",
+      status: 429,
+      message: "Too many requests",
+      headers: {},
+      retryAfterSeconds: 60,
+      requestId: undefined
+    }
+  ] as const;
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const transport = new GitHubRestTransport({
+        authorityProvider: async () => verifiedAuthority("rate-limited-token"),
+        now: () => now,
+        fetch: async () => new Response(JSON.stringify({ message: scenario.message }), {
+          status: scenario.status,
+          headers: { "content-type": "application/json", ...scenario.headers }
+        })
+      });
+
+      const result = await transport.readBranchHead(repository, "hunsu/state");
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.deepEqual(result.error, {
+        code: "rate_limited",
+        message: scenario.message,
+        status: scenario.status,
+        retryAfterSeconds: scenario.retryAfterSeconds,
+        ...(scenario.requestId ? { requestId: scenario.requestId } : {})
+      });
+    });
+  }
+});
+
+test("GitHub REST serializes installation requests and short-circuits the Retry-After window", async () => {
+  let now = Date.UTC(2026, 6, 14, 8, 0, 0);
+  let authorityRequests = 0;
+  let githubRequests = 0;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => {
+      authorityRequests += 1;
+      return verifiedAuthority("rate-limited-token");
+    },
+    now: () => now,
+    fetch: async () => {
+      githubRequests += 1;
+      if (githubRequests === 1) {
+        return json({ message: "You have exceeded a secondary rate limit." }, 403, {
+          "retry-after": "60",
+          "x-github-request-id": "RATE:COOLDOWN"
+        });
+      }
+      return json({ object: { sha: "a".repeat(40) } });
+    }
+  });
+
+  const concurrent = await Promise.all([
+    transport.readBranchHead(repository, "hunsu/state"),
+    transport.readBranchHead(repository, "hunsu/state"),
+    transport.readBranchHead(repository, "hunsu/state")
+  ]);
+  assert.equal(githubRequests, 1);
+  assert.equal(authorityRequests, 1);
+  for (const result of concurrent) {
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "rate_limited");
+      assert.equal(result.error.retryAfterSeconds, 60);
+      assert.equal(result.error.requestId, "RATE:COOLDOWN");
+    }
+  }
+
+  now += 30_000;
+  const waiting = await transport.readBranchHead(repository, "hunsu/state");
+  assert.equal(waiting.ok, false);
+  if (!waiting.ok) assert.equal(waiting.error.retryAfterSeconds, 30);
+  assert.equal(githubRequests, 1);
+  assert.equal(authorityRequests, 1);
+
+  now += 30_000;
+  assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), {
+    ok: true,
+    value: "a".repeat(40)
+  });
+  assert.equal(githubRequests, 2);
+  assert.equal(authorityRequests, 2);
+});
+
+test("GitHub REST applies installation cooldown when authority minting is rate limited", async () => {
+  let now = Date.UTC(2026, 6, 14, 8, 0, 0);
+  let authorityRequests = 0;
+  let githubRequests = 0;
+  const transport = new GitHubRestTransport({
+    now: () => now,
+    authorityProvider: async () => {
+      authorityRequests += 1;
+      if (authorityRequests === 1) {
+        throw new GitHubAuthorityError({
+          code: "rate_limited",
+          message: "Too many installation token requests",
+          status: 429,
+          retryAfterSeconds: 47,
+          requestId: "RATE:TOKEN-MINT"
+        });
+      }
+      return verifiedAuthority("recovered-installation-token");
+    },
+    fetch: async () => {
+      githubRequests += 1;
+      return json({ object: { sha: "a".repeat(40) } });
+    }
+  });
+
+  const concurrent = await Promise.all([
+    transport.readBranchHead(repository, "hunsu/state"),
+    transport.readBranchHead(repository, "hunsu/state"),
+    transport.readBranchHead(repository, "hunsu/state")
+  ]);
+  assert.equal(authorityRequests, 1);
+  assert.equal(githubRequests, 0);
+  for (const result of concurrent) {
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "rate_limited");
+      assert.equal(result.error.retryAfterSeconds, 47);
+      assert.equal(result.error.requestId, "RATE:TOKEN-MINT");
+    }
+  }
+
+  now += 47_000;
+  assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), {
+    ok: true,
+    value: "a".repeat(40)
+  });
+  assert.equal(authorityRequests, 2);
+  assert.equal(githubRequests, 1);
+});
+
+test("GitHub REST suppresses queued token mints during transient and forbidden authority cooldowns", async t => {
+  const scenarios = [
+    {
+      name: "upstream 503 with Retry-After",
+      error: {
+        code: "invalid_response" as const,
+        message: "GitHub installation token request failed with 503.",
+        status: 503,
+        retryAfterSeconds: 7,
+        requestId: "UPSTREAM:TOKEN-MINT"
+      },
+      cooldownMs: 7_000
+    },
+    {
+      name: "non-rate 403",
+      error: {
+        code: "forbidden" as const,
+        message: "GitHub rejected the installation token request.",
+        status: 403,
+        requestId: "AUTH:TOKEN-MINT"
+      },
+      cooldownMs: 30_000
+    }
+  ] as const;
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      let now = Date.UTC(2026, 6, 14, 8, 0, 0);
+      let authorityRequests = 0;
+      let githubRequests = 0;
+      const transport = new GitHubRestTransport({
+        now: () => now,
+        authorityProvider: async () => {
+          authorityRequests += 1;
+          if (authorityRequests === 1) throw new GitHubAuthorityError(scenario.error);
+          return verifiedAuthority("recovered-installation-token");
+        },
+        fetch: async () => {
+          githubRequests += 1;
+          return json({ object: { sha: "a".repeat(40) } });
+        }
+      });
+
+      const concurrent = await Promise.all([
+        transport.readBranchHead(repository, "hunsu/state"),
+        transport.readBranchHead(repository, "hunsu/state"),
+        transport.readBranchHead(repository, "hunsu/state")
+      ]);
+      assert.equal(authorityRequests, 1);
+      assert.equal(githubRequests, 0);
+      assert.equal(concurrent.every(result => !result.ok && result.error.code === scenario.error.code), true);
+
+      now += scenario.cooldownMs - 1_000;
+      const waiting = await transport.readBranchHead(repository, "hunsu/state");
+      assert.equal(waiting.ok, false);
+      assert.equal(authorityRequests, 1);
+      assert.equal(githubRequests, 0);
+      if (!waiting.ok && "retryAfterSeconds" in scenario.error) {
+        assert.equal(waiting.error.retryAfterSeconds, 1);
+      }
+
+      now += 1_000;
+      assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), {
+        ok: true,
+        value: "a".repeat(40)
+      });
+      assert.equal(authorityRequests, 2);
+      assert.equal(githubRequests, 1);
+    });
+  }
+});
+
+test("GitHub REST suppresses queued calls during upstream 5xx and network cooldowns", async t => {
+  const scenarios = [
+    {
+      name: "REST 503 with Retry-After",
+      cooldownMs: 7_000,
+      firstResponse() {
+        return json({ message: "GitHub is temporarily unavailable" }, 503, {
+          "retry-after": "7",
+          "x-github-request-id": "UPSTREAM:REST"
+        });
+      },
+      expectedError: {
+        code: "invalid_response" as const,
+        message: "GitHub is temporarily unavailable",
+        status: 503,
+        retryAfterSeconds: 7,
+        requestId: "UPSTREAM:REST"
+      }
+    },
+    {
+      name: "network failure",
+      cooldownMs: 5_000,
+      firstResponse(): Response {
+        throw new Error("socket details must not escape");
+      },
+      expectedError: {
+        code: "network" as const,
+        message: "GitHub request failed before receiving a usable response.",
+        retryAfterSeconds: 5
+      }
+    }
+  ] as const;
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      let now = Date.UTC(2026, 6, 14, 8, 0, 0);
+      let authorityRequests = 0;
+      let githubRequests = 0;
+      const transport = new GitHubRestTransport({
+        now: () => now,
+        authorityProvider: async () => {
+          authorityRequests += 1;
+          return verifiedAuthority("installation-token");
+        },
+        fetch: async () => {
+          githubRequests += 1;
+          return githubRequests === 1
+            ? scenario.firstResponse()
+            : json({ object: { sha: "a".repeat(40) } });
+        }
+      });
+
+      const concurrent = await Promise.all([
+        transport.readBranchHead(repository, "hunsu/state"),
+        transport.readBranchHead(repository, "hunsu/state"),
+        transport.readBranchHead(repository, "hunsu/state")
+      ]);
+      assert.equal(authorityRequests, 1);
+      assert.equal(githubRequests, 1);
+      for (const result of concurrent) {
+        assert.equal(result.ok, false);
+        if (!result.ok) assert.deepEqual(result.error, scenario.expectedError);
+      }
+
+      now += scenario.cooldownMs - 1_000;
+      const waiting = await transport.readBranchHead(repository, "hunsu/state");
+      assert.equal(waiting.ok, false);
+      if (!waiting.ok) assert.equal(waiting.error.retryAfterSeconds, 1);
+      assert.equal(authorityRequests, 1);
+      assert.equal(githubRequests, 1);
+
+      now += 1_000;
+      assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), {
+        ok: true,
+        value: "a".repeat(40)
+      });
+      assert.equal(authorityRequests, 2);
+      assert.equal(githubRequests, 2);
+    });
+  }
+});
+
+test("GitHub REST invalidates a rejected installation token and retries once", async () => {
+  let authorityVersion = 1;
+  const authorizationHeaders: string[] = [];
+  let invalidations = 0;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority(`installation-token-${authorityVersion}`),
+    invalidateAuthority: (installationId, rejectedToken) => {
+      assert.equal(installationId, repository.installationId);
+      assert.equal(rejectedToken, "installation-token-1");
+      invalidations += 1;
+      authorityVersion += 1;
+    },
+    fetch: async (_input, init = {}) => {
+      authorizationHeaders.push(new Headers(init.headers).get("authorization") ?? "");
+      return authorizationHeaders.length === 1
+        ? json({ message: "Bad credentials" }, 401)
+        : json({ object: { sha: "a".repeat(40) } });
+    }
+  });
+
+  assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), {
+    ok: true,
+    value: "a".repeat(40)
+  });
+  assert.equal(invalidations, 1);
+  assert.deepEqual(authorizationHeaders, [
+    "Bearer installation-token-1",
+    "Bearer installation-token-2"
+  ]);
 });
 
 test("GitHub REST initializes state from the created ref response without rereading the ref", async () => {
@@ -457,6 +820,52 @@ const invalidGraphqlBlobResponses: ReadonlyArray<{
   }
 ];
 
+test("GitHub REST recognizes a successful-status GraphQL rate-limit response", async () => {
+  const headSha = "d".repeat(40);
+  const now = Date.UTC(2026, 6, 14, 8, 0, 0);
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("test-installation-value"),
+    now: () => now,
+    fetch: async input => {
+      const url = String(input);
+      if (url.includes("/git/ref/heads/hunsu/state")) return json({ object: { sha: headSha } });
+      if (url.endsWith(`/git/commits/${headSha}`)) return json({ tree: { sha: "root-tree" } });
+      if (url.endsWith("/git/trees/root-tree")) {
+        return json({ tree: [{ path: ".hunsu", type: "tree", sha: "state-tree" }] });
+      }
+      if (url.endsWith("/git/trees/state-tree?recursive=1")) {
+        return json({ truncated: false, tree: [{
+          path: eventPath,
+          type: "blob",
+          sha: "event-blob",
+          size: 3
+        }] });
+      }
+      if (url.endsWith("/graphql")) {
+        return new Response(JSON.stringify({ errors: [{ message: "API rate limit exceeded for this installation." }] }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(Math.floor(now / 1_000) + 90)
+          }
+        });
+      }
+      return json({ message: `Unexpected ${url}` }, 500);
+    }
+  });
+
+  const result = await transport.readBranch(repository, "hunsu/state");
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.deepEqual(result.error, {
+    code: "rate_limited",
+    message: "API rate limit exceeded for this installation.",
+    status: 200,
+    retryAfterSeconds: 90
+  });
+});
+
 for (const scenario of invalidGraphqlBlobResponses) {
   test(`GitHub REST rejects ${scenario.name} in a state blob response`, async () => {
     const headSha = "d".repeat(40);
@@ -611,10 +1020,12 @@ test("GitHub REST resolves non-state branch heads without downloading trees", as
   assert.equal(calls, 1);
 });
 
-function json(body: unknown, status = 200): Response {
+function json(body: unknown, status = 200, headers: HeadersInit = {}): Response {
+  const responseHeaders = new Headers(headers);
+  if (!responseHeaders.has("content-type")) responseHeaders.set("content-type", "application/json");
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" }
+    headers: responseHeaders
   });
 }
 

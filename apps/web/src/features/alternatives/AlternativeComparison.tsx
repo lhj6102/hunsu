@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Check, GitBranch, GitCommit, Scale, X } from "lucide-react";
 import { apiErrorMessage } from "@/shared/api/client";
+import { invalidateProjectQueries } from "@/shared/api/polling";
 import { rejectAlternative, selectAlternative } from "@/shared/api/projectApi";
 import type { AlternativeComparison as RecordedAlternativeComparison, GoalAlternative } from "@/shared/api/types";
 import { useLogicalSubmissionKey } from "@/shared/api/useLogicalSubmissionKey";
@@ -49,9 +50,7 @@ export function AlternativeComparison({
     onSuccess: () => {
       submission.succeeded();
       setPending(undefined);
-      void queryClient.invalidateQueries({ queryKey: ["projects", projectId, "goals", goalId] });
-      void queryClient.invalidateQueries({ queryKey: ["projects", projectId] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void invalidateProjectQueries(queryClient);
     }
   });
   if (alternatives.length < 2 && comparisons.length === 0) {

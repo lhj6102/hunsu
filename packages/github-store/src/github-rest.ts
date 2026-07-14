@@ -8,12 +8,15 @@ import type {
   RepositoryLocator,
   TransportResult
 } from "./types.ts";
-import { HUNSU_STATE_BRANCH } from "./types.ts";
+import { GitHubAuthorityError, HUNSU_STATE_BRANCH } from "./types.ts";
 
 const GITHUB_API_VERSION = "2026-03-10";
 const GITHUB_USER_AGENT = "hunsu-plugin-production";
 const GRAPHQL_BLOB_BATCH_SIZE = 500;
 const MAX_STATE_BLOB_REQUESTS_PER_READ = 13;
+const MAX_INSTALLATION_COOLDOWNS = 128;
+const TRANSIENT_FAILURE_COOLDOWN_SECONDS = 5;
+const AUTHORITY_FORBIDDEN_COOLDOWN_SECONDS = 30;
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -26,24 +29,39 @@ export type InstallationAuthorityProvider = (
   installationId: number
 ) => Promise<ContentsWriteInstallationAuthority>;
 
+export type InstallationAuthorityInvalidator = (installationId: number, rejectedToken: string) => void;
+
 export type GitHubRestTransportOptions = {
   authorityProvider: InstallationAuthorityProvider;
+  invalidateAuthority?: InstallationAuthorityInvalidator;
   fetch?: FetchLike;
   apiBaseUrl?: string;
+  now?: () => number;
+};
+
+type InstallationCooldown = {
+  retryAt: number;
+  error: GitHubTransportError;
 };
 
 export class GitHubRestTransport implements GitHubTransport {
   readonly #authorityProvider: InstallationAuthorityProvider;
+  readonly #invalidateAuthority: InstallationAuthorityInvalidator | undefined;
   readonly #fetch: FetchLike;
   readonly #apiBaseUrl: string;
+  readonly #now: () => number;
+  readonly #installationRequestTails = new Map<number, Promise<void>>();
+  readonly #installationCooldowns = new Map<number, InstallationCooldown>();
 
   constructor(options: GitHubRestTransportOptions) {
     this.#authorityProvider = options.authorityProvider;
+    this.#invalidateAuthority = options.invalidateAuthority;
     const fetch = options.fetch;
     this.#fetch = fetch
       ? (request, init) => fetch(request, init)
       : (request, init) => globalThis.fetch(request, init);
     this.#apiBaseUrl = (options.apiBaseUrl ?? "https://api.github.com").replace(/\/$/u, "");
+    this.#now = options.now ?? (() => Date.now());
   }
 
   async listInstallationRepositories(installationId: number): Promise<TransportResult<RepositoryGrant[]>> {
@@ -326,34 +344,181 @@ export class GitHubRestTransport implements GitHubTransport {
     conflictOnValidation = false,
     allowNotFound = false
   ): Promise<TransportResult<T>> {
+    return this.#withInstallationRequestLock(
+      installationId,
+      () => this.#requestWithCooldown<T>(installationId, path, init, conflictOnValidation, allowNotFound)
+    );
+  }
+
+  async #requestWithCooldown<T>(
+    installationId: number,
+    path: string,
+    init: RequestInit,
+    conflictOnValidation: boolean,
+    allowNotFound: boolean
+  ): Promise<TransportResult<T>> {
+    const cooldown = this.#activeInstallationCooldown(installationId);
+    if (cooldown) return failure(cooldown);
     try {
-      const authority = await this.#authorityProvider(installationId);
-      const response = await this.#fetch(`${this.#apiBaseUrl}${path}`, {
-        ...init,
-        headers: {
-          accept: "application/vnd.github+json",
-          authorization: `Bearer ${authority.token}`,
-          "content-type": "application/json",
-          "user-agent": GITHUB_USER_AGENT,
-          "x-github-api-version": GITHUB_API_VERSION,
-          ...init.headers
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const authority = await this.#authorityProvider(installationId);
+        const response = await this.#fetch(`${this.#apiBaseUrl}${path}`, {
+          ...init,
+          headers: {
+            accept: "application/vnd.github+json",
+            authorization: `Bearer ${authority.token}`,
+            "content-type": "application/json",
+            "user-agent": GITHUB_USER_AGENT,
+            "x-github-api-version": GITHUB_API_VERSION,
+            ...init.headers
+          }
+        });
+        if (response.ok) {
+          const body = await response.json() as T;
+          const graphQlRateLimit = path === "/graphql" ? graphQlRateLimitMessage(body) : undefined;
+          if (graphQlRateLimit) return this.#recordRateLimit(installationId, response, graphQlRateLimit);
+          return ok(body);
         }
-      });
-      if (!response.ok) {
+
+        if (response.status === 401 && attempt === 0 && this.#invalidateAuthority) {
+          this.#invalidateAuthority(installationId, authority.token);
+          continue;
+        }
+
         const message = await readErrorMessage(response);
         if (response.status === 404 && allowNotFound) return notFound(message);
         if (conflictOnValidation && (response.status === 409 || response.status === 422)) return conflict(message, response.status);
-        if (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0") {
-          return failure({ code: "rate_limited", message, status: response.status });
-        }
+        if (isGitHubRateLimitResponse(response, message)) return this.#recordRateLimit(installationId, response, message);
         if (response.status === 401 || response.status === 403) return failure({ code: "forbidden", message, status: response.status });
         if (response.status === 404) return notFound(message);
         if (response.status === 409 || response.status === 422) return conflict(message, response.status);
+        if (response.status >= 500) {
+          const retryAfterSeconds = githubRetryAfterSeconds(
+            response.headers,
+            this.#now(),
+            TRANSIENT_FAILURE_COOLDOWN_SECONDS
+          );
+          const requestId = response.headers.get("x-github-request-id");
+          return this.#recordInstallationCooldown(
+            installationId,
+            {
+              code: "invalid_response",
+              message,
+              status: response.status,
+              retryAfterSeconds,
+              ...(requestId ? { requestId } : {})
+            },
+            retryAfterSeconds
+          );
+        }
         return failure({ code: "invalid_response", message, status: response.status });
       }
-      return ok(await response.json() as T);
+      return invalidResponse("GitHub authority refresh did not produce a usable response.");
     } catch (error) {
-      return failure({ code: "network", message: error instanceof Error ? error.message : "GitHub request failed." });
+      if (error instanceof GitHubAuthorityError) {
+        const cooldownSeconds = error.transportError.retryAfterSeconds
+          ?? (error.transportError.code === "forbidden"
+            ? AUTHORITY_FORBIDDEN_COOLDOWN_SECONDS
+            : TRANSIENT_FAILURE_COOLDOWN_SECONDS);
+        return this.#recordInstallationCooldown(installationId, error.transportError, cooldownSeconds);
+      }
+      const transportError: GitHubTransportError = {
+        code: "network",
+        message: "GitHub request failed before receiving a usable response.",
+        retryAfterSeconds: TRANSIENT_FAILURE_COOLDOWN_SECONDS
+      };
+      return this.#recordInstallationCooldown(
+        installationId,
+        transportError,
+        TRANSIENT_FAILURE_COOLDOWN_SECONDS
+      );
+    }
+  }
+
+  async #withInstallationRequestLock<T>(installationId: number, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#installationRequestTails.get(installationId) ?? Promise.resolve();
+    let release = (): void => {};
+    const current = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.#installationRequestTails.set(installationId, tail);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#installationRequestTails.get(installationId) === tail) {
+        this.#installationRequestTails.delete(installationId);
+      }
+    }
+  }
+
+  #activeInstallationCooldown(installationId: number): GitHubTransportError | undefined {
+    const now = this.#now();
+    this.#pruneInstallationCooldowns(now);
+    const cooldown = this.#installationCooldowns.get(installationId);
+    if (!cooldown) return undefined;
+    this.#installationCooldowns.delete(installationId);
+    this.#installationCooldowns.set(installationId, cooldown);
+    const error = cooldown.error;
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.status === undefined ? {} : { status: error.status }),
+      ...(error.retryAfterSeconds === undefined
+        ? {}
+        : { retryAfterSeconds: Math.max(1, Math.ceil((cooldown.retryAt - now) / 1_000)) }),
+      ...(error.requestId === undefined ? {} : { requestId: error.requestId })
+    };
+  }
+
+  #recordRateLimit(
+    installationId: number,
+    response: Response,
+    message: string
+  ): TransportResult<never> {
+    const error = githubRateLimitError(response, message, this.#now());
+    return this.#recordInstallationCooldown(
+      installationId,
+      error,
+      error.retryAfterSeconds ?? 60
+    );
+  }
+
+  #recordInstallationCooldown(
+    installationId: number,
+    error: GitHubTransportError,
+    cooldownSeconds: number
+  ): TransportResult<never> {
+    const now = this.#now();
+    const retryAt = now + cooldownSeconds * 1_000;
+    const current = this.#installationCooldowns.get(installationId);
+    if (!current || current.retryAt <= retryAt) {
+      this.#installationCooldowns.delete(installationId);
+      this.#installationCooldowns.set(installationId, {
+        retryAt,
+        error: {
+          code: error.code,
+          message: error.message,
+          ...(error.status === undefined ? {} : { status: error.status }),
+          ...(error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: error.retryAfterSeconds }),
+          ...(error.requestId === undefined ? {} : { requestId: error.requestId })
+        }
+      });
+    }
+    this.#pruneInstallationCooldowns(now);
+    while (this.#installationCooldowns.size > MAX_INSTALLATION_COOLDOWNS) {
+      const oldest = this.#installationCooldowns.keys().next().value as number | undefined;
+      if (oldest === undefined) break;
+      this.#installationCooldowns.delete(oldest);
+    }
+    return failure(error);
+  }
+
+  #pruneInstallationCooldowns(now: number): void {
+    for (const [installationId, cooldown] of this.#installationCooldowns) {
+      if (cooldown.retryAt <= now) this.#installationCooldowns.delete(installationId);
     }
   }
 }
@@ -458,6 +623,52 @@ function failure(error: GitHubTransportError): TransportResult<never> {
 
 function invalidResponse(message: string): TransportResult<never> {
   return failure({ code: "invalid_response", message });
+}
+
+export function isGitHubRateLimitResponse(response: Response, message: string): boolean {
+  if (response.status !== 403 && response.status !== 429) return false;
+  return response.status === 429
+    || response.headers.get("x-ratelimit-remaining") === "0"
+    || response.headers.has("retry-after")
+    || /(?:secondary\s+)?rate\s+limit/iu.test(message);
+}
+
+function graphQlRateLimitMessage(body: unknown): string | undefined {
+  if (!isRecord(body) || !Array.isArray(body.errors)) return undefined;
+  const messages = body.errors.flatMap(error => isRecord(error) && typeof error.message === "string" ? [error.message] : []);
+  return messages.find(message => /(?:secondary\s+)?rate\s+limit/iu.test(message));
+}
+
+export function githubRateLimitError(response: Response, message: string, now: number): GitHubTransportError {
+  return {
+    code: "rate_limited",
+    message,
+    status: response.status,
+    retryAfterSeconds: githubRetryAfterSeconds(response.headers, now),
+    ...(response.headers.get("x-github-request-id")
+      ? { requestId: response.headers.get("x-github-request-id")! }
+      : {})
+  };
+}
+
+export function githubRetryAfterSeconds(headers: Headers, now: number, fallbackSeconds = 60): number {
+  const declared = headers.get("retry-after");
+  if (declared) {
+    const seconds = Number(declared);
+    if (Number.isSafeInteger(seconds) && seconds >= 0) return Math.max(1, seconds);
+    const retryAt = Date.parse(declared);
+    if (Number.isFinite(retryAt)) return Math.max(1, Math.ceil((retryAt - now) / 1_000));
+  }
+  if (headers.get("x-ratelimit-remaining") === "0") {
+    const declaredReset = headers.get("x-ratelimit-reset");
+    const resetAtSeconds = declaredReset === null || declaredReset.trim() === ""
+      ? Number.NaN
+      : Number(declaredReset);
+    if (Number.isSafeInteger(resetAtSeconds) && resetAtSeconds >= 0) {
+      return Math.max(1, Math.ceil((resetAtSeconds * 1_000 - now) / 1_000));
+    }
+  }
+  return fallbackSeconds;
 }
 
 function conflict(message: string, status?: number): TransportResult<never> {

@@ -31,7 +31,25 @@ export type GitHubTransportError = {
   code: "not_found" | "forbidden" | "conflict" | "invalid_response" | "rate_limited" | "network";
   message: string;
   status?: number;
+  retryAfterSeconds?: number;
+  requestId?: string;
 };
+
+export class GitHubAuthorityError extends Error {
+  readonly transportError: GitHubTransportError;
+
+  constructor(error: GitHubTransportError) {
+    super(error.message);
+    this.name = "GitHubAuthorityError";
+    this.transportError = {
+      code: error.code,
+      message: error.message,
+      ...(error.status === undefined ? {} : { status: error.status }),
+      ...(error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: error.retryAfterSeconds }),
+      ...(error.requestId === undefined ? {} : { requestId: error.requestId })
+    };
+  }
+}
 
 export type TransportResult<T> =
   | { ok: true; value: T }

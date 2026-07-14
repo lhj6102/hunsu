@@ -1,6 +1,13 @@
 import { createSign } from "node:crypto";
 import type { GitHubAppConfig } from "@hunsu/config";
-import type { ContentsWriteInstallationAuthority } from "@hunsu/github-store";
+import {
+  githubRateLimitError,
+  githubRetryAfterSeconds,
+  GitHubAuthorityError,
+  isGitHubRateLimitResponse,
+  type ContentsWriteInstallationAuthority,
+  type GitHubTransportError
+} from "@hunsu/github-store";
 import { err, ok, type Result } from "@hunsu/protocol";
 import type { AuthorizedInstallation, GitHubUser } from "../types.ts";
 
@@ -10,6 +17,7 @@ const GITHUB_API_VERSION = "2026-03-10";
 const GITHUB_USER_AGENT = "hunsu-plugin-production";
 const INSTALLATION_TOKEN_REFRESH_SKEW_SECONDS = 60;
 const INSTALLATION_TOKEN_CACHE_MAX_ENTRIES = 128;
+const INSTALLATION_TOKEN_TRANSIENT_RETRY_SECONDS = 5;
 
 type CachedInstallationAuthority = {
   authority: ContentsWriteInstallationAuthority;
@@ -25,6 +33,8 @@ export class GitHubAppTokenProvider {
   readonly #now: () => number;
   readonly #cacheMaxEntries: number;
   readonly #cache = new Map<number, CachedInstallationAuthority>();
+  readonly #inFlight = new Map<number, Promise<ContentsWriteInstallationAuthority>>();
+  readonly #cacheGenerations = new Map<number, number>();
   #cacheAccessOrder = 0;
 
   constructor(input: {
@@ -60,45 +70,81 @@ export class GitHubAppTokenProvider {
       return cached.authority;
     }
 
-    const response = await this.#fetch(`${this.#apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
-      method: "POST",
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${this.#appJwt(now)}`,
-        "content-type": "application/json",
-        "user-agent": GITHUB_USER_AGENT,
-        "x-github-api-version": GITHUB_API_VERSION
-      },
-      body: JSON.stringify({ permissions: { contents: "write" } })
-    });
+    const inFlight = this.#inFlight.get(installationId);
+    if (inFlight) return inFlight;
+    const generation = this.#cacheGenerations.get(installationId) ?? 0;
+    const minted = this.#mintAuthority(installationId, now, generation);
+    this.#inFlight.set(installationId, minted);
+    try {
+      return await minted;
+    } finally {
+      if (this.#inFlight.get(installationId) === minted) this.#inFlight.delete(installationId);
+    }
+  };
+
+  invalidate(installationId: number, rejectedToken: string): boolean {
+    const cached = this.#cache.get(installationId);
+    if (!cached || cached.authority.token !== rejectedToken) return false;
+    this.#cache.delete(installationId);
+    this.#cacheGenerations.set(installationId, (this.#cacheGenerations.get(installationId) ?? 0) + 1);
+    return true;
+  }
+
+  async #mintAuthority(
+    installationId: number,
+    now: number,
+    generation: number
+  ): Promise<ContentsWriteInstallationAuthority> {
+    let response: Response;
+    try {
+      response = await this.#fetch(`${this.#apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
+        method: "POST",
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${this.#appJwt(now)}`,
+          "content-type": "application/json",
+          "user-agent": GITHUB_USER_AGENT,
+          "x-github-api-version": GITHUB_API_VERSION
+        },
+        body: JSON.stringify({ permissions: { contents: "write" } })
+      });
+    } catch {
+      throw new GitHubAuthorityError({
+        code: "network",
+        message: "GitHub installation token request failed before receiving a response.",
+        retryAfterSeconds: INSTALLATION_TOKEN_TRANSIENT_RETRY_SECONDS
+      });
+    }
     const body = await readJson(response);
-    if (!response.ok
-      || !isRecord(body)
+    if (!response.ok) {
+      throw new GitHubAuthorityError(installationTokenHttpError(response, body, now * 1_000));
+    }
+    if (!isRecord(body)
       || typeof body.token !== "string"
       || body.token.length === 0
       || typeof body.expires_at !== "string") {
-      throw new Error(`GitHub installation token request failed with ${response.status}.`);
+      throw new GitHubAuthorityError(installationTokenInvalidResponse(response, "GitHub returned an invalid installation token response."));
     }
     if (!isRecord(body.permissions) || body.permissions.contents !== "write") {
-      throw new Error("GitHub installation token is missing the required Contents write permission.");
+      throw new GitHubAuthorityError(installationTokenInvalidResponse(response, "GitHub installation token is missing the required Contents write permission."));
     }
     const expiresAt = Math.floor(Date.parse(body.expires_at) / 1000);
-    if (!Number.isFinite(expiresAt) || expiresAt <= now) throw new Error("GitHub returned an already-expired installation token.");
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+      throw new GitHubAuthorityError(installationTokenInvalidResponse(response, "GitHub returned an already-expired installation token."));
+    }
     const authority: ContentsWriteInstallationAuthority = {
       token: body.token,
       permissions: { contents: "write" }
     };
-    this.#cache.set(installationId, {
-      authority,
-      expiresAt,
-      lastUsedOrder: this.#nextCacheAccessOrder()
-    });
-    this.#pruneTokenCache(now);
+    if ((this.#cacheGenerations.get(installationId) ?? 0) === generation) {
+      this.#cache.set(installationId, {
+        authority,
+        expiresAt,
+        lastUsedOrder: this.#nextCacheAccessOrder()
+      });
+      this.#pruneTokenCache(now);
+    }
     return authority;
-  };
-
-  invalidate(installationId: number): void {
-    this.#cache.delete(installationId);
   }
 
   #pruneTokenCache(now: number): void {
@@ -424,6 +470,46 @@ function decodeProviderCode(value: unknown): GitHubOAuthProviderCode | null {
     || value.error === "redirect_uri_mismatch"
     || value.error === "unverified_user_email") return value.error;
   return null;
+}
+
+function installationTokenHttpError(response: Response, body: unknown, now: number): GitHubTransportError {
+  const providerMessage = isRecord(body) && typeof body.message === "string" && body.message.trim()
+    ? body.message.trim()
+    : `GitHub installation token request failed with ${response.status}.`;
+  if (isGitHubRateLimitResponse(response, providerMessage)) {
+    return githubRateLimitError(response, providerMessage, now);
+  }
+  const error = installationTokenInvalidResponse(
+    response,
+    response.status === 401 || response.status === 403
+      ? "GitHub rejected the installation token request."
+      : `GitHub installation token request failed with ${response.status}.`,
+    response.status === 401 || response.status === 403 ? "forbidden" : "invalid_response"
+  );
+  return response.status >= 500
+    ? {
+        ...error,
+        retryAfterSeconds: githubRetryAfterSeconds(
+          response.headers,
+          now,
+          INSTALLATION_TOKEN_TRANSIENT_RETRY_SECONDS
+        )
+      }
+    : error;
+}
+
+function installationTokenInvalidResponse(
+  response: Response,
+  message: string,
+  code: GitHubTransportError["code"] = "invalid_response"
+): GitHubTransportError {
+  const requestId = response.headers.get("x-github-request-id");
+  return {
+    code,
+    message,
+    status: response.status,
+    ...(requestId ? { requestId } : {})
+  };
 }
 
 function oauthFailure(input: {

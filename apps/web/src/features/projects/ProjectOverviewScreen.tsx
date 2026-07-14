@@ -3,7 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { GitBranch, Github, Plus, Scale, Sparkles } from "lucide-react";
 import { goalPath, pushAppPath } from "@/app/routes";
 import { apiErrorMessage } from "@/shared/api/client";
+import { invalidateProjectQueries, pollingQueryOptions, readQueryOptions } from "@/shared/api/polling";
 import { createGoal, fetchProject, fetchRunners, rebuildProject } from "@/shared/api/projectApi";
+import type { ProjectResponse } from "@/shared/api/types";
 import { useLogicalSubmissionKey } from "@/shared/api/useLogicalSubmissionKey";
 import { formatTimestamp, repositoryLabel, safeHttpHref } from "@/shared/format";
 import { Badge } from "@/shared/ui/badge";
@@ -11,7 +13,7 @@ import { Button } from "@/shared/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { Label } from "@/shared/ui/label";
-import { PageError, PageLoading, EmptyState } from "@/shared/ui/page-state";
+import { PageError, PageLoading, PageRefreshWarning, EmptyState } from "@/shared/ui/page-state";
 import { PageHeading } from "@/shared/ui/page-heading";
 import { Textarea } from "@/shared/ui/textarea";
 import { EvidenceList, GoalGrid, RepositoryHealthCard, RunList } from "@/features/projects/ProjectComponents";
@@ -24,8 +26,11 @@ export function ProjectOverviewScreen({ projectId }: { projectId: string }) {
   const query = useQuery({
     queryKey,
     queryFn: ({ signal }) => fetchProject(projectId, signal),
-    refetchInterval: 5_000,
-    refetchIntervalInBackground: false
+    ...pollingQueryOptions<ProjectResponse>({
+      activeIntervalMs: 5_000,
+      stableIntervalMs: 60_000,
+      isActive: data => data.project.runs.some(run => run.status === "running")
+    })
   });
   const rebuildMutation = useMutation({
     mutationFn: () => {
@@ -34,12 +39,11 @@ export function ProjectOverviewScreen({ projectId }: { projectId: string }) {
     },
     onSuccess: () => {
       rebuildSubmission.succeeded();
-      void queryClient.invalidateQueries({ queryKey });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void invalidateProjectQueries(queryClient);
     }
   });
   if (query.isLoading) return <PageLoading label="Loading Project…" />;
-  if (query.isError || !query.data) return <PageError message={apiErrorMessage(query.error, "Project is unavailable.")} onRetry={() => void query.refetch()} />;
+  if (!query.data) return <PageError message={apiErrorMessage(query.error, "Project is unavailable.")} onRetry={() => void query.refetch()} />;
   const project = query.data.project;
   const activeRuns = project.runs.filter(run => run.status === "running");
   const repositoryHref = safeHttpHref(project.repository.url);
@@ -57,6 +61,14 @@ export function ProjectOverviewScreen({ projectId }: { projectId: string }) {
             </>
           )}
         />
+
+        {query.isError ? (
+          <PageRefreshWarning
+            message={apiErrorMessage(query.error, "Project state could not be refreshed.")}
+            retrying={query.isFetching}
+            onRetry={() => void query.refetch()}
+          />
+        ) : null}
 
         <div className="mt-6 flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
           <Badge variant="outline"><Github />{repositoryLabel(project.repository.owner, project.repository.name)}</Badge>
@@ -155,7 +167,8 @@ function CreateGoalDialog({ projectId, expectedStateSha, open, onOpenChange }: {
     queryKey: ["projects", projectId, "runners"],
     queryFn: ({ signal }) => fetchRunners(projectId, signal),
     enabled: open,
-    staleTime: 30_000
+    staleTime: 30_000,
+    ...readQueryOptions()
   });
   const mutation = useMutation({
     mutationFn: () => {
@@ -175,8 +188,7 @@ function CreateGoalDialog({ projectId, expectedStateSha, open, onOpenChange }: {
     },
     onSuccess: result => {
       submission.succeeded();
-      void queryClient.invalidateQueries({ queryKey: ["projects", projectId] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void invalidateProjectQueries(queryClient);
       onOpenChange(false);
       pushAppPath(goalPath(projectId, result.value.goalId));
     }
@@ -196,6 +208,13 @@ function CreateGoalDialog({ projectId, expectedStateSha, open, onOpenChange }: {
           <DialogDescription>Describe an outcome and how evidence will show it has been achieved.</DialogDescription>
         </DialogHeader>
         <div className="grid max-h-[62vh] gap-4 overflow-y-auto pr-1">
+          {runnersQuery.isError ? (
+            <PageRefreshWarning
+              message={apiErrorMessage(runnersQuery.error, "Runners are unavailable.")}
+              retrying={runnersQuery.isFetching}
+              onRetry={() => void runnersQuery.refetch()}
+            />
+          ) : null}
           <Field label="Title" htmlFor="goal-title"><Input id="goal-title" value={title} onChange={event => setTitle(event.target.value)} /></Field>
           <Field label="Desired outcome" htmlFor="goal-outcome"><Textarea id="goal-outcome" value={outcome} onChange={event => setOutcome(event.target.value)} /></Field>
           <Field label="Acceptance criteria" htmlFor="goal-criteria" hint="One criterion per line"><Textarea id="goal-criteria" value={criteria} onChange={event => setCriteria(event.target.value)} /></Field>

@@ -48,7 +48,7 @@ Reconstruction reads event files from the exact state head, validates ordering a
 
 A repository may contain several Projects. The Project Index scans only the intersection of repositories granted to the GitHub App installation and repositories the authenticated user can access. User read/write permission is overlaid on the App grant, and missing or corrupt state is reported explicitly.
 
-Web projections are cacheable and disposable. GitHub webhooks invalidate or refresh them, while a four-second cache bound lets normal Web polling recover delayed or missed deliveries across API instances. Deleting the projection store never deletes Project data.
+Web projections are cacheable and disposable. GitHub state-ref webhooks invalidate them without eagerly reconstructing the repository, while a four-second cache bound lets normal Web polling recover delayed or missed deliveries across API instances. The raw repository grants for one GitHub App installation may be cached for up to sixty seconds and are invalidated by installation or repository-grant webhooks; the authenticated user's current repository permissions are still intersected on every request. GitHub requests are serialized per installation within an API isolate. A primary or secondary rate-limit response establishes an in-memory cooldown for the exact provider retry boundary, while transient or forbidden installation-token failures use short bounded cooldowns to suppress queued retries. Deleting either cache never deletes Project data.
 
 ## Run branches and verification
 

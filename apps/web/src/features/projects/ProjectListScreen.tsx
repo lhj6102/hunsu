@@ -3,8 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, GitBranch, Github, Plus, Sparkles } from "lucide-react";
 import { projectPath, pushAppPath } from "@/app/routes";
 import { apiErrorMessage } from "@/shared/api/client";
+import { invalidateProjectQueries, pollingQueryOptions, readQueryOptions } from "@/shared/api/polling";
 import { createProject, fetchProjects, fetchRepositories, PROJECT_LIST_QUERY_KEY } from "@/shared/api/projectApi";
-import type { ProjectListItem, RepositorySummary } from "@/shared/api/types";
+import type { ProjectListItem, ProjectListResponse, RepositorySummary } from "@/shared/api/types";
 import { useLogicalSubmissionKey } from "@/shared/api/useLogicalSubmissionKey";
 import { relativeTimestamp, repositoryLabel, shortSha } from "@/shared/format";
 import { Badge } from "@/shared/ui/badge";
@@ -13,7 +14,7 @@ import { Card, CardContent } from "@/shared/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { Label } from "@/shared/ui/label";
-import { PageError, PageLoading, EmptyState } from "@/shared/ui/page-state";
+import { PageError, PageLoading, PageRefreshWarning, EmptyState } from "@/shared/ui/page-state";
 import { PageHeading } from "@/shared/ui/page-heading";
 import { ReviewStatusBadge, RunStatusBadge } from "@/shared/ui/domain-badge";
 import { Textarea } from "@/shared/ui/textarea";
@@ -23,12 +24,15 @@ export function ProjectListScreen() {
   const query = useQuery({
     queryKey: PROJECT_LIST_QUERY_KEY,
     queryFn: ({ signal }) => fetchProjects(signal),
-    refetchInterval: 15_000,
-    refetchIntervalInBackground: false
+    ...pollingQueryOptions<ProjectListResponse>({
+      activeIntervalMs: 15_000,
+      stableIntervalMs: 60_000,
+      isActive: data => data.projects.some(project => project.activeRunCount > 0)
+    })
   });
   if (query.isLoading) return <PageLoading label="Loading Projects…" />;
-  if (query.isError) return <PageError message={apiErrorMessage(query.error, "Projects are unavailable.")} onRetry={() => void query.refetch()} />;
-  const projects = query.data?.projects ?? [];
+  if (!query.data) return <PageError message={apiErrorMessage(query.error, "Projects are unavailable.")} onRetry={() => void query.refetch()} />;
+  const projects = query.data.projects;
   return (
     <main className="apple-page min-h-screen overflow-y-auto">
       <div className="mx-auto w-full max-w-[1240px] px-6 py-8 lg:px-10 lg:py-12">
@@ -38,6 +42,13 @@ export function ProjectListScreen() {
           description="Each Hunsu Project is backed by one GitHub repository and preserves Goals, Runs, evidence, decisions, and alternative futures."
           actions={<Button type="button" size="lg" onClick={() => setCreateOpen(true)}><Plus />New Project</Button>}
         />
+        {query.isError ? (
+          <PageRefreshWarning
+            message={apiErrorMessage(query.error, "Projects could not be refreshed.")}
+            retrying={query.isFetching}
+            onRetry={() => void query.refetch()}
+          />
+        ) : null}
         <div className="mt-8">
           {projects.length > 0 ? (
             <div className="grid gap-4 lg:grid-cols-2">
@@ -111,7 +122,8 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
     queryKey: ["repositories"],
     queryFn: ({ signal }) => fetchRepositories(signal),
     enabled: open,
-    staleTime: 30_000
+    staleTime: 30_000,
+    ...readQueryOptions()
   });
   const repositories = repositoriesQuery.data?.repositories.filter(repository => repository.granted) ?? [];
   const [repositoryKey, setRepositoryKey] = useState("");
@@ -136,7 +148,7 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
     },
     onSuccess: result => {
       submission.succeeded();
-      void queryClient.invalidateQueries({ queryKey: PROJECT_LIST_QUERY_KEY });
+      void invalidateProjectQueries(queryClient);
       onOpenChange(false);
       pushAppPath(projectPath(result.value.projectId));
     },
@@ -165,6 +177,13 @@ function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChan
           <DialogDescription>Select a GitHub repository and describe the product outcome this Project owns.</DialogDescription>
         </DialogHeader>
         <div className="grid gap-4">
+          {repositoriesQuery.isError ? (
+            <PageRefreshWarning
+              message={apiErrorMessage(repositoriesQuery.error, "Repositories are unavailable.")}
+              retrying={repositoriesQuery.isFetching}
+              onRetry={() => void repositoriesQuery.refetch()}
+            />
+          ) : null}
           <div className="grid gap-2">
             <Label htmlFor="project-repository">Repository</Label>
             <select id="project-repository" className="h-10 rounded-md border bg-white/72 px-3 text-sm" value={repositoryKey} onChange={event => selectRepository(event.target.value)}>

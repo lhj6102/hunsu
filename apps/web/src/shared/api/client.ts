@@ -67,6 +67,9 @@ export function apiErrorMessage(error: unknown, fallback: string): string {
       ? `${error.message} Expected ${expected}, but GitHub is at ${actual}. Refresh and try again.`
       : `${error.message} Refresh and try again.`;
   }
+  if (error instanceof ApiRequestError && error.problem.requestId) {
+    return `${error.message} GitHub request ID: ${error.problem.requestId}.`;
+  }
   return error instanceof Error ? error.message : fallback;
 }
 
@@ -83,6 +86,8 @@ async function readProblem(response: Response): Promise<ApiProblem> {
       code: textField(nested, "code") ?? `http_${response.status}`,
       message: textField(nested, "message") ?? textField(body, "message") ?? `Hunsu API request failed with ${response.status}.`,
       retryable: typeof nested.retryable === "boolean" ? nested.retryable : undefined,
+      retryAfterSeconds: positiveIntegerField(nested, "retryAfterSeconds"),
+      requestId: textField(nested, "requestId"),
       expectedStateSha: textField(nested, "expectedStateSha"),
       actualStateSha: textField(nested, "actualStateSha"),
       fieldErrors: isStringRecord(nested.fieldErrors) ? nested.fieldErrors : undefined
@@ -105,4 +110,9 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 function textField(value: Record<string, unknown>, key: string): string | undefined {
   const item = value[key];
   return typeof item === "string" && item.trim() ? item.trim() : undefined;
+}
+
+function positiveIntegerField(value: Record<string, unknown>, key: string): number | undefined {
+  const item = value[key];
+  return Number.isSafeInteger(item) && (item as number) > 0 ? item as number : undefined;
 }

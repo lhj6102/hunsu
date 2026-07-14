@@ -435,14 +435,20 @@ function json(value: unknown, status = 200, headers?: HeadersInit): Response {
 }
 
 function problem(error: ApiError, headers?: HeadersInit): Response {
+  const responseHeaders = new Headers(headers);
+  if (error.retryAfterSeconds !== undefined && !responseHeaders.has("retry-after")) {
+    responseHeaders.set("retry-after", String(error.retryAfterSeconds));
+  }
   return json({ error: {
     code: error.code,
     message: error.message,
     retryable: error.retryable,
+    ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+    ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
     ...(error.expectedStateSha ? { expectedStateSha: error.expectedStateSha } : {}),
     ...(error.actualStateSha ? { actualStateSha: error.actualStateSha } : {}),
     ...(error.fieldErrors ? { fieldErrors: error.fieldErrors } : {})
-  } }, error.status, headers);
+  } }, error.status, responseHeaders);
 }
 
 function oauthProblem(error: OAuthProtocolError): Response {

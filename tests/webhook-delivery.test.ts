@@ -2,8 +2,6 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
 import {
-  apiFailure,
-  apiOk,
   GitHubWebhookProcessor,
   InMemoryEphemeralStateStore,
   type HunsuApplicationService
@@ -11,19 +9,14 @@ import {
 
 const SECRET = "webhook-lifecycle-secret";
 
-test("webhook reconciliation failure explicitly releases its lease for a safe retry", async () => {
-  let attempts = 0;
+test("state-ref webhooks invalidate once without eagerly reconstructing GitHub state", async () => {
+  const invalidated: Array<{ installationId: number; repositoryId: number }> = [];
   const service = {
-    async reconcileRepository() {
-      attempts += 1;
-      return attempts === 1
-        ? apiFailure({
-            code: "temporarily_unavailable",
-            message: "GitHub state was temporarily unavailable.",
-            status: 503,
-            retryable: true
-          })
-        : apiOk({ projectCount: 1 });
+    invalidateRepository(repository: { installationId: number; repositoryId: number }) {
+      invalidated.push({
+        installationId: repository.installationId,
+        repositoryId: repository.repositoryId
+      });
     },
     invalidateInstallation() {}
   } as unknown as HunsuApplicationService;
@@ -35,23 +28,19 @@ test("webhook reconciliation failure explicitly releases its lease for a safe re
   });
   const request = webhookRequest();
 
-  const failed = await processor.process(request.headers, request.body);
-  assert.equal(failed.ok, false);
-  assert.equal(attempts, 1);
-
-  const retried = await processor.process(request.headers, request.body);
-  assert.deepEqual(retried, {
+  const accepted = await processor.process(request.headers, request.body);
+  assert.deepEqual(accepted, {
     ok: true,
     value: { accepted: true, duplicate: false, signal: "state_ref_changed" }
   });
-  assert.equal(attempts, 2);
+  assert.deepEqual(invalidated, [{ installationId: 17, repositoryId: 29 }]);
 
   const duplicate = await processor.process(request.headers, request.body);
   assert.deepEqual(duplicate, {
     ok: true,
     value: { accepted: true, duplicate: true, signal: "duplicate" }
   });
-  assert.equal(attempts, 2);
+  assert.equal(invalidated.length, 1);
 });
 
 function webhookRequest(): { headers: Headers; body: Uint8Array } {

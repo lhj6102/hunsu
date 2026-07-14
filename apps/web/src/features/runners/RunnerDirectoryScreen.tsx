@@ -2,23 +2,23 @@ import { useQuery } from "@tanstack/react-query";
 import { Bot, Boxes, ChevronRight, Network, ShieldCheck, Users } from "lucide-react";
 import { pushAppPath, runPath } from "@/app/routes";
 import { apiErrorMessage } from "@/shared/api/client";
+import { pollingQueryOptions } from "@/shared/api/polling";
 import { fetchRunners } from "@/shared/api/projectApi";
 import type { Player, Runner, Team } from "@/shared/api/types";
 import { formatTimestamp } from "@/shared/format";
 import { Badge } from "@/shared/ui/badge";
 import { RunStatusBadge } from "@/shared/ui/domain-badge";
-import { PageError, PageLoading, EmptyState } from "@/shared/ui/page-state";
+import { PageError, PageLoading, PageRefreshWarning, EmptyState } from "@/shared/ui/page-state";
 import { PageHeading } from "@/shared/ui/page-heading";
 
 export function RunnerDirectoryScreen({ projectId }: { projectId: string }) {
   const query = useQuery({
     queryKey: ["projects", projectId, "runners"],
     queryFn: ({ signal }) => fetchRunners(projectId, signal),
-    refetchInterval: 15_000,
-    refetchIntervalInBackground: false
+    ...pollingQueryOptions(60_000)
   });
   if (query.isLoading) return <PageLoading label="Loading Runners…" />;
-  if (query.isError || !query.data) return <PageError message={apiErrorMessage(query.error, "Runners are unavailable.")} onRetry={() => void query.refetch()} />;
+  if (!query.data) return <PageError message={apiErrorMessage(query.error, "Runners are unavailable.")} onRetry={() => void query.refetch()} />;
   const teams = query.data.runners.filter((runner): runner is Team => runner.kind === "team");
   const players = query.data.runners.filter((runner): runner is Player => runner.kind === "player");
   return (
@@ -29,6 +29,13 @@ export function RunnerDirectoryScreen({ projectId }: { projectId: string }) {
           title="Teams and Players"
           description="A Runner is exactly one reusable Player or Team definition. Runs are execution records; Runners are not processes."
         />
+        {query.isError ? (
+          <PageRefreshWarning
+            message={apiErrorMessage(query.error, "Runners could not be refreshed.")}
+            retrying={query.isFetching}
+            onRetry={() => void query.refetch()}
+          />
+        ) : null}
         <div className="mt-8 grid gap-4 sm:grid-cols-3">
           <DirectoryMetric icon={<Boxes />} label="Teams" value={teams.length} />
           <DirectoryMetric icon={<Bot />} label="Players" value={players.length} />

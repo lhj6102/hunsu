@@ -4,6 +4,7 @@ import {
   GitHubProjectStore,
   HUNSU_STATE_BRANCH,
   type GitHubTransport,
+  type GitHubTransportError,
   type RepositoryGrant,
   type RepositoryLocator,
   type StateActor,
@@ -131,6 +132,15 @@ type CachedRepositoryCatalog = {
   sizeBytes: number;
 };
 
+type CachedInstallationRepositories = {
+  installationId: number;
+  repositories: readonly RepositoryGrant[];
+  cachedAt: number;
+  lastAccessedAt: number;
+  lastAccessOrder: number;
+  sizeBytes: number;
+};
+
 type CacheGeneration = {
   generation: number;
   lastAccessedAt: number;
@@ -142,12 +152,25 @@ type CacheGenerationToken = {
   generation: number;
 };
 
+type InstallationCacheGenerationToken = {
+  installationKey: string;
+  generation: number;
+};
+
+type InstallationRepositoryFlight = {
+  generation: number;
+  promise: Promise<ApiResult<readonly RepositoryGrant[]>>;
+};
+
 export type ProjectionCachePolicy = {
   idleTtlMs: number;
   maxProjectEntries: number;
   maxProjectBytes: number;
   maxCatalogEntries: number;
   maxCatalogBytes: number;
+  installationTtlMs: number;
+  maxInstallationEntries: number;
+  maxInstallationBytes: number;
   maxGenerationEntries: number;
 };
 
@@ -159,6 +182,9 @@ const DEFAULT_PROJECTION_CACHE_POLICY: ProjectionCachePolicy = {
   maxProjectBytes: 16 * 1024 * 1024,
   maxCatalogEntries: 256,
   maxCatalogBytes: 2 * 1024 * 1024,
+  installationTtlMs: 60_000,
+  maxInstallationEntries: 128,
+  maxInstallationBytes: 4 * 1024 * 1024,
   maxGenerationEntries: 512
 };
 
@@ -172,7 +198,10 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   readonly #cachePolicy: ProjectionCachePolicy;
   readonly #cache = new Map<string, CachedProject>();
   readonly #catalogCache = new Map<string, CachedRepositoryCatalog>();
+  readonly #installationCache = new Map<string, CachedInstallationRepositories>();
   readonly #cacheGenerations = new Map<string, CacheGeneration>();
+  readonly #installationCacheGenerations = new Map<string, CacheGeneration>();
+  readonly #installationRepositoryFlights = new Map<string, InstallationRepositoryFlight>();
   #nextCacheGeneration = 1;
   #nextCacheAccessOrder = 1;
 
@@ -241,10 +270,12 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const grants = await this.#authorizedRepositories(context);
     if (!grants.ok) return grants;
     const synchronizedAt = this.#timestamp();
-    const repositories = await Promise.all(grants.value.map(async repository => {
+    const repositories: unknown[] = [];
+    for (const repository of grants.value) {
       const state = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
-      const stateHeadSha = state.ok ? state.value ?? "" : "";
-      return {
+      if (!state.ok) return transportFailure(state.error);
+      const stateHeadSha = state.value ?? "";
+      repositories.push({
         owner: repository.owner,
         name: repository.name,
         url: `https://github.com/${repository.owner}/${repository.name}`,
@@ -254,8 +285,8 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
         granted: true,
         stateHeadSha,
         updatedAt: synchronizedAt
-      };
-    }));
+      });
+    }
     return apiOk({ repositories });
   }
 
@@ -315,6 +346,8 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   }
 
   invalidateInstallation(installationId: number): void {
+    this.#installationCache.delete(installationCacheKey(installationId));
+    this.#advanceInstallationCacheGeneration(installationId);
     for (const [key, entry] of this.#cache) if (entry.repository.installationId === installationId) this.#cache.delete(key);
     for (const [key, entry] of this.#catalogCache) if (entry.repository.installationId === installationId) this.#catalogCache.delete(key);
     const prefix = `${installationId}:`;
@@ -610,7 +643,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (normalizedBaseRef) {
       const branch = normalizedBaseRef.replace(/^refs\/heads\//u, "");
       const exists = await this.#transport.readBranch(repository.value, branch);
-      if (!exists.ok) return transportFailure(exists.error.message, exists.error.code === "forbidden" ? 403 : 503);
+      if (!exists.ok) return transportFailure(exists.error);
       if (!exists.value) return apiFailure({ code: "stale_base", message: `Selected base ref ${normalizedBaseRef} does not exist.`, status: 412, retryable: false });
     }
     const patch: ProjectPatch = {
@@ -977,7 +1010,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const selectedRef = normalizeRef(input.baseRef);
     const selectedBranch = selectedRef.replace(/^refs\/heads\//u, "");
     const exists = await this.#transport.readBranch(repository, selectedBranch);
-    if (!exists.ok) return transportFailure(exists.error.message, exists.error.code === "forbidden" ? 403 : 503);
+    if (!exists.ok) return transportFailure(exists.error);
     if (!exists.value) return apiFailure({ code: "stale_base", message: `Selected base ref ${selectedRef} does not exist.`, status: 412, retryable: false });
     const at = this.#timestamp();
     const project: Project = {
@@ -1256,7 +1289,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
       if (!project) return notFound(`Project ${projectId} was not found.`);
       const branch = String(project.baseRef).replace(/^refs\/heads\//u, "");
       const currentBase = await this.#transport.readBranch(repository.value, branch);
-      if (!currentBase.ok) return transportFailure(currentBase.error.message, 503);
+      if (!currentBase.ok) return transportFailure(currentBase.error);
       if (!currentBase.value || currentBase.value.headSha !== baseSha) {
         return apiFailure({ code: "stale_base", message: "The selected Project base ref changed before the Run started.", status: 412, retryable: true, actualStateSha: currentBase.value?.headSha });
       }
@@ -1745,7 +1778,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (!input.idempotencyKey.trim() || input.idempotencyKey.length > 256) return invalidRequest("An idempotency key containing 1 to 256 characters is required.");
     if (input.factories.length === 0) return invalidRequest("A mutation must contain at least one command.");
     const base = await this.#transport.readBranch(input.repository, input.repository.defaultBranch);
-    if (!base.ok) return transportFailure(base.error.message, base.error.code === "forbidden" ? 403 : 503);
+    if (!base.ok) return transportFailure(base.error);
     if (!base.value) return apiFailure({ code: "stale_base", message: "The repository default branch is unavailable.", status: 412, retryable: true });
     const at = this.#timestamp();
     const domainActor = requestActor(input.context);
@@ -1849,12 +1882,29 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (!repositories.ok) return repositories;
     const matches: AuthorizedProject[] = [];
     for (const repository of repositories.value) {
-      const loaded = await this.#loadProject(repository, projectId);
-      if (!loaded.ok) {
-        if (loaded.error.code === "not_found") continue;
-        return loaded;
+      const now = this.#cacheNow();
+      const cached = this.#getCachedProject(cacheKey(repository, projectId), now);
+      if (cached && cacheIsFresh(cached, now)) {
+        matches.push(authorizeProject(cached, repository));
+        continue;
       }
-      matches.push(loaded.value);
+
+      const catalog = this.#getCachedCatalog(repositoryCacheKey(repository), now);
+      if (catalog && cacheIsFresh(catalog, now)) {
+        if (!catalog.projectIds.includes(projectId)) continue;
+        const loaded = await this.#loadProject(repository, projectId);
+        if (!loaded.ok) {
+          if (loaded.error.code === "not_found") continue;
+          return loaded;
+        }
+        matches.push(loaded.value);
+        continue;
+      }
+
+      const loaded = await this.#loadRepositoryProjects(repository, false);
+      if (!loaded.ok) return loaded;
+      const match = loaded.value.find(entry => projectIdOf(entry.state) === projectId);
+      if (match) matches.push(match);
     }
     if (matches.length === 0) return notFound(`Project ${projectId} was not found.`);
     if (matches.length > 1) return conflict(`Project id ${projectId} is ambiguous across the authorized repositories.`);
@@ -1975,6 +2025,28 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     this.#enforceCatalogCacheBounds();
   }
 
+  #getCachedInstallationRepositories(key: string, now: number): CachedInstallationRepositories | undefined {
+    this.#pruneInstallationCache(now);
+    const entry = this.#installationCache.get(key);
+    if (!entry) return undefined;
+    entry.lastAccessedAt = now;
+    entry.lastAccessOrder = this.#cacheAccessOrder();
+    return entry;
+  }
+
+  #putCachedInstallationRepositories(key: string, entry: CachedInstallationRepositories): void {
+    const now = this.#cacheNow();
+    this.#pruneInstallationCache(now);
+    if (entry.sizeBytes > this.#cachePolicy.maxInstallationBytes) {
+      this.#installationCache.delete(key);
+      return;
+    }
+    entry.lastAccessedAt = now;
+    entry.lastAccessOrder = this.#cacheAccessOrder();
+    this.#installationCache.set(key, entry);
+    this.#enforceInstallationCacheBounds();
+  }
+
   #projectsFromCatalog(
     catalog: CachedRepositoryCatalog,
     repository: RepositoryGrant,
@@ -2024,6 +2096,36 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     return this.#cacheGenerations.get(token.repositoryKey)?.generation === token.generation;
   }
 
+  #captureInstallationCacheGeneration(installationId: number): InstallationCacheGenerationToken {
+    const now = this.#cacheNow();
+    this.#pruneCacheGenerations(now);
+    const installationKey = installationCacheKey(installationId);
+    const current = this.#installationCacheGenerations.get(installationKey);
+    const generation = current?.generation ?? this.#cacheGeneration();
+    this.#installationCacheGenerations.set(installationKey, {
+      generation,
+      lastAccessedAt: now,
+      lastAccessOrder: this.#cacheAccessOrder()
+    });
+    this.#enforceInstallationGenerationCacheBounds();
+    return { installationKey, generation };
+  }
+
+  #advanceInstallationCacheGeneration(installationId: number): void {
+    const now = this.#cacheNow();
+    this.#pruneCacheGenerations(now);
+    this.#installationCacheGenerations.set(installationCacheKey(installationId), {
+      generation: this.#cacheGeneration(),
+      lastAccessedAt: now,
+      lastAccessOrder: this.#cacheAccessOrder()
+    });
+    this.#enforceInstallationGenerationCacheBounds();
+  }
+
+  #installationCacheGenerationIsCurrent(token: InstallationCacheGenerationToken): boolean {
+    return this.#installationCacheGenerations.get(token.installationKey)?.generation === token.generation;
+  }
+
   #pruneProjectionCaches(now: number): void {
     for (const [key, entry] of this.#cache) {
       if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#cache.delete(key);
@@ -2035,11 +2137,22 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     this.#enforceCatalogCacheBounds();
   }
 
+  #pruneInstallationCache(now: number): void {
+    for (const [key, entry] of this.#installationCache) {
+      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#installationCache.delete(key);
+    }
+    this.#enforceInstallationCacheBounds();
+  }
+
   #pruneCacheGenerations(now: number): void {
     for (const [key, entry] of this.#cacheGenerations) {
       if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#cacheGenerations.delete(key);
     }
+    for (const [key, entry] of this.#installationCacheGenerations) {
+      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#installationCacheGenerations.delete(key);
+    }
     this.#enforceGenerationCacheBounds();
+    this.#enforceInstallationGenerationCacheBounds();
   }
 
   #enforceProjectCacheBounds(): void {
@@ -2064,12 +2177,34 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     }
   }
 
+  #enforceInstallationCacheBounds(): void {
+    let totalBytes = 0;
+    for (const entry of this.#installationCache.values()) totalBytes += entry.sizeBytes;
+    if (this.#installationCache.size <= this.#cachePolicy.maxInstallationEntries
+      && totalBytes <= this.#cachePolicy.maxInstallationBytes) return;
+    const candidates = sortedCacheEntries(this.#installationCache);
+    for (const [key, entry] of candidates) {
+      if (this.#installationCache.size <= this.#cachePolicy.maxInstallationEntries
+        && totalBytes <= this.#cachePolicy.maxInstallationBytes) break;
+      if (this.#installationCache.delete(key)) totalBytes -= entry.sizeBytes;
+    }
+  }
+
   #enforceGenerationCacheBounds(): void {
     if (this.#cacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) return;
     const candidates = sortedCacheEntries(this.#cacheGenerations);
     for (const [key] of candidates) {
       if (this.#cacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) break;
       this.#cacheGenerations.delete(key);
+    }
+  }
+
+  #enforceInstallationGenerationCacheBounds(): void {
+    if (this.#installationCacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) return;
+    const candidates = sortedCacheEntries(this.#installationCacheGenerations);
+    for (const [key] of candidates) {
+      if (this.#installationCacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) break;
+      this.#installationCacheGenerations.delete(key);
     }
   }
 
@@ -2087,7 +2222,47 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
 
   async #stateHead(repository: RepositoryLocator): Promise<ApiResult<string | undefined>> {
     const result = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
-    return result.ok ? apiOk(result.value) : transportFailure(result.error.message, result.error.code === "forbidden" ? 403 : 503);
+    return result.ok ? apiOk(result.value) : transportFailure(result.error);
+  }
+
+  async #installationRepositories(installationId: number): Promise<ApiResult<readonly RepositoryGrant[]>> {
+    const key = installationCacheKey(installationId);
+    const now = this.#cacheNow();
+    const cached = this.#getCachedInstallationRepositories(key, now);
+    if (cached && installationCacheIsFresh(cached, now, this.#cachePolicy.installationTtlMs)) {
+      return apiOk(cached.repositories);
+    }
+
+    const generation = this.#captureInstallationCacheGeneration(installationId);
+    const inFlight = this.#installationRepositoryFlights.get(key);
+    if (inFlight?.generation === generation.generation) return inFlight.promise;
+
+    const promise = this.#fetchInstallationRepositories(installationId, generation);
+    this.#installationRepositoryFlights.set(key, { generation: generation.generation, promise });
+    try {
+      return await promise;
+    } finally {
+      if (this.#installationRepositoryFlights.get(key)?.promise === promise) {
+        this.#installationRepositoryFlights.delete(key);
+      }
+    }
+  }
+
+  async #fetchInstallationRepositories(
+    installationId: number,
+    generation: InstallationCacheGenerationToken
+  ): Promise<ApiResult<readonly RepositoryGrant[]>> {
+    const listed = await this.#transport.listInstallationRepositories(installationId);
+    if (!listed.ok) return transportFailure(listed.error);
+    const repositories = listed.value.map(cloneRepositoryGrant);
+    if (this.#installationCacheGenerationIsCurrent(generation)) {
+      const cachedAt = this.#cacheNow();
+      this.#putCachedInstallationRepositories(
+        generation.installationKey,
+        cachedInstallationRepositories(installationId, repositories, cachedAt)
+      );
+    }
+    return apiOk(repositories);
   }
 
   async #authorizedRepositories(context: AuthContext, requestedInstallationId?: number): Promise<ApiResult<RepositoryGrant[]>> {
@@ -2110,8 +2285,8 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
       if (userAccess.size !== installation.repositories.length) {
         return forbidden("The GitHub authorization context contains duplicate repositories.");
       }
-      const listed = await this.#transport.listInstallationRepositories(installationId);
-      if (!listed.ok) return transportFailure(listed.error.message, listed.error.code === "forbidden" ? 403 : 503);
+      const listed = await this.#installationRepositories(installationId);
+      if (!listed.ok) return listed;
       for (const repository of listed.value) {
         const userPermission = userAccess.get(repository.repositoryId);
         if (!userPermission) continue;
@@ -2367,6 +2542,10 @@ function repositoryCacheKey(repository: Pick<RepositoryLocator, "installationId"
   return `${repository.installationId}:${repository.repositoryId}`;
 }
 
+function installationCacheKey(installationId: number): string {
+  return String(installationId);
+}
+
 function repositoryLocator(repository: RepositoryLocator): RepositoryLocator {
   return {
     installationId: repository.installationId,
@@ -2417,6 +2596,34 @@ function cachedRepositoryCatalog(
   };
 }
 
+function cachedInstallationRepositories(
+  installationId: number,
+  repositories: readonly RepositoryGrant[],
+  cachedAt: number
+): CachedInstallationRepositories {
+  const grants = repositories.map(cloneRepositoryGrant);
+  return {
+    installationId,
+    repositories: grants,
+    cachedAt,
+    lastAccessedAt: cachedAt,
+    lastAccessOrder: 0,
+    sizeBytes: encodedCacheSize({ installationId, repositories: grants })
+  };
+}
+
+function cloneRepositoryGrant(repository: RepositoryGrant): RepositoryGrant {
+  return {
+    installationId: repository.installationId,
+    repositoryId: repository.repositoryId,
+    owner: repository.owner,
+    name: repository.name,
+    defaultBranch: repository.defaultBranch,
+    private: repository.private,
+    permissions: { contents: repository.permissions.contents }
+  };
+}
+
 function authorizeProject(entry: CachedProject, repository: RepositoryGrant): AuthorizedProject {
   return {
     repository,
@@ -2427,9 +2634,14 @@ function authorizeProject(entry: CachedProject, repository: RepositoryGrant): Au
   };
 }
 
-function cacheIsFresh(entry: Pick<CachedProject, "cachedAt">, now: number): boolean {
+function cacheIsFresh(entry: { cachedAt: number }, now: number): boolean {
   const age = now - entry.cachedAt;
   return age >= 0 && age < PROJECTION_CACHE_TTL_MS;
+}
+
+function installationCacheIsFresh(entry: { cachedAt: number }, now: number, ttlMs: number): boolean {
+  const age = now - entry.cachedAt;
+  return age >= 0 && age < ttlMs;
 }
 
 function projectionCachePolicy(overrides: Partial<ProjectionCachePolicy> | undefined): ProjectionCachePolicy {
@@ -2569,12 +2781,41 @@ function storeFailure(error: StoreError): ApiResult<never> {
     if (code === "NOT_FOUND") return notFound(message);
     return invalidRequest(message);
   }
-  if (error.code === "transport" && error.cause?.code === "forbidden") return forbidden(error.message);
+  if (error.code === "transport" && error.cause) return transportFailure(error.cause);
   return apiFailure({ code: error.code === "invalid_event" ? "invalid_request" : "temporarily_unavailable", message: error.message, status: error.code === "invalid_event" ? 400 : 503, retryable: error.code !== "invalid_event" });
 }
 
-function transportFailure(message: string, status: number): ApiResult<never> {
-  return status === 403 ? forbidden(message) : apiFailure({ code: "temporarily_unavailable", message, status, retryable: true });
+function transportFailure(error: GitHubTransportError): ApiResult<never> {
+  if (error.code === "forbidden") {
+    return apiFailure({
+      code: "forbidden",
+      message: error.message,
+      status: 403,
+      retryable: false,
+      ...(error.requestId === undefined ? {} : { requestId: error.requestId })
+    });
+  }
+  if (error.code === "rate_limited") {
+    const retryAfterSeconds = Number.isSafeInteger(error.retryAfterSeconds) && (error.retryAfterSeconds ?? 0) > 0
+      ? error.retryAfterSeconds!
+      : 60;
+    return apiFailure({
+      code: "temporarily_unavailable",
+      message: `GitHub is temporarily rate limiting this installation. Retry after at least ${retryAfterSeconds} seconds.`,
+      status: 503,
+      retryable: true,
+      retryAfterSeconds,
+      ...(error.requestId === undefined ? {} : { requestId: error.requestId })
+    });
+  }
+  return apiFailure({
+    code: "temporarily_unavailable",
+    message: error.message,
+    status: 503,
+    retryable: true,
+    ...(error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: error.retryAfterSeconds }),
+    ...(error.requestId === undefined ? {} : { requestId: error.requestId })
+  });
 }
 
 function pluginError(error: ApiError): PluginSafeError {
@@ -2582,9 +2823,15 @@ function pluginError(error: ApiError): PluginSafeError {
     code: error.code,
     message: error.message,
     retryable: error.retryable,
+    ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+    ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
     ...(error.expectedStateSha ? { expectedStateSha: error.expectedStateSha } : {}),
     ...(error.actualStateSha ? { actualStateSha: error.actualStateSha } : {}),
-    recovery: error.retryable ? "Reload the Project state and retry with the new state SHA." : undefined
+    recovery: error.retryAfterSeconds !== undefined
+      ? `Wait at least ${error.retryAfterSeconds} seconds before retrying. Continuing during the GitHub rate-limit window can extend the outage.`
+      : error.retryable
+        ? "Reload the Project state and retry with the new state SHA."
+        : undefined
   };
 }
 

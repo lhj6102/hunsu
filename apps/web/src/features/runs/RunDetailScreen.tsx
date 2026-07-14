@@ -1,12 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, ExternalLink, GitBranch, GitCommit, Milestone, Timer, Users } from "lucide-react";
 import { apiErrorMessage } from "@/shared/api/client";
+import { pollingQueryOptions } from "@/shared/api/polling";
 import { fetchRun } from "@/shared/api/projectApi";
+import type { RunResponse } from "@/shared/api/types";
 import { formatTimestamp, safeHttpHref, shortSha } from "@/shared/format";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { RunStatusBadge } from "@/shared/ui/domain-badge";
-import { EmptyState, PageError, PageLoading } from "@/shared/ui/page-state";
+import { EmptyState, PageError, PageLoading, PageRefreshWarning } from "@/shared/ui/page-state";
 import { PageHeading } from "@/shared/ui/page-heading";
 import { EvidenceList } from "@/features/projects/ProjectComponents";
 
@@ -14,11 +16,14 @@ export function RunDetailScreen({ projectId, runId }: { projectId: string; runId
   const query = useQuery({
     queryKey: ["projects", projectId, "runs", runId],
     queryFn: ({ signal }) => fetchRun(projectId, runId, signal),
-    refetchInterval: 5_000,
-    refetchIntervalInBackground: false
+    ...pollingQueryOptions<RunResponse>({
+      activeIntervalMs: 5_000,
+      stableIntervalMs: false,
+      isActive: data => data.run.status === "running"
+    })
   });
   if (query.isLoading) return <PageLoading label="Loading Run…" />;
-  if (query.isError || !query.data) return <PageError message={apiErrorMessage(query.error, "Run is unavailable.")} onRetry={() => void query.refetch()} />;
+  if (!query.data) return <PageError message={apiErrorMessage(query.error, "Run is unavailable.")} onRetry={() => void query.refetch()} />;
   const run = query.data.run;
   const resultHref = safeHttpHref(run.resultUrl);
   return (
@@ -30,6 +35,13 @@ export function RunDetailScreen({ projectId, runId }: { projectId: string; runId
           description={`One ${run.runner.kind} Runner working from an immutable Goal and base commit contract.`}
           actions={resultHref ? <Button asChild variant="outline"><a href={resultHref} target="_blank" rel="noreferrer"><ExternalLink />Result commit</a></Button> : undefined}
         />
+        {query.isError ? (
+          <PageRefreshWarning
+            message={apiErrorMessage(query.error, "Run state could not be refreshed.")}
+            retrying={query.isFetching}
+            onRetry={() => void query.refetch()}
+          />
+        ) : null}
         <div className="mt-5 flex flex-wrap items-center gap-2">
           <RunStatusBadge status={run.status} />
           <Badge variant="outline"><Users />{run.runner.name}</Badge>
