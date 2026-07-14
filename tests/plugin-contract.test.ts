@@ -11,8 +11,8 @@ const expectedTools = [
   "hunsu.projects.list", "hunsu.projects.get", "hunsu.projects.create", "hunsu.projects.update", "hunsu.projects.rebuild",
   "hunsu.goals.list", "hunsu.goals.get", "hunsu.goals.create", "hunsu.goals.update", "hunsu.goals.pause", "hunsu.goals.complete",
   "hunsu.runners.list", "hunsu.runners.get", "hunsu.runners.create_player", "hunsu.runners.create_team", "hunsu.runners.update",
-  "hunsu.runs.start", "hunsu.runs.checkpoint", "hunsu.runs.attach_evidence", "hunsu.runs.complete", "hunsu.runs.fail", "hunsu.runs.cancel",
-  "hunsu.coach.review", "hunsu.coach.propose_change", "hunsu.coach.propose_hunsu",
+  "hunsu.runs.get", "hunsu.runs.start", "hunsu.runs.checkpoint", "hunsu.runs.attach_evidence", "hunsu.runs.complete", "hunsu.runs.fail", "hunsu.runs.cancel",
+  "hunsu.coach.get", "hunsu.coach.review", "hunsu.coach.propose_change", "hunsu.coach.propose_hunsu",
   "hunsu.alternatives.compare", "hunsu.alternatives.select", "hunsu.alternatives.reject"
 ];
 
@@ -24,6 +24,8 @@ test("plugin contract exposes the complete command surface", () => {
     assert.equal(tool.inputSchema.additionalProperties, false);
   }
   assert.equal(HUNSU_MCP_TOOLS.find(tool => tool.name === "hunsu.alternatives.compare")?.readOnly, false);
+  assert.equal(HUNSU_MCP_TOOLS.find(tool => tool.name === "hunsu.runs.get")?.readOnly, true);
+  assert.equal(HUNSU_MCP_TOOLS.find(tool => tool.name === "hunsu.coach.get")?.readOnly, true);
   const complete = HUNSU_MCP_TOOLS.find(tool => tool.name === "hunsu.goals.complete")?.inputSchema;
   assert.ok(Array.isArray(complete?.required) && complete.required.includes("selectedRunId"));
   const createProject = HUNSU_MCP_TOOLS.find(tool => tool.name === "hunsu.projects.create")?.inputSchema;

@@ -225,6 +225,28 @@ test("application service completes and reconstructs the GitHub-backed divergent
     idempotencyKey: "player-update-after-start",
     expectedStateSha: stateHeadSha
   })).stateHeadSha;
+  const playerRead = await service.call("hunsu.runners.get", {
+    repository: repo,
+    projectId: "project-one",
+    runnerId: "player-one"
+  }, auth);
+  if (!playerRead.ok) assert.fail(playerRead.error.message);
+  assert.equal(playerRead.stateHeadSha, stateHeadSha);
+  assert.deepEqual(playerRead.data, {
+    kind: "player",
+    id: "player-one",
+    name: "player-one",
+    promptTemplate: "Implement the refined Goal and report criterion-linked evidence.",
+    resources: [{
+      id: "skill:verification",
+      kind: "skill",
+      name: "verification",
+      reference: "skill://verification"
+    }],
+    runtimePolicy: { filesystem: "worktree_write", network: "enabled", approvals: "on_request" },
+    goalCount: 0,
+    recentResults: []
+  });
   const beforeTeamUpdate = stateHeadSha;
   stateHeadSha = (await mutation(service, "hunsu.runners.update", {
     repository: repo,
@@ -304,6 +326,32 @@ test("application service completes and reconstructs the GitHub-backed divergent
   const firstStart = await mutation(service, "hunsu.runs.start", firstStartInput);
   stateHeadSha = firstStart.stateHeadSha;
   assert.equal((firstStart.data as { schema: string }).schema, "hunsu.run-contract.v1");
+  const startedRunRead = await service.call("hunsu.runs.get", {
+    repository: repo,
+    projectId: "project-one",
+    runId: "run-one"
+  }, auth);
+  if (!startedRunRead.ok) assert.fail(startedRunRead.error.message);
+  assert.equal(startedRunRead.stateHeadSha, stateHeadSha);
+  const startedRunSnapshot = (startedRunRead.data as {
+    runnerSnapshot: {
+      kind: string;
+      resources: Array<{ id: string; kind: string; name: string; reference: string }>;
+      runtimePolicy: { filesystem: string; network: string; approvals: string };
+    };
+  }).runnerSnapshot;
+  assert.equal(startedRunSnapshot.kind, "player");
+  assert.deepEqual(startedRunSnapshot.resources, [{
+    id: "skill:verification",
+    kind: "skill",
+    name: "verification",
+    reference: "skill://verification"
+  }]);
+  assert.deepEqual(startedRunSnapshot.runtimePolicy, {
+    filesystem: "worktree_write",
+    network: "enabled",
+    approvals: "on_request"
+  });
   const firstCommit = transport.addCommit({
     repository,
     branch: "hunsu/run/project-one/goal-one/run-one",
@@ -405,6 +453,22 @@ test("application service completes and reconstructs the GitHub-backed divergent
     idempotencyKey: "coach-hunsu-proposal",
     expectedStateSha: stateHeadSha
   })).stateHeadSha;
+  const coachRead = await service.call("hunsu.coach.get", {
+    repository: repo,
+    projectId: "project-one"
+  }, auth);
+  if (!coachRead.ok) assert.fail(coachRead.error.message);
+  assert.equal(coachRead.stateHeadSha, stateHeadSha);
+  const coachProjection = coachRead.data as {
+    assessment: { summary: string };
+    proposals: Array<{ id: string; kind: string; status: string }>;
+  };
+  assert.equal(coachProjection.assessment.summary, "The first result works but another future may be stronger.");
+  assert.deepEqual(coachProjection.proposals.map(proposal => ({
+    id: proposal.id,
+    kind: proposal.kind,
+    status: proposal.status
+  })), [{ id: "proposal-one", kind: "hunsu", status: "proposed" }]);
 
   const webAuth = { ...auth, client: "web" as const };
   const unconfirmedStartInput = {

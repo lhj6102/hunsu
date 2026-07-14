@@ -104,9 +104,9 @@ function PlayerCard({ projectId, player }: { projectId: string; player: Player }
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <div className="rounded-[14px] bg-white/62 p-3">
           <p className="flex items-center gap-1.5 text-[10px] font-semibold uppercase text-muted-foreground"><ShieldCheck className="size-3" />Policy</p>
-          <p className="mt-2 text-[11px]">Network: {player.runtimePolicy.network}</p>
+          <p className="mt-2 text-[11px]">Filesystem: {player.runtimePolicy.filesystem}</p>
+          <p className="mt-1 text-[11px]">Network: {player.runtimePolicy.network}</p>
           <p className="mt-1 text-[11px]">Approvals: {player.runtimePolicy.approvals}</p>
-          {player.runtimePolicy.model ? <p className="mt-1 truncate text-[11px]">Model: {player.runtimePolicy.model}</p> : null}
         </div>
         <div className="rounded-[14px] bg-white/62 p-3">
           <p className="text-[10px] font-semibold uppercase text-muted-foreground">Resources</p>

@@ -5,7 +5,7 @@ description: Start, execute, checkpoint, and finish a Hunsu Run through a Player
 
 # Hunsu Run
 
-1. Load the Project, Goal, and available Runners. Prefer a Player for the first vertical slice unless the user explicitly selects a Team.
+1. Load the Project, Goal, and available Runners. When recovering an interrupted Run, call `hunsu.runs.get` and continue from its immutable snapshots, checkpoints, and evidence. Prefer a Player for the first vertical slice unless the user explicitly selects a Team.
 2. If no suitable Runner exists, create one with its canonical `runnerId`; Runner definitions have no separate name. Use `hunsu.runners.create_player` for a Player or `hunsu.runners.create_team` for a Team. A Player requires its prompt, resources, and complete runtime policy. A Team requires its complete strategy (`mode`, `promptTemplate`, and `maxRounds`) plus ordered Player membership (`playerId`, `role`, and 1-based `order`). Reserve `hunsu.runners.update` for replacing the complete definition of an existing same-kind Runner; never send fields from the other variant.
 3. Call `hunsu.runs.start` and treat the returned Run contract as immutable. Updating a Runner later changes only future Run snapshots.
 4. Verify the active repository, exact base SHA, and returned `hunsu/run/<project>/<goal>/<run>` branch before editing. Stop and report a stale-base conflict instead of rebasing silently.

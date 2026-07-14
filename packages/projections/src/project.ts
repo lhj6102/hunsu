@@ -29,6 +29,7 @@ import type {
   ProjectionContext,
   ProjectListItemProjection,
   ProjectOverviewProjection,
+  ResourceProjection,
   RepositoryProjection,
   RunDetailProjection,
   RunnerProjection,
@@ -429,6 +430,7 @@ function runnerProjection(state: ProjectState, runner: Runner): RunnerProjection
       promptTemplate: runner.promptTemplate,
       resources: runner.resources.map(resourceProjection),
       runtimePolicy: {
+        filesystem: runner.runtimePolicy.fileAccess === "project_write" ? "worktree_write" : "read_only",
         network: runner.runtimePolicy.network === "allowed" ? "enabled" : "disabled",
         approvals: runner.runtimePolicy.approval === "user" ? "on_request" : "never"
       },
@@ -465,6 +467,7 @@ function runnerSnapshotProjection(state: ProjectState, snapshot: RunnerSnapshot)
       promptTemplate: snapshot.promptTemplate,
       resources: snapshot.resources.map(resourceProjection),
       runtimePolicy: {
+        filesystem: snapshot.runtimePolicy.fileAccess === "project_write" ? "worktree_write" : "read_only",
         network: snapshot.runtimePolicy.network === "allowed" ? "enabled" : "disabled",
         approvals: snapshot.runtimePolicy.approval === "user" ? "on_request" : "never"
       },
@@ -695,10 +698,10 @@ function repositoryProjection(project: Project): RepositoryProjection {
   };
 }
 
-function resourceProjection(resource: ResourceBinding): { id: string; kind: "skill" | "plugin"; name: string; version?: string } {
+function resourceProjection(resource: ResourceBinding): ResourceProjection {
   return resource.type === "skill"
-    ? { id: `skill:${resource.name}`, kind: "skill", name: resource.name }
-    : { id: `plugin:${resource.name}`, kind: "plugin", name: resource.name, version: resource.version };
+    ? { id: `skill:${resource.name}`, kind: "skill", name: resource.name, reference: resource.source }
+    : { id: `plugin:${resource.name}`, kind: "plugin", name: resource.name, reference: resource.version };
 }
 
 function runnerInstructions(snapshot: RunnerSnapshot): string {

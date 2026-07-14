@@ -157,6 +157,11 @@ const definitions: HunsuToolDefinition[] = [
     expectedStateSha: stateSha
   }, ["repository", "projectId", "runnerId", "definition", "idempotencyKey", "expectedStateSha"]),
 
+  readTool("hunsu.runs.get", "Load one Run with its immutable Goal and Runner snapshots, checkpoints, and evidence.", {
+    repository,
+    projectId: id,
+    runId: id
+  }, ["repository", "projectId", "runId"]),
   writeTool("hunsu.runs.start", "Create a Run branch and return an immutable execution contract.", {
     repository,
     projectId: id,
@@ -194,6 +199,10 @@ const definitions: HunsuToolDefinition[] = [
     reason: string
   }, [...mutationRequired("runId"), "reason"]),
 
+  readTool("hunsu.coach.get", "Load the Coach assessment, proposals, and evidence-based recommendations for a Project.", {
+    repository,
+    projectId: id
+  }, ["repository", "projectId"]),
   writeTool("hunsu.coach.review", "Record an evidence-grounded Coach review.", {
     repository,
     projectId: id,
