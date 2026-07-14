@@ -46,6 +46,8 @@ export type ApiError = {
   message: string;
   status: number;
   retryable: boolean;
+  retryAfterSeconds?: number;
+  requestId?: string;
   expectedStateSha?: string;
   actualStateSha?: string;
   fieldErrors?: Record<string, string>;

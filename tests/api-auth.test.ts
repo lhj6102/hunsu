@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, verify } from "node:crypto";
 import test from "node:test";
+import { GitHubAuthorityError } from "../packages/github-store/src/index.ts";
 import {
   GitHubAppTokenProvider,
   GitHubOAuthClient,
@@ -269,6 +270,174 @@ test("GitHub App installation tokens are short-lived and cached without exposing
     token: "installation-token-2",
     permissions: { contents: "write" }
   });
+  assert.equal(calls, 2);
+});
+
+test("GitHub App installation token minting coalesces concurrent cold requests", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const now = Date.UTC(2026, 6, 13);
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const provider = new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    apiBaseUrl: "https://github-api.example.test",
+    now: () => now,
+    fetch: async () => {
+      calls += 1;
+      await gate;
+      return jsonResponse({
+        token: "coalesced-installation-token",
+        expires_at: new Date(now + 3_600_000).toISOString(),
+        permissions: { contents: "write" }
+      }, 201);
+    }
+  });
+
+  const authorities = Array.from({ length: 20 }, () => provider.getAuthority(17));
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  release();
+  assert.deepEqual(
+    await Promise.all(authorities),
+    Array.from({ length: 20 }, () => ({
+      token: "coalesced-installation-token",
+      permissions: { contents: "write" }
+    }))
+  );
+  assert.equal(calls, 1);
+});
+
+test("GitHub App installation token mint failures remain retryable after coalescing", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const now = Date.UTC(2026, 6, 13);
+  let calls = 0;
+  const provider = new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    apiBaseUrl: "https://github-api.example.test",
+    now: () => now,
+    fetch: async () => {
+      calls += 1;
+      return calls === 1
+        ? jsonResponse({ message: "temporary mint failure" }, 503)
+        : jsonResponse({
+            token: "recovered-installation-token",
+            expires_at: new Date(now + 3_600_000).toISOString(),
+            permissions: { contents: "write" }
+          }, 201);
+    }
+  });
+
+  const failures = await Promise.allSettled(Array.from({ length: 8 }, () => provider.getAuthority(17)));
+  assert.equal(calls, 1);
+  assert.equal(failures.every(result => result.status === "rejected"), true);
+  assert.equal((await provider.getAuthority(17)).token, "recovered-installation-token");
+  assert.equal(calls, 2);
+});
+
+test("GitHub App installation token HTTP failures preserve typed transport diagnostics", async t => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const now = Date.UTC(2026, 6, 13);
+  const scenarios = [
+    {
+      name: "bare 429 rate limit",
+      status: 429,
+      body: { message: "Too many requests" },
+      headers: { "retry-after": "47", "x-github-request-id": "RATE:TOKEN" },
+      expected: {
+        code: "rate_limited",
+        message: "Too many requests",
+        status: 429,
+        retryAfterSeconds: 47,
+        requestId: "RATE:TOKEN"
+      }
+    },
+    {
+      name: "non-rate 403",
+      status: 403,
+      body: { message: "Resource not accessible by integration" },
+      headers: { "x-github-request-id": "AUTH:TOKEN" },
+      expected: {
+        code: "forbidden",
+        message: "GitHub rejected the installation token request.",
+        status: 403,
+        requestId: "AUTH:TOKEN"
+      }
+    },
+    {
+      name: "upstream 503",
+      status: 503,
+      body: { message: "Service unavailable" },
+      headers: { "retry-after": "11", "x-github-request-id": "UPSTREAM:TOKEN" },
+      expected: {
+        code: "invalid_response",
+        message: "GitHub installation token request failed with 503.",
+        status: 503,
+        retryAfterSeconds: 11,
+        requestId: "UPSTREAM:TOKEN"
+      }
+    }
+  ] as const;
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const provider = new GitHubAppTokenProvider({
+        appId: 42,
+        privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        apiBaseUrl: "https://github-api.example.test",
+        now: () => now,
+        fetch: async () => jsonResponse(scenario.body, scenario.status, scenario.headers)
+      });
+
+      await assert.rejects(provider.getAuthority(17), (error: unknown) => {
+        if (!(error instanceof GitHubAuthorityError)) return false;
+        assert.deepEqual(error.transportError, scenario.expected);
+        return true;
+      });
+    });
+  }
+});
+
+test("stale 401 invalidation cannot evict a newer in-flight installation token", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const now = Date.UTC(2026, 6, 13);
+  let calls = 0;
+  let releaseFresh!: () => void;
+  const freshGate = new Promise<void>(resolve => {
+    releaseFresh = resolve;
+  });
+  const provider = new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    apiBaseUrl: "https://github-api.example.test",
+    now: () => now,
+    fetch: async () => {
+      calls += 1;
+      if (calls === 2) await freshGate;
+      return jsonResponse({
+        token: calls === 1 ? "rejected-installation-token" : "fresh-installation-token",
+        expires_at: new Date(now + 3_600_000).toISOString(),
+        permissions: { contents: "write" }
+      }, 201);
+    }
+  });
+
+  const rejected = await provider.getAuthority(17);
+  assert.equal(provider.invalidate(17, rejected.token), true);
+  const refreshes = Array.from({ length: 20 }, () => provider.getAuthority(17));
+  await Promise.resolve();
+  assert.equal(calls, 2);
+  for (let index = 0; index < 20; index += 1) {
+    assert.equal(provider.invalidate(17, rejected.token), false);
+  }
+  releaseFresh();
+  const authorities = await Promise.all(refreshes);
+  assert.equal(authorities.every(authority => authority.token === "fresh-installation-token"), true);
+  assert.equal((await provider.getAuthority(17)).token, "fresh-installation-token");
   assert.equal(calls, 2);
 });
 
@@ -658,9 +827,11 @@ function githubRepository(
   return { id, permissions };
 }
 
-function jsonResponse(value: unknown, status = 200): Response {
+function jsonResponse(value: unknown, status = 200, headers: HeadersInit = {}): Response {
+  const responseHeaders = new Headers(headers);
+  if (!responseHeaders.has("content-type")) responseHeaders.set("content-type", "application/json");
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" }
+    headers: responseHeaders
   });
 }

@@ -1,4 +1,4 @@
-import { AlertCircle, Loader2, RotateCw } from "lucide-react";
+import { AlertCircle, AlertTriangle, Loader2, RotateCw } from "lucide-react";
 import { Button } from "@/shared/ui/button";
 
 export function PageLoading({ label = "Loading Hunsu…" }: { label?: string }) {
@@ -26,6 +26,30 @@ export function PageError({ message, onRetry }: { message: string; onRetry?: () 
           </Button>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+export function PageRefreshWarning({
+  message,
+  onRetry,
+  retrying = false
+}: {
+  message: string;
+  onRetry: () => void;
+  retrying?: boolean;
+}) {
+  return (
+    <div role="alert" className="mt-5 flex flex-col gap-3 rounded-[14px] border border-amber-200 bg-amber-50/72 px-4 py-3 text-amber-950 sm:flex-row sm:items-center">
+      <AlertTriangle className="size-4 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <p className="text-[12px] font-semibold">Automatic refresh paused</p>
+        <p className="mt-0.5 text-[11px] leading-4 text-amber-900/80">{message}</p>
+      </div>
+      <Button type="button" size="sm" variant="outline" disabled={retrying} onClick={onRetry}>
+        <RotateCw className={retrying ? "animate-spin" : ""} />
+        {retrying ? "Retrying…" : "Retry refresh"}
+      </Button>
     </div>
   );
 }

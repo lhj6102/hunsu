@@ -1,5 +1,6 @@
 import { getApi, patchApi, postApi } from "@/shared/api/client";
 import { alternativeDecisionRequest } from "@/shared/api/alternativeDecision";
+import { PROJECT_QUERY_ROOT } from "@/shared/api/polling";
 import type {
   CoachResponse,
   GoalResponse,
@@ -12,7 +13,7 @@ import type {
   SessionResponse
 } from "@/shared/api/types";
 
-export const PROJECT_LIST_QUERY_KEY = ["projects"] as const;
+export const PROJECT_LIST_QUERY_KEY = PROJECT_QUERY_ROOT;
 
 export function fetchSession(signal?: AbortSignal): Promise<SessionResponse> {
   return getApi<SessionResponse>("/api/session", signal);

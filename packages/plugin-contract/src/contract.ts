@@ -98,6 +98,8 @@ export type PluginSafeError = {
   code: PluginErrorCode;
   message: string;
   retryable: boolean;
+  retryAfterSeconds?: number;
+  requestId?: string;
   recovery?: string;
   expectedStateSha?: string;
   actualStateSha?: string;

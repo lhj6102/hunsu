@@ -12,7 +12,7 @@ import {
   type GitHubOAuthClient,
   type GitHubOAuthFailure
 } from "../apps/api/src/index.ts";
-import { MemoryGitHubTransport, type RepositoryGrant } from "../packages/github-store/src/index.ts";
+import { MemoryGitHubTransport, type RepositoryGrant, type TransportResult } from "../packages/github-store/src/index.ts";
 
 const API = "https://api.example.test";
 const WEB = "https://web.example.test";
@@ -175,6 +175,60 @@ test("GitHub OAuth callback diagnostics are response-only, closed, and credentia
       upstreamStatus: null,
       providerCode: null
     });
+  });
+});
+
+test("rate-limited API responses expose an exact Retry-After boundary", async () => {
+  const transport = new class extends MemoryGitHubTransport {
+    override async listInstallationRepositories(): Promise<TransportResult<RepositoryGrant[]>> {
+      return {
+        ok: false,
+        error: {
+          code: "rate_limited",
+          message: "API rate limit exceeded for installation ID 17.",
+          status: 429,
+          retryAfterSeconds: 137,
+          requestId: "RATE:HTTP"
+        }
+      };
+    }
+  }([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const sessions = new SessionManager({
+    secret: "test-session-secret-that-is-at-least-thirty-two-bytes",
+    ttlSeconds: 3600,
+    cookieName: "hunsu_session",
+    secure: true
+  });
+  const stateStore = new InMemoryEphemeralStateStore();
+  const app = new HunsuHttpApp({
+    service,
+    sessions,
+    githubOAuth: {
+      authorizationUrl: () => "https://github.example.test/authorize",
+      authenticate: async () => ({ ok: true, value: { user: webContext.user, installations: [...webContext.installations] } })
+    } as unknown as GitHubOAuthClient,
+    mcpOAuth: new McpOAuthService({ baseUrl: API, secret: sessions.config.secret, stateStore }),
+    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore }),
+    publicApiUrl: API,
+    webUrl: WEB,
+    githubAppSlug: "hunsu-test"
+  });
+  const issued = sessions.issue({ user: webContext.user, installations: webContext.installations, selectedInstallationId: 17 });
+  const response = await app.handle(new Request(`${API}/api/projects`, {
+    headers: { cookie: `hunsu_session=${encodeURIComponent(issued.token)}` }
+  }));
+
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("retry-after"), "137");
+  assert.deepEqual(await response.json(), {
+    error: {
+      code: "temporarily_unavailable",
+      message: "GitHub is temporarily rate limiting this installation. Retry after at least 137 seconds.",
+      retryable: true,
+      retryAfterSeconds: 137,
+      requestId: "RATE:HTTP"
+    }
   });
 });
 

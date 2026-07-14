@@ -9,8 +9,9 @@ import {
   shouldFetchProjectList,
   type AppRoute
 } from "@/app/routes";
+import { pollingQueryOptions } from "@/shared/api/polling";
 import { fetchProjects, PROJECT_LIST_QUERY_KEY } from "@/shared/api/projectApi";
-import type { SessionResponse } from "@/shared/api/types";
+import type { ProjectListResponse, SessionResponse } from "@/shared/api/types";
 import { relativeTimestamp } from "@/shared/format";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/shared/ui/badge";
@@ -33,8 +34,11 @@ export function ProjectAppShell({
     queryKey: PROJECT_LIST_QUERY_KEY,
     queryFn: ({ signal }) => fetchProjects(signal),
     enabled: projectListEnabled,
-    refetchInterval: 15_000,
-    refetchIntervalInBackground: false
+    ...pollingQueryOptions<ProjectListResponse>({
+      activeIntervalMs: 15_000,
+      stableIntervalMs: 60_000,
+      isActive: data => data.projects.some(project => project.activeRunCount > 0)
+    })
   });
   const projects = projectsQuery.data?.projects ?? [];
   const projectListLoaded = projectsQuery.data !== undefined;

@@ -9,7 +9,9 @@ import {
   rejectCoachProposal,
   requestCoachReview
 } from "@/shared/api/projectApi";
+import { invalidateProjectQueries, pollingQueryOptions } from "@/shared/api/polling";
 import type {
+  CoachResponse,
   CoachComparisonRecommendation,
   CoachProposal,
   CoachSelectionRecommendation,
@@ -23,7 +25,7 @@ import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { ConfirmActionDialog } from "@/shared/ui/confirm-action-dialog";
 import { GoalStatusBadge, RunStatusBadge, humanize } from "@/shared/ui/domain-badge";
-import { EmptyState, PageError, PageLoading } from "@/shared/ui/page-state";
+import { EmptyState, PageError, PageLoading, PageRefreshWarning } from "@/shared/ui/page-state";
 import { PageHeading } from "@/shared/ui/page-heading";
 
 type ProposalDecision = { kind: "confirm" | "reject"; proposal: CoachProposal };
@@ -37,8 +39,11 @@ export function CoachScreen({ projectId }: { projectId: string }) {
   const query = useQuery({
     queryKey,
     queryFn: ({ signal }) => fetchCoach(projectId, signal),
-    refetchInterval: 10_000,
-    refetchIntervalInBackground: false
+    ...pollingQueryOptions<CoachResponse>({
+      activeIntervalMs: 10_000,
+      stableIntervalMs: 60_000,
+      isActive: data => data.coach.stalledRuns.some(run => run.status === "running")
+    })
   });
   const reviewMutation = useMutation({
     mutationFn: () => {
@@ -65,13 +70,11 @@ export function CoachScreen({ projectId }: { projectId: string }) {
     onSuccess: () => {
       proposalSubmission.succeeded();
       setDecision(undefined);
-      void queryClient.invalidateQueries({ queryKey });
-      void queryClient.invalidateQueries({ queryKey: ["projects", projectId] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void invalidateProjectQueries(queryClient);
     }
   });
   if (query.isLoading) return <PageLoading label="Loading Coach…" />;
-  if (query.isError || !query.data) return <PageError message={apiErrorMessage(query.error, "Coach view is unavailable.")} onRetry={() => void query.refetch()} />;
+  if (!query.data) return <PageError message={apiErrorMessage(query.error, "Coach view is unavailable.")} onRetry={() => void query.refetch()} />;
   const coach = query.data.coach;
   const openProposals = coach.proposals.filter(proposal => proposal.status === "proposed");
   return (
@@ -83,6 +86,13 @@ export function CoachScreen({ projectId }: { projectId: string }) {
           description="The Coach reviews Goals, Runs, evidence, and alternatives. Recommendations never confirm consequential changes without a person."
           actions={<Button type="button" disabled={reviewMutation.isPending} onClick={() => reviewMutation.mutate()}><RefreshCw className={reviewMutation.isPending ? "animate-spin" : ""} />{reviewMutation.isPending ? "Reviewing…" : "Request review"}</Button>}
         />
+        {query.isError ? (
+          <PageRefreshWarning
+            message={apiErrorMessage(query.error, "Coach state could not be refreshed.")}
+            retrying={query.isFetching}
+            onRetry={() => void query.refetch()}
+          />
+        ) : null}
 
         <section className="mt-8 rounded-[22px] border bg-white/64 p-5 sm:p-6">
           <div className="flex items-start gap-3">

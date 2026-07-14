@@ -423,6 +423,8 @@ export type ApiProblem = {
   code: string;
   message: string;
   retryable?: boolean;
+  retryAfterSeconds?: number;
+  requestId?: string;
   expectedStateSha?: string;
   actualStateSha?: string;
   fieldErrors?: Record<string, string>;

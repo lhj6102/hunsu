@@ -2,14 +2,16 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bot, Check, Clipboard, Pause, Play, RotateCcw, Sparkles } from "lucide-react";
 import { apiErrorMessage } from "@/shared/api/client";
+import { invalidateProjectQueries, pollingQueryOptions } from "@/shared/api/polling";
 import { fetchGoal, requestHunsu, updateGoal } from "@/shared/api/projectApi";
+import type { GoalResponse } from "@/shared/api/types";
 import { useLogicalSubmissionKey } from "@/shared/api/useLogicalSubmissionKey";
 import { formatTimestamp, shortSha } from "@/shared/format";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { ConfirmActionDialog } from "@/shared/ui/confirm-action-dialog";
 import { GoalStatusBadge, ReviewStatusBadge } from "@/shared/ui/domain-badge";
-import { EmptyState, PageError, PageLoading } from "@/shared/ui/page-state";
+import { EmptyState, PageError, PageLoading, PageRefreshWarning } from "@/shared/ui/page-state";
 import { PageHeading } from "@/shared/ui/page-heading";
 import { AlternativeComparison } from "@/features/alternatives/AlternativeComparison";
 import { latestCompletedRun } from "@/features/goals/goalActionModel";
@@ -26,13 +28,14 @@ export function GoalDetailScreen({ projectId, goalId }: { projectId: string; goa
   const query = useQuery({
     queryKey,
     queryFn: ({ signal }) => fetchGoal(projectId, goalId, signal),
-    refetchInterval: 5_000,
-    refetchIntervalInBackground: false
+    ...pollingQueryOptions<GoalResponse>({
+      activeIntervalMs: 5_000,
+      stableIntervalMs: 60_000,
+      isActive: data => data.goal.runs.some(run => run.status === "running")
+    })
   });
   const invalidate = () => {
-    void queryClient.invalidateQueries({ queryKey });
-    void queryClient.invalidateQueries({ queryKey: ["projects", projectId] });
-    void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    void invalidateProjectQueries(queryClient);
   };
   const lifecycleMutation = useMutation({
     mutationFn: ({ status, selectedRunId }: { status: "active" | "paused" | "completed"; selectedRunId?: string }) => {
@@ -68,7 +71,7 @@ export function GoalDetailScreen({ projectId, goalId }: { projectId: string; goa
     }
   });
   if (query.isLoading) return <PageLoading label="Loading Goal…" />;
-  if (query.isError || !query.data) return <PageError message={apiErrorMessage(query.error, "Goal is unavailable.")} onRetry={() => void query.refetch()} />;
+  if (!query.data) return <PageError message={apiErrorMessage(query.error, "Goal is unavailable.")} onRetry={() => void query.refetch()} />;
   const goal = query.data.goal;
   const sourceRun = latestCompletedRun(goal.runs);
   const selectedRunId = goal.decision?.recommendedRunId ?? (sourceRun?.status === "completed" ? sourceRun.id : undefined);
@@ -101,6 +104,13 @@ export function GoalDetailScreen({ projectId, goalId }: { projectId: string; goa
             </>
           )}
         />
+        {query.isError ? (
+          <PageRefreshWarning
+            message={apiErrorMessage(query.error, "Goal state could not be refreshed.")}
+            retrying={query.isFetching}
+            onRetry={() => void query.refetch()}
+          />
+        ) : null}
         <div className="mt-5 flex flex-wrap items-center gap-2">
           <GoalStatusBadge status={goal.status} />
           <Badge variant="outline">{goal.priority ?? "normal"} priority</Badge>

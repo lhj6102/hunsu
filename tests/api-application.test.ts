@@ -796,6 +796,250 @@ test("repository authorization preserves multi-installation ambiguity checks", a
   assert.equal(result.error.code, "conflict");
 });
 
+test("installation repository membership is TTL cached while current user permissions are overlaid per request", async () => {
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  let cacheNow = 0;
+  const service = new HunsuApplicationService({ transport, cacheNow: () => cacheNow });
+  await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-membership-cache",
+    title: "Membership cache",
+    objective: "Reuse raw App grants without retaining user authorization",
+    baseRef: "main",
+    coachId: "coach-membership-cache",
+    idempotencyKey: "project-membership-cache-create"
+  });
+  assert.equal(transport.installationRepositoryReads, 1);
+
+  const readOnly: AuthContext = {
+    ...auth,
+    client: "web",
+    installations: [{
+      ...auth.installations[0],
+      repositories: [{ repositoryId: repository.repositoryId, permissions: { contents: "read" } }]
+    }]
+  };
+  const readOnlyProject = await service.webProject(readOnly, "project-membership-cache");
+  if (!readOnlyProject.ok) assert.fail(readOnlyProject.error.message);
+  assert.equal(
+    (readOnlyProject.value.project as { health: { repositoryAccess: string } }).health.repositoryAccess,
+    "read_only"
+  );
+  assert.equal(transport.installationRepositoryReads, 1);
+
+  cacheNow = 4_001;
+  const reused = await service.webProject(readOnly, "project-membership-cache");
+  if (!reused.ok) assert.fail(reused.error.message);
+  assert.equal(transport.installationRepositoryReads, 1);
+
+  cacheNow = 60_001;
+  const refreshed = await service.webProject(readOnly, "project-membership-cache");
+  if (!refreshed.ok) assert.fail(refreshed.error.message);
+  assert.equal(transport.installationRepositoryReads, 2);
+});
+
+test("concurrent installation membership cache misses share one transport request", async () => {
+  const transport = new DeferredInstallationRepositoryMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const deferred = transport.deferNextInstallationRepositoryRead();
+  const webAuth = { ...auth, client: "web" as const };
+
+  const first = service.sessionRepositories(webAuth);
+  await deferred.captured;
+  const second = service.sessionRepositories(webAuth);
+  await Promise.resolve();
+  assert.equal(transport.installationRepositoryReads, 1);
+  deferred.release();
+
+  const results = await Promise.all([first, second]);
+  for (const result of results) {
+    if (!result.ok) assert.fail(result.error.message);
+    assert.equal(result.value.repositories.length, 1);
+  }
+  assert.equal(transport.installationRepositoryReads, 1);
+});
+
+test("session repository state heads are read sequentially within an installation", async () => {
+  const repositories = Array.from({ length: 4 }, (_, index): RepositoryGrant => ({
+    ...repository,
+    repositoryId: repository.repositoryId + index,
+    name: `${repository.name}-${index + 1}`
+  }));
+  const transport = new ConcurrentHeadMemoryGitHubTransport(
+    repositories.map(item => ({ repository: item, initialSha: INITIAL_SHA }))
+  );
+  const service = new HunsuApplicationService({ transport });
+  const context: AuthContext = {
+    ...auth,
+    client: "web",
+    installations: [{
+      ...auth.installations[0],
+      repositories: repositories.map(item => ({
+        repositoryId: item.repositoryId,
+        permissions: { contents: "write" as const }
+      }))
+    }]
+  };
+
+  const listed = await service.sessionRepositories(context);
+  if (!listed.ok) assert.fail(listed.error.message);
+  assert.equal(listed.value.repositories.length, repositories.length);
+  assert.equal(transport.maximumConcurrentStateHeadReads, 1);
+});
+
+test("installation invalidation prevents a stale in-flight membership read from repopulating the cache", async () => {
+  const replacement: RepositoryGrant = {
+    ...repository,
+    repositoryId: 30,
+    name: "replacement-product"
+  };
+  const transport = new DeferredInstallationRepositoryMemoryGitHubTransport([
+    { repository, initialSha: INITIAL_SHA },
+    { repository: replacement, initialSha: INITIAL_SHA }
+  ]);
+  transport.visibleRepositories = [repository];
+  const service = new HunsuApplicationService({ transport });
+  const context: AuthContext = {
+    ...auth,
+    client: "web",
+    installations: [{
+      ...auth.installations[0],
+      repositories: [
+        { repositoryId: repository.repositoryId, permissions: { contents: "write" } },
+        { repositoryId: replacement.repositoryId, permissions: { contents: "write" } }
+      ]
+    }]
+  };
+  const deferred = transport.deferNextInstallationRepositoryRead();
+  const stale = service.sessionRepositories(context);
+  await deferred.captured;
+
+  transport.visibleRepositories = [replacement];
+  service.invalidateInstallation(repository.installationId);
+  const refreshed = await service.sessionRepositories(context);
+  if (!refreshed.ok) assert.fail(refreshed.error.message);
+  assert.deepEqual(refreshed.value.repositories.map(item => (item as { name: string }).name), [replacement.name]);
+  assert.equal(transport.installationRepositoryReads, 2);
+
+  deferred.release();
+  const staleResult = await stale;
+  if (!staleResult.ok) assert.fail(staleResult.error.message);
+  assert.deepEqual(staleResult.value.repositories.map(item => (item as { name: string }).name), [repository.name]);
+
+  const cached = await service.sessionRepositories(context);
+  if (!cached.ok) assert.fail(cached.error.message);
+  assert.deepEqual(cached.value.repositories.map(item => (item as { name: string }).name), [replacement.name]);
+  assert.equal(transport.installationRepositoryReads, 2);
+});
+
+test("installation membership cache uses bounded deterministic LRU eviction", async () => {
+  const second: RepositoryGrant = {
+    ...repository,
+    installationId: 18,
+    repositoryId: 30,
+    name: "second-installation"
+  };
+  const third: RepositoryGrant = {
+    ...repository,
+    installationId: 19,
+    repositoryId: 31,
+    name: "third-installation"
+  };
+  const transport = new CountingMemoryGitHubTransport([
+    { repository, initialSha: INITIAL_SHA },
+    { repository: second, initialSha: INITIAL_SHA },
+    { repository: third, initialSha: INITIAL_SHA }
+  ]);
+  const service = new HunsuApplicationService({
+    transport,
+    projectionCachePolicy: { maxInstallationEntries: 2 }
+  });
+  const contextFor = (item: RepositoryGrant): AuthContext => ({
+    ...auth,
+    client: "web",
+    selectedInstallationId: item.installationId,
+    installations: [{
+      id: item.installationId,
+      accountLogin: item.owner,
+      accountType: "organization",
+      repositories: [{ repositoryId: item.repositoryId, permissions: { contents: "write" } }]
+    }]
+  });
+
+  for (const item of [repository, second, repository, third, repository, second]) {
+    const listed = await service.sessionRepositories(contextFor(item));
+    if (!listed.ok) assert.fail(listed.error.message);
+  }
+  assert.equal(transport.installationRepositoryReads, 4);
+});
+
+test("oversize installation membership entries are not retained", async () => {
+  const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({
+    transport,
+    projectionCachePolicy: { maxInstallationBytes: 1 }
+  });
+  const webAuth = { ...auth, client: "web" as const };
+
+  for (let index = 0; index < 2; index += 1) {
+    const listed = await service.sessionRepositories(webAuth);
+    if (!listed.ok) assert.fail(listed.error.message);
+  }
+  assert.equal(transport.installationRepositoryReads, 2);
+});
+
+test("Project lookup reuses repository catalog negative knowledge after the four-second bound", async () => {
+  const emptyRepository: RepositoryGrant = {
+    ...repository,
+    repositoryId: 30,
+    name: "empty-product"
+  };
+  const transport = new CountingMemoryGitHubTransport([
+    { repository, initialSha: INITIAL_SHA },
+    { repository: emptyRepository, initialSha: INITIAL_SHA }
+  ]);
+  let cacheNow = 0;
+  const service = new HunsuApplicationService({ transport, cacheNow: () => cacheNow });
+  await mutation(service, "hunsu.projects.create", {
+    repository: { owner: repository.owner, name: repository.name },
+    projectId: "project-catalog-lookup",
+    title: "Catalog lookup",
+    objective: "Avoid probing every repository for a known-absent Project id",
+    baseRef: "main",
+    coachId: "coach-catalog-lookup",
+    idempotencyKey: "project-catalog-lookup-create"
+  });
+  const webAuth: AuthContext = {
+    ...auth,
+    client: "web",
+    installations: [{
+      ...auth.installations[0],
+      repositories: [
+        { repositoryId: repository.repositoryId, permissions: { contents: "write" } },
+        { repositoryId: emptyRepository.repositoryId, permissions: { contents: "write" } }
+      ]
+    }]
+  };
+  const primed = await service.webProjects(webAuth);
+  if (!primed.ok) assert.fail(primed.error.message);
+  transport.stateHeadReads = 0;
+  transport.stateBranchReads = 0;
+
+  const absent = await service.webProject(webAuth, "project-not-in-either-catalog");
+  assert.equal(absent.ok, false);
+  if (absent.ok) assert.fail("Expected a missing Project response.");
+  assert.equal(absent.error.code, "not_found");
+  assert.equal(transport.stateHeadReads, 0);
+  assert.equal(transport.stateBranchReads, 0);
+
+  cacheNow = 4_001;
+  const found = await service.webProject(webAuth, "project-catalog-lookup");
+  if (!found.ok) assert.fail(found.error.message);
+  assert.equal((found.value.project as { title: string }).title, "Catalog lookup");
+  assert.equal(transport.stateHeadReads, 2);
+  assert.equal(transport.stateBranchReads, 0);
+});
+
 test("bounded projection polling recovers a missed webhook across API instances", async () => {
   const transport = new CountingMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
   let cacheNow = 0;
@@ -1155,6 +1399,48 @@ test("an exact empty reconstruction cannot cache a newer state head with no Proj
   assert.equal((refreshed.value.projects[0] as { title: string }).title, "Exact snapshot");
 });
 
+test("GitHub rate limits retain their retry boundary across Web and Plugin errors", async () => {
+  const transport = new RateLimitedMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const web = await service.webProjects({ ...auth, client: "web" });
+  assert.deepEqual(web, {
+    ok: false,
+    error: {
+      code: "temporarily_unavailable",
+      message: "GitHub is temporarily rate limiting this installation. Retry after at least 137 seconds.",
+      status: 503,
+      retryable: true,
+      retryAfterSeconds: 137,
+      requestId: "RATE:TEST"
+    }
+  });
+
+  const plugin = await service.call("hunsu.projects.list", {}, auth);
+  assert.equal(plugin.ok, false);
+  if (plugin.ok) return;
+  assert.equal(plugin.error.retryAfterSeconds, 137);
+  assert.equal(plugin.error.requestId, "RATE:TEST");
+  assert.equal(plugin.error.recovery, "Wait at least 137 seconds before retrying. Continuing during the GitHub rate-limit window can extend the outage.");
+});
+
+test("repository selection does not disguise a rate-limited state-head read as an empty state branch", async () => {
+  const transport = new RateLimitedStateHeadMemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const result = await service.sessionRepositories({ ...auth, client: "web" });
+
+  assert.deepEqual(result, {
+    ok: false,
+    error: {
+      code: "temporarily_unavailable",
+      message: "GitHub is temporarily rate limiting this installation. Retry after at least 91 seconds.",
+      status: 503,
+      retryable: true,
+      retryAfterSeconds: 91,
+      requestId: "RATE:STATE-HEAD"
+    }
+  });
+});
+
 async function mutation(service: HunsuApplicationService, name: string, input: Record<string, unknown>) {
   const response = await service.call(name, input, auth);
   if (!response.ok) assert.fail(response.error.message);
@@ -1163,8 +1449,14 @@ async function mutation(service: HunsuApplicationService, name: string, input: R
 }
 
 class CountingMemoryGitHubTransport extends MemoryGitHubTransport {
+  installationRepositoryReads = 0;
   stateHeadReads = 0;
   stateBranchReads = 0;
+
+  override async listInstallationRepositories(installationId: number): Promise<TransportResult<RepositoryGrant[]>> {
+    this.installationRepositoryReads += 1;
+    return super.listInstallationRepositories(installationId);
+  }
 
   override async readBranchHead(repository: RepositoryLocator, branch: string): Promise<TransportResult<string | undefined>> {
     if (branch === HUNSU_STATE_BRANCH) this.stateHeadReads += 1;
@@ -1174,6 +1466,85 @@ class CountingMemoryGitHubTransport extends MemoryGitHubTransport {
   override async readBranch(repository: RepositoryLocator, branch: string): Promise<TransportResult<BranchSnapshot | undefined>> {
     if (branch === HUNSU_STATE_BRANCH) this.stateBranchReads += 1;
     return super.readBranch(repository, branch);
+  }
+}
+
+class ConcurrentHeadMemoryGitHubTransport extends CountingMemoryGitHubTransport {
+  maximumConcurrentStateHeadReads = 0;
+  #concurrentStateHeadReads = 0;
+
+  override async readBranchHead(repository: RepositoryLocator, branch: string): Promise<TransportResult<string | undefined>> {
+    if (branch !== HUNSU_STATE_BRANCH) return super.readBranchHead(repository, branch);
+    this.#concurrentStateHeadReads += 1;
+    this.maximumConcurrentStateHeadReads = Math.max(
+      this.maximumConcurrentStateHeadReads,
+      this.#concurrentStateHeadReads
+    );
+    await new Promise<void>(resolve => setImmediate(resolve));
+    try {
+      return await super.readBranchHead(repository, branch);
+    } finally {
+      this.#concurrentStateHeadReads -= 1;
+    }
+  }
+}
+
+class RateLimitedMemoryGitHubTransport extends MemoryGitHubTransport {
+  override async listInstallationRepositories(): Promise<TransportResult<RepositoryGrant[]>> {
+    return {
+      ok: false,
+      error: {
+        code: "rate_limited",
+        message: "API rate limit exceeded for installation ID 17.",
+        status: 429,
+        retryAfterSeconds: 137,
+        requestId: "RATE:TEST"
+      }
+    };
+  }
+}
+
+class RateLimitedStateHeadMemoryGitHubTransport extends MemoryGitHubTransport {
+  override async readBranchHead(): Promise<TransportResult<string | undefined>> {
+    return {
+      ok: false,
+      error: {
+        code: "rate_limited",
+        message: "API rate limit exceeded for installation ID 17.",
+        status: 429,
+        retryAfterSeconds: 91,
+        requestId: "RATE:STATE-HEAD"
+      }
+    };
+  }
+}
+
+class DeferredInstallationRepositoryMemoryGitHubTransport extends CountingMemoryGitHubTransport {
+  visibleRepositories: readonly RepositoryGrant[] | undefined;
+  #deferred: { captured: () => void; released: Promise<void> } | undefined;
+
+  deferNextInstallationRepositoryRead(): { captured: Promise<void>; release: () => void } {
+    let markCaptured!: () => void;
+    let release!: () => void;
+    const captured = new Promise<void>(resolve => { markCaptured = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    this.#deferred = { captured: markCaptured, released };
+    return { captured, release };
+  }
+
+  override async listInstallationRepositories(installationId: number): Promise<TransportResult<RepositoryGrant[]>> {
+    const listed = await super.listInstallationRepositories(installationId);
+    if (!listed.ok) return listed;
+    const snapshot = (this.visibleRepositories ?? listed.value)
+      .filter(item => item.installationId === installationId)
+      .map(item => structuredClone(item));
+    const deferred = this.#deferred;
+    if (deferred) {
+      this.#deferred = undefined;
+      deferred.captured();
+      await deferred.released;
+    }
+    return { ok: true, value: snapshot };
   }
 }
 
