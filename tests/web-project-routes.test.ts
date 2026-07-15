@@ -10,6 +10,7 @@ import {
 } from "../apps/web/src/app/routes.ts";
 import { validateGraphTopology } from "../apps/web/src/features/node-graph/graphModel.ts";
 import { fallbackGraphLayout } from "../apps/web/src/features/node-graph/fallbackGraphLayout.ts";
+import { GRAPH_COACHING_GAP, GRAPH_RUN_GAP } from "../apps/web/src/features/node-graph/layoutMetrics.ts";
 import { createLogicalSubmissionKey } from "../apps/web/src/shared/api/logicalSubmissionKey.ts";
 import { eventDateBound } from "../apps/web/src/features/events/eventFilters.ts";
 import type { GraphEdge, GraphNodeSummary } from "../apps/web/src/shared/api/types.ts";
@@ -113,6 +114,8 @@ test("the fallback layout preserves rightward Runs and downward Coaching", () =>
   assert.ok(positions.get(RUN_SHA)!.x > positions.get(ROOT_SHA)!.x);
   assert.ok(positions.get(COACH_SHA)!.y > positions.get(ROOT_SHA)!.y);
   assert.ok(positions.get(SECOND_PARENT_SHA)!.y > positions.get(RUN_SHA)!.y);
+  assert.ok(positions.get(RUN_SHA)!.x - positions.get(ROOT_SHA)!.x >= GRAPH_RUN_GAP);
+  assert.ok(positions.get(COACH_SHA)!.y - positions.get(ROOT_SHA)!.y >= GRAPH_COACHING_GAP);
 });
 
 test("Web links reject unsafe URL schemes", () => {

@@ -1,12 +1,13 @@
 import ELK from "elkjs/lib/elk-api.js";
 import type { ELK as ElkInstance, ELKConstructorArguments, ElkNode } from "elkjs/lib/elk-api.js";
 import ElkWorker from "elkjs/lib/elk-worker.min.js?worker";
+import {
+  GRAPH_COACHING_GAP,
+  GRAPH_NODE_HEIGHT,
+  GRAPH_NODE_WIDTH,
+  GRAPH_RUN_GAP
+} from "@/features/node-graph/layoutMetrics";
 import type { GraphLayoutRequest, PositionedGraphNode } from "@/features/node-graph/layoutTypes";
-
-const NODE_WIDTH = 184;
-const NODE_HEIGHT = 112;
-const RUN_GAP = 286;
-const COACHING_GAP = 196;
 
 export type PendingGraphLayout = {
   readonly result: Promise<readonly PositionedGraphNode[]>;
@@ -41,8 +42,8 @@ async function layoutGraph(elk: ElkInstance, input: GraphLayoutRequest): Promise
     },
     children: input.nodes.map(node => ({
       id: node.sha,
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
+      width: GRAPH_NODE_WIDTH,
+      height: GRAPH_NODE_HEIGHT,
       layoutOptions: { "elk.portConstraints": "FIXED_SIDE" },
       ports: [
         port(node.sha, "run-in", "WEST"),
@@ -87,8 +88,8 @@ function enforceSemanticAxes(
     for (const edge of outgoing.get(sourceSha) ?? []) {
       const target = positions.get(edge.targetSha);
       if (target) {
-        if (edge.kind === "run") target.x = Math.max(target.x, source.x + RUN_GAP);
-        else target.y = Math.max(target.y, source.y + COACHING_GAP);
+        if (edge.kind === "run") target.x = Math.max(target.x, source.x + GRAPH_RUN_GAP);
+        else target.y = Math.max(target.y, source.y + GRAPH_COACHING_GAP);
       }
       incoming.set(edge.targetSha, (incoming.get(edge.targetSha) ?? 1) - 1);
       if ((incoming.get(edge.targetSha) ?? 0) === 0) queue.push(edge.targetSha);
