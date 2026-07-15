@@ -150,6 +150,8 @@ test("Node detail exposes the actual immutable Runner Value and Node-scoped acti
   ));
 
   assert.equal(detail.lineage.kind, "coaching_child");
+  assert.equal(detail.payloadDigest, fixture.coachingChild.payloadDigest);
+  assert.equal(detail.planDigest, fixture.coachingChild.planDigest);
   assert.equal(detail.plan.how.name, "Custom Matrix Runner");
   assert.equal(detail.plan.how.typeKey, "matrix/orchestrator");
   assert.equal(detail.plan.how.schemaVersion, "2.3.0");
@@ -161,6 +163,18 @@ test("Node detail exposes the actual immutable Runner Value and Node-scoped acti
   assert.deepEqual(detail.plan.nextGoals.map(goal => goal.title), [fixture.goalC.title]);
   assert.deepEqual(detail.activeRuns.map(run => run.id), [fixture.activeRun.id]);
   assert.equal(detail.outgoingEdges.length, 0, "an active Run is inspector state, not a dangling edge");
+});
+
+test("Run child Node detail includes evidence from the incoming completed Run", () => {
+  const detail = projectionValue(nodeDetailProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.runChildA.commitSha,
+    fixture.context
+  ));
+
+  assert.equal(detail.payloadDigest, fixture.runChildA.payloadDigest);
+  assert.deepEqual(detail.evidence.map(item => item.id), [fixture.evidence.id]);
 });
 
 test("A target SHA represented with two structural parents is surfaced as an integrity error", () => {
@@ -237,6 +251,32 @@ test("Sibling Run Nodes count as unresolved divergence until decisions decorate 
   ));
   assert.deepEqual(selected.decisions.map(decision => decision.kind), ["selected"]);
   assert.deepEqual(selected.comparisons.map(comparison => comparison.id), [fixture.comparison.id]);
+  assert.deepEqual(selected.comparisons[0]?.nodeShas, [fixture.runChildA.commitSha, fixture.runChildB.commitSha]);
+  assert.equal(selected.comparisons[0]?.disposition.type, "decisions_recorded");
+
+  const root = projectionValue(nodeDetailProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.root.commitSha,
+    fixture.context
+  ));
+  assert.deepEqual(root.coachingProposals.map(proposal => ({
+    id: proposal.id,
+    sourcePayloadDigest: proposal.sourcePayloadDigest,
+    sourcePlanDigest: proposal.sourcePlanDigest,
+    proposedPlanDigest: proposal.proposedPlanDigest,
+    summary: proposal.summary,
+    rationale: proposal.rationale,
+    disposition: proposal.disposition.type
+  })), [{
+    id: fixture.proposal.id,
+    sourcePayloadDigest: fixture.root.payloadDigest,
+    sourcePlanDigest: fixture.root.planDigest,
+    proposedPlanDigest: fixture.proposal.proposedPlanDigest,
+    summary: fixture.proposal.summary,
+    rationale: fixture.proposal.rationale,
+    disposition: "confirmed"
+  }]);
 });
 
 test("decisions are scoped by Project when repositories share the same commit SHAs", () => {
@@ -520,7 +560,8 @@ function buildFixture() {
     proposedPlan: coachingPlan,
     proposedPlanDigest: computeNodePlanDigest(coachingPlan),
     expectedStateSha: sha("f"),
-    reason: must(makeReason("Use a custom evidence-first matrix Runner.")),
+    summary: must(makeEvidenceSummary("Use a custom evidence-first matrix Runner.")),
+    rationale: must(makeReason("The custom matrix makes the evidence strategy explicit.")),
     proposedAt: t2
   };
   const coachingChild: CoachingChildNode = {
@@ -579,6 +620,7 @@ function buildFixture() {
     recordedAt: t2
   };
   const comparison: AlternativeComparison = {
+    type: "sibling_runs",
     id: must(makeComparisonId("comparison-ab")),
     projectId,
     parentNodeSha: rootSha,

@@ -173,10 +173,57 @@ export type EvidenceSummary = {
   createdAt: string;
 };
 
-export type ComparisonSummary = {
+export type ComparisonDecisionSummary = {
+  id: string;
+  type: "selection" | "rejection";
+  comparisonId: string;
+  nodeShas: readonly string[];
+  rationale: string;
+  decidedAt: string;
+};
+
+type ComparisonSummaryBase = {
   id: string;
   summary: string;
-  siblingNodeShas: readonly string[];
+  nodeShas: readonly string[];
+  disposition:
+    | { type: "undecided" }
+    | { type: "decisions_recorded"; decisions: readonly ComparisonDecisionSummary[] };
+  recordedAt: string;
+};
+
+export type ComparisonSummary =
+  | (ComparisonSummaryBase & { type: "sibling_runs"; parentNodeSha: string })
+  | (ComparisonSummaryBase & {
+      type: "coached_how_experiment";
+      anchorNodeSha: string;
+      goalDigest: string;
+    });
+
+export type CoachingProposalSummary = {
+  id: string;
+  sourceNodeSha: string;
+  sourcePayloadDigest: string;
+  sourcePlanDigest: string;
+  proposedPlanDigest: string;
+  expectedStateSha: string;
+  summary: string;
+  rationale: string;
+  proposedAt: string;
+  disposition:
+    | { type: "pending" }
+    | { type: "confirmed"; decisionId: string; childNodeSha: string; reason: string; decidedAt: string }
+    | { type: "rejected"; decisionId: string; reason: string; decidedAt: string };
+};
+
+export type CoachReviewSummary = {
+  id: string;
+  target:
+    | { type: "node"; nodeSha: string }
+    | { type: "run"; runId: string }
+    | { type: "comparison"; comparisonId: string };
+  assessment: string;
+  recommendations: readonly string[];
   recordedAt: string;
 };
 
@@ -186,6 +233,8 @@ export type DecisionSummary =
 
 export type NodeDetail = {
   sha: string;
+  payloadDigest: string;
+  planDigest: string;
   title: string;
   commitUrl: string;
   treeSha: string;
@@ -203,6 +252,8 @@ export type NodeDetail = {
   evidence: readonly EvidenceSummary[];
   comparisons: readonly ComparisonSummary[];
   decisions: readonly DecisionSummary[];
+  coachingProposals: readonly CoachingProposalSummary[];
+  coachReviews: readonly CoachReviewSummary[];
 };
 
 export type NodeDetailResponse = {

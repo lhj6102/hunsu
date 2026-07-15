@@ -1,4 +1,4 @@
 interface:
   display_name: "Hunsu Diverge"
-  short_description: "Compare and decide sibling Node futures."
-  default_prompt: "Use $hunsu-diverge to compare completed sibling Nodes and record separate user-confirmed decisions."
+  short_description: "Compare sibling Runs or coached How results."
+  default_prompt: "Use $hunsu-diverge to recover or compare one explicit result cohort and record rejection and selection only after separate user confirmations."

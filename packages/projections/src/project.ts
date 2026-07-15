@@ -1,4 +1,5 @@
 import type {
+  AlternativeComparison,
   AlternativeDecision,
   CompletedRun,
   DomainActor,
@@ -100,21 +101,99 @@ export function nodeDetailProjection(
   const node = state.nodes.find(candidate => candidate.projectId === project.id && candidate.commitSha === nodeSha);
   if (!node) return failure("node_not_found", `Node ${nodeSha} was not found.`);
   const edges = graphEdges(state, project.id);
-  const nodeRuns = state.runs.filter(run => run.projectId === project.id && run.sourceNodeSha === node.commitSha);
+  const nodeRuns = state.runs.filter(run => run.projectId === project.id && (
+    run.sourceNodeSha === node.commitSha
+    || run.status === "completed" && run.resultNodeSha === node.commitSha
+  ));
   const relevantRunIds = new Set(nodeRuns.map(run => String(run.id)));
   const evidence = state.evidence
     .filter(item => item.projectId === project.id && relevantRunIds.has(String(item.runId)))
     .map(item => evidenceProjection(state, item));
   const comparisons = state.comparisons
-    .filter(item => item.projectId === project.id && (item.parentNodeSha === node.commitSha || item.nodeShas.includes(node.commitSha)))
-    .map(item => ({
-      id: String(item.id),
-      summary: String(item.summary),
-      siblingNodeShas: item.nodeShas.map(String),
-      recordedAt: String(item.recordedAt)
+    .filter(item => item.projectId === project.id && comparisonRelatesToNode(item, String(node.commitSha)))
+    .map(item => {
+      const decisions = projectDecisions(state, project.id)
+        .filter(decision => decision.comparisonId === item.id)
+        .map(decision => ({
+          id: String(decision.id),
+          type: decision.type,
+          comparisonId: String(decision.comparisonId),
+          nodeShas: decision.type === "selection" ? [String(decision.selectedNodeSha)] : decision.rejectedNodeShas.map(String),
+          rationale: String(decision.rationale),
+          decidedAt: String(decision.decidedAt)
+        }));
+      const base = {
+        id: String(item.id),
+        summary: String(item.summary),
+        nodeShas: item.nodeShas.map(String),
+        disposition: decisions.length === 0
+          ? { type: "undecided" as const }
+          : { type: "decisions_recorded" as const, decisions },
+        recordedAt: String(item.recordedAt)
+      };
+      return item.type === "sibling_runs"
+        ? { ...base, type: "sibling_runs" as const, parentNodeSha: String(item.parentNodeSha) }
+        : {
+            ...base,
+            type: "coached_how_experiment" as const,
+            anchorNodeSha: String(item.anchorNodeSha),
+            goalDigest: String(item.goalDigest)
+          };
+    });
+  const coachingProposals = state.coachingProposals
+    .filter(item => item.projectId === project.id && item.sourceNodeSha === node.commitSha)
+    .map(proposal => {
+      const decision = state.coachingProposalDecisions.find(item => item.proposalId === proposal.id);
+      return {
+        id: String(proposal.id),
+        sourceNodeSha: String(proposal.sourceNodeSha),
+        sourcePayloadDigest: String(proposal.sourcePayloadDigest),
+        sourcePlanDigest: String(proposal.sourcePlanDigest),
+        proposedPlanDigest: String(proposal.proposedPlanDigest),
+        expectedStateSha: String(proposal.expectedStateSha),
+        summary: String(proposal.summary),
+        rationale: String(proposal.rationale),
+        proposedAt: String(proposal.proposedAt),
+        disposition: !decision
+          ? { type: "pending" as const }
+          : decision.status === "confirmed"
+            ? {
+                type: "confirmed" as const,
+                decisionId: String(decision.id),
+                childNodeSha: String(decision.childNodeSha),
+                reason: String(decision.reason),
+                decidedAt: String(decision.decidedAt)
+              }
+            : {
+                type: "rejected" as const,
+                decisionId: String(decision.id),
+                reason: String(decision.reason),
+                decidedAt: String(decision.decidedAt)
+              }
+      };
+    });
+  const comparisonIds = new Set(comparisons.map(comparison => comparison.id));
+  const coachReviews = state.coachReviews
+    .filter(review => review.projectId === project.id && (
+      review.target.type === "node" && review.target.nodeSha === node.commitSha
+      || review.target.type === "run" && relevantRunIds.has(String(review.target.runId))
+      || review.target.type === "comparison" && comparisonIds.has(String(review.target.comparisonId))
+    ))
+    .map(review => ({
+      id: String(review.id),
+      target: review.target.type === "node"
+        ? { type: "node" as const, nodeSha: String(review.target.nodeSha) }
+        : review.target.type === "run"
+          ? { type: "run" as const, runId: String(review.target.runId) }
+          : { type: "comparison" as const, comparisonId: String(review.target.comparisonId) },
+      assessment: String(review.assessment),
+      recommendations: review.recommendations.map(String),
+      recordedAt: String(review.recordedAt)
     }));
   return ok({
     sha: String(node.commitSha),
+    payloadDigest: String(node.payloadDigest),
+    planDigest: String(node.planDigest),
     title: String(node.commitTitle),
     commitUrl: `https://github.com/${project.repository.owner}/${project.repository.name}/commit/${node.commitSha}`,
     treeSha: String(node.treeSha),
@@ -135,7 +214,9 @@ export function nodeDetailProjection(
     activeRuns: activeRuns(state, project.id).filter(run => run.sourceNodeSha === nodeSha),
     evidence,
     comparisons,
-    decisions: decisionsForNode(state, node.projectId, node.commitSha)
+    decisions: decisionsForNode(state, node.projectId, node.commitSha),
+    coachingProposals,
+    coachReviews
   });
 }
 
@@ -256,7 +337,7 @@ function graphEdges(state: ProjectState, projectId: string): GraphEdgeProjection
       sourceSha: String(node.parentSha),
       targetSha: String(node.commitSha),
       proposalId: String(node.proposalId),
-      summary: String(proposal.reason),
+      summary: String(proposal.summary),
       confirmedAt: String(decision.decidedAt)
     });
   }
@@ -359,13 +440,30 @@ function unresolvedDivergenceCount(state: ProjectState, projectId: string): numb
   const rejected = new Set(decisions.flatMap(decision => decision.type === "rejection" ? decision.rejectedNodeShas.map(String) : []));
   for (const shas of byParent.values()) {
     if (shas.length < 2) continue;
-    const selectedSiblings = shas.filter(sha => selected.has(sha) && !rejected.has(sha));
-    const allRejected = shas.every(sha => rejected.has(sha));
-    const oneSelected = selectedSiblings.length === 1
-      && shas.every(sha => sha === selectedSiblings[0] || rejected.has(sha));
-    if (!allRejected && !oneSelected) count += 1;
+    if (!comparisonCohortResolved(shas, selected, rejected)) count += 1;
+  }
+  const coachedCohorts = new Map<string, Set<string>>();
+  for (const comparison of state.comparisons) {
+    if (String(comparison.projectId) !== projectId || comparison.type !== "coached_how_experiment") continue;
+    const key = `${comparison.anchorNodeSha}:${comparison.goalDigest}`;
+    const nodeShas = coachedCohorts.get(key) ?? new Set<string>();
+    for (const nodeSha of comparison.nodeShas) nodeShas.add(String(nodeSha));
+    coachedCohorts.set(key, nodeShas);
+  }
+  for (const nodeShas of coachedCohorts.values()) {
+    if (nodeShas.size >= 2 && !comparisonCohortResolved([...nodeShas], selected, rejected)) count += 1;
   }
   return count;
+}
+
+function comparisonCohortResolved(
+  nodeShas: readonly string[],
+  selected: ReadonlySet<string>,
+  rejected: ReadonlySet<string>
+): boolean {
+  const selectedNodes = nodeShas.filter(sha => selected.has(sha) && !rejected.has(sha));
+  return nodeShas.every(sha => rejected.has(sha))
+    || selectedNodes.length === 1 && nodeShas.every(sha => sha === selectedNodes[0] || rejected.has(sha));
 }
 
 function decisionsForNode(
@@ -404,6 +502,15 @@ function projectDecisions(
     .filter(comparison => comparison.projectId === projectId)
     .map(comparison => comparison.id));
   return state.decisions.filter(decision => comparisonIds.has(decision.comparisonId));
+}
+
+function comparisonRelatesToNode(comparison: AlternativeComparison, nodeSha: string): boolean {
+  return comparison.nodeShas.some(sha => String(sha) === nodeSha)
+    || String(comparisonAnchorSha(comparison)) === nodeSha;
+}
+
+function comparisonAnchorSha(comparison: AlternativeComparison): AlternativeComparison["nodeShas"][number] {
+  return comparison.type === "sibling_runs" ? comparison.parentNodeSha : comparison.anchorNodeSha;
 }
 
 function evidenceProjection(state: ProjectState, evidence: EvidenceRef): EvidenceSummaryProjection {
@@ -457,7 +564,7 @@ function eventReference(state: ProjectState, event: DomainEvent): DomainEventLis
       if (target.type === "node") return { kind: "node", nodeSha: String(target.nodeSha) };
       if (target.type === "run") return runReferenceById(state, target.runId);
       const comparison = state.comparisons.find(item => item.id === target.comparisonId);
-      return comparison ? { kind: "node", nodeSha: String(comparison.parentNodeSha) } : { kind: "project" };
+      return comparison ? { kind: "node", nodeSha: String(comparisonAnchorSha(comparison)) } : { kind: "project" };
     }
     case "CoachingProposalRecorded": return { kind: "node", nodeSha: String(event.proposal.sourceNodeSha) };
     case "CoachingProposalConfirmed": return { kind: "node", nodeSha: String(event.decision.childNodeSha) };
@@ -465,7 +572,7 @@ function eventReference(state: ProjectState, event: DomainEvent): DomainEventLis
       const proposal = state.coachingProposals.find(item => item.id === event.decision.proposalId);
       return proposal ? { kind: "node", nodeSha: String(proposal.sourceNodeSha) } : { kind: "project" };
     }
-    case "AlternativesCompared": return { kind: "node", nodeSha: String(event.comparison.parentNodeSha) };
+    case "AlternativesCompared": return { kind: "node", nodeSha: String(comparisonAnchorSha(event.comparison)) };
     case "AlternativeSelected": return { kind: "node", nodeSha: String(event.decision.selectedNodeSha) };
     case "AlternativesRejected": return { kind: "node", nodeSha: String(event.decision.rejectedNodeShas[0]) };
   }
@@ -504,7 +611,9 @@ function eventSummary(event: DomainEvent): string {
     case "CoachingProposalConfirmed": return `Confirmed Coaching transition ${event.decision.proposalId}`;
     case "CoachingChildNodeRegistered": return `Registered Coaching child Node ${shortSha(event.node.commitSha)}`;
     case "CoachingProposalRejected": return `Rejected Coaching transition ${event.decision.proposalId}`;
-    case "AlternativesCompared": return `Compared ${event.comparison.nodeShas.length} sibling Nodes`;
+    case "AlternativesCompared": return event.comparison.type === "sibling_runs"
+      ? `Compared ${event.comparison.nodeShas.length} sibling Nodes`
+      : `Compared ${event.comparison.nodeShas.length} coached How experiment Nodes`;
     case "AlternativeSelected": return `Selected Node ${shortSha(event.decision.selectedNodeSha)}`;
     case "AlternativesRejected": return `Rejected ${event.decision.rejectedNodeShas.length} Node alternative(s)`;
   }

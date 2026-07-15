@@ -276,7 +276,8 @@ export type CoachingProposal = {
   readonly proposedPlan: NodePlan;
   readonly proposedPlanDigest: NodePlanDigest;
   readonly expectedStateSha: GitCommitSha;
-  readonly reason: Reason;
+  readonly summary: EvidenceSummary;
+  readonly rationale: Reason;
   readonly proposedAt: IsoTimestamp;
 };
 
@@ -309,15 +310,29 @@ export type ComparisonFinding = {
   }>;
 };
 
-export type AlternativeComparison = {
+type AlternativeComparisonBase = {
   readonly id: ComparisonId;
   readonly projectId: ProjectId;
-  readonly parentNodeSha: GitCommitSha;
   readonly nodeShas: AtLeastTwo<GitCommitSha>;
   readonly findings: readonly ComparisonFinding[];
   readonly summary: EvidenceSummary;
   readonly recordedAt: IsoTimestamp;
 };
+
+export type SiblingRunsComparison = AlternativeComparisonBase & {
+  readonly type: "sibling_runs";
+  readonly parentNodeSha: GitCommitSha;
+};
+
+export type CoachedHowExperimentComparison = AlternativeComparisonBase & {
+  readonly type: "coached_how_experiment";
+  readonly anchorNodeSha: GitCommitSha;
+  readonly goalDigest: GoalDigest;
+};
+
+export type AlternativeComparison =
+  | SiblingRunsComparison
+  | CoachedHowExperimentComparison;
 
 export type SelectionDecision = {
   readonly type: "selection";
@@ -379,6 +394,25 @@ export type EventMetadata = {
   readonly recordedAt: IsoTimestamp;
 };
 
+type CompareAlternativesCommandBase = {
+  readonly type: "CompareAlternatives";
+  readonly meta: CommandMetadata;
+  readonly comparisonId: ComparisonId;
+  readonly projectId: ProjectId;
+  readonly nodeShas: AtLeastTwo<GitCommitSha>;
+  readonly findings: readonly ComparisonFinding[];
+  readonly summary: EvidenceSummary;
+};
+
+export type CompareAlternativesCommand =
+  | (CompareAlternativesCommandBase & {
+      readonly comparisonType: "sibling_runs";
+    })
+  | (CompareAlternativesCommandBase & {
+      readonly comparisonType: "coached_how_experiment";
+      readonly anchorNodeSha: GitCommitSha;
+    });
+
 export type ProjectCommand =
   | {
       readonly type: "CreateProject";
@@ -437,15 +471,7 @@ export type ProjectCommand =
       readonly proposalId: CoachingProposalId;
       readonly reason: Reason;
     }
-  | {
-      readonly type: "CompareAlternatives";
-      readonly meta: CommandMetadata;
-      readonly comparisonId: ComparisonId;
-      readonly projectId: ProjectId;
-      readonly nodeShas: AtLeastTwo<GitCommitSha>;
-      readonly findings: readonly ComparisonFinding[];
-      readonly summary: EvidenceSummary;
-    }
+  | CompareAlternativesCommand
   | {
       readonly type: "SelectAlternative";
       readonly meta: CommandMetadata;

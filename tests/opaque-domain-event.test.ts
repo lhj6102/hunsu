@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
+import { gunzipSync, gzipSync } from "node:zlib";
 import {
+  OPAQUE_DOMAIN_EVENT_CODEC,
+  OPAQUE_DOMAIN_EVENT_SCHEMA,
   decodeOpaqueDomainEvent,
   encodeOpaqueDomainEvent
 } from "../apps/api/src/opaque-domain-event.ts";
@@ -22,11 +26,16 @@ import {
   HUNSU_STATE_BRANCH,
   MemoryGitHubTransport,
   encodeNodeEnvelope,
-  type RepositoryGrant
+  type ProjectStateCodec,
+  type RepositoryGrant,
+  type StoreResult
 } from "../packages/github-store/src/index.ts";
 import {
+  HISTORICAL_PROJECT_EVENT_SCHEMA,
   NODE_PAYLOAD_SCHEMA,
+  PROJECT_EVENT_SCHEMA,
   RUNNER_VALUE_SCHEMA,
+  canonicalJson,
   computeGoalDigest,
   computeNodePayloadDigest,
   computeNodePlanDigest,
@@ -37,11 +46,15 @@ import {
   runBranchName,
   type AcceptanceCriterion,
   type CanonicalJsonValue,
+  type CoachingProposalId,
   type CommandFingerprint,
+  type ComparisonId,
   type DesiredOutcome,
   type DomainEvent,
+  type EvidenceSummary,
   type EventId,
   type GitCommitSha,
+  type GitTreeSha,
   type GoalKey,
   type GoalTitle,
   type GoalValue,
@@ -52,6 +65,7 @@ import {
   type ProjectId,
   type Project,
   type RootNode,
+  type Reason,
   type RunId,
   type RunnerSchemaVersion,
   type RunnerTypeIntegrity,
@@ -142,6 +156,219 @@ test("opaque Domain event decoding rejects metadata, digest, and shape tampering
   assert.equal(decodeOpaqueDomainEvent({ ...encoded.value, decodedSize: encoded.value.decodedSize + 1 }, runnerTypes).ok, false);
   assert.equal(decodeOpaqueDomainEvent({ ...encoded.value, legacy: true }, runnerTypes).ok, false);
   assert.equal(decodeOpaqueDomainEvent({ ...encoded.value, data: "not base64" }, runnerTypes).ok, false);
+});
+
+test("an unchanged historical v2 RunStarted keeps its canonical opaque digest verifiable", () => {
+  const current = encodeOpaqueDomainEvent(event);
+  if (!current.ok) assert.fail(current.error.message);
+  const historical = JSON.parse(decodedOpaqueCanonical(current.value)) as {
+    schema: string;
+    event: Record<string, unknown>;
+  };
+  historical.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  const historicalCanonical = `${canonicalJson(historical as CanonicalJsonValue)}\n`;
+  const historicalOpaque = encodeTestOpaqueCanonical(historicalCanonical);
+  const originalDigest = historicalOpaque.digest;
+  assert.deepEqual(decodeOpaqueDomainEvent(historicalOpaque, runnerTypes), ok(event));
+  assert.equal(historicalOpaque.digest, originalDigest);
+  assert.notEqual((JSON.parse(historicalCanonical) as { schema: string }).schema, PROJECT_EVENT_SCHEMA);
+});
+
+test("GitHub reconstruction preserves historical v2 opaque digests and appends v3 events idempotently", async () => {
+  const repository: RepositoryGrant = {
+    installationId: 51,
+    repositoryId: 52,
+    owner: "qa-owner",
+    name: "historical-events",
+    defaultBranch: "main",
+    private: true,
+    permissions: { contents: "write" }
+  };
+  const baseSha = "8".repeat(40);
+  const sourceTreeSha = "9".repeat(40) as GitTreeSha;
+  const sourcePlan = { schema: "hunsu.node-plan.v1" as const, nextGoals: [goal], how: runner };
+  const proposedPlan = { ...sourcePlan, nextGoals: [] };
+  const sourcePayloadDigest = computeNodePayloadDigest({
+    schema: NODE_PAYLOAD_SCHEMA,
+    projectId,
+    commitSha: sourceNodeSha,
+    treeSha: sourceTreeSha,
+    plan: sourcePlan
+  });
+  const commonMeta = {
+    idempotencyKey: "4".repeat(64) as IdempotencyKey,
+    fingerprint: "5".repeat(64) as CommandFingerprint,
+    actor: { type: "coach" as const, id: "historical-coach" as NonEmptyText },
+    recordedAt: startedAt
+  };
+  const firstResult = "c".repeat(40) as GitCommitSha;
+  const secondResult = "d".repeat(40) as GitCommitSha;
+  const proposal: DomainEvent = {
+    type: "CoachingProposalRecorded",
+    meta: { ...commonMeta, eventId: "event-historical-proposal" as EventId },
+    proposal: {
+      id: "proposal-historical" as CoachingProposalId,
+      projectId,
+      sourceNodeSha,
+      sourcePayloadDigest,
+      sourcePlanDigest: computeNodePlanDigest(sourcePlan),
+      proposedPlan,
+      proposedPlanDigest: computeNodePlanDigest(proposedPlan),
+      expectedStateSha: baseSha as GitCommitSha,
+      summary: "Historical proposal evidence." as EvidenceSummary,
+      rationale: "Historical combined reason." as Reason,
+      proposedAt: startedAt
+    }
+  };
+  const comparison: DomainEvent = {
+    type: "AlternativesCompared",
+    meta: { ...commonMeta, eventId: "event-historical-comparison" as EventId },
+    comparison: {
+      type: "sibling_runs",
+      id: "comparison-historical" as ComparisonId,
+      projectId,
+      parentNodeSha: sourceNodeSha,
+      nodeShas: [firstResult, secondResult],
+      findings: [{
+        subject: "Production evidence" as NonEmptyText,
+        summaries: [
+          { nodeSha: firstResult, summary: "First result passed." as EvidenceSummary },
+          { nodeSha: secondResult, summary: "Second result passed." as EvidenceSummary }
+        ]
+      }],
+      summary: "Historical comparison fallback." as EvidenceSummary,
+      recordedAt: startedAt
+    }
+  };
+
+  type ReplayState = { projectId: string; events: readonly DomainEvent[] };
+  const codec: ProjectStateCodec<DomainEvent, ReplayState> = {
+    projectId: state => state.projectId,
+    nodeAnchors: () => [],
+    encodeEvent: encodeOpaqueDomainEvent,
+    decodeEvent: input => decodeOpaqueDomainEvent(input, runnerTypes),
+    replay(events): StoreResult<ReplayState> {
+      const projectIds = events.map(replayFixtureProjectId);
+      if (events.length === 0 || projectIds.some(id => id !== String(projectId))) {
+        return { ok: false, error: { code: "invalid_event", message: "historical replay fixture has the wrong Project" } };
+      }
+      return { ok: true, value: { projectId: String(projectId), events: [...events] } };
+    },
+    materialize: state => ({
+      ok: true,
+      value: { "project.json": { schema: "hunsu.test-project.v1", projectId: state.projectId, eventCount: state.events.length } }
+    })
+  };
+
+  const initialTransport = new MemoryGitHubTransport([{ repository, initialSha: baseSha }]);
+  const initialStore = new GitHubProjectStore(initialTransport, codec);
+  const initial = await initialStore.append({
+    repository,
+    projectId: String(projectId),
+    baseSha,
+    expectedHeadSha: baseSha,
+    idempotencyKey: "historical-v2-batch",
+    occurredAt: String(startedAt),
+    actor: { kind: "system", operation: "reconcile" },
+    command: { type: "HistoricalFixtureBatch", projectId },
+    decide: () => ({ ok: true, value: [proposal, comparison] })
+  });
+  if (!initial.ok) assert.fail(initial.error.message);
+  const initialBranch = await initialTransport.readBranch(repository, HUNSU_STATE_BRANCH);
+  if (!initialBranch.ok || !initialBranch.value) assert.fail("initial event stream is missing");
+  const historicalFiles = { ...initialBranch.value.files };
+  const originalStoredIds: string[] = [];
+  for (const [path, content] of Object.entries(historicalFiles).filter(([path]) => path.includes("/events/"))) {
+    const rewritten = rewriteHistoricalEventFile(content);
+    historicalFiles[path] = rewritten.content;
+    originalStoredIds.push(rewritten.eventId);
+  }
+
+  const historicalHead = "e".repeat(40);
+  const historicalTransport = new MemoryGitHubTransport([{
+    repository,
+    initialSha: historicalHead,
+    initialFiles: historicalFiles,
+    branches: { [repository.defaultBranch]: historicalHead, [HUNSU_STATE_BRANCH]: historicalHead }
+  }]);
+  const historicalStore = new GitHubProjectStore(historicalTransport, codec);
+  const reconstructed = await historicalStore.readProject(repository, String(projectId));
+  if (!reconstructed.ok) assert.fail(reconstructed.error.message);
+  assert.equal(reconstructed.value.eventCount, 2);
+  const reconstructedProposal = reconstructed.value.state.events.find(item => item.type === "CoachingProposalRecorded");
+  assert.equal(reconstructedProposal?.type, "CoachingProposalRecorded");
+  if (reconstructedProposal?.type === "CoachingProposalRecorded") {
+    assert.equal(reconstructedProposal.proposal.summary, "Historical combined reason.");
+    assert.equal(reconstructedProposal.proposal.rationale, "Historical combined reason.");
+  }
+  const reconstructedComparison = reconstructed.value.state.events.find(item => item.type === "AlternativesCompared");
+  assert.equal(reconstructedComparison?.type, "AlternativesCompared");
+  if (reconstructedComparison?.type === "AlternativesCompared") {
+    assert.equal(reconstructedComparison.comparison.type, "sibling_runs");
+    assert.deepEqual(
+      reconstructedComparison.comparison.findings[0]?.summaries.map(item => item.nodeSha),
+      [firstResult, secondResult]
+    );
+    assert.equal(
+      reconstructedComparison.comparison.findings[0]?.summaries[1]?.summary,
+      comparison.comparison.summary
+    );
+  }
+
+  const currentEvent: DomainEvent = {
+    type: "ProjectMaterializationsRebuilt",
+    meta: {
+      ...commonMeta,
+      eventId: "event-current-v3" as EventId,
+      recordedAt: "2026-07-15T00:01:00.000Z" as IsoTimestamp
+    },
+    projectId
+  };
+  const appended = await historicalStore.append({
+    repository,
+    projectId: String(projectId),
+    baseSha: historicalHead,
+    expectedHeadSha: historicalHead,
+    idempotencyKey: "mixed-stream-v3-append",
+    occurredAt: "2026-07-15T00:01:00.000Z",
+    actor: { kind: "system", operation: "rebuild" },
+    command: { type: "CurrentV3Append", projectId },
+    decide: () => ({ ok: true, value: [currentEvent] })
+  });
+  if (!appended.ok) assert.fail(appended.error.message);
+  const retry = await historicalStore.append({
+    repository,
+    projectId: String(projectId),
+    baseSha: historicalHead,
+    expectedHeadSha: historicalHead,
+    idempotencyKey: "mixed-stream-v3-append",
+    occurredAt: "2026-07-15T00:01:00.000Z",
+    actor: { kind: "system", operation: "rebuild" },
+    command: { type: "CurrentV3Append", projectId },
+    decide: () => assert.fail("idempotent mixed-stream retry must not decide again")
+  });
+  assert.equal(retry.ok && retry.value.idempotentReplay, true);
+
+  const mixedBranch = await historicalTransport.readBranch(repository, HUNSU_STATE_BRANCH);
+  if (!mixedBranch.ok || !mixedBranch.value) assert.fail("mixed event stream is missing");
+  const storedFiles = Object.entries(mixedBranch.value.files)
+    .filter(([path]) => path.includes("/events/"))
+    .map(([, content]) => JSON.parse(content) as Record<string, unknown>)
+    .sort((left, right) => Number(left.sequence) - Number(right.sequence));
+  assert.equal(storedFiles.length, 3);
+  assert.deepEqual(
+    storedFiles.slice(0, 2).map(file => file.eventId).sort(),
+    originalStoredIds.sort()
+  );
+  assert.equal(storedFiles.every(file => file.schema === "hunsu.project-event.v2"), true);
+  assert.equal(storedFiles.every(file => !Object.hasOwn(file, "encodedEvent")), true);
+  const currentStored = storedFiles.find(file => {
+    const opaque = file.event as Record<string, unknown>;
+    return decodedOpaqueCanonical(opaque).includes("event-current-v3");
+  });
+  assert.ok(currentStored);
+  const currentCanonical = decodedOpaqueCanonical(currentStored.event as Record<string, unknown>);
+  assert.equal((JSON.parse(currentCanonical) as { schema: string }).schema, PROJECT_EVENT_SCHEMA);
 });
 
 test("GitHub state event files contain no plaintext Goal title, Runner name, or prompt", async () => {
@@ -310,6 +537,18 @@ test("GitHub state event files contain no plaintext Goal title, Runner name, or 
   if (!graphOnly.ok) assert.fail(graphOnly.error.message);
   assert.deepEqual(Object.keys(graphOnly.value.files), [`${projectRoot}/${SHARDED_READ_MODEL_PATHS.graphManifest}`]);
 
+  const historicalCommit = await transport.commitFiles({
+    repository,
+    branch: HUNSU_STATE_BRANCH,
+    expectedHeadSha: appended.value.stateHeadSha,
+    message: "seed historical v2 opaque events",
+    updates: eventFiles.map(([path, content]) => ({
+      path,
+      content: rewriteHistoricalEventFile(content, false).content
+    }))
+  });
+  if (!historicalCommit.ok) assert.fail(historicalCommit.error.message);
+
   const reconstructed = await store.readProject(repository, projectId);
   if (!reconstructed.ok) assert.fail(reconstructed.error.message);
 
@@ -317,7 +556,7 @@ test("GitHub state event files contain no plaintext Goal title, Runner name, or 
     repository,
     projectId,
     baseSha,
-    expectedHeadSha: appended.value.stateHeadSha,
+    expectedHeadSha: historicalCommit.value,
     idempotencyKey: "opaque-run-start",
     occurredAt: "2026-07-15T00:01:00.000Z",
     actor: { kind: "plugin", userId: "qa-user", clientId: "qa-client" },
@@ -350,7 +589,107 @@ test("GitHub state event files contain no plaintext Goal title, Runner name, or 
   const reconstructedAgain = await store.readProject(repository, projectId);
   if (!reconstructedAgain.ok) assert.fail(reconstructedAgain.error.message);
   assert.equal(reconstructedAgain.value.eventCount, 3);
+  const mixedBranch = await transport.readBranch(repository, HUNSU_STATE_BRANCH);
+  if (!mixedBranch.ok || !mixedBranch.value) assert.fail("mixed production-style event stream is missing");
+  const mixedStoredEvents = Object.entries(mixedBranch.value.files)
+    .filter(([path]) => path.startsWith(`${projectRoot}/events/`))
+    .map(([, content]) => JSON.parse(content) as Record<string, unknown>)
+    .sort((left, right) => Number(left.sequence) - Number(right.sequence));
+  assert.deepEqual(
+    mixedStoredEvents.map(stored => (JSON.parse(decodedOpaqueCanonical(stored.event as Record<string, unknown>)) as { schema: string }).schema),
+    [HISTORICAL_PROJECT_EVENT_SCHEMA, HISTORICAL_PROJECT_EVENT_SCHEMA, PROJECT_EVENT_SCHEMA]
+  );
+  const mixedCatalog = decodeShardedProjectCatalog(
+    JSON.parse(mixedBranch.value.files[`${projectRoot}/${SHARDED_READ_MODEL_PATHS.project}`]!)
+  );
+  if (!mixedCatalog.ok) assert.fail(mixedCatalog.error.message);
+  assert.equal(mixedCatalog.value.checkpoint.chainDigest, rawEventChainDigest(mixedStoredEvents));
 });
+
+function replayFixtureProjectId(event: DomainEvent): string | undefined {
+  switch (event.type) {
+    case "CoachingProposalRecorded":
+      return String(event.proposal.projectId);
+    case "AlternativesCompared":
+      return String(event.comparison.projectId);
+    case "ProjectMaterializationsRebuilt":
+      return String(event.projectId);
+    default:
+      return undefined;
+  }
+}
+
+function rewriteHistoricalEventFile(content: string, normalizeChangedShape = true): { content: string; eventId: string } {
+  const stored = JSON.parse(content) as Record<string, unknown>;
+  const eventId = stored.eventId;
+  if (typeof eventId !== "string" || typeof stored.event !== "object" || stored.event === null) {
+    assert.fail("stored event fixture is invalid");
+  }
+  const canonical = decodedOpaqueCanonical(stored.event as Record<string, unknown>);
+  const envelope = JSON.parse(canonical) as {
+    schema: string;
+    event: Record<string, unknown>;
+  };
+  if (normalizeChangedShape && envelope.event.type === "CoachingProposalRecorded") {
+    const proposal = envelope.event.proposal as Record<string, unknown>;
+    const rationale = proposal.rationale;
+    delete proposal.summary;
+    delete proposal.rationale;
+    proposal.reason = rationale;
+  } else if (normalizeChangedShape && envelope.event.type === "AlternativesCompared") {
+    const comparison = envelope.event.comparison as Record<string, unknown>;
+    delete comparison.type;
+    const findings = comparison.findings as Array<{ summaries: unknown[] }>;
+    findings[0]?.summaries.pop();
+  } else if (normalizeChangedShape) {
+    assert.fail("historical rewrite fixture contains an unexpected event type");
+  }
+  envelope.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  const historicalCanonical = `${canonicalJson(envelope as CanonicalJsonValue)}\n`;
+  stored.event = encodeTestOpaqueCanonical(historicalCanonical);
+  return {
+    content: `${canonicalJson(stored as CanonicalJsonValue)}\n`,
+    eventId
+  };
+}
+
+function decodedOpaqueCanonical(envelope: Record<string, unknown>): string {
+  if (typeof envelope.data !== "string") assert.fail("opaque fixture data is missing");
+  return new TextDecoder("utf-8", { fatal: true }).decode(
+    gunzipSync(Buffer.from(envelope.data, "base64"))
+  );
+}
+
+function encodeTestOpaqueCanonical(canonical: string) {
+  const decoded = new TextEncoder().encode(canonical);
+  const compressed = gzipSync(decoded, { level: 9 });
+  const data = Buffer.from(compressed).toString("base64");
+  return {
+    schema: OPAQUE_DOMAIN_EVENT_SCHEMA,
+    codec: OPAQUE_DOMAIN_EVENT_CODEC,
+    decodedSize: decoded.byteLength,
+    encodedSize: Buffer.byteLength(data, "utf8"),
+    digest: `hunsu-domain-event-v2:sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`,
+    data
+  };
+}
+
+function rawEventChainDigest(events: readonly Record<string, unknown>[]): string {
+  const chain = events.map(stored => {
+    const opaque = stored.event as Record<string, unknown>;
+    return {
+      sequence: stored.sequence,
+      storedEventId: stored.eventId,
+      idempotencyKeyHash: stored.idempotencyKeyHash,
+      commandHash: stored.commandHash,
+      previousStateSha: stored.previousStateSha,
+      commandEventCount: stored.commandEventCount,
+      occurredAt: stored.occurredAt,
+      eventDigest: opaque.digest
+    };
+  });
+  return `hunsu-event-chain-v2:sha256:${createHash("sha256").update(canonicalJson(chain as CanonicalJsonValue), "utf8").digest("hex")}`;
+}
 
 function isRecord(value: CanonicalJsonValue): value is { readonly [key: string]: CanonicalJsonValue } {
   return value !== null && typeof value === "object" && !Array.isArray(value);

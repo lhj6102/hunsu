@@ -21,6 +21,8 @@ export type BranchSnapshot = {
 };
 
 export type ProjectReadModelName = "catalog" | "graph" | "activity" | "event_index";
+export type NodeActivityKind = "runs" | "evidence" | "comparisons" | "decisions" | "coaching" | "reviews";
+export type KeyedNodeActivityKind = "comparisons" | "coaching" | "reviews";
 
 /**
  * A closed set of state resources that ordinary read paths may request. Keeping
@@ -50,9 +52,23 @@ export type StateFileSelection =
       readonly nodeSha: string;
     }
   | {
-      readonly kind: "node_activity";
+      readonly kind: "node_activity_index";
       readonly projectId: string;
       readonly nodeSha: string;
+    }
+  | {
+      readonly kind: "node_activity_page";
+      readonly projectId: string;
+      readonly nodeSha: string;
+      readonly activityKind: NodeActivityKind;
+      readonly page: number;
+    }
+  | {
+      readonly kind: "node_activity_record";
+      readonly projectId: string;
+      readonly nodeSha: string;
+      readonly activityKind: KeyedNodeActivityKind;
+      readonly activityId: string;
     }
   | {
       readonly kind: "run_activity";
@@ -196,6 +212,18 @@ export type StoredProjectEvent<Event> = {
   event: Event;
 };
 
+/**
+ * A decoded authoritative event plus the exact encoded payload that passed the
+ * Project codec boundary. `encodedEvent` is in-memory transport evidence and is
+ * never part of the outer stored-event JSON envelope.
+ */
+export type VerifiedStoredProjectEvent<Event> = StoredProjectEvent<Event> & {
+  readonly encodedEvent: {
+    readonly type: "verified";
+    readonly value: unknown;
+  };
+};
+
 export type StoreError = {
   code:
     | "state_not_found"
@@ -232,7 +260,7 @@ export type ProjectStateCodec<Event, State> = {
   replay(events: readonly Event[]): StoreResult<State>;
   materialize(
     state: State,
-    events: readonly StoredProjectEvent<Event>[]
+    events: readonly VerifiedStoredProjectEvent<Event>[]
   ): StoreResult<Readonly<Record<string, unknown>>>;
 };
 
@@ -258,7 +286,7 @@ export type ReconstructedProject<State, Event = unknown> = {
   state: State;
   stateHeadSha: string;
   eventCount: number;
-  events: readonly StoredProjectEvent<Event>[];
+  events: readonly VerifiedStoredProjectEvent<Event>[];
 };
 
 export type ReconstructedRepository<State, Event = unknown> =

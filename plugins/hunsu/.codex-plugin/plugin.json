@@ -1,6 +1,6 @@
 {
   "name": "hunsu",
-  "version": "0.2.0+codex.20260715023340",
+  "version": "0.2.0+codex.20260715054148",
   "description": "Run GitHub-backed Hunsu Commit Node Projects from Codex.",
   "author": {
     "name": "Hunsu"
@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Hunsu",
     "shortDescription": "Execute Commit Node Goals with Codex.",
-    "longDescription": "Bootstrap Commit Node Projects, execute one Node-owned Goal through any registered Runner type, attach evidence, confirm Coaching transitions, and compare sibling futures.",
+    "longDescription": "Bootstrap Commit Node Projects, discover exact Runner capabilities, execute one Node-owned Goal, recover evidence and Coaching state, and compare sibling Runs or same-Goal coached How experiments.",
     "developerName": "Hunsu",
     "category": "Productivity",
     "capabilities": [
@@ -29,8 +29,8 @@
     "websiteURL": "https://hunsu.app",
     "defaultPrompt": [
       "Open the Hunsu Project for this repository.",
-      "Start a Run for one Goal on the selected Node.",
-      "Compare completed sibling Node alternatives."
+      "Discover an exact Runner capability and start one Node-owned Goal Run.",
+      "Compare completed sibling Runs or same-Goal coached How results without changing graph topology."
     ]
   },
   "mcpServers": "./.mcp.json",

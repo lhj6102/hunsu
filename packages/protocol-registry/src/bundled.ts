@@ -1,11 +1,13 @@
-import type { RegistryResult, RunnerValueSchema } from "./model.ts";
+import type { RegistryResult, RunnerObjectValueSchema, RunnerValueSchema } from "./model.ts";
 import { REGISTRY_DEFINITION_SCHEMA } from "./model.ts";
 import { createDefinitionRegistry, createRegistryEntry } from "./registry.ts";
 
 export const BUNDLED_RUNNER_TYPE_ORIGIN = "hunsu" as const;
 export const BUNDLED_PLAYER_TYPE_KEY = "runner.player" as const;
 export const BUNDLED_TEAM_TYPE_KEY = "runner.team" as const;
-export const BUNDLED_RUNNER_TYPE_VERSION = "1.0.0" as const;
+export const BUNDLED_PLAYER_TYPE_VERSION = "1.0.0" as const;
+export const BUNDLED_TEAM_LEGACY_TYPE_VERSION = "1.0.0" as const;
+export const BUNDLED_TEAM_TYPE_VERSION = "1.1.0" as const;
 
 export function createBundledDefinitionRegistry(): RegistryResult<import("./model.ts").DefinitionRegistry> {
   const executor = createRegistryEntry(BUNDLED_RUNNER_TYPE_ORIGIN, {
@@ -21,7 +23,7 @@ export function createBundledDefinitionRegistry(): RegistryResult<import("./mode
     schema: REGISTRY_DEFINITION_SCHEMA,
     kind: "runner_type",
     key: BUNDLED_PLAYER_TYPE_KEY,
-    version: BUNDLED_RUNNER_TYPE_VERSION,
+    version: BUNDLED_PLAYER_TYPE_VERSION,
     runnerType: {
       displayName: "Player",
       valueSchema: playerValueSchema(),
@@ -34,14 +36,14 @@ export function createBundledDefinitionRegistry(): RegistryResult<import("./mode
   });
   if (!player.ok) return player;
 
-  const team = createRegistryEntry(BUNDLED_RUNNER_TYPE_ORIGIN, {
+  const legacyTeam = createRegistryEntry(BUNDLED_RUNNER_TYPE_ORIGIN, {
     schema: REGISTRY_DEFINITION_SCHEMA,
     kind: "runner_type",
     key: BUNDLED_TEAM_TYPE_KEY,
-    version: BUNDLED_RUNNER_TYPE_VERSION,
+    version: BUNDLED_TEAM_LEGACY_TYPE_VERSION,
     runnerType: {
       displayName: "Team",
-      valueSchema: teamValueSchema(),
+      valueSchema: legacyTeamValueSchema(),
       executor: {
         schema: "hunsu.runner-executor.v1",
         resource: executor.value.lock,
@@ -49,8 +51,25 @@ export function createBundledDefinitionRegistry(): RegistryResult<import("./mode
       }
     }
   });
+  if (!legacyTeam.ok) return legacyTeam;
+
+  const team = createRegistryEntry(BUNDLED_RUNNER_TYPE_ORIGIN, {
+    schema: REGISTRY_DEFINITION_SCHEMA,
+    kind: "runner_type",
+    key: BUNDLED_TEAM_TYPE_KEY,
+    version: BUNDLED_TEAM_TYPE_VERSION,
+    runnerType: {
+      displayName: "Team",
+      valueSchema: teamValueSchema(),
+      executor: {
+        schema: "hunsu.runner-executor.v1",
+        resource: executor.value.lock,
+        entrypoint: "bundled.team.v1.1"
+      }
+    }
+  });
   if (!team.ok) return team;
-  return createDefinitionRegistry([executor.value, player.value, team.value]);
+  return createDefinitionRegistry([executor.value, player.value, legacyTeam.value, team.value]);
 }
 
 export function playerValueSchema(): RunnerValueSchema {
@@ -69,19 +88,41 @@ export function teamValueSchema(): RunnerValueSchema {
       maxRounds: integerSchema(1, 100)
     }),
     players: {
+      type: "contiguous_ordered_array",
+      minItems: 1,
+      maxItems: 64,
+      orderField: "order",
+      startAt: 1,
+      items: teamPlayerSchema()
+    }
+  });
+}
+
+export function legacyTeamValueSchema(): RunnerValueSchema {
+  return objectSchema({
+    strategy: objectSchema({
+      mode: enumSchema("sequence", "parallel", "coordinated"),
+      promptTemplate: textSchema(1, 100_000),
+      maxRounds: integerSchema(1, 100)
+    }),
+    players: {
       type: "array",
       minItems: 1,
       maxItems: 64,
       uniqueItems: false,
-      items: objectSchema({
-        name: textSchema(1, 256),
-        role: textSchema(1, 1_000),
-        order: integerSchema(1, 64),
-        promptTemplate: textSchema(1, 100_000),
-        resources: resourcesSchema(),
-        runtimePolicy: runtimePolicySchema()
-      })
+      items: teamPlayerSchema()
     }
+  });
+}
+
+function teamPlayerSchema(): RunnerObjectValueSchema {
+  return objectSchema({
+    name: textSchema(1, 256),
+    role: textSchema(1, 1_000),
+    order: integerSchema(1, 64),
+    promptTemplate: textSchema(1, 100_000),
+    resources: resourcesSchema(),
+    runtimePolicy: runtimePolicySchema()
   });
 }
 
@@ -107,7 +148,7 @@ function runtimePolicySchema(): RunnerValueSchema {
   });
 }
 
-function objectSchema(properties: Readonly<Record<string, RunnerValueSchema>>): RunnerValueSchema {
+function objectSchema(properties: Readonly<Record<string, RunnerValueSchema>>): RunnerObjectValueSchema {
   return { type: "object", properties, required: Object.keys(properties).sort(), additionalProperties: false };
 }
 

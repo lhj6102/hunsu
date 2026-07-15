@@ -35,6 +35,32 @@ export type ProjectGraphNode = {
     | { readonly type: "coaching"; readonly parentSha: string; readonly proposalId: string };
 };
 
+/**
+ * The topology-only identity committed by a Graph page Merkle root. Keep this
+ * deliberately narrower than the card DTO: display metadata can change its
+ * projection without weakening parent or outgoing-edge membership proofs.
+ */
+export type GraphNodeTopologyIdentity = {
+  readonly type: ProjectGraphNode["type"];
+  readonly sha: string;
+  readonly managedRef: string;
+  readonly ordinal: number;
+  readonly parentOrdinal: number | null;
+  readonly lineage: ProjectGraphNode["lineage"];
+};
+
+export type GraphNodeIdentityProofStep = {
+  readonly side: "left" | "right";
+  readonly digest: string;
+};
+
+export type GraphNodeIdentityProof = {
+  readonly pageIndex: number;
+  readonly leafIndex: number;
+  readonly identity: GraphNodeTopologyIdentity;
+  readonly siblings: readonly GraphNodeIdentityProofStep[];
+};
+
 export type ProjectGraphEdge =
   | {
       readonly type: "run";
@@ -83,6 +109,8 @@ export type RunActivityReadModel = ActiveRunReadModel & {
 export type EvidenceActivityReadModel = {
   readonly id: string;
   readonly runId: string;
+  /** Canonical Goal digest copied from the immutable Run snapshot. */
+  readonly goalDigest: string;
   readonly kind: "diff" | "check" | "screenshot" | "report" | "note";
   readonly summary: string;
   readonly target: { readonly type: "run" } | { readonly type: "criterion"; readonly criterion: string };
@@ -93,16 +121,31 @@ export type EvidenceActivityReadModel = {
   readonly recordedAt: string;
 };
 
-export type ComparisonActivityReadModel = {
+type ComparisonActivityBaseReadModel = {
   readonly id: string;
-  readonly parentNodeSha: string;
+  readonly eventId: string;
   readonly nodeShas: readonly string[];
   readonly summary: string;
   readonly recordedAt: string;
+  readonly disposition:
+    | { readonly type: "undecided" }
+    | { readonly type: "decisions_recorded"; readonly decisions: readonly DecisionActivityReadModel[] };
 };
+
+export type ComparisonActivityReadModel =
+  | (ComparisonActivityBaseReadModel & {
+      readonly type: "sibling_runs";
+      readonly parentNodeSha: string;
+    })
+  | (ComparisonActivityBaseReadModel & {
+      readonly type: "coached_how_experiment";
+      readonly anchorNodeSha: string;
+      readonly goalDigest: string;
+    });
 
 export type DecisionActivityReadModel = {
   readonly id: string;
+  readonly eventId: string;
   readonly type: "selection" | "rejection";
   readonly comparisonId: string;
   readonly nodeShas: readonly string[];
@@ -112,19 +155,38 @@ export type DecisionActivityReadModel = {
 
 export type CoachingActivityReadModel = {
   readonly id: string;
+  readonly eventId: string;
   readonly sourceNodeSha: string;
   readonly sourcePayloadDigest: string;
+  readonly sourcePlanDigest: string;
   readonly proposedPlanDigest: string;
+  readonly expectedStateSha: string;
+  readonly summary: string;
+  readonly rationale: string;
   readonly proposedAt: string;
-  readonly reason: string;
   readonly disposition:
     | { readonly type: "pending" }
-    | { readonly type: "confirmed"; readonly childNodeSha: string; readonly decidedAt: string }
-    | { readonly type: "rejected"; readonly decidedAt: string };
+    | {
+      readonly type: "confirmed";
+      readonly decisionId: string;
+      readonly decisionEventId: string;
+      readonly childRegistrationEventId: string;
+      readonly childNodeSha: string;
+        readonly reason: string;
+        readonly decidedAt: string;
+      }
+    | {
+        readonly type: "rejected";
+        readonly decisionId: string;
+        readonly decisionEventId: string;
+        readonly reason: string;
+        readonly decidedAt: string;
+      };
 };
 
 export type ReviewActivityReadModel = {
   readonly id: string;
+  readonly eventId: string;
   readonly targetType: "node" | "run" | "comparison";
   readonly targetId: string;
   readonly assessment: string;

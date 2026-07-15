@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
+import { gunzipSync, gzipSync } from "node:zlib";
 import {
   HunsuApplicationService,
   bundledRunnerTypes,
@@ -15,7 +17,12 @@ import {
   type RepositoryLocator,
   type TransportResult
 } from "../packages/github-store/src/index.ts";
-import { computeGoalDigest, decodeNodePlan } from "../packages/protocol/src/index.ts";
+import { canonicalJson, computeGoalDigest, decodeNodePlan } from "../packages/protocol/src/index.ts";
+import {
+  decodeNodeActivityIndex,
+  decodeNodeActivityRecord,
+  decodeRunActivityShard
+} from "../apps/api/src/sharded-read-models.ts";
 
 const INITIAL_SHA = "1".repeat(40);
 
@@ -125,6 +132,141 @@ test("Project discovery periodically revalidates the root managed Node anchor at
   const revalidated = await service.call("hunsu.projects.list", {}, auth);
   assert.equal(revalidated.ok, true);
   assert.equal(transport.exactAnchorReads, 2);
+});
+
+test("stable Node inspector reads reuse bounded Project and selected-anchor verification caches", async () => {
+  class TrackingMemoryTransport extends MemoryGitHubTransport {
+    branchHeadReads = 0;
+    exactAnchorReads = 0;
+
+    override async readBranchHead(...args: Parameters<MemoryGitHubTransport["readBranchHead"]>) {
+      this.branchHeadReads += 1;
+      return super.readBranchHead(...args);
+    }
+
+    override async readManagedNodeAnchors(...args: Parameters<MemoryGitHubTransport["readManagedNodeAnchors"]>) {
+      this.exactAnchorReads += 1;
+      return super.readManagedNodeAnchors(...args);
+    }
+  }
+
+  const transport = new TrackingMemoryTransport([{ repository, initialSha: INITIAL_SHA }]);
+  let cacheNow = 0;
+  const service = new HunsuApplicationService({
+    transport,
+    cacheNow: () => cacheNow,
+    projectionCachePolicy: { projectTtlMs: 10, nodeAnchorTtlMs: 20 }
+  });
+  await mutation(service, "hunsu.projects.create", {
+    repository: repositoryInput,
+    projectId: "project-node-inspector-cache",
+    title: "Node inspector cache trial",
+    rootNodeSha: INITIAL_SHA,
+    initialPlan,
+    idempotencyKey: "create-project-node-inspector-cache",
+    expectedStateSha: INITIAL_SHA,
+    confirmedByUser: true
+  });
+
+  service.invalidateAll();
+  transport.branchHeadReads = 0;
+  transport.exactAnchorReads = 0;
+  const readNode = () => service.call("hunsu.nodes.get", {
+    repository: repositoryInput,
+    projectId: "project-node-inspector-cache",
+    nodeSha: INITIAL_SHA
+  }, auth);
+
+  const first = await readNode();
+  if (!first.ok) assert.fail(first.error.message);
+  assert.equal(transport.branchHeadReads, 1);
+  assert.equal(transport.exactAnchorReads, 2, "the first read verifies the root catalog and selected Node independently");
+
+  const cached = await readNode();
+  if (!cached.ok) assert.fail(cached.error.message);
+  assert.equal(transport.branchHeadReads, 1, "a fresh Project cache avoids even the state-head lookup");
+  assert.equal(transport.exactAnchorReads, 2, "a fresh selected-anchor cache avoids another managed-ref lookup");
+
+  cacheNow = 11;
+  const projectRevalidated = await readNode();
+  if (!projectRevalidated.ok) assert.fail(projectRevalidated.error.message);
+  assert.equal(transport.branchHeadReads, 2);
+  assert.equal(transport.exactAnchorReads, 3, "Project TTL expiry revalidates only the root while the selected anchor remains fresh");
+
+  cacheNow = 21;
+  const allRevalidated = await readNode();
+  if (!allRevalidated.ok) assert.fail(allRevalidated.error.message);
+  assert.equal(transport.branchHeadReads, 3);
+  assert.equal(transport.exactAnchorReads, 5, "both root and selected anchor are revalidated after their bounded TTLs");
+
+  service.invalidateRepository(repository);
+  const invalidated = await readNode();
+  if (!invalidated.ok) assert.fail(invalidated.error.message);
+  assert.equal(transport.branchHeadReads, 4);
+  assert.equal(transport.exactAnchorReads, 7, "repository invalidation clears both authority caches immediately");
+});
+
+test("an invalidated selected-anchor flight cannot republish a stale verification", async () => {
+  let releaseDeferred!: () => void;
+  let markDeferredStarted!: () => void;
+  const deferred = new Promise<void>(resolve => {
+    releaseDeferred = resolve;
+  });
+  const deferredStarted = new Promise<void>(resolve => {
+    markDeferredStarted = resolve;
+  });
+  class DeferredAnchorTransport extends MemoryGitHubTransport {
+    exactAnchorReads = 0;
+    deferredCall = Number.POSITIVE_INFINITY;
+
+    override async readManagedNodeAnchors(...args: Parameters<MemoryGitHubTransport["readManagedNodeAnchors"]>) {
+      const call = ++this.exactAnchorReads;
+      const result = await super.readManagedNodeAnchors(...args);
+      if (call === this.deferredCall) {
+        markDeferredStarted();
+        await deferred;
+      }
+      return result;
+    }
+  }
+
+  const transport = new DeferredAnchorTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  await mutation(service, "hunsu.projects.create", {
+    repository: repositoryInput,
+    projectId: "project-invalidated-anchor-flight",
+    title: "Invalidated anchor flight trial",
+    rootNodeSha: INITIAL_SHA,
+    initialPlan,
+    idempotencyKey: "create-project-invalidated-anchor-flight",
+    expectedStateSha: INITIAL_SHA,
+    confirmedByUser: true
+  });
+
+  service.invalidateAll();
+  transport.exactAnchorReads = 0;
+  transport.deferredCall = 2;
+  const readNode = () => service.call("hunsu.nodes.get", {
+    repository: repositoryInput,
+    projectId: "project-invalidated-anchor-flight",
+    nodeSha: INITIAL_SHA
+  }, auth);
+
+  const stale = readNode();
+  await deferredStarted;
+  assert.equal(transport.exactAnchorReads, 2, "the selected-anchor verification is the deferred second lookup");
+  service.invalidateRepository(repository);
+  releaseDeferred();
+  const staleResult = await stale;
+  if (!staleResult.ok) assert.fail(staleResult.error.message);
+
+  const current = await readNode();
+  if (!current.ok) assert.fail(current.error.message);
+  assert.equal(
+    transport.exactAnchorReads,
+    4,
+    "the invalidated flight cannot satisfy either authority lookup after repository invalidation"
+  );
 });
 
 test("concurrent Project shell and Graph reads share installation and repository projection flights", async () => {
@@ -349,6 +491,41 @@ test("application service executes the v2 Node lifecycle with idempotent GitHub-
   const root = reconstructedBeforeCoaching.value.state.nodes.find(node => node.commitSha === INITIAL_SHA);
   if (!root) assert.fail("Root Node was not reconstructed.");
 
+  stateHeadSha = (await mutation(service, "hunsu.coach.review", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    nodeSha: INITIAL_SHA,
+    reviewId: "review-one",
+    assessment: "Both completed Runs have immutable criterion evidence.",
+    findings: ["The result Nodes preserve the source How."],
+    recommendation: "Compare the two completed alternatives.",
+    idempotencyKey: "review-one-create",
+    expectedStateSha: stateHeadSha
+  })).stateHeadSha;
+
+  const reviewList = await service.call("hunsu.coach.reviews.list", {
+    repository: repositoryInput, projectId: "project-one", nodeSha: INITIAL_SHA, limit: 1
+  }, auth);
+  if (!reviewList.ok) assert.fail(reviewList.error.message);
+  const listedReviews = reviewList.data as { reviews: Array<{ id: string; recommendations: string[] }>; window: { hasMore: boolean } };
+  assert.deepEqual(listedReviews.reviews.map(item => item.id), ["review-one"]);
+  assert.equal(listedReviews.reviews[0]?.recommendations.length, 2);
+  assert.equal(listedReviews.window.hasMore, false);
+  const staleReviewCursor = await service.call("hunsu.coach.reviews.list", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    nodeSha: INITIAL_SHA,
+    cursor: `${"f".repeat(40)}:0`,
+    limit: 1
+  }, auth);
+  assert.equal(staleReviewCursor.ok, false);
+  if (!staleReviewCursor.ok) assert.equal(staleReviewCursor.error.code, "invalid_request");
+  const reviewDetail = await service.call("hunsu.coach.reviews.get", {
+    repository: repositoryInput, projectId: "project-one", nodeSha: INITIAL_SHA, reviewId: "review-one"
+  }, auth);
+  if (!reviewDetail.ok) assert.fail(reviewDetail.error.message);
+  assert.equal((reviewDetail.data as { review: { assessment: string } }).review.assessment, "Both completed Runs have immutable criterion evidence.");
+
   const proposedPlan = {
     ...initialPlan,
     how: { ...initialPlan.how, name: "Coached Production Player" }
@@ -366,6 +543,37 @@ test("application service executes the v2 Node lifecycle with idempotent GitHub-
     expectedStateSha: stateHeadSha
   };
   stateHeadSha = (await mutation(service, "hunsu.coach.propose_transition", proposalInput)).stateHeadSha;
+
+  const proposalList = await service.call("hunsu.coach.proposals.list", {
+    repository: repositoryInput, projectId: "project-one", sourceNodeSha: INITIAL_SHA, limit: 50
+  }, auth);
+  if (!proposalList.ok) assert.fail(proposalList.error.message);
+  const listedProposal = (proposalList.data as { proposals: Array<Record<string, any>> }).proposals[0];
+  assert.equal(listedProposal?.summary, proposalInput.summary);
+  assert.equal(listedProposal?.rationale, proposalInput.rationale);
+  assert.equal(listedProposal?.sourcePayloadDigest, root.payloadDigest);
+  assert.equal(listedProposal?.sourcePlanDigest, root.planDigest);
+  assert.equal(listedProposal?.disposition.type, "pending");
+  assert.equal(listedProposal?.proposedPlan, undefined, "opaque list materialization must not contain the proposed plan");
+
+  const proposalDetail = await service.call("hunsu.coach.proposals.get", {
+    repository: repositoryInput, projectId: "project-one", sourceNodeSha: INITIAL_SHA, proposalId: "proposal-one"
+  }, auth);
+  if (!proposalDetail.ok) assert.fail(proposalDetail.error.message);
+  const detailedProposal = (proposalDetail.data as { proposal: Record<string, any> }).proposal;
+  assert.equal(detailedProposal.source.payloadDigest, root.payloadDigest);
+  assert.equal(detailedProposal.source.plan.how.name, initialPlan.how.name);
+  assert.equal(detailedProposal.proposed.plan.how.name, "Coached Production Player");
+  assert.equal(detailedProposal.summary, proposalInput.summary);
+  assert.equal(detailedProposal.rationale, proposalInput.rationale);
+
+  const completedResultNode = await service.call("hunsu.nodes.get", {
+    repository: repositoryInput, projectId: "project-one", nodeSha: first.resultSha
+  }, auth);
+  if (!completedResultNode.ok) assert.fail(completedResultNode.error.message);
+  const completedResultDetail = completedResultNode.data as { payloadDigest: string; evidence: Array<{ id: string }> };
+  assert.match(completedResultDetail.payloadDigest, /^hunsu-node-payload-v1:sha256:[0-9a-f]{64}$/u);
+  assert.ok(completedResultDetail.evidence.length > 0, "result Node detail must include incoming Run evidence");
 
   const unconfirmedHead = stateHeadSha;
   const unconfirmed = await service.call("hunsu.coach.confirm_transition", {
@@ -398,9 +606,66 @@ test("application service executes the v2 Node lifecycle with idempotent GitHub-
   assert.equal(coachingCommit.value.treeSha, rootCommit.value.treeSha);
   assert.equal(await refValue(transport, `refs/tags/hunsu/node/project-one/${coachingSha}`), coachingSha);
 
+  const confirmedProposal = await service.call("hunsu.coach.proposals.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    sourceNodeSha: INITIAL_SHA,
+    proposalId: "proposal-one"
+  }, auth);
+  if (!confirmedProposal.ok) assert.fail(confirmedProposal.error.message);
+  const confirmedDisposition = (confirmedProposal.data as {
+    proposal: { disposition: Record<string, unknown> };
+  }).proposal.disposition;
+  assert.equal(confirmedDisposition.type, "confirmed");
+  assert.match(String(confirmedDisposition.decisionId), /^decision-[0-9a-f]{20}$/u);
+  assert.equal(confirmedDisposition.childNodeSha, coachingSha);
+  assert.equal(confirmedDisposition.reason, "User confirmed the Coaching transition.");
+  assert.match(String(confirmedDisposition.decidedAt), /^2026-07-15T01:00:[0-9]{2}\.000Z$/u);
+  assert.equal(confirmedDisposition.decisionEventId, undefined);
+  assert.equal(confirmedDisposition.childRegistrationEventId, undefined);
+
+  const rejectedProposal = await mutation(service, "hunsu.coach.propose_transition", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    sourceNodeSha: INITIAL_SHA,
+    sourcePayloadDigest: String(root.payloadDigest),
+    proposalId: "proposal-rejected",
+    proposedPlan: {
+      ...initialPlan,
+      how: { ...initialPlan.how, name: "Rejected Production Player" }
+    },
+    summary: "Consider another Runner identity.",
+    rationale: "Exercise authoritative rejection recovery.",
+    idempotencyKey: "proposal-rejected-create",
+    expectedStateSha: stateHeadSha
+  });
+  stateHeadSha = rejectedProposal.stateHeadSha;
+  const rejectedDecision = await mutation(service, "hunsu.coach.reject_transition", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    proposalId: "proposal-rejected",
+    reason: "Keep the confirmed Coaching child.",
+    idempotencyKey: "proposal-rejected-reject",
+    expectedStateSha: stateHeadSha,
+    confirmedByUser: true
+  });
+  stateHeadSha = rejectedDecision.stateHeadSha;
+  const rejectedProposalDetail = await service.call("hunsu.coach.proposals.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    sourceNodeSha: INITIAL_SHA,
+    proposalId: "proposal-rejected"
+  }, auth);
+  if (!rejectedProposalDetail.ok) assert.fail(rejectedProposalDetail.error.message);
+  assert.equal(
+    (rejectedProposalDetail.data as { proposal: { disposition: { type: string } } }).proposal.disposition.type,
+    "rejected"
+  );
+
   const comparison = await mutation(service, "hunsu.alternatives.compare", {
     repository: repositoryInput,
     projectId: "project-one",
+    comparisonType: "sibling_runs",
     sourceNodeSha: INITIAL_SHA,
     comparisonId: "comparison-one",
     nodeShas: [first.resultSha, second.resultSha],
@@ -416,6 +681,28 @@ test("application service executes the v2 Node lifecycle with idempotent GitHub-
     expectedStateSha: stateHeadSha
   });
   stateHeadSha = comparison.stateHeadSha;
+
+  const comparisonList = await service.call("hunsu.alternatives.list", {
+    repository: repositoryInput, projectId: "project-one", nodeSha: INITIAL_SHA, limit: 50
+  }, auth);
+  if (!comparisonList.ok) assert.fail(comparisonList.error.message);
+  const listedComparison = (comparisonList.data as { comparisons: Array<Record<string, any>> }).comparisons[0];
+  assert.equal(listedComparison?.type, "sibling_runs");
+  assert.equal(listedComparison?.parentNodeSha, INITIAL_SHA);
+  assert.equal(listedComparison?.summary, "Both sibling Nodes are valid; the second is preferred.");
+  assert.equal(listedComparison?.findings, undefined, "comparison list must not duplicate authoritative findings");
+  assert.equal(listedComparison?.disposition.type, "undecided");
+  const comparisonDetail = await service.call("hunsu.alternatives.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    comparisonType: "sibling_runs",
+    sourceNodeSha: INITIAL_SHA,
+    comparisonId: "comparison-one"
+  }, auth);
+  if (!comparisonDetail.ok) assert.fail(comparisonDetail.error.message);
+  const detailedComparison = (comparisonDetail.data as { comparison: Record<string, any> }).comparison;
+  assert.equal(detailedComparison.findings[0]?.subject, "Production evidence");
+  assert.equal(detailedComparison.findings[0]?.summaries.length, 2);
 
   const rejectWithoutConfirmation = await service.call("hunsu.alternatives.reject", {
     repository: repositoryInput,
@@ -466,6 +753,21 @@ test("application service executes the v2 Node lifecycle with idempotent GitHub-
     expectedStateSha: stateHeadSha,
     confirmedByUser: true
   })).stateHeadSha;
+
+  const decidedComparison = await service.call("hunsu.alternatives.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    comparisonType: "sibling_runs",
+    sourceNodeSha: INITIAL_SHA,
+    comparisonId: "comparison-one"
+  }, auth);
+  if (!decidedComparison.ok) assert.fail(decidedComparison.error.message);
+  const decidedDisposition = (decidedComparison.data as {
+    comparison: { disposition: { type: string; decisions: Array<{ type: string; nodeShas: string[] }> } }
+  }).comparison.disposition;
+  assert.equal(decidedDisposition.type, "decisions_recorded");
+  assert.deepEqual(decidedDisposition.decisions.map(item => item.type).sort(), ["rejection", "selection"]);
+  assert.equal(decidedDisposition.decisions.every(item => (item as { eventId?: string }).eventId === undefined), true);
 
   const rejectedContinuation = await service.call("hunsu.runs.start", {
     repository: repositoryInput,
@@ -567,6 +869,269 @@ test("application service executes the v2 Node lifecycle with idempotent GitHub-
   assert.equal(finalState.value.state.runs.filter(run => run.status === "running").length, 0);
   assert.equal(finalState.value.state.nodes.filter(node => node.type !== "root" && !node.parentSha).length, 0);
   assert.equal(finalState.value.state.nodes.length, new Set(finalState.value.state.nodes.map(node => node.commitSha)).size);
+
+  const exactState = await transport.readBranch(repository, HUNSU_STATE_BRANCH);
+  if (!exactState.ok || !exactState.value) assert.fail("Exact state is unavailable for authoritative recovery tampering.");
+  const confirmedProposalPath = `.hunsu/v2/projects/project-one/snapshots/nodes/${INITIAL_SHA}/coaching/by-id/proposal-one.json`;
+  const rejectedProposalPath = `.hunsu/v2/projects/project-one/snapshots/nodes/${INITIAL_SHA}/coaching/by-id/proposal-rejected.json`;
+  const comparisonPath = `.hunsu/v2/projects/project-one/snapshots/nodes/${INITIAL_SHA}/comparisons/by-id/comparison-one.json`;
+  const runActivityPath = ".hunsu/v2/projects/project-one/snapshots/runs/run-one.json";
+  let comparisonEventId = "";
+  const forgedComparisonActivity = mutateReadModelEnvelope(
+    exactState.value.files[comparisonPath]!,
+    "nodeActivityRecord",
+    payload => {
+      const comparison = payload.value;
+      assert.equal(comparison.disposition.type, "decisions_recorded");
+      comparisonEventId = comparison.eventId;
+      for (const decision of comparison.disposition.decisions) {
+        decision.rationale = "Forged materialized comparison rationale.";
+      }
+    }
+  );
+  const forgedConfirmedProposal = mutateReadModelEnvelope(
+    exactState.value.files[confirmedProposalPath]!,
+    "nodeActivityRecord",
+    payload => {
+      assert.equal(payload.value.disposition.type, "confirmed");
+      payload.value.disposition.childRegistrationEventId = comparisonEventId;
+    }
+  );
+  const forgedRejectedProposalRecord = mutateReadModelEnvelope(
+    exactState.value.files[rejectedProposalPath]!,
+    "nodeActivityRecord",
+    payload => {
+      assert.equal(payload.value.disposition.type, "rejected");
+      payload.value.disposition.reason = "Forged materialized rejection rationale.";
+    }
+  );
+  const forgedRunActivity = mutateReadModelEnvelope(
+    exactState.value.files[runActivityPath]!,
+    "runActivity",
+    payload => {
+      const evidence = payload.evidence.find((item: any) => item.target.type === "criterion");
+      assert.ok(evidence);
+      evidence.target.criterion = "A criterion outside the selected Goal";
+    }
+  );
+  assert.equal(decodeNodeActivityRecord(JSON.parse(forgedConfirmedProposal)).ok, true);
+  assert.equal(decodeNodeActivityRecord(JSON.parse(forgedRejectedProposalRecord)).ok, true);
+  assert.equal(decodeNodeActivityRecord(JSON.parse(forgedComparisonActivity)).ok, true);
+  assert.equal(decodeRunActivityShard(JSON.parse(forgedRunActivity)).ok, true);
+  const forged = await transport.commitFiles({
+    repository,
+    branch: HUNSU_STATE_BRANCH,
+    expectedHeadSha: exactState.value.headSha,
+    message: "Forge disposable activity materializations for recovery QA",
+    updates: [
+      { path: confirmedProposalPath, content: forgedConfirmedProposal },
+      { path: rejectedProposalPath, content: forgedRejectedProposalRecord },
+      { path: comparisonPath, content: forgedComparisonActivity },
+      { path: runActivityPath, content: forgedRunActivity }
+    ]
+  });
+  if (!forged.ok) assert.fail(forged.error.message);
+  service.invalidateAll();
+
+  const forgedProposal = await service.call("hunsu.coach.proposals.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    sourceNodeSha: INITIAL_SHA,
+    proposalId: "proposal-one"
+  }, auth);
+  assert.equal(forgedProposal.ok, false);
+  if (!forgedProposal.ok) assert.equal(forgedProposal.error.code, "integrity_error");
+  const forgedRejectedProposal = await service.call("hunsu.coach.proposals.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    sourceNodeSha: INITIAL_SHA,
+    proposalId: "proposal-rejected"
+  }, auth);
+  assert.equal(forgedRejectedProposal.ok, false);
+  if (!forgedRejectedProposal.ok) assert.equal(forgedRejectedProposal.error.code, "integrity_error");
+  const forgedComparison = await service.call("hunsu.alternatives.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    comparisonType: "sibling_runs",
+    sourceNodeSha: INITIAL_SHA,
+    comparisonId: "comparison-one"
+  }, auth);
+  assert.equal(forgedComparison.ok, false);
+  if (!forgedComparison.ok) assert.equal(forgedComparison.error.code, "integrity_error");
+  const forgedRun = await service.call("hunsu.runs.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    runId: "run-one"
+  }, auth);
+  assert.equal(forgedRun.ok, false);
+  if (!forgedRun.ok) assert.equal(forgedRun.error.code, "integrity_error");
+  const unchangedMain = await transport.readBranchHead(repository, repository.defaultBranch);
+  if (!unchangedMain.ok) assert.fail(unchangedMain.error.message);
+  assert.equal(unchangedMain.value, INITIAL_SHA);
+});
+
+test("coached How comparison detail and Event detail verify the authoritative variant summary", async () => {
+  const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  let tick = 0;
+  const service = new HunsuApplicationService({
+    transport,
+    now: () => new Date(Date.UTC(2026, 6, 15, 2, 30, tick++))
+  });
+  const projectId = "coached-event-read";
+  const created = await mutation(service, "hunsu.projects.create", {
+    repository: repositoryInput,
+    projectId,
+    title: "Coached Event Read",
+    rootNodeSha: INITIAL_SHA,
+    initialPlan,
+    idempotencyKey: "coached-event-create",
+    expectedStateSha: INITIAL_SHA,
+    confirmedByUser: true
+  });
+
+  const completeCoachedCandidate = async (input: {
+    sourceNodeSha: string;
+    runId: string;
+    resultFile: string;
+    expectedStateSha: string;
+  }) => {
+    const started = await mutation(service, "hunsu.runs.start", {
+      repository: repositoryInput,
+      projectId,
+      sourceNodeSha: input.sourceNodeSha,
+      goalDigest: goalDigestAt(0),
+      runId: input.runId,
+      idempotencyKey: `${input.runId}-start`,
+      expectedStateSha: input.expectedStateSha
+    });
+    const contract = started.data as { repository: { branch: string } };
+    const result = transport.addCommit({
+      repository,
+      branch: contract.repository.branch,
+      parentSha: input.sourceNodeSha,
+      files: { [input.resultFile]: `${input.runId} result\n` },
+      message: `${input.runId} result`
+    });
+    if (!result.ok) assert.fail(result.error.message);
+    const completed = await mutation(service, "hunsu.runs.complete", {
+      repository: repositoryInput,
+      projectId,
+      runId: input.runId,
+      resultSha: result.value,
+      evidence: [{
+        kind: "check",
+        summary: `${input.runId} satisfies the shared Goal.`,
+        target: { type: "criterion", criterion: initialPlan.nextGoals[0]!.acceptanceCriteria[0]! },
+        location: { type: "git", commitSha: result.value, path: input.resultFile }
+      }],
+      idempotencyKey: `${input.runId}-complete`,
+      expectedStateSha: started.stateHeadSha
+    });
+    return { stateHeadSha: completed.stateHeadSha, resultNodeSha: result.value };
+  };
+
+  const baseline = await completeCoachedCandidate({
+    sourceNodeSha: INITIAL_SHA,
+    runId: "coached-event-baseline",
+    resultFile: "baseline.txt",
+    expectedStateSha: created.stateHeadSha
+  });
+  const rootDetail = await service.call("hunsu.nodes.get", {
+    repository: repositoryInput,
+    projectId,
+    nodeSha: INITIAL_SHA
+  }, auth);
+  if (!rootDetail.ok) assert.fail(rootDetail.error.message);
+  const sourcePayloadDigest = (rootDetail.data as { payloadDigest: string }).payloadDigest;
+  const proposal = await mutation(service, "hunsu.coach.propose_transition", {
+    repository: repositoryInput,
+    projectId,
+    sourceNodeSha: INITIAL_SHA,
+    sourcePayloadDigest,
+    proposalId: "coached-event-proposal",
+    proposedPlan: {
+      ...initialPlan,
+      how: { ...initialPlan.how, name: "Coached Event Player" }
+    },
+    summary: "Change only the How for the controlled experiment.",
+    rationale: "Compare the baseline and coached Runner on the same Goal.",
+    idempotencyKey: "coached-event-proposal-create",
+    expectedStateSha: baseline.stateHeadSha
+  });
+  const confirmed = await mutation(service, "hunsu.coach.confirm_transition", {
+    repository: repositoryInput,
+    projectId,
+    proposalId: "coached-event-proposal",
+    idempotencyKey: "coached-event-proposal-confirm",
+    expectedStateSha: proposal.stateHeadSha,
+    confirmedByUser: true
+  });
+  const coachingNodeSha = (confirmed.data as { childNodeSha: string }).childNodeSha;
+  const coached = await completeCoachedCandidate({
+    sourceNodeSha: coachingNodeSha,
+    runId: "coached-event-candidate",
+    resultFile: "coached.txt",
+    expectedStateSha: confirmed.stateHeadSha
+  });
+
+  const compared = await mutation(service, "hunsu.alternatives.compare", {
+    repository: repositoryInput,
+    projectId,
+    comparisonType: "coached_how_experiment",
+    anchorNodeSha: INITIAL_SHA,
+    comparisonId: "coached-event-comparison",
+    nodeShas: [baseline.resultNodeSha, coached.resultNodeSha],
+    findings: [{
+      criterion: "Shared Goal evidence",
+      summaries: [
+        { nodeSha: baseline.resultNodeSha, summary: "The baseline result satisfies the shared Goal." },
+        { nodeSha: coached.resultNodeSha, summary: "The coached result satisfies the shared Goal." }
+      ]
+    }],
+    summary: "The baseline and coached How results are both verified.",
+    idempotencyKey: "coached-event-comparison-create",
+    expectedStateSha: coached.stateHeadSha
+  });
+
+  const comparison = await service.call("hunsu.alternatives.get", {
+    repository: repositoryInput,
+    projectId,
+    comparisonType: "coached_how_experiment",
+    anchorNodeSha: INITIAL_SHA,
+    comparisonId: "coached-event-comparison"
+  }, auth);
+  if (!comparison.ok) assert.fail(comparison.error.message);
+  assert.equal(
+    (comparison.data as { comparison: { type: string; summary: string } }).comparison.type,
+    "coached_how_experiment"
+  );
+
+  const events = await service.call("hunsu.events.list", {
+    repository: repositoryInput,
+    projectId,
+    eventType: "AlternativesCompared",
+    limit: 50
+  }, auth);
+  if (!events.ok) assert.fail(events.error.message);
+  const comparisonEvent = (events.data as {
+    events: Array<{ id: string; type: string; summary: string }>;
+  }).events.find(event => event.type === "AlternativesCompared");
+  assert.ok(comparisonEvent);
+  assert.equal(comparisonEvent.summary, "Compared 2 coached How experiment Nodes");
+  const event = await service.call("hunsu.events.get", {
+    repository: repositoryInput,
+    projectId,
+    eventId: comparisonEvent.id
+  }, auth);
+  if (!event.ok) assert.fail(event.error.message);
+  const eventDetail = event.data as {
+    stateHeadSha: string;
+    event: { type: string; summary: string; reference: { kind: string; nodeSha?: string } };
+  };
+  assert.equal(eventDetail.stateHeadSha, compared.stateHeadSha);
+  assert.equal(eventDetail.event.type, "AlternativesCompared");
+  assert.equal(eventDetail.event.summary, "Compared 2 coached How experiment Nodes");
+  assert.deepEqual(eventDetail.event.reference, { kind: "node", nodeSha: INITIAL_SHA });
 });
 
 test("confirmed Project rebuild CAS-writes recovered materializations and retries idempotently", async () => {
@@ -697,6 +1262,7 @@ test("Coaching confirmation reuses an orphan commit and tag after a state CAS fa
     sourcePayloadDigest: String(root.payloadDigest),
     proposalId: "proposal-orphan-retry",
     proposedPlan,
+    summary: "Prepare a deterministic Coaching retry.",
     rationale: "Exercise the prepared-ref retry boundary.",
     idempotencyKey: "proposal-orphan-retry-create",
     expectedStateSha: created.stateHeadSha
@@ -762,6 +1328,7 @@ test("ordinary REST and MCP reads use exact-head materializations without event 
   class TrackingTransport extends MemoryGitHubTransport {
     blockStateReplay = false;
     stateReplayReads = 0;
+    managedAnchorReads = 0;
     readonly targetedSelections: Array<Parameters<MemoryGitHubTransport["readStateFilesAtHead"]>[2]> = [];
 
     override async readBranch(target: RepositoryLocator, branch: string) {
@@ -779,6 +1346,11 @@ test("ordinary REST and MCP reads use exact-head materializations without event 
     ) {
       this.targetedSelections.push(selections);
       return super.readStateFilesAtHead(target, stateHeadSha, selections);
+    }
+
+    override async readManagedNodeAnchors(...args: Parameters<MemoryGitHubTransport["readManagedNodeAnchors"]>) {
+      this.managedAnchorReads += 1;
+      return super.readManagedNodeAnchors(...args);
     }
   }
 
@@ -813,12 +1385,36 @@ test("ordinary REST and MCP reads use exact-head materializations without event 
   assert.equal(listData.repositories[0]?.state.stateHeadSha, started.stateHeadSha);
   const project = await service.call("hunsu.projects.get", { repository: repositoryInput, projectId: "project-one" }, auth);
   if (!project.ok) assert.fail(project.error.message);
+  const targetedBeforeActivityLists = transport.targetedSelections.length;
+  const anchorsBeforeActivityLists = transport.managedAnchorReads;
+  const [reviewList, proposalList, comparisonList] = await Promise.all([
+    service.call("hunsu.coach.reviews.list", {
+      repository: repositoryInput, projectId: "project-one", nodeSha: INITIAL_SHA, limit: 50
+    }, auth),
+    service.call("hunsu.coach.proposals.list", {
+      repository: repositoryInput, projectId: "project-one", sourceNodeSha: INITIAL_SHA, limit: 50
+    }, auth),
+    service.call("hunsu.alternatives.list", {
+      repository: repositoryInput, projectId: "project-one", nodeSha: INITIAL_SHA, limit: 50
+    }, auth)
+  ]);
+  if (!reviewList.ok) assert.fail(reviewList.error.message);
+  if (!proposalList.ok) assert.fail(proposalList.error.message);
+  if (!comparisonList.ok) assert.fail(comparisonList.error.message);
+  const activityListSelections = transport.targetedSelections.slice(targetedBeforeActivityLists).flat();
+  assert.equal(activityListSelections.some(selection => selection.kind === "project_read_model" && selection.model === "activity"), true);
+  assert.equal(activityListSelections.some(selection => selection.kind === "node_activity_index"), true);
+  assert.equal(activityListSelections.some(selection => selection.kind === "node_payload" || selection.kind === "graph_node"), false);
+  assert.equal(transport.managedAnchorReads, anchorsBeforeActivityLists);
   const targetedBeforeGraph = transport.targetedSelections.length;
   const graph = await service.call("hunsu.nodes.graph", { repository: repositoryInput, projectId: "project-one", limit: 300 }, auth);
   if (!graph.ok) assert.fail(graph.error.message);
   const targetedAfterGraph = transport.targetedSelections.length;
-  assert.equal(targetedAfterGraph, targetedBeforeGraph + 1);
-  assert.deepEqual(transport.targetedSelections.at(-1)?.map(selection => selection.kind).sort(), ["graph_page", "project_read_model"]);
+  assert.equal(targetedAfterGraph, targetedBeforeGraph + 2);
+  const graphSelections = transport.targetedSelections.slice(targetedBeforeGraph);
+  assert.deepEqual(graphSelections[0]?.map(selection => selection.kind).sort(), ["graph_page", "project_read_model"]);
+  assert.deepEqual(graphSelections[1]?.map(selection => selection.kind), ["graph_node"]);
+  assert.equal(graphSelections[1]!.length <= 300, true);
   const graphAgain = await service.call("hunsu.nodes.graph", { repository: repositoryInput, projectId: "project-one", limit: 300 }, auth);
   if (!graphAgain.ok) assert.fail(graphAgain.error.message);
   assert.equal(transport.targetedSelections.length, targetedAfterGraph);
@@ -840,7 +1436,8 @@ test("ordinary REST and MCP reads use exact-head materializations without event 
   const selections = transport.targetedSelections.flat();
   assert.equal(selections.filter(selection => selection.kind === "graph_page").length, 1);
   assert.equal(selections.filter(selection => selection.kind === "graph_node").length >= 1, true);
-  assert.equal(selections.filter(selection => selection.kind === "node_activity").length, 1);
+  assert.equal(selections.filter(selection => selection.kind === "node_activity_index").length, 1);
+  assert.equal(selections.filter(selection => selection.kind === "node_activity_page").length, 1);
   assert.equal(selections.filter(selection => selection.kind === "run_activity").length, 1);
   assert.equal(selections.filter(selection => selection.kind === "event_index_shard").length, 1);
   assert.equal(selections.filter(selection => selection.kind === "event_locator").length, 1);
@@ -868,6 +1465,97 @@ test("ordinary REST and MCP reads use exact-head materializations without event 
   const rejectedEvent = await service.call("hunsu.events.get", { repository: repositoryInput, projectId: "project-one", eventId }, auth);
   assert.equal(rejectedEvent.ok, false);
   if (!rejectedEvent.ok) assert.equal(rejectedEvent.error.code, "integrity_error");
+});
+
+test("Node activity lists fetch only the required physical pages and the inspector loads the newest page", async () => {
+  class TrackingTransport extends MemoryGitHubTransport {
+    readonly targetedSelections: Array<Parameters<MemoryGitHubTransport["readStateFilesAtHead"]>[2]> = [];
+
+    override async readStateFilesAtHead(
+      target: RepositoryLocator,
+      stateHeadSha: string,
+      selections: Parameters<MemoryGitHubTransport["readStateFilesAtHead"]>[2]
+    ) {
+      this.targetedSelections.push(selections);
+      return super.readStateFilesAtHead(target, stateHeadSha, selections);
+    }
+  }
+
+  const transport = new TrackingTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport, now: () => new Date("2026-07-15T04:00:00.000Z") });
+  let stateHeadSha = (await mutation(service, "hunsu.projects.create", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    title: "Paged activity Project",
+    rootNodeSha: INITIAL_SHA,
+    initialPlan,
+    idempotencyKey: "paged-activity-create",
+    expectedStateSha: INITIAL_SHA,
+    confirmedByUser: true
+  })).stateHeadSha;
+  for (let index = 0; index < 55; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    stateHeadSha = (await mutation(service, "hunsu.coach.review", {
+      repository: repositoryInput,
+      projectId: "project-one",
+      nodeSha: INITIAL_SHA,
+      reviewId: `review-${suffix}`,
+      assessment: `Review ${suffix}`,
+      findings: [`Finding ${suffix}`],
+      recommendation: `Recommendation ${suffix}`,
+      idempotencyKey: `review-${suffix}-create`,
+      expectedStateSha: stateHeadSha
+    })).stateHeadSha;
+  }
+
+  const materialized = await transport.readBranch(repository, HUNSU_STATE_BRANCH);
+  if (!materialized.ok || !materialized.value) assert.fail("Paged activity state is unavailable.");
+  const activityIndexPath = exactStateFilePath({
+    kind: "node_activity_index", projectId: "project-one", nodeSha: INITIAL_SHA
+  });
+  const decodedActivityIndex = decodeNodeActivityIndex(JSON.parse(materialized.value.files[activityIndexPath]!));
+  if (!decodedActivityIndex.ok) assert.fail(decodedActivityIndex.error.message);
+  assert.deepEqual(decodedActivityIndex.value.categories.reviews, {
+    count: 55,
+    pageCount: 2,
+    pageCommitmentRoot: decodedActivityIndex.value.categories.reviews.pageCommitmentRoot
+  });
+  assert.equal("pages" in decodedActivityIndex.value.categories.reviews, false);
+
+  service.invalidateAll();
+  transport.targetedSelections.length = 0;
+  const crossing = await service.call("hunsu.coach.reviews.list", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    nodeSha: INITIAL_SHA,
+    limit: 10,
+    cursor: `${stateHeadSha}:45`
+  }, auth);
+  if (!crossing.ok) assert.fail(crossing.error.message);
+  assert.deepEqual((crossing.data as { reviews: Array<{ id: string }> }).reviews.map(review => review.id),
+    Array.from({ length: 10 }, (_, index) => `review-${String(index + 45).padStart(3, "0")}`));
+  const crossingPages = transport.targetedSelections.flat().flatMap(selection =>
+    selection.kind === "node_activity_page" ? [selection] : []
+  );
+  assert.equal(transport.targetedSelections.flat().filter(selection => selection.kind === "node_activity_index").length, 1);
+  assert.deepEqual(crossingPages.map(selection => selection.page).sort((left, right) => left - right), [0, 1]);
+  assert.equal(crossingPages.every(selection => selection.activityKind === "reviews"), true);
+
+  service.invalidateAll();
+  transport.targetedSelections.length = 0;
+  const node = await service.call("hunsu.nodes.get", {
+    repository: repositoryInput,
+    projectId: "project-one",
+    nodeSha: INITIAL_SHA
+  }, auth);
+  if (!node.ok) assert.fail(node.error.message);
+  assert.deepEqual((node.data as { coachReviews: Array<{ id: string }> }).coachReviews.map(review => review.id),
+    Array.from({ length: 5 }, (_, index) => `review-${String(index + 50).padStart(3, "0")}`));
+  const inspectorPages = transport.targetedSelections.flat().flatMap(selection =>
+    selection.kind === "node_activity_page" ? [selection] : []
+  );
+  assert.equal(transport.targetedSelections.flat().filter(selection => selection.kind === "node_activity_index").length, 1);
+  assert.deepEqual(inspectorPages.map(selection => [selection.activityKind, selection.page]), [["reviews", 1]]);
 });
 
 test("Project bootstrap contexts expose the exact default-branch CAS base and current initialized state head", async () => {
@@ -1115,4 +1803,24 @@ async function refValue(transport: MemoryGitHubTransport, ref: string): Promise<
   const result = await transport.readRef(repository as RepositoryLocator, ref);
   if (!result.ok) assert.fail(result.error.message);
   return result.value;
+}
+
+function mutateReadModelEnvelope(
+  content: string,
+  kind: "nodeActivityRecord" | "runActivity",
+  mutate: (payload: any) => void
+): string {
+  const envelope = JSON.parse(content) as Record<string, any>;
+  const payload = JSON.parse(gunzipSync(Buffer.from(String(envelope.data), "base64")).toString("utf8"));
+  mutate(payload);
+  const canonical = canonicalJson(payload);
+  const decoded = Buffer.from(canonical, "utf8");
+  const data = gzipSync(decoded, { level: 9 }).toString("base64");
+  return `${JSON.stringify({
+    ...envelope,
+    decodedSize: decoded.byteLength,
+    encodedSize: Buffer.byteLength(data, "utf8"),
+    digest: `hunsu-${kind}-read-model-v2:sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`,
+    data
+  })}\n`;
 }

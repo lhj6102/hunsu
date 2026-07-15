@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { type StoreResult } from "@hunsu/github-store";
 import {
+  canonicalJson,
+  decodeCanonicalJsonValue,
   decodeDomainEvent,
   encodeDomainEvent,
   type DomainEvent,
@@ -78,14 +80,27 @@ export function decodeOpaqueDomainEvent(
     return failure("Opaque Domain event digest does not match its decoded data.");
   }
 
+  let raw: unknown;
+  try {
+    raw = JSON.parse(canonical);
+  } catch {
+    return failure("Opaque Domain event data is not valid JSON.");
+  }
+  const canonicalValue = decodeCanonicalJsonValue(raw);
+  if (!canonicalValue.ok || `${canonicalJson(canonicalValue.value)}\n` !== canonical) {
+    return failure("Opaque Domain event data is not canonical event JSON.");
+  }
+
   const event = decodeDomainEvent(canonical, runnerTypes);
   if (!event.ok) {
     return failure(`Opaque Domain event is invalid at ${event.error.path}: ${event.error.message}`);
   }
-  if (encodeDomainEvent(event.value) !== canonical) {
-    return failure("Opaque Domain event data is not canonical v2 event JSON.");
-  }
   return ok(event.value);
+}
+
+export function verifiedOpaqueDomainEventDigest(input: unknown): StoreResult<string> {
+  const envelope = decodeEnvelope(input);
+  return envelope.ok ? ok(envelope.value.digest) : envelope;
 }
 
 function decodeEnvelope(input: unknown): StoreResult<OpaqueDomainEvent> {

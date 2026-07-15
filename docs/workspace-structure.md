@@ -31,17 +31,17 @@ packages/protocol-registry
   -> packages/protocol
 ```
 
-`packages/protocol` owns branded primitives, Goal and Runner values, Node variants, Run lifecycles, Coaching and decision commands/events, and strict versioned codecs. It has no Node, browser, GitHub, filesystem, or network dependency.
+`packages/protocol` owns branded primitives, Goal and Runner values, Node variants, Run lifecycles, Coaching and decision commands/events, the exact `sibling_runs` and `coached_how_experiment` comparison variants, and strict versioned codecs. It has no Node, browser, GitHub, filesystem, or network dependency.
 
-`packages/core` owns pure command decisions, event application, replay, Node single-parent validation, Run transitions, Coaching confirmation boundaries, sibling comparison invariants, and user-decision enforcement. It performs no I/O.
+`packages/core` owns pure command decisions, event application, replay, Node single-parent validation, Run transitions, Coaching confirmation boundaries, explicit comparison-cohort invariants, unresolved-divergence calculation, and user-decision enforcement. It performs no I/O. Comparisons and decisions are decorations over completed result Nodes and never alter structural topology.
 
 `packages/github-store` owns repository grants, refs, blobs, trees, commits, managed Node tags, encoded materializations, append-only v2 event storage, compare-and-swap updates, Run branch creation and verification, and full reconstruction. It imports only the protocol-owned Node payload envelope contract and accepts all domain behavior through a codec interface instead of importing application services.
 
 `packages/projections` derives disposable Project context, Node Graph, Node detail, Events, Run, evidence, comparison, and decision query models from replayed state.
 
-`packages/plugin-contract` owns strict MCP tool schemas, `RunContract v2`, OAuth-facing safe errors, confirmation metadata, and structured results.
+`packages/plugin-contract` owns strict MCP tool schemas, `RunContract v2`, OAuth-facing safe errors, confirmation metadata, structured results, bounded recovery reads, and read-only Runner capability discovery.
 
-`packages/protocol-registry` owns exact, integrity-checked Runner type definitions and executor contracts plus Coach, Skill, and resource definitions. Registered Runner types are extensible; state cannot inject executable code.
+`packages/protocol-registry` owns exact, integrity-checked Runner type definitions and executor contracts plus Coach, Skill, and resource definitions. It derives the read-only Runner capability catalog—exact lock, display name, schema digest, and native schema AST—without exposing executor implementation. Registered Runner types are extensible; state cannot inject executable code.
 
 `packages/config` is the only source for service hosts, ports, public URLs, GitHub App configuration, and session configuration.
 
@@ -49,4 +49,4 @@ packages/protocol-registry
 
 `apps/web` owns React presentation and user interaction. It cannot import GitHub transports, core command handling, Node APIs, runtime worktrees, or secrets.
 
-`plugins/hunsu` owns installation metadata and guided Project, Node Run, Coaching, Events, and sibling-decision workflows. It calls MCP and never writes GitHub state directly.
+`plugins/hunsu` owns installation metadata and guided Project, Node Run, Coaching, Events, recovery, Runner-capability discovery, sibling-Run comparison, and coached-How experiment workflows. It calls MCP and never writes GitHub state directly.

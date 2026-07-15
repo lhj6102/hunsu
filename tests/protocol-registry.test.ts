@@ -4,13 +4,20 @@ import test from "node:test";
 import type { Result, RunnerTypeLock } from "../packages/protocol/src/index.ts";
 import {
   BUNDLED_PLAYER_TYPE_KEY,
+  BUNDLED_PLAYER_TYPE_VERSION,
   BUNDLED_TEAM_TYPE_KEY,
+  BUNDLED_TEAM_LEGACY_TYPE_VERSION,
+  BUNDLED_TEAM_TYPE_VERSION,
   REGISTRY_DEFINITION_SCHEMA,
   REGISTRY_INTEGRITY_PREFIX,
   REGISTRY_SNAPSHOT_SCHEMA,
   RUNNER_TYPE_INTEGRITY_PREFIX,
+  RUNNER_VALUE_SCHEMA_DIGEST_PREFIX,
+  RUNNER_VALUE_SCHEMA_SCHEMA,
   canonicalizeRegistryDefinition,
+  canonicalizeRunnerValueSchema,
   computeDefinitionIntegrity,
+  computeRunnerValueSchemaDigest,
   createBundledDefinitionRegistry,
   createDefinitionRegistry,
   createRegistryEntry,
@@ -18,8 +25,11 @@ import {
   createRunnerValueTypeRegistry,
   decodeDefinitionRegistry,
   decodeRegistryDefinition,
+  decodeRunnerValueSchema,
   definitionLockToRunnerTypeLock,
+  listRunnerTypeCapabilityDefinitions,
   resolveRunnerTypeDefinition,
+  runnerTypeCapabilityDefinition,
   verifyDefinitionIntegrity,
   type DefinitionLock,
   type DefinitionRegistry,
@@ -74,16 +84,77 @@ test("registry resolves an extensible Runner type through an exact type lock", (
   assert.deepEqual(resolved.lock, lock);
 });
 
-test("bundled Player and Team are ordinary Runner type entries, not a closed union", () => {
+test("public Runner capability definitions expose canonical schemas without executor metadata", () => {
+  const fixture = completeRegistry();
+  const lock = value(definitionLockToRunnerTypeLock(fixture.runner.lock));
+  const capability = value(runnerTypeCapabilityDefinition(fixture.registry, lock));
+  assert.equal(capability.displayName, "Release Train");
+  assert.deepEqual(capability.type, lock);
+  assert.equal(capability.valueSchema.schema, RUNNER_VALUE_SCHEMA_SCHEMA);
+  assert.match(capability.valueSchema.digest, new RegExp(`^${RUNNER_VALUE_SCHEMA_DIGEST_PREFIX}[0-9a-f]{64}$`, "u"));
+  assert.equal(capability.valueSchema.root.type, "object");
+  assert.doesNotMatch(JSON.stringify(capability), /entrypoint|runner-executor|resource\.github/u);
+
+  const canonical = value(canonicalizeRunnerValueSchema(capability.valueSchema.root));
+  assert.equal(
+    capability.valueSchema.digest,
+    `${RUNNER_VALUE_SCHEMA_DIGEST_PREFIX}${createHash("sha256").update(canonical, "utf8").digest("hex")}`
+  );
+  if (capability.valueSchema.root.type !== "object") assert.fail("Release Train schema is not an object.");
+  const reordered = {
+    ...capability.valueSchema.root,
+    properties: {
+      strict: capability.valueSchema.root.properties.strict,
+      stages: capability.valueSchema.root.properties.stages
+    },
+    required: [...capability.valueSchema.root.required].reverse()
+  };
+  assert.equal(value(computeRunnerValueSchemaDigest(reordered)), capability.valueSchema.digest);
+  const changed = {
+    ...capability.valueSchema.root,
+    properties: {
+      ...capability.valueSchema.root.properties,
+      strict: { type: "null" }
+    }
+  };
+  assert.notEqual(value(computeRunnerValueSchemaDigest(changed)), capability.valueSchema.digest);
+
+  const listed = value(listRunnerTypeCapabilityDefinitions(fixture.registry));
+  assert.deepEqual(listed, [capability]);
+});
+
+test("bundled Team preserves its 1.0 lock while 1.1 adds contiguous ordered players", () => {
   const registry = value(createBundledDefinitionRegistry());
   const runnerTypes = registry.entries.filter(entry => entry.definition.kind === "runner_type");
-  assert.deepEqual(runnerTypes.map(entry => entry.definition.key), [BUNDLED_PLAYER_TYPE_KEY, BUNDLED_TEAM_TYPE_KEY]);
+  assert.deepEqual(runnerTypes.map(entry => ({ key: entry.definition.key, version: entry.definition.version })), [
+    { key: BUNDLED_PLAYER_TYPE_KEY, version: BUNDLED_PLAYER_TYPE_VERSION },
+    { key: BUNDLED_TEAM_TYPE_KEY, version: BUNDLED_TEAM_LEGACY_TYPE_VERSION },
+    { key: BUNDLED_TEAM_TYPE_KEY, version: BUNDLED_TEAM_TYPE_VERSION }
+  ]);
+  const legacyDefinition = runnerTypes.find(entry => entry.definition.key === BUNDLED_TEAM_TYPE_KEY
+    && entry.definition.version === BUNDLED_TEAM_LEGACY_TYPE_VERSION);
+  const currentDefinition = runnerTypes.find(entry => entry.definition.key === BUNDLED_TEAM_TYPE_KEY
+    && entry.definition.version === BUNDLED_TEAM_TYPE_VERSION);
+  assert.ok(legacyDefinition && legacyDefinition.definition.kind === "runner_type");
+  assert.ok(currentDefinition && currentDefinition.definition.kind === "runner_type");
+  assert.equal(
+    legacyDefinition.lock.integrity,
+    "hunsu-runner-type-v1:sha256:faa36a365179585fcbdfd7409e0087c827b721c1159f9405f88ed38ba0185dfe"
+  );
+  assert.equal(legacyDefinition.definition.runnerType.executor.entrypoint, "bundled.team.v1");
+  assert.equal(currentDefinition.definition.runnerType.executor.entrypoint, "bundled.team.v1.1");
+  assert.notEqual(currentDefinition.lock.integrity, legacyDefinition.lock.integrity);
 
   const decoders = value(createRunnerValueTypeRegistry(registry));
-  assert.equal(decoders.length, 2);
-  const player = decoders.find(decoder => decoder.type.key === BUNDLED_PLAYER_TYPE_KEY);
-  const team = decoders.find(decoder => decoder.type.key === BUNDLED_TEAM_TYPE_KEY);
+  assert.equal(decoders.length, 3);
+  const player = decoders.find(decoder => decoder.type.key === BUNDLED_PLAYER_TYPE_KEY
+    && decoder.type.schemaVersion === BUNDLED_PLAYER_TYPE_VERSION);
+  const legacyTeam = decoders.find(decoder => decoder.type.key === BUNDLED_TEAM_TYPE_KEY
+    && decoder.type.schemaVersion === BUNDLED_TEAM_LEGACY_TYPE_VERSION);
+  const team = decoders.find(decoder => decoder.type.key === BUNDLED_TEAM_TYPE_KEY
+    && decoder.type.schemaVersion === BUNDLED_TEAM_TYPE_VERSION);
   assert.ok(player);
+  assert.ok(legacyTeam);
   assert.ok(team);
 
   const playerValue = {
@@ -96,17 +167,90 @@ test("bundled Player and Team are ordinary Runner type entries, not a closed uni
 
   const teamValue = {
     strategy: { mode: "sequence", promptTemplate: "Coordinate.", maxRounds: 2 },
-    players: [{
-      name: "Builder",
-      role: "build",
-      order: 1,
-      promptTemplate: "Build.",
-      resources: [],
-      runtimePolicy: { filesystem: "worktree_write", network: "enabled", approvals: "on_request" }
-    }]
+    players: [
+      {
+        name: "Verifier",
+        role: "verify",
+        order: 2,
+        promptTemplate: "Verify.",
+        resources: [],
+        runtimePolicy: { filesystem: "read_only", network: "disabled", approvals: "never" }
+      },
+      {
+        name: "Builder",
+        role: "build",
+        order: 1,
+        promptTemplate: "Build.",
+        resources: [],
+        runtimePolicy: { filesystem: "worktree_write", network: "enabled", approvals: "on_request" }
+      }
+    ]
   } as const;
   assert.equal(team.decode(teamValue, "$.value").ok, true);
+  assert.equal(legacyTeam.decode(teamValue, "$.value").ok, true);
   assert.equal(team.decode({ ...teamValue, strategy: { ...teamValue.strategy, mode: "unknown" } }, "$.value").ok, false);
+  const duplicateOrder = {
+    ...teamValue,
+    players: [teamValue.players[0], { ...teamValue.players[1], order: 2 }]
+  } as const;
+  const gappedOrder = {
+    ...teamValue,
+    players: [teamValue.players[1], { ...teamValue.players[0], order: 3 }]
+  } as const;
+  assert.equal(legacyTeam.decode(duplicateOrder, "$.value").ok, true);
+  assert.equal(legacyTeam.decode(gappedOrder, "$.value").ok, true);
+  assert.equal(team.decode(duplicateOrder, "$.value").ok, false);
+  assert.equal(team.decode(gappedOrder, "$.value").ok, false);
+
+  const teamCapabilities = value(listRunnerTypeCapabilityDefinitions(registry))
+    .filter(capability => capability.type.key === BUNDLED_TEAM_TYPE_KEY);
+  assert.deepEqual(teamCapabilities.map(capability => capability.type.schemaVersion), [
+    BUNDLED_TEAM_LEGACY_TYPE_VERSION,
+    BUNDLED_TEAM_TYPE_VERSION
+  ]);
+});
+
+test("contiguous ordered array schemas lock exact item and order invariants", () => {
+  const itemSchema = {
+    type: "object",
+    properties: {
+      order: { type: "integer", minimum: 1, maximum: 3 },
+      label: { type: "string", minLength: 1, maxLength: 32 }
+    },
+    required: ["label", "order"],
+    additionalProperties: false
+  } as const;
+  const schema = {
+    type: "contiguous_ordered_array",
+    items: itemSchema,
+    minItems: 1,
+    maxItems: 3,
+    orderField: "order",
+    startAt: 1
+  } as const;
+  assert.deepEqual(value(decodeRunnerValueSchema(schema)), schema);
+
+  const invalid: readonly unknown[] = [
+    { ...schema, extra: true },
+    { ...schema, items: { type: "integer", minimum: 1, maximum: 3 } },
+    { ...schema, orderField: "missing" },
+    {
+      ...schema,
+      items: {
+        ...itemSchema,
+        properties: { ...itemSchema.properties, order: { type: "string", minLength: 1, maxLength: 3 } }
+      }
+    },
+    { ...schema, items: { ...itemSchema, required: ["label"] } },
+    {
+      ...schema,
+      items: {
+        ...itemSchema,
+        properties: { ...itemSchema.properties, order: { type: "integer", minimum: 1, maximum: 2 } }
+      }
+    }
+  ];
+  for (const candidate of invalid) assert.equal(decodeRunnerValueSchema(candidate).ok, false);
 });
 
 test("custom Runner payload decoder rejects extras, missing fields, wrong variants, and duplicates", () => {

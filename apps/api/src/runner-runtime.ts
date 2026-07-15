@@ -6,21 +6,26 @@ import {
 } from "@hunsu/protocol";
 import {
   BUNDLED_PLAYER_TYPE_KEY,
+  BUNDLED_PLAYER_TYPE_VERSION,
   BUNDLED_RUNNER_TYPE_ORIGIN,
-  BUNDLED_RUNNER_TYPE_VERSION,
   BUNDLED_TEAM_TYPE_KEY,
+  BUNDLED_TEAM_LEGACY_TYPE_VERSION,
+  BUNDLED_TEAM_TYPE_VERSION,
   createBundledDefinitionRegistry,
   createRunnerValueTypeRegistry,
   decodeDefinitionRegistry,
+  listRunnerTypeCapabilityDefinitions,
   resolveRegistryDefinition,
   resolveRunnerTypeDefinition,
   type DefinitionLock,
   type DefinitionRegistry,
   type RegistryError,
-  type RunnerExecutorContract
+  type RunnerExecutorContract,
+  type RunnerTypeCapabilityDefinition
 } from "@hunsu/protocol-registry";
 
 const trustedRunnerRuntimeBrand: unique symbol = Symbol("hunsu.trusted-runner-runtime");
+export const RUNNER_CAPABILITY_SCHEMA = "hunsu.runner-capability.v1" as const;
 
 export type RunnerExecution = {
   readonly instructions: string;
@@ -60,10 +65,21 @@ export type RunnerRuntimeResult<Value> =
   | { readonly ok: true; readonly value: Value }
   | { readonly ok: false; readonly error: RunnerRuntimeError };
 
+export type RunnerCapability = RunnerTypeCapabilityDefinition & {
+  readonly schema: typeof RUNNER_CAPABILITY_SCHEMA;
+  /**
+   * This attests only that the trusted server runtime can resolve RunContract
+   * v2. It does not claim that caller-side resources are installed or that a
+   * Run has already executed.
+   */
+  readonly runContractResolution: { readonly status: "available" };
+};
+
 export type TrustedRunnerRuntime = {
   readonly [trustedRunnerRuntimeBrand]: true;
   readonly registry: DefinitionRegistry;
   readonly runnerTypes: RunnerValueTypeRegistry;
+  readonly runnerCapabilities: readonly RunnerCapability[];
   readonly execute: (runner: RunnerValue) => RunnerRuntimeResult<RunnerExecution>;
 };
 
@@ -85,6 +101,8 @@ export function createTrustedRunnerRuntime(input: {
   const decodedRunnerTypes = createRunnerValueTypeRegistry(registry);
   if (!decodedRunnerTypes.ok) return registryFailure("invalid_registry", decodedRunnerTypes.error);
   const runnerTypes = decodedRunnerTypes.value;
+  const capabilityDefinitions = listRunnerTypeCapabilityDefinitions(registry);
+  if (!capabilityDefinitions.ok) return registryFailure("invalid_registry", capabilityDefinitions.error);
   const expectedExecutors = uniqueExecutors(registry);
   if (expectedExecutors.length === 0) {
     return failure("invalid_registry", "A trusted Runner runtime requires at least one registered Runner type.");
@@ -107,6 +125,11 @@ export function createTrustedRunnerRuntime(input: {
       return failure("missing_executor_adapter", `No trusted local executor adapter is registered for ${executorLabel(executor)}.`);
     }
   }
+  const runnerCapabilities: readonly RunnerCapability[] = capabilityDefinitions.value.map(definition => ({
+    schema: RUNNER_CAPABILITY_SCHEMA,
+    ...definition,
+    runContractResolution: { status: "available" }
+  }));
 
   return {
     ok: true,
@@ -114,6 +137,7 @@ export function createTrustedRunnerRuntime(input: {
       [trustedRunnerRuntimeBrand]: true,
       registry,
       runnerTypes,
+      runnerCapabilities,
       execute(runner) {
         const resolved = resolveRunnerTypeDefinition(registry, runner.type);
         if (!resolved.ok) return registryFailure("runner_type_mismatch", resolved.error);
@@ -154,9 +178,26 @@ export function createBundledRunnerExecutorAdapters(
   const official = createBundledDefinitionRegistry();
   if (!official.ok) return registryFailure("invalid_registry", official.error);
 
-  const player = exactBundledRunnerDefinition(registry.value, official.value, BUNDLED_PLAYER_TYPE_KEY);
+  const player = exactBundledRunnerDefinition(
+    registry.value,
+    official.value,
+    BUNDLED_PLAYER_TYPE_KEY,
+    BUNDLED_PLAYER_TYPE_VERSION
+  );
   if (!player.ok) return player;
-  const team = exactBundledRunnerDefinition(registry.value, official.value, BUNDLED_TEAM_TYPE_KEY);
+  const legacyTeam = exactBundledRunnerDefinition(
+    registry.value,
+    official.value,
+    BUNDLED_TEAM_TYPE_KEY,
+    BUNDLED_TEAM_LEGACY_TYPE_VERSION
+  );
+  if (!legacyTeam.ok) return legacyTeam;
+  const team = exactBundledRunnerDefinition(
+    registry.value,
+    official.value,
+    BUNDLED_TEAM_TYPE_KEY,
+    BUNDLED_TEAM_TYPE_VERSION
+  );
   if (!team.ok) return team;
 
   return {
@@ -170,17 +211,29 @@ export function createBundledRunnerExecutorAdapters(
         }
       },
       {
+        executor: legacyTeam.value,
+        execute(runner) {
+          const payload = runner.value as TeamRunnerPayload;
+          return runnerAdapterOk({
+            instructions: payload.strategy.promptTemplate,
+            toolPolicy: teamToolPolicy(payload.players)
+          });
+        }
+      },
+      {
         executor: team.value,
         execute(runner) {
           const payload = runner.value as TeamRunnerPayload;
-          const policies = payload.players.map(playerValue => playerValue.runtimePolicy);
+          const players = [...payload.players].sort((left, right) => left.order - right.order);
           return runnerAdapterOk({
-            instructions: payload.strategy.promptTemplate,
-            toolPolicy: {
-              filesystem: policies.some(policy => policy.filesystem === "worktree_write") ? "worktree_write" : "read_only",
-              network: policies.some(policy => policy.network === "enabled") ? "enabled" : "disabled",
-              approvals: policies.some(policy => policy.approvals === "on_request") ? "on_request" : "never"
-            }
+            instructions: [
+              `Team strategy mode: ${payload.strategy.mode}.`,
+              `Maximum rounds: ${payload.strategy.maxRounds}.`,
+              `Team instructions: ${payload.strategy.promptTemplate}`,
+              "Ordered players:",
+              ...players.map(playerValue => `${playerValue.order}. ${playerValue.name} [${playerValue.role}]: ${playerValue.promptTemplate}`)
+            ].join("\n"),
+            toolPolicy: teamToolPolicy(players)
           });
         }
       }
@@ -203,31 +256,32 @@ export const bundledRunnerRuntime: TrustedRunnerRuntime = createDefaultRuntime()
 function exactBundledRunnerDefinition(
   registry: DefinitionRegistry,
   official: DefinitionRegistry,
-  key: typeof BUNDLED_PLAYER_TYPE_KEY | typeof BUNDLED_TEAM_TYPE_KEY
+  key: typeof BUNDLED_PLAYER_TYPE_KEY | typeof BUNDLED_TEAM_TYPE_KEY,
+  version: string
 ): RunnerRuntimeResult<RunnerExecutorContract> {
-  const expected = runnerDefinition(official, key);
-  if (!expected) return failure("invalid_registry", `The official bundled Registry is missing ${key}.`);
+  const expected = runnerDefinition(official, key, version);
+  if (!expected) return failure("invalid_registry", `The official bundled Registry is missing ${key}@${version}.`);
   const candidate = registry.entries.find(entry =>
     entry.definition.kind === "runner_type"
     && entry.lock.origin === BUNDLED_RUNNER_TYPE_ORIGIN
     && entry.lock.key === key
-    && entry.lock.version === BUNDLED_RUNNER_TYPE_VERSION
+    && entry.lock.version === version
   );
   if (!candidate || candidate.definition.kind !== "runner_type") {
-    return failure("missing_executor_adapter", `The Registry does not contain the exact bundled Runner type ${key}.`);
+    return failure("missing_executor_adapter", `The Registry does not contain the exact bundled Runner type ${key}@${version}.`);
   }
   if (candidate.lock.integrity !== expected.lock.integrity) {
-    return failure("executor_lock_mismatch", `Bundled Runner type ${key} does not match its official integrity lock.`);
+    return failure("executor_lock_mismatch", `Bundled Runner type ${key}@${version} does not match its official integrity lock.`);
   }
   return { ok: true, value: candidate.definition.runnerType.executor };
 }
 
-function runnerDefinition(registry: DefinitionRegistry, key: string) {
+function runnerDefinition(registry: DefinitionRegistry, key: string, version: string) {
   return registry.entries.find(entry =>
     entry.definition.kind === "runner_type"
     && entry.lock.origin === BUNDLED_RUNNER_TYPE_ORIGIN
     && entry.lock.key === key
-    && entry.lock.version === BUNDLED_RUNNER_TYPE_VERSION
+    && entry.lock.version === version
   );
 }
 
@@ -375,6 +429,25 @@ type PlayerRunnerPayload = {
 };
 
 type TeamRunnerPayload = {
-  readonly strategy: { readonly promptTemplate: string };
-  readonly players: readonly { readonly runtimePolicy: ToolPolicy }[];
+  readonly strategy: {
+    readonly mode: "sequence" | "parallel" | "coordinated";
+    readonly promptTemplate: string;
+    readonly maxRounds: number;
+  };
+  readonly players: readonly {
+    readonly name: string;
+    readonly role: string;
+    readonly order: number;
+    readonly promptTemplate: string;
+    readonly runtimePolicy: ToolPolicy;
+  }[];
 };
+
+function teamToolPolicy(players: TeamRunnerPayload["players"]): ToolPolicy {
+  const policies = players.map(player => player.runtimePolicy);
+  return {
+    filesystem: policies.some(policy => policy.filesystem === "worktree_write") ? "worktree_write" : "read_only",
+    network: policies.some(policy => policy.network === "enabled") ? "enabled" : "disabled",
+    approvals: policies.some(policy => policy.approvals === "on_request") ? "on_request" : "never"
+  };
+}

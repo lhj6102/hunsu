@@ -47,6 +47,40 @@ export type RunnerTypeLock = {
   readonly integrity: RunnerTypeIntegrity;
 };
 
+export type RunnerCapabilityCatalogDigest = `hunsu-runner-capability-catalog-v1:sha256:${string}`;
+
+export type RunnerCapability = {
+  readonly schema: "hunsu.runner-capability.v1";
+  readonly type: RunnerTypeLock;
+  readonly displayName: string;
+  readonly valueSchema: {
+    readonly schema: "hunsu.runner-value-schema.v1";
+    readonly digest: `hunsu-runner-value-schema-v1:sha256:${string}`;
+    readonly root: CanonicalJsonValue;
+  };
+  readonly runContractResolution: { readonly status: "available" };
+};
+
+export type RunnerCapabilityRepositoryIdentity = {
+  readonly installationId: number;
+  readonly repositoryId: number;
+  readonly owner: string;
+  readonly name: string;
+  readonly defaultBranch: string;
+};
+
+export type RunnerCapabilityList = {
+  readonly repository: RunnerCapabilityRepositoryIdentity;
+  readonly catalogDigest: RunnerCapabilityCatalogDigest;
+  readonly capabilities: readonly RunnerCapability[];
+  readonly nextCursor: string | null;
+};
+
+export type RunnerCapabilityDetail = {
+  readonly repository: RunnerCapabilityRepositoryIdentity;
+  readonly capability: RunnerCapability;
+};
+
 export type RunnerValue = {
   readonly schema: "hunsu.runner-value.v1";
   readonly type: RunnerTypeLock;

@@ -18,7 +18,14 @@ import {
   decodeNodePlan,
   decodeRunnerValue
 } from "../packages/protocol/src/index.ts";
+import type {
+  RunnerCapabilityDetail,
+  RunnerCapabilityList
+} from "../packages/plugin-contract/src/index.ts";
 import {
+  BUNDLED_PLAYER_TYPE_VERSION,
+  BUNDLED_TEAM_LEGACY_TYPE_VERSION,
+  BUNDLED_TEAM_TYPE_VERSION,
   REGISTRY_DEFINITION_SCHEMA,
   createBundledDefinitionRegistry,
   createDefinitionRegistry,
@@ -53,9 +60,51 @@ const auth: AuthContext = {
   client: "mcp"
 };
 
-test("bundled Player and Team retain trusted local executor adapters", () => {
-  const teamType = bundledRunnerRuntime.runnerTypes.find(item => item.type.key === "runner.team")?.type;
+test("bundled Team 1.0 remains executable while Team 1.1 enforces contiguous order", () => {
+  assert.deepEqual(bundledRunnerRuntime.runnerCapabilities.map(capability =>
+    `${capability.type.key}@${capability.type.schemaVersion}`), [
+    `runner.player@${BUNDLED_PLAYER_TYPE_VERSION}`,
+    `runner.team@${BUNDLED_TEAM_LEGACY_TYPE_VERSION}`,
+    `runner.team@${BUNDLED_TEAM_TYPE_VERSION}`
+  ]);
+  for (const capability of bundledRunnerRuntime.runnerCapabilities) {
+    assert.equal(capability.schema, "hunsu.runner-capability.v1");
+    assert.equal(capability.runContractResolution.status, "available");
+    assert.match(capability.valueSchema.digest, /^hunsu-runner-value-schema-v1:sha256:[0-9a-f]{64}$/u);
+    assert.doesNotMatch(JSON.stringify(capability), /entrypoint|runner-executor|resource\.hunsu-codex-executor/u);
+  }
+  const legacyTeamType = bundledRunnerRuntime.runnerTypes.find(item =>
+    item.type.key === "runner.team" && item.type.schemaVersion === BUNDLED_TEAM_LEGACY_TYPE_VERSION)?.type;
+  const teamType = bundledRunnerRuntime.runnerTypes.find(item =>
+    item.type.key === "runner.team" && item.type.schemaVersion === BUNDLED_TEAM_TYPE_VERSION)?.type;
+  assert.ok(legacyTeamType);
   assert.ok(teamType);
+  const legacyTeam = decodeRunnerValue({
+    schema: "hunsu.runner-value.v1",
+    type: legacyTeamType,
+    name: "Legacy Verification Team",
+    value: {
+      strategy: { mode: "sequence", promptTemplate: "Use the preserved Team instructions.", maxRounds: 2 },
+      players: [{
+        name: "Legacy Verifier",
+        role: "Verify",
+        order: 7,
+        promptTemplate: "Verify.",
+        resources: [],
+        runtimePolicy: { filesystem: "read_only", network: "enabled", approvals: "on_request" }
+      }]
+    }
+  }, bundledRunnerRuntime.runnerTypes);
+  if (!legacyTeam.ok) assert.fail(legacyTeam.error.message);
+  const legacyExecution = bundledRunnerRuntime.execute(legacyTeam.value);
+  if (!legacyExecution.ok) assert.fail(legacyExecution.error.message);
+  assert.equal(legacyExecution.value.instructions, "Use the preserved Team instructions.");
+  assert.deepEqual(legacyExecution.value.toolPolicy, {
+    filesystem: "read_only",
+    network: "enabled",
+    approvals: "on_request"
+  });
+
   const team = decodeRunnerValue({
     schema: "hunsu.runner-value.v1",
     type: teamType,
@@ -64,20 +113,20 @@ test("bundled Player and Team retain trusted local executor adapters", () => {
       strategy: { mode: "sequence", promptTemplate: "Verify in sequence.", maxRounds: 2 },
       players: [
         {
-          name: "Builder",
-          role: "Build",
-          order: 1,
-          promptTemplate: "Build.",
-          resources: [],
-          runtimePolicy: { filesystem: "worktree_write", network: "disabled", approvals: "never" }
-        },
-        {
           name: "Verifier",
           role: "Verify",
           order: 2,
           promptTemplate: "Verify.",
           resources: [],
           runtimePolicy: { filesystem: "read_only", network: "enabled", approvals: "on_request" }
+        },
+        {
+          name: "Builder",
+          role: "Build",
+          order: 1,
+          promptTemplate: "Build.",
+          resources: [],
+          runtimePolicy: { filesystem: "worktree_write", network: "disabled", approvals: "never" }
         }
       ]
     }
@@ -85,12 +134,26 @@ test("bundled Player and Team retain trusted local executor adapters", () => {
   if (!team.ok) assert.fail(team.error.message);
   const execution = bundledRunnerRuntime.execute(team.value);
   if (!execution.ok) assert.fail(execution.error.message);
-  assert.equal(execution.value.instructions, "Verify in sequence.");
+  assert.equal(execution.value.instructions, [
+    "Team strategy mode: sequence.",
+    "Maximum rounds: 2.",
+    "Team instructions: Verify in sequence.",
+    "Ordered players:",
+    "1. Builder [Build]: Build.",
+    "2. Verifier [Verify]: Verify."
+  ].join("\n"));
   assert.deepEqual(execution.value.toolPolicy, {
     filesystem: "worktree_write",
     network: "enabled",
     approvals: "on_request"
   });
+  const invalidCurrent = decodeRunnerValue({
+    schema: "hunsu.runner-value.v1",
+    type: teamType,
+    name: "Invalid Current Team",
+    value: legacyTeam.value.value
+  }, bundledRunnerRuntime.runnerTypes);
+  assert.equal(invalidCurrent.ok, false);
 });
 
 test("trusted Runner runtime rejects missing and mismatched local executor adapters", () => {
@@ -116,6 +179,131 @@ test("trusted Runner runtime rejects missing and mismatched local executor adapt
   assert.equal(mismatched.error.code, "executor_lock_mismatch");
 });
 
+test("repository-scoped Runner capability MCP reads are exact, bounded, and catalog-bound", async () => {
+  const fixture = releaseTrainFixture();
+  const bundledAdapters = createBundledRunnerExecutorAdapters(fixture.registry);
+  if (!bundledAdapters.ok) assert.fail(bundledAdapters.error.message);
+  const runtimeResult = createTrustedRunnerRuntime({
+    registry: fixture.registry,
+    adapters: [...bundledAdapters.value, { executor: fixture.executor, execute: releaseTrainExecution }]
+  });
+  if (!runtimeResult.ok) assert.fail(runtimeResult.error.message);
+  const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport, runnerRuntime: runtimeResult.value });
+  const readAuth: AuthContext = {
+    ...auth,
+    installations: auth.installations.map(installation => ({
+      ...installation,
+      repositories: installation.repositories.map(item => ({
+        ...item,
+        permissions: { contents: "read" as const }
+      }))
+    }))
+  };
+
+  const first = await service.call("hunsu.runner_capabilities.list", {
+    repository: repositoryInput,
+    limit: 2
+  }, readAuth);
+  if (!first.ok) assert.fail(first.error.message);
+  assert.equal(first.stateHeadSha, undefined);
+  const firstPage = first.data as RunnerCapabilityList;
+  assert.deepEqual(firstPage.repository, {
+    installationId: repository.installationId,
+    repositoryId: repository.repositoryId,
+    owner: repository.owner,
+    name: repository.name,
+    defaultBranch: repository.defaultBranch
+  });
+  assert.match(firstPage.catalogDigest, /^hunsu-runner-capability-catalog-v1:sha256:[0-9a-f]{64}$/u);
+  assert.deepEqual(firstPage.capabilities.map(capability => capability.type.key), [
+    "runner.player",
+    "runner.release-train"
+  ]);
+  assert.match(firstPage.nextCursor ?? "", new RegExp(`^${firstPage.catalogDigest}:[1-9][0-9]*$`, "u"));
+  assert.doesNotMatch(
+    JSON.stringify(firstPage),
+    /entrypoint|runner-executor|release-train-executor/u
+  );
+
+  const second = await service.call("hunsu.runner_capabilities.list", {
+    repository: repositoryInput,
+    cursor: firstPage.nextCursor,
+    limit: 2
+  }, readAuth);
+  if (!second.ok) assert.fail(second.error.message);
+  const secondPage = second.data as RunnerCapabilityList;
+  assert.equal(secondPage.catalogDigest, firstPage.catalogDigest);
+  assert.deepEqual(secondPage.capabilities.map(capability =>
+    `${capability.type.key}@${capability.type.schemaVersion}`), [
+    `runner.team@${BUNDLED_TEAM_LEGACY_TYPE_VERSION}`,
+    `runner.team@${BUNDLED_TEAM_TYPE_VERSION}`
+  ]);
+  assert.equal(secondPage.nextCursor, null);
+
+  const detailResult = await service.call("hunsu.runner_capabilities.get", {
+    repository: repositoryInput,
+    type: fixture.runnerType
+  }, readAuth);
+  if (!detailResult.ok) assert.fail(detailResult.error.message);
+  const detail = detailResult.data as RunnerCapabilityDetail;
+  assert.deepEqual(detail.repository, firstPage.repository);
+  assert.equal(detail.capability.schema, "hunsu.runner-capability.v1");
+  assert.deepEqual(detail.capability.type, fixture.runnerType);
+  assert.equal(detail.capability.displayName, "Release Train");
+  assert.deepEqual(detail.capability.valueSchema.root, {
+    type: "object",
+    properties: {
+      stages: {
+        type: "array",
+        items: { type: "string", minLength: 1, maxLength: 128 },
+        minItems: 1,
+        maxItems: 16,
+        uniqueItems: true
+      },
+      strict: { type: "boolean" }
+    },
+    required: ["stages", "strict"],
+    additionalProperties: false
+  });
+  assert.deepEqual(detail.capability.runContractResolution, { status: "available" });
+  assert.doesNotMatch(JSON.stringify(detail), /entrypoint|runner-executor|release-train-executor/u);
+
+  const oversized = await service.call("hunsu.runner_capabilities.list", {
+    repository: repositoryInput,
+    limit: 51
+  }, readAuth);
+  assert.equal(oversized.ok, false);
+  if (!oversized.ok) assert.equal(oversized.error.code, "invalid_request");
+
+  const partial = await service.call("hunsu.runner_capabilities.get", {
+    repository: repositoryInput,
+    type: { key: "runner.release-train" }
+  }, readAuth);
+  assert.equal(partial.ok, false);
+  if (!partial.ok) assert.equal(partial.error.code, "invalid_request");
+
+  const unavailable = await service.call("hunsu.runner_capabilities.get", {
+    repository: repositoryInput,
+    type: { ...fixture.runnerType, integrity: `hunsu-runner-type-v1:sha256:${"f".repeat(64)}` }
+  }, readAuth);
+  assert.equal(unavailable.ok, false);
+  if (!unavailable.ok) assert.equal(unavailable.error.code, "not_found");
+
+  const bundledService = new HunsuApplicationService({ transport });
+  const stale = await bundledService.call("hunsu.runner_capabilities.list", {
+    repository: repositoryInput,
+    cursor: firstPage.nextCursor,
+    limit: 2
+  }, readAuth);
+  assert.equal(stale.ok, false);
+  if (!stale.ok) assert.equal(stale.error.code, "invalid_request");
+
+  const state = await transport.readBranch(repository, "hunsu/state");
+  if (!state.ok) assert.fail(state.error.message);
+  assert.equal(state.value, undefined, "read-only Runner discovery must not initialize or mutate repository state");
+});
+
 test("custom Release Train Runner creates, reconstructs, and starts with its trusted RunContract", async () => {
   const fixture = releaseTrainFixture();
   const bundledAdapters = createBundledRunnerExecutorAdapters(fixture.registry);
@@ -130,8 +318,35 @@ test("custom Release Train Runner creates, reconstructs, and starts with its tru
   assert.deepEqual(runtime.runnerTypes.map(item => String(item.type.key)).sort(), [
     "runner.player",
     "runner.release-train",
+    "runner.team",
     "runner.team"
   ]);
+  assert.deepEqual(runtime.runnerCapabilities.map(capability => capability.type.key), [
+    "runner.player",
+    "runner.release-train",
+    "runner.team",
+    "runner.team"
+  ]);
+  const releaseCapability = runtime.runnerCapabilities.find(capability => capability.type.key === "runner.release-train");
+  assert.ok(releaseCapability);
+  assert.deepEqual(releaseCapability.type, fixture.runnerType);
+  assert.equal(releaseCapability.displayName, "Release Train");
+  assert.deepEqual(releaseCapability.valueSchema.root, {
+    type: "object",
+    properties: {
+      stages: {
+        type: "array",
+        items: { type: "string", minLength: 1, maxLength: 128 },
+        minItems: 1,
+        maxItems: 16,
+        uniqueItems: true
+      },
+      strict: { type: "boolean" }
+    },
+    required: ["stages", "strict"],
+    additionalProperties: false
+  });
+  assert.doesNotMatch(JSON.stringify(releaseCapability), /entrypoint|runner-executor|release-train-executor/u);
 
   const initialPlan = {
     schema: "hunsu.node-plan.v1" as const,

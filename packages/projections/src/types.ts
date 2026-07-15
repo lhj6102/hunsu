@@ -142,11 +142,58 @@ export type EvidenceSummaryProjection = {
   readonly createdAt: string;
 };
 
-export type ComparisonSummaryProjection = {
+export type ComparisonDecisionProjection = {
+  readonly id: string;
+  readonly type: "selection" | "rejection";
+  readonly comparisonId: string;
+  readonly nodeShas: readonly string[];
+  readonly rationale: string;
+  readonly decidedAt: string;
+};
+
+type ComparisonProjectionBase = {
   readonly id: string;
   readonly summary: string;
-  readonly siblingNodeShas: readonly string[];
+  readonly nodeShas: readonly string[];
+  readonly disposition:
+    | { readonly type: "undecided" }
+    | { readonly type: "decisions_recorded"; readonly decisions: readonly ComparisonDecisionProjection[] };
   readonly recordedAt: string;
+};
+
+export type ComparisonSummaryProjection =
+  | (ComparisonProjectionBase & { readonly type: "sibling_runs"; readonly parentNodeSha: string })
+  | (ComparisonProjectionBase & {
+      readonly type: "coached_how_experiment";
+      readonly anchorNodeSha: string;
+      readonly goalDigest: string;
+    });
+
+export type CoachReviewProjection = {
+  readonly id: string;
+  readonly target:
+    | { readonly type: "node"; readonly nodeSha: string }
+    | { readonly type: "run"; readonly runId: string }
+    | { readonly type: "comparison"; readonly comparisonId: string };
+  readonly assessment: string;
+  readonly recommendations: readonly string[];
+  readonly recordedAt: string;
+};
+
+export type CoachingProposalProjection = {
+  readonly id: string;
+  readonly sourceNodeSha: string;
+  readonly sourcePayloadDigest: string;
+  readonly sourcePlanDigest: string;
+  readonly proposedPlanDigest: string;
+  readonly expectedStateSha: string;
+  readonly summary: string;
+  readonly rationale: string;
+  readonly proposedAt: string;
+  readonly disposition:
+    | { readonly type: "pending" }
+    | { readonly type: "confirmed"; readonly decisionId: string; readonly childNodeSha: string; readonly reason: string; readonly decidedAt: string }
+    | { readonly type: "rejected"; readonly decisionId: string; readonly reason: string; readonly decidedAt: string };
 };
 
 export type DecisionSummaryProjection =
@@ -155,6 +202,9 @@ export type DecisionSummaryProjection =
 
 export type NodeDetailProjection = {
   readonly sha: string;
+  /** Verified digest of the exact Node payload decoded for this detail view. */
+  readonly payloadDigest: string;
+  readonly planDigest: string;
   readonly title: string;
   readonly commitUrl: string;
   readonly treeSha: string;
@@ -172,6 +222,8 @@ export type NodeDetailProjection = {
   readonly evidence: readonly EvidenceSummaryProjection[];
   readonly comparisons: readonly ComparisonSummaryProjection[];
   readonly decisions: readonly DecisionSummaryProjection[];
+  readonly coachingProposals: readonly CoachingProposalProjection[];
+  readonly coachReviews: readonly CoachReviewProjection[];
 };
 
 export type RunDetailProjection = {

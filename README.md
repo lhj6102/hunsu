@@ -14,7 +14,7 @@ authorize GitHub
   -> push a result commit and attach evidence
   -> register the verified result as a Run child Node
   -> propose and separately confirm Coaching changes as a same-tree child Node
-  -> compare completed sibling Run Nodes
+  -> compare either structural sibling Runs or an exact coached-How experiment cohort
   -> explicitly reject and select alternatives
 ```
 
@@ -28,7 +28,8 @@ No local daemon, pairing ceremony, command-line setup, or workflow job is part o
 - A **Run** digests exactly one Goal and creates a child Node only after verified completion.
 - **Coaching** proposes a full replacement Node Plan and creates a metadata-only child commit only after separate confirmation.
 - Every non-root Node has one structural parent. Branching is allowed; merging is not.
-- A **Decision** decorates sibling alternatives without creating convergence edges.
+- A **Comparison** is either structural `sibling_runs` or a non-structural `coached_how_experiment`; neither creates an edge.
+- A **Decision** decorates a comparison cohort without creating convergence edges.
 
 See [Domain language](docs/domain-language.md) for the complete contract.
 

@@ -12,11 +12,15 @@ import {
 } from "../packages/core/src/index.ts";
 import { decodeNodeEnvelope, encodeNodeEnvelope } from "../packages/github-store/src/index.ts";
 import {
+  HISTORICAL_PROJECT_EVENT_SCHEMA,
   NODE_PLAN_SCHEMA,
   RUNNER_VALUE_SCHEMA,
   computeGoalDigest,
   computeNodePayloadDigest,
   computeNodePlanDigest,
+  computeRunnerDigest,
+  decodeDomainEvent,
+  encodeDomainEvent,
   makeAcceptanceCriterion,
   makeCoachingProposalId,
   makeCommandFingerprint,
@@ -52,6 +56,8 @@ import {
   nodePayloadFor,
   runBranchName,
   type CommandMetadata,
+  type CompletedRun,
+  type ComparisonId,
   type CoachingProposalId,
   type DomainActor,
   type DomainEvent,
@@ -69,7 +75,8 @@ import {
   type RootNode,
   type RunChildNode,
   type RunId,
-  type RunnerValue
+  type RunnerValue,
+  type RunnerValueTypeRegistry
 } from "../packages/protocol/src/index.ts";
 
 const integrity: ProjectIntegrityBoundary = {
@@ -156,19 +163,43 @@ test("Commit Node commands enforce one-Goal Runs, Coaching-only plan changes, si
   state = accept(state, completeCommand(state, fixture, secondRunId, sha("c"), tree("3"), 12), events);
   assert.equal(unresolvedDivergenceCount(state, fixture.project.id), 1);
 
+  const pendingRejectedSourceProposalId = take(makeCoachingProposalId("proposal_pending_before_rejection"));
+  state = accept(state, {
+    type: "RecordCoachingProposal",
+    meta: metadata(13, { type: "coach", id: text("coach-alpha") }),
+    proposal: {
+      id: pendingRejectedSourceProposalId,
+      projectId: fixture.project.id,
+      sourceNodeSha: firstChild.commitSha,
+      sourcePayloadDigest: firstChild.payloadDigest,
+      sourcePlanDigest: firstChild.planDigest,
+      proposedPlan: fixture.root.plan,
+      proposedPlanDigest: fixture.root.planDigest,
+      expectedStateSha: sha("f"),
+      summary: take(makeEvidenceSummary("Restore a Goal before the source decision.")),
+      rationale: reason("Verify confirmation revalidates the source disposition."),
+      proposedAt: time(13)
+    }
+  }, events);
+
   const comparisonId = take(makeComparisonId("comparison_alpha"));
   state = accept(state, {
     type: "CompareAlternatives",
+    comparisonType: "sibling_runs",
     meta: metadata(14, { type: "coach", id: text("coach-alpha") }),
     comparisonId,
     projectId: fixture.project.id,
     nodeShas: [sha("b"), sha("c")],
     findings: [{
       subject: text("Production evidence"),
-      summaries: [{ nodeSha: sha("b"), summary: take(makeEvidenceSummary("The first future passes.")) }]
+      summaries: [
+        { nodeSha: sha("b"), summary: take(makeEvidenceSummary("The first future passes.")) },
+        { nodeSha: sha("c"), summary: take(makeEvidenceSummary("The second future passes.")) }
+      ]
     }],
     summary: take(makeEvidenceSummary("Both sibling futures are verifiable."))
   }, events);
+  assert.equal(state.comparisons[0]?.type, "sibling_runs");
 
   const pluginRejection = applyProjectCommand(state, {
     type: "RejectAlternatives",
@@ -192,6 +223,28 @@ test("Commit Node commands enforce one-Goal Runs, Coaching-only plan changes, si
     rationale: reason("The second future has clearer evidence.")
   }, events);
   assert.equal(unresolvedDivergenceCount(state, fixture.project.id), 1);
+
+  const rejectedSourceChild = coachingNode(
+    fixture.project,
+    firstChild,
+    pendingRejectedSourceProposalId,
+    fixture.root.plan,
+    sha("e"),
+    firstChild.treeSha,
+    time(17)
+  );
+  const confirmAfterSourceRejection = applyProjectCommand(state, {
+    type: "ConfirmCoachingProposal",
+    meta: metadata(17),
+    nodeEventId: eventId(117),
+    decisionId: take(makeDecisionId("decision_confirm_rejected_source")),
+    proposalId: pendingRejectedSourceProposalId,
+    reason: reason("Attempt to continue the rejected source."),
+    node: rejectedSourceChild,
+    payload: envelope(rejectedSourceChild)
+  });
+  assert.equal(confirmAfterSourceRejection.ok, false);
+  if (!confirmAfterSourceRejection.ok) assert.match(confirmAfterSourceRejection.error.message, /Rejected Nodes/u);
 
   const automaticSelection = applyProjectCommand(state, {
     type: "SelectAlternative",
@@ -228,7 +281,8 @@ test("Commit Node commands enforce one-Goal Runs, Coaching-only plan changes, si
       proposedPlan: fixture.root.plan,
       proposedPlanDigest: fixture.root.planDigest,
       expectedStateSha: sha("f"),
-      reason: reason("Attempt to continue a rejected future."),
+      summary: take(makeEvidenceSummary("Restore the original plan on the rejected result.")),
+      rationale: reason("Attempt to continue a rejected future."),
       proposedAt: time(19)
     }
   });
@@ -250,11 +304,14 @@ test("Commit Node commands enforce one-Goal Runs, Coaching-only plan changes, si
       proposedPlan: coachedPlan,
       proposedPlanDigest: computeNodePlanDigest(coachedPlan),
       expectedStateSha: sha("f"),
-      reason: reason("Add the next product outcome."),
+      summary: take(makeEvidenceSummary("Add a follow-up resilience Goal.")),
+      rationale: reason("Add the next product outcome."),
       proposedAt: time(20)
     }
   }, events);
   assert.equal(state.nodes.length, 3, "a proposal alone creates no Node");
+  assert.equal(state.coachingProposals.at(-1)?.summary, "Add a follow-up resilience Goal.");
+  assert.equal(state.coachingProposals.at(-1)?.rationale, "Add the next product outcome.");
 
   const coachingSha = sha("d");
   const wrongTreeNode = coachingNode(fixture.project, selectedChild, proposalId, coachedPlan, coachingSha, tree("9"), time(22));
@@ -298,7 +355,8 @@ test("Commit Node commands enforce one-Goal Runs, Coaching-only plan changes, si
       proposedPlan: correctNode.plan,
       proposedPlanDigest: correctNode.planDigest,
       expectedStateSha: sha("f"),
-      reason: reason("No actual plan change."),
+      summary: take(makeEvidenceSummary("Leave the Node Plan unchanged.")),
+      rationale: reason("No actual plan change."),
       proposedAt: time(26)
     }
   });
@@ -349,6 +407,33 @@ test("Commit Node commands enforce one-Goal Runs, Coaching-only plan changes, si
   assert.equal(replayed.ok, true);
   if (replayed.ok) assert.deepEqual(replayed.value, state);
 
+  const historicalRunnerTypes = runnerTypesFor(fixture.runner);
+  let removedHistoricalSummary = false;
+  const historicalEvents = events.map(event => {
+    const historical = historicalV2Fixture(event, !removedHistoricalSummary);
+    if (event.type === "AlternativesCompared" && event.comparison.type === "sibling_runs") {
+      removedHistoricalSummary = true;
+    }
+    const decoded = decodeDomainEvent(historical, historicalRunnerTypes);
+    if (!decoded.ok) assert.fail(`Historical v2 fixture failed at ${decoded.error.path}: ${decoded.error.message}`);
+    return decoded.value;
+  });
+  assert.equal(removedHistoricalSummary, true, "the replay fixture must exercise an incomplete historical finding");
+  const historicalReplay = replayDomainEvents(historicalEvents);
+  assert.equal(historicalReplay.ok, true);
+  if (historicalReplay.ok) {
+    const historicalProposal = historicalReplay.value.coachingProposals[0];
+    assert.ok(historicalProposal);
+    assert.equal(historicalProposal.summary, historicalProposal.rationale);
+    const historicalComparison = historicalReplay.value.comparisons[0];
+    assert.ok(historicalComparison);
+    assert.equal(historicalComparison.type, "sibling_runs");
+    assert.deepEqual(
+      historicalComparison.findings[0]?.summaries.map(item => item.nodeSha),
+      historicalComparison.nodeShas
+    );
+  }
+
   const duplicateEvent = applyDomainEvent(state, events[0]!);
   assert.equal(duplicateEvent.ok, false);
   if (!duplicateEvent.ok) assert.equal(duplicateEvent.error.code, "INVALID_EVENT");
@@ -396,7 +481,8 @@ test("Coaching proposals bind the source payload and exact command state head", 
     proposedPlan: changedPlan,
     proposedPlanDigest: computeNodePlanDigest(changedPlan),
     expectedStateSha: sha("f"),
-    reason: reason("Bind the complete source Node."),
+    summary: take(makeEvidenceSummary("Bind a follow-up Goal to the complete source Node.")),
+    rationale: reason("Bind the complete source Node."),
     proposedAt: time(45)
   };
   const wrongPayload = applyProjectCommand(created.value.state, {
@@ -444,6 +530,183 @@ test("domain replay rejects incomplete and invalid multi-event command batches",
   if (!reversed.ok) assert.match(reversed.error.message, /incomplete or invalid/u);
 });
 
+test("Coached How experiments compare one completed result per confirmed How source and resolve as one explicit cohort", () => {
+  const experiment = makeCoachedHowExperimentState();
+  const originalTopology = experiment.state.nodes;
+  assert.equal(unresolvedDivergenceCount(experiment.state, experiment.fixture.project.id), 0);
+
+  const comparisonId = take(makeComparisonId("comparison_coached_how"));
+  let state = accept(experiment.state, coachedHowComparisonCommand(experiment, comparisonId, 60), []);
+  const comparison = state.comparisons[0];
+  assert.equal(comparison?.type, "coached_how_experiment");
+  if (comparison?.type !== "coached_how_experiment") assert.fail("expected a Coached How experiment comparison");
+  assert.equal(comparison.anchorNodeSha, experiment.fixture.root.commitSha);
+  assert.equal(comparison.goalDigest, experiment.fixture.goalDigest);
+  assert.equal(unresolvedDivergenceCount(state, experiment.fixture.project.id), 1);
+  assert.deepEqual(state.nodes, originalTopology, "comparison cannot alter structural Nodes or edges");
+
+  const repeatedComparisonId = take(makeComparisonId("comparison_coached_how_repeat"));
+  state = accept(state, coachedHowComparisonCommand(experiment, repeatedComparisonId, 61), []);
+  assert.equal(unresolvedDivergenceCount(state, experiment.fixture.project.id), 1, "repeated comparisons share one explicit cohort");
+
+  state = accept(state, {
+    type: "RejectAlternatives",
+    meta: metadata(62),
+    decisionId: take(makeDecisionId("decision_reject_baseline_how")),
+    projectId: experiment.fixture.project.id,
+    comparisonId,
+    rejectedNodeShas: [experiment.baselineResult.commitSha],
+    rationale: reason("The coached How produced stronger evidence.")
+  }, []);
+  assert.equal(unresolvedDivergenceCount(state, experiment.fixture.project.id), 1);
+
+  state = accept(state, {
+    type: "SelectAlternative",
+    meta: metadata(63),
+    decisionId: take(makeDecisionId("decision_select_coached_how")),
+    projectId: experiment.fixture.project.id,
+    comparisonId,
+    selectedNodeSha: experiment.coachedResult.commitSha,
+    rationale: reason("Select the result from the coached How.")
+  }, []);
+  assert.equal(unresolvedDivergenceCount(state, experiment.fixture.project.id), 0);
+  assert.deepEqual(state.nodes, originalTopology, "decisions decorate result Nodes without changing structural edges");
+
+  const secondSelection = applyProjectCommand(state, {
+    type: "SelectAlternative",
+    meta: metadata(64),
+    decisionId: take(makeDecisionId("decision_select_same_cohort_twice")),
+    projectId: experiment.fixture.project.id,
+    comparisonId: repeatedComparisonId,
+    selectedNodeSha: experiment.coachedResult.commitSha,
+    rationale: reason("Attempt another selection through a repeated comparison.")
+  });
+  assert.equal(secondSelection.ok, false);
+  if (!secondSelection.ok) assert.match(secondSelection.error.message, /cohort already has a selected future/u);
+});
+
+test("Coached How experiment validation rejects forged candidates, unconfirmed sources, plan drift, and overlapping cohort identities", () => {
+  const experiment = makeCoachedHowExperimentState();
+  const command = coachedHowComparisonCommand(experiment, take(makeComparisonId("comparison_invalid_coached_how")), 70);
+
+  const unconfirmed = applyProjectCommand({ ...experiment.state, coachingProposalDecisions: [] }, command);
+  assert.equal(unconfirmed.ok, false);
+  if (!unconfirmed.ok) assert.match(unconfirmed.error.message, /directly confirmed Coaching proposal/u);
+
+  const forgedRun: CompletedRun = { ...experiment.coachedRun, resultNodeSha: sha("9") };
+  const forged = applyProjectCommand({
+    ...experiment.state,
+    runs: experiment.state.runs.map(run => run.id === forgedRun.id ? forgedRun : run)
+  }, command);
+  assert.equal(forged.ok, false);
+  if (!forged.ok) assert.match(forged.error.message, /actual completed Run/u);
+
+  const wrongTreeSource = { ...experiment.coachedSource, treeSha: tree("9") };
+  const wrongTree = applyProjectCommand({
+    ...experiment.state,
+    nodes: experiment.state.nodes.map(node => node.commitSha === wrongTreeSource.commitSha ? wrongTreeSource : node)
+  }, command);
+  assert.equal(wrongTree.ok, false);
+  if (!wrongTree.ok) assert.match(wrongTree.error.message, /preserve the anchor tree SHA/u);
+
+  const driftedPlan: NodePlan = {
+    ...experiment.coachedSource.plan,
+    nextGoals: [experiment.fixture.goal, experiment.fixture.followupGoal]
+  };
+  const driftedSource = {
+    ...experiment.coachedSource,
+    plan: driftedPlan,
+    planDigest: computeNodePlanDigest(driftedPlan)
+  };
+  const planDrift = applyProjectCommand({
+    ...experiment.state,
+    nodes: experiment.state.nodes.map(node => node.commitSha === driftedSource.commitSha ? driftedSource : node),
+    coachingProposals: experiment.state.coachingProposals.map(proposal => proposal.id === driftedSource.proposalId
+      ? { ...proposal, proposedPlan: driftedPlan, proposedPlanDigest: driftedSource.planDigest }
+      : proposal)
+  }, command);
+  assert.equal(planDrift.ok, false);
+  if (!planDrift.ok) assert.match(planDrift.error.message, /byte-identical except for How/u);
+
+  const otherGoalDigest = computeGoalDigest(experiment.fixture.followupGoal);
+  const otherGoalPlan: NodePlan = { ...experiment.coachedSource.plan, nextGoals: [experiment.fixture.followupGoal] };
+  const otherGoalSource = {
+    ...experiment.coachedSource,
+    plan: otherGoalPlan,
+    planDigest: computeNodePlanDigest(otherGoalPlan)
+  };
+  const otherGoalResult = { ...experiment.coachedResult, consumedGoalDigest: otherGoalDigest };
+  const otherGoalRun: CompletedRun = {
+    ...experiment.coachedRun,
+    goal: experiment.fixture.followupGoal,
+    goalDigest: otherGoalDigest
+  };
+  const mismatchedGoal = applyProjectCommand({
+    ...experiment.state,
+    nodes: experiment.state.nodes.map(node => {
+      if (node.commitSha === otherGoalSource.commitSha) return otherGoalSource;
+      if (node.commitSha === otherGoalResult.commitSha) return otherGoalResult;
+      return node;
+    }),
+    runs: experiment.state.runs.map(run => run.id === otherGoalRun.id ? otherGoalRun : run)
+  }, command);
+  assert.equal(mismatchedGoal.ok, false);
+  if (!mismatchedGoal.ok) assert.match(mismatchedGoal.error.message, /same canonical Goal/u);
+
+  const incompleteFinding = applyProjectCommand(experiment.state, {
+    ...command,
+    meta: metadata(71, { type: "coach", id: text("coach-alpha") }),
+    comparisonId: take(makeComparisonId("comparison_incomplete_finding")),
+    findings: [{
+      subject: text("Acceptance criterion"),
+      summaries: [{ nodeSha: experiment.baselineResult.commitSha, summary: take(makeEvidenceSummary("Only one candidate.")) }]
+    }]
+  });
+  assert.equal(incompleteFinding.ok, false);
+  if (!incompleteFinding.ok) assert.match(incompleteFinding.error.message, /every included result Node exactly once/u);
+
+  const secondBaselineRunId = runId("run_second_baseline_how");
+  const secondBaselineResult = runChildNode(
+    experiment.fixture.project,
+    experiment.fixture.root,
+    secondBaselineRunId,
+    experiment.fixture.goalDigest,
+    experiment.baselineResult.plan,
+    sha("e"),
+    tree("4"),
+    time(72)
+  );
+  const secondBaselineRun = completedRunFor(
+    experiment.fixture,
+    experiment.fixture.root,
+    secondBaselineResult,
+    secondBaselineRunId,
+    time(72)
+  );
+  const stateWithSibling: ProjectState = {
+    ...experiment.state,
+    nodes: [...experiment.state.nodes, secondBaselineResult],
+    runs: [...experiment.state.runs, secondBaselineRun]
+  };
+  const overlappingState = accept(stateWithSibling, {
+    type: "CompareAlternatives",
+    comparisonType: "sibling_runs",
+    meta: metadata(72, { type: "coach", id: text("coach-alpha") }),
+    comparisonId: take(makeComparisonId("comparison_overlapping_sibling")),
+    projectId: experiment.fixture.project.id,
+    nodeShas: [experiment.baselineResult.commitSha, secondBaselineResult.commitSha],
+    findings: [],
+    summary: take(makeEvidenceSummary("Compare two baseline sibling results."))
+  }, []);
+  const overlap = applyProjectCommand(overlappingState, {
+    ...command,
+    meta: metadata(73, { type: "coach", id: text("coach-alpha") }),
+    comparisonId: take(makeComparisonId("comparison_overlap_coached"))
+  });
+  assert.equal(overlap.ok, false);
+  if (!overlap.ok) assert.match(overlap.error.message, /same explicit cohort key/u);
+});
+
 test("alternative decisions cannot dispose identical commit SHAs in another Project", () => {
   const first = makeFixture();
   const secondProjectId = take(makeProjectId("project_beta"));
@@ -481,6 +744,130 @@ test("alternative decisions cannot dispose identical commit SHAs in another Proj
   };
   assert.equal(unresolvedDivergenceCount(state, first.project.id), 1);
 });
+
+function makeCoachedHowExperimentState() {
+  const fixture = makeFixture();
+  const coachedRunner: RunnerValue = {
+    ...fixture.runner,
+    name: text("Coached QA verification swarm"),
+    value: { prompt: "Verify production with the coached strategy." }
+  };
+  const coachedPlan: NodePlan = { ...fixture.root.plan, how: coachedRunner };
+  const proposalId = take(makeCoachingProposalId("proposal_coached_how_experiment"));
+  const coachedSource = coachingNode(
+    fixture.project,
+    fixture.root,
+    proposalId,
+    coachedPlan,
+    sha("b"),
+    fixture.root.treeSha,
+    time(50)
+  );
+  const baselineRunId = runId("run_baseline_how");
+  const coachedRunId = runId("run_coached_how");
+  const baselineResultPlan: NodePlan = { ...fixture.root.plan, nextGoals: [] };
+  const coachedResultPlan: NodePlan = { ...coachedSource.plan, nextGoals: [] };
+  const baselineResult = runChildNode(
+    fixture.project,
+    fixture.root,
+    baselineRunId,
+    fixture.goalDigest,
+    baselineResultPlan,
+    sha("c"),
+    tree("2"),
+    time(51)
+  );
+  const coachedResult = runChildNode(
+    fixture.project,
+    coachedSource,
+    coachedRunId,
+    fixture.goalDigest,
+    coachedResultPlan,
+    sha("d"),
+    tree("3"),
+    time(52)
+  );
+  const baselineRun = completedRunFor(fixture, fixture.root, baselineResult, baselineRunId, time(51));
+  const coachedRun = completedRunFor(fixture, coachedSource, coachedResult, coachedRunId, time(52));
+  const state: ProjectState = {
+    ...emptyProjectState(),
+    projects: [fixture.project],
+    nodes: [fixture.root, coachedSource, baselineResult, coachedResult],
+    runs: [baselineRun, coachedRun],
+    coachingProposals: [{
+      id: proposalId,
+      projectId: fixture.project.id,
+      sourceNodeSha: fixture.root.commitSha,
+      sourcePayloadDigest: fixture.root.payloadDigest,
+      sourcePlanDigest: fixture.root.planDigest,
+      proposedPlan: coachedPlan,
+      proposedPlanDigest: computeNodePlanDigest(coachedPlan),
+      expectedStateSha: sha("f"),
+      summary: take(makeEvidenceSummary("Use a coached How against the same Goal and source tree.")),
+      rationale: reason("Compare the baseline and coached execution strategies."),
+      proposedAt: time(49)
+    }],
+    coachingProposalDecisions: [{
+      status: "confirmed",
+      id: take(makeDecisionId("decision_confirm_coached_how")),
+      proposalId,
+      childNodeSha: coachedSource.commitSha,
+      reason: reason("Confirm the coached How experiment source."),
+      decidedAt: time(50)
+    }]
+  };
+  return { fixture, state, coachedSource, baselineResult, coachedResult, baselineRun, coachedRun };
+}
+
+function completedRunFor(
+  fixture: ReturnType<typeof makeFixture>,
+  source: Node,
+  result: RunChildNode,
+  id: RunId,
+  completedAt: IsoTimestamp
+): CompletedRun {
+  return {
+    status: "completed",
+    id,
+    projectId: fixture.project.id,
+    sourceNodeSha: source.commitSha,
+    goal: fixture.goal,
+    goalDigest: fixture.goalDigest,
+    runner: source.plan.how,
+    runnerDigest: computeRunnerDigest(source.plan.how),
+    branch: runBranchName(fixture.project.id, source.commitSha, id),
+    checkpoints: [],
+    evidenceIds: [],
+    startedAt: time(48),
+    resultNodeSha: result.commitSha,
+    verifiedAt: completedAt,
+    completedAt
+  };
+}
+
+function coachedHowComparisonCommand(
+  experiment: ReturnType<typeof makeCoachedHowExperimentState>,
+  comparisonId: ComparisonId,
+  sequence: number
+): Extract<ProjectCommand, { type: "CompareAlternatives"; comparisonType: "coached_how_experiment" }> {
+  return {
+    type: "CompareAlternatives",
+    comparisonType: "coached_how_experiment",
+    meta: metadata(sequence, { type: "coach", id: text("coach-alpha") }),
+    comparisonId,
+    projectId: experiment.fixture.project.id,
+    anchorNodeSha: experiment.fixture.root.commitSha,
+    nodeShas: [experiment.baselineResult.commitSha, experiment.coachedResult.commitSha],
+    findings: [{
+      subject: text("Acceptance criterion"),
+      summaries: [
+        { nodeSha: experiment.baselineResult.commitSha, summary: take(makeEvidenceSummary("Baseline evidence satisfies the criterion.")) },
+        { nodeSha: experiment.coachedResult.commitSha, summary: take(makeEvidenceSummary("Coached evidence satisfies the criterion.")) }
+      ]
+    }],
+    summary: take(makeEvidenceSummary("Compare the same Goal through baseline and coached How values."))
+  };
+}
 
 function makeFixture(): {
   project: Project;
@@ -711,6 +1098,50 @@ function text(value: string) {
 
 function reason(value: string) {
   return take(makeReason(value));
+}
+
+function runnerTypesFor(runner: RunnerValue): RunnerValueTypeRegistry {
+  return [{
+    type: runner.type,
+    decode(value, path) {
+      if (typeof value === "object"
+        && value !== null
+        && !Array.isArray(value)
+        && Object.keys(value).length === 1
+        && typeof (value as { prompt?: unknown }).prompt === "string"
+      ) {
+        return { ok: true, value: { prompt: (value as { prompt: string }).prompt } };
+      }
+      return {
+        ok: false,
+        error: { type: "RunnerValueDecodeError", path, message: "payload must contain exactly prompt" }
+      };
+    }
+  }];
+}
+
+/** Exact origin/main v2 shapes: one proposal reason and no comparison discriminant. */
+function historicalV2Fixture(event: DomainEvent, removeOneComparisonSummary: boolean): string {
+  const envelope = JSON.parse(encodeDomainEvent(event)) as {
+    schema: string;
+    event: Record<string, unknown>;
+  };
+  if (event.type === "CoachingProposalRecorded") {
+    const proposal = envelope.event.proposal as Record<string, unknown>;
+    delete proposal.summary;
+    delete proposal.rationale;
+    proposal.reason = event.proposal.rationale;
+    envelope.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  } else if (event.type === "AlternativesCompared" && event.comparison.type === "sibling_runs") {
+    const comparison = envelope.event.comparison as Record<string, unknown>;
+    delete comparison.type;
+    if (removeOneComparisonSummary) {
+      const findings = comparison.findings as Array<{ summaries: unknown[] }>;
+      findings[0]?.summaries.pop();
+    }
+    envelope.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  }
+  return JSON.stringify(envelope);
 }
 
 function take<T, E>(result: Result<T, E>): T {

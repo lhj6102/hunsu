@@ -1,4 +1,4 @@
 interface:
   display_name: "Hunsu Coach"
-  short_description: "Review and propose Node Plan transitions."
-  default_prompt: "Use $hunsu-coach to review this Node and propose an evidence-grounded Coaching transition."
+  short_description: "Recover, review, and propose Node Plan transitions."
+  default_prompt: "Use $hunsu-coach to recover recorded Coach state, review this Node, resolve any changed How capability, and propose an evidence-grounded transition."

@@ -83,7 +83,8 @@ import {
   type RunnerDigest
 } from "./primitives.ts";
 
-export const PROJECT_EVENT_SCHEMA = "hunsu.project-event.v2" as const;
+export const PROJECT_EVENT_SCHEMA = "hunsu.project-event.v3" as const;
+export const HISTORICAL_PROJECT_EVENT_SCHEMA = "hunsu.project-event.v2" as const;
 export const PROJECT_STATE_SCHEMA = "hunsu.project-state.v2" as const;
 
 export type ProtocolCodecError = {
@@ -104,10 +105,16 @@ export function decodeDomainEvent(
   if (!parsed.ok) return parsed;
   const root = exactRecord(parsed.value, "$", ["schema", "event"]);
   if (!root.ok) return root;
-  if (root.value.schema !== PROJECT_EVENT_SCHEMA) {
-    return invalid("$.schema", `schema must be ${PROJECT_EVENT_SCHEMA}`);
+  if (root.value.schema === PROJECT_EVENT_SCHEMA) {
+    return decodeEvent(root.value.event, "$.event", runnerTypes);
   }
-  return decodeEvent(root.value.event, "$.event", runnerTypes);
+  if (root.value.schema === HISTORICAL_PROJECT_EVENT_SCHEMA) {
+    return decodeHistoricalV2Event(root.value.event, "$.event", runnerTypes);
+  }
+  return invalid(
+    "$.schema",
+    `schema must be ${PROJECT_EVENT_SCHEMA} or ${HISTORICAL_PROJECT_EVENT_SCHEMA}`
+  );
 }
 
 export function encodeProjectState(state: ProjectState): string {
@@ -478,7 +485,56 @@ function decodeEvent(
       return invalid(`${path}.decision.type`, "event type and alternative decision type must agree");
     }
     default:
-      return invalid(`${path}.type`, "unsupported v2 event type");
+      return invalid(`${path}.type`, "unsupported v3 event type");
+  }
+}
+
+/**
+ * Freeze the exact event variants emitted by the original v2 runtime. Only the
+ * two shapes that changed in v3 are normalized; every other variant continues
+ * through the same exact-field decoder because its v2 and v3 representation is
+ * byte-for-byte identical.
+ */
+function decodeHistoricalV2Event(
+  value: unknown,
+  path: string,
+  runnerTypes: RunnerValueTypeRegistry
+): Result<DomainEvent, ProtocolCodecError> {
+  if (!isRecord(value) || typeof value.type !== "string") return invalid(path, "event must be a typed object");
+  const meta = decodeEventMetadata(value.meta, `${path}.meta`);
+  if (!meta.ok) return meta;
+  switch (value.type) {
+    case "CoachingProposalRecorded": {
+      const record = exactRecord(value, path, ["type", "meta", "proposal"]);
+      if (!record.ok) return record;
+      const proposal = decodeHistoricalV2CoachingProposal(record.value.proposal, `${path}.proposal`, runnerTypes);
+      return proposal.ok ? ok({ type: "CoachingProposalRecorded", meta: meta.value, proposal: proposal.value }) : proposal;
+    }
+    case "AlternativesCompared": {
+      const record = exactRecord(value, path, ["type", "meta", "comparison"]);
+      if (!record.ok) return record;
+      const comparison = decodeHistoricalV2Comparison(record.value.comparison, `${path}.comparison`);
+      return comparison.ok ? ok({ type: "AlternativesCompared", meta: meta.value, comparison: comparison.value }) : comparison;
+    }
+    case "ProjectCreated":
+    case "ProjectMaterializationsRebuilt":
+    case "RootNodeRegistered":
+    case "RunStarted":
+    case "RunCheckpointed":
+    case "RunEvidenceAttached":
+    case "RunCompleted":
+    case "RunChildNodeRegistered":
+    case "RunFailed":
+    case "RunCanceled":
+    case "CoachReviewRecorded":
+    case "CoachingProposalConfirmed":
+    case "CoachingProposalRejected":
+    case "CoachingChildNodeRegistered":
+    case "AlternativeSelected":
+    case "AlternativesRejected":
+      return decodeEvent(value, path, runnerTypes);
+    default:
+      return invalid(`${path}.type`, "unsupported historical v2 event type");
   }
 }
 
@@ -838,6 +894,52 @@ function decodeCoachReview(value: unknown, path: string): Result<CoachReview, Pr
 function decodeCoachingProposal(value: unknown, path: string, runnerTypes: RunnerValueTypeRegistry): Result<CoachingProposal, ProtocolCodecError> {
   const record = exactRecord(value, path, [
     "id", "projectId", "sourceNodeSha", "sourcePayloadDigest", "sourcePlanDigest",
+    "proposedPlan", "proposedPlanDigest", "expectedStateSha", "summary", "rationale", "proposedAt"
+  ]);
+  if (!record.ok) return record;
+  const id = primitive(makeCoachingProposalId(record.value.id), `${path}.id`);
+  if (!id.ok) return id;
+  const projectId = primitive(makeProjectId(record.value.projectId), `${path}.projectId`);
+  if (!projectId.ok) return projectId;
+  const sourceNodeSha = primitive(makeGitCommitSha(record.value.sourceNodeSha, `${path}.sourceNodeSha`), `${path}.sourceNodeSha`);
+  if (!sourceNodeSha.ok) return sourceNodeSha;
+  const sourcePayloadDigest = primitive(makeNodePayloadDigest(record.value.sourcePayloadDigest), `${path}.sourcePayloadDigest`);
+  if (!sourcePayloadDigest.ok) return sourcePayloadDigest;
+  const sourcePlanDigest = primitive(makeNodePlanDigest(record.value.sourcePlanDigest), `${path}.sourcePlanDigest`);
+  if (!sourcePlanDigest.ok) return sourcePlanDigest;
+  const proposedPlan = decodeNodePlan(record.value.proposedPlan, runnerTypes, `${path}.proposedPlan`);
+  if (!proposedPlan.ok) return proposedPlan;
+  const proposedPlanDigest = primitive(makeNodePlanDigest(record.value.proposedPlanDigest), `${path}.proposedPlanDigest`);
+  if (!proposedPlanDigest.ok) return proposedPlanDigest;
+  const expectedStateSha = primitive(makeGitCommitSha(record.value.expectedStateSha, `${path}.expectedStateSha`), `${path}.expectedStateSha`);
+  if (!expectedStateSha.ok) return expectedStateSha;
+  const summary = primitive(makeEvidenceSummary(record.value.summary, `${path}.summary`), `${path}.summary`);
+  if (!summary.ok) return summary;
+  const rationale = primitive(makeReason(record.value.rationale, `${path}.rationale`), `${path}.rationale`);
+  if (!rationale.ok) return rationale;
+  const proposedAt = primitive(makeIsoTimestamp(record.value.proposedAt, `${path}.proposedAt`), `${path}.proposedAt`);
+  return proposedAt.ok ? ok({
+    id: id.value,
+    projectId: projectId.value,
+    sourceNodeSha: sourceNodeSha.value,
+    sourcePayloadDigest: sourcePayloadDigest.value,
+    sourcePlanDigest: sourcePlanDigest.value,
+    proposedPlan: proposedPlan.value,
+    proposedPlanDigest: proposedPlanDigest.value,
+    expectedStateSha: expectedStateSha.value,
+    summary: summary.value,
+    rationale: rationale.value,
+    proposedAt: proposedAt.value
+  }) : proposedAt;
+}
+
+function decodeHistoricalV2CoachingProposal(
+  value: unknown,
+  path: string,
+  runnerTypes: RunnerValueTypeRegistry
+): Result<CoachingProposal, ProtocolCodecError> {
+  const record = exactRecord(value, path, [
+    "id", "projectId", "sourceNodeSha", "sourcePayloadDigest", "sourcePlanDigest",
     "proposedPlan", "proposedPlanDigest", "expectedStateSha", "reason", "proposedAt"
   ]);
   if (!record.ok) return record;
@@ -857,8 +959,10 @@ function decodeCoachingProposal(value: unknown, path: string, runnerTypes: Runne
   if (!proposedPlanDigest.ok) return proposedPlanDigest;
   const expectedStateSha = primitive(makeGitCommitSha(record.value.expectedStateSha, `${path}.expectedStateSha`), `${path}.expectedStateSha`);
   if (!expectedStateSha.ok) return expectedStateSha;
-  const reason = primitive(makeReason(record.value.reason, `${path}.reason`), `${path}.reason`);
-  if (!reason.ok) return reason;
+  const summary = primitive(makeEvidenceSummary(record.value.reason, `${path}.reason`), `${path}.reason`);
+  if (!summary.ok) return summary;
+  const rationale = primitive(makeReason(record.value.reason, `${path}.reason`), `${path}.reason`);
+  if (!rationale.ok) return rationale;
   const proposedAt = primitive(makeIsoTimestamp(record.value.proposedAt, `${path}.proposedAt`), `${path}.proposedAt`);
   return proposedAt.ok ? ok({
     id: id.value,
@@ -869,7 +973,8 @@ function decodeCoachingProposal(value: unknown, path: string, runnerTypes: Runne
     proposedPlan: proposedPlan.value,
     proposedPlanDigest: proposedPlanDigest.value,
     expectedStateSha: expectedStateSha.value,
-    reason: reason.value,
+    summary: summary.value,
+    rationale: rationale.value,
     proposedAt: proposedAt.value
   }) : proposedAt;
 }
@@ -895,14 +1000,17 @@ function decodeCoachingDecision(value: unknown, path: string): Result<CoachingPr
 }
 
 function decodeComparison(value: unknown, path: string): Result<AlternativeComparison, ProtocolCodecError> {
-  const record = exactRecord(value, path, ["id", "projectId", "parentNodeSha", "nodeShas", "findings", "summary", "recordedAt"]);
+  if (!isRecord(value) || (value.type !== "sibling_runs" && value.type !== "coached_how_experiment")) {
+    return invalid(`${path}.type`, "unsupported alternative comparison type");
+  }
+  const record = exactRecord(value, path, value.type === "sibling_runs"
+    ? ["type", "id", "projectId", "parentNodeSha", "nodeShas", "findings", "summary", "recordedAt"]
+    : ["type", "id", "projectId", "anchorNodeSha", "goalDigest", "nodeShas", "findings", "summary", "recordedAt"]);
   if (!record.ok) return record;
   const id = primitive(makeComparisonId(record.value.id), `${path}.id`);
   if (!id.ok) return id;
   const projectId = primitive(makeProjectId(record.value.projectId), `${path}.projectId`);
   if (!projectId.ok) return projectId;
-  const parentNodeSha = primitive(makeGitCommitSha(record.value.parentNodeSha, `${path}.parentNodeSha`), `${path}.parentNodeSha`);
-  if (!parentNodeSha.ok) return parentNodeSha;
   const nodeShas = decodeArray(record.value.nodeShas, `${path}.nodeShas`, (item, itemPath) => primitive(makeGitCommitSha(item, itemPath), itemPath));
   if (!nodeShas.ok) return nodeShas;
   const atLeastTwo = primitive(makeAtLeastTwo(nodeShas.value, `${path}.nodeShas`), `${path}.nodeShas`);
@@ -910,10 +1018,109 @@ function decodeComparison(value: unknown, path: string): Result<AlternativeCompa
   if (new Set(atLeastTwo.value).size !== atLeastTwo.value.length) return invalid(`${path}.nodeShas`, "comparison Node SHAs must be unique");
   const findings = decodeArray(record.value.findings, `${path}.findings`, decodeComparisonFinding);
   if (!findings.ok) return findings;
+  for (const [findingIndex, finding] of findings.value.entries()) {
+    const summaryShas = finding.summaries.map(item => item.nodeSha);
+    if (summaryShas.length !== atLeastTwo.value.length
+      || new Set(summaryShas).size !== summaryShas.length
+      || atLeastTwo.value.some(nodeSha => !summaryShas.includes(nodeSha))
+    ) {
+      return invalid(`${path}.findings[${findingIndex}].summaries`, "must summarize every included result Node exactly once");
+    }
+  }
   const summary = primitive(makeEvidenceSummary(record.value.summary, `${path}.summary`), `${path}.summary`);
   if (!summary.ok) return summary;
   const recordedAt = primitive(makeIsoTimestamp(record.value.recordedAt, `${path}.recordedAt`), `${path}.recordedAt`);
-  return recordedAt.ok ? ok({ id: id.value, projectId: projectId.value, parentNodeSha: parentNodeSha.value, nodeShas: atLeastTwo.value, findings: findings.value, summary: summary.value, recordedAt: recordedAt.value }) : recordedAt;
+  if (!recordedAt.ok) return recordedAt;
+  if (value.type === "sibling_runs") {
+    const parentNodeSha = primitive(makeGitCommitSha(record.value.parentNodeSha, `${path}.parentNodeSha`), `${path}.parentNodeSha`);
+    return parentNodeSha.ok ? ok({
+      type: "sibling_runs",
+      id: id.value,
+      projectId: projectId.value,
+      parentNodeSha: parentNodeSha.value,
+      nodeShas: atLeastTwo.value,
+      findings: findings.value,
+      summary: summary.value,
+      recordedAt: recordedAt.value
+    }) : parentNodeSha;
+  }
+  const anchorNodeSha = primitive(makeGitCommitSha(record.value.anchorNodeSha, `${path}.anchorNodeSha`), `${path}.anchorNodeSha`);
+  if (!anchorNodeSha.ok) return anchorNodeSha;
+  const goalDigest = primitive(makeGoalDigest(record.value.goalDigest), `${path}.goalDigest`);
+  return goalDigest.ok ? ok({
+    type: "coached_how_experiment",
+    id: id.value,
+    projectId: projectId.value,
+    anchorNodeSha: anchorNodeSha.value,
+    goalDigest: goalDigest.value,
+    nodeShas: atLeastTwo.value,
+    findings: findings.value,
+    summary: summary.value,
+    recordedAt: recordedAt.value
+  }) : goalDigest;
+}
+
+function decodeHistoricalV2Comparison(
+  value: unknown,
+  path: string
+): Result<AlternativeComparison, ProtocolCodecError> {
+  const record = exactRecord(value, path, [
+    "id", "projectId", "parentNodeSha", "nodeShas", "findings", "summary", "recordedAt"
+  ]);
+  if (!record.ok) return record;
+  const id = primitive(makeComparisonId(record.value.id), `${path}.id`);
+  if (!id.ok) return id;
+  const projectId = primitive(makeProjectId(record.value.projectId), `${path}.projectId`);
+  if (!projectId.ok) return projectId;
+  const parentNodeSha = primitive(makeGitCommitSha(record.value.parentNodeSha, `${path}.parentNodeSha`), `${path}.parentNodeSha`);
+  if (!parentNodeSha.ok) return parentNodeSha;
+  const nodeShas = decodeArray(record.value.nodeShas, `${path}.nodeShas`, (item, itemPath) =>
+    primitive(makeGitCommitSha(item, itemPath), itemPath));
+  if (!nodeShas.ok) return nodeShas;
+  const atLeastTwo = primitive(makeAtLeastTwo(nodeShas.value, `${path}.nodeShas`), `${path}.nodeShas`);
+  if (!atLeastTwo.ok) return atLeastTwo;
+  if (new Set(atLeastTwo.value).size !== atLeastTwo.value.length) {
+    return invalid(`${path}.nodeShas`, "comparison Node SHAs must be unique");
+  }
+  const findings = decodeArray(record.value.findings, `${path}.findings`, decodeComparisonFinding);
+  if (!findings.ok) return findings;
+  const summary = primitive(makeEvidenceSummary(record.value.summary, `${path}.summary`), `${path}.summary`);
+  if (!summary.ok) return summary;
+  const normalizedFindings: ComparisonFinding[] = [];
+  for (const [findingIndex, finding] of findings.value.entries()) {
+    const summariesByNode = new Map(finding.summaries.map(item => [item.nodeSha, item]));
+    if (summariesByNode.size !== finding.summaries.length
+      || finding.summaries.some(item => !atLeastTwo.value.includes(item.nodeSha))
+    ) {
+      return invalid(
+        `${path}.findings[${findingIndex}].summaries`,
+        "historical comparison summaries must be unique and belong to an included result Node"
+      );
+    }
+    const normalizedSummaries = primitive(makeNonEmptyArray(
+      atLeastTwo.value.map(nodeSha => summariesByNode.get(nodeSha) ?? {
+        nodeSha,
+        summary: summary.value
+      }),
+      `${path}.findings[${findingIndex}].summaries`
+    ), `${path}.findings[${findingIndex}].summaries`);
+    if (!normalizedSummaries.ok) return normalizedSummaries;
+    normalizedFindings.push({
+      subject: finding.subject,
+      summaries: normalizedSummaries.value
+    });
+  }
+  const recordedAt = primitive(makeIsoTimestamp(record.value.recordedAt, `${path}.recordedAt`), `${path}.recordedAt`);
+  return recordedAt.ok ? ok({
+    type: "sibling_runs",
+    id: id.value,
+    projectId: projectId.value,
+    parentNodeSha: parentNodeSha.value,
+    nodeShas: atLeastTwo.value,
+    findings: normalizedFindings,
+    summary: summary.value,
+    recordedAt: recordedAt.value
+  }) : recordedAt;
 }
 
 function decodeComparisonFinding(value: unknown, path: string): Result<ComparisonFinding, ProtocolCodecError> {
