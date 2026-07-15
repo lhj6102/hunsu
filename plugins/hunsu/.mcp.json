@@ -3,7 +3,7 @@
     "hunsu": {
       "url": "https://plugin.hunsu.app/mcp",
       "auth": "oauth",
-      "oauth_resource": "https://plugin.hunsu.app/"
+      "oauth_resource": "https://plugin.hunsu.app/mcp"
     }
   }
 }

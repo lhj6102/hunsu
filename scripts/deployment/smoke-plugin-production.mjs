@@ -98,6 +98,15 @@ async function runSuite(sourceSha) {
     if (body.authorization_endpoint !== `${ORIGIN}/oauth/authorize` || body.token_endpoint !== `${ORIGIN}/oauth/token`) {
       fail("Authorization-server metadata endpoints are not same-origin production endpoints.");
     }
+    if (!Array.isArray(body.grant_types_supported)
+      || body.grant_types_supported.length !== 2
+      || body.grant_types_supported[0] !== "authorization_code"
+      || body.grant_types_supported[1] !== "refresh_token"
+      || !Array.isArray(body.token_endpoint_auth_methods_supported)
+      || body.token_endpoint_auth_methods_supported.length !== 1
+      || body.token_endpoint_auth_methods_supported[0] !== "none") {
+      fail("Authorization-server metadata does not advertise the exact public-client refresh contract.");
+    }
     return response.status;
   }, results), check("mcp-authentication-challenge", async () => {
     const response = await request("/mcp", {

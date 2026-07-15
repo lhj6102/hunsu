@@ -120,7 +120,7 @@ function validatePlugin(value) {
   if (!isObject(server)) return issue("Plugin MCP config must contain exactly one hunsu server.");
   equal(server.url, `${origin}/mcp`, "Plugin MCP endpoint");
   equal(server.auth, "oauth", "Plugin MCP auth");
-  equal(server.oauth_resource, `${origin}/`, "Plugin OAuth resource");
+  equal(server.oauth_resource, `${origin}/mcp`, "Plugin OAuth resource");
 }
 
 async function validateRetiredOriginIsAbsent() {

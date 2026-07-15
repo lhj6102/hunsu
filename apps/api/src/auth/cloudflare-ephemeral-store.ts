@@ -2,7 +2,14 @@ import type { HunsuEphemeralState } from "../cloudflare/HunsuEphemeralState.ts";
 import type {
   ConsentState,
   EphemeralStateStore,
-  PendingAuthorizationCode
+  PendingAuthorizationCode,
+  RefreshGrant,
+  RefreshGrantRotation,
+  RefreshGrantRotationResult
+} from "./ephemeral-store.ts";
+import {
+  encodeRefreshGrant,
+  encodeRefreshGrantRotation
 } from "./ephemeral-store.ts";
 
 type EphemeralNamespace = DurableObjectNamespace<HunsuEphemeralState>;
@@ -36,6 +43,16 @@ export class DurableObjectEphemeralStateStore implements EphemeralStateStore {
     return stub.consumeAuthorizationCode(this.#now());
   }
 
+  async createRefreshGrant(input: RefreshGrant): Promise<boolean> {
+    const stub = await this.#stub("refresh-grant", input.familyId);
+    return stub.createRefreshGrant(encodeRefreshGrant(input), this.#now());
+  }
+
+  async rotateRefreshGrant(input: RefreshGrantRotation): Promise<RefreshGrantRotationResult> {
+    const stub = await this.#stub("refresh-grant", input.familyId);
+    return stub.rotateRefreshGrant(encodeRefreshGrantRotation(input), this.#now());
+  }
+
   async claimWebhookDelivery(deliveryId: string, expiresAt: number): Promise<boolean> {
     const stub = await this.#stub("webhook-delivery", deliveryId);
     return stub.claimWebhookDelivery(expiresAt, this.#now());
@@ -55,7 +72,7 @@ export class DurableObjectEphemeralStateStore implements EphemeralStateStore {
     return stub.releaseWebhookDelivery(leaseExpiresAt);
   }
 
-  async #stub(kind: "consent" | "authorization-code" | "webhook-delivery", key: string) {
+  async #stub(kind: "consent" | "authorization-code" | "refresh-grant" | "webhook-delivery", key: string) {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${kind}\0${key}`));
     const name = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
     return this.#namespace.getByName(`${kind}:${name}`);

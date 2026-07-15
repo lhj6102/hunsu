@@ -386,7 +386,9 @@ globalThis.fetch = async input => {
       return Response.json({
         issuer: origin,
         authorization_endpoint: origin + "/oauth/authorize",
-        token_endpoint: origin + "/oauth/token"
+        token_endpoint: origin + "/oauth/token",
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        token_endpoint_auth_methods_supported: ["none"]
       });
     case "/mcp":
       return new Response(null, {

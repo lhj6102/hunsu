@@ -51,12 +51,28 @@ export class HunsuHttpApp {
   }
 
   handle = async (request: Request): Promise<Response> => {
+    const oauthJsonEndpoint = isOAuthJsonEndpoint(request);
     try {
       const response = await this.#route(request);
       return this.#withBrowserHeaders(request, response);
     } catch (error) {
-      if (error instanceof HttpInputError) return this.#withBrowserHeaders(request, problem(error.error));
+      if (error instanceof HttpInputError) {
+        return oauthJsonEndpoint
+          ? oauthProblem(new OAuthProtocolError(
+              "invalid_request",
+              error.error.status === 413 ? "The OAuth request body is too large." : "The OAuth request body is invalid.",
+              400
+            ))
+          : this.#withBrowserHeaders(request, problem(error.error));
+      }
       if (error instanceof OAuthProtocolError) return oauthProblem(error);
+      if (oauthJsonEndpoint) {
+        return oauthProblem(new OAuthProtocolError(
+          "server_error",
+          "The OAuth service could not complete the request.",
+          500
+        ));
+      }
       return this.#withBrowserHeaders(request, problem({ code: "temporarily_unavailable", message: "The Hunsu API could not complete the request.", status: 500, retryable: true }));
     }
   };
@@ -72,7 +88,10 @@ export class HunsuHttpApp {
       return json(this.#mcpOAuth.authorizationServerMetadata());
     }
     if (request.method === "POST" && url.pathname === "/oauth/register") {
-      return json(this.#mcpOAuth.register(await readJson(request, 65_536)), 201, { "cache-control": "no-store" });
+      return json(this.#mcpOAuth.register(await readJson(request, 65_536)), 201, {
+        "cache-control": "no-store",
+        pragma: "no-cache"
+      });
     }
     if (request.method === "GET" && url.pathname === "/oauth/authorize") {
       const context = this.#sessions.authenticate(request);
@@ -91,7 +110,10 @@ export class HunsuHttpApp {
     }
     if (request.method === "POST" && url.pathname === "/oauth/token") {
       const form = await readForm(request, 65_536);
-      return json(await this.#mcpOAuth.exchange(form), 200, { "cache-control": "no-store" });
+      return json(await this.#mcpOAuth.exchange(form, request.headers.get("authorization")), 200, {
+        "cache-control": "no-store",
+        pragma: "no-cache"
+      });
     }
 
     if (request.method === "GET" && url.pathname === "/api/auth/github") {
@@ -571,7 +593,18 @@ function problem(error: ApiError, headers?: HeadersInit): Response {
 }
 
 function oauthProblem(error: OAuthProtocolError): Response {
-  return json({ error: error.code, error_description: error.message }, error.status, { "cache-control": "no-store" });
+  const headers: Record<string, string> = {
+    "cache-control": "no-store",
+    pragma: "no-cache"
+  };
+  if (error.wwwAuthenticate !== null) headers["www-authenticate"] = error.wwwAuthenticate;
+  return json({ error: error.code, error_description: error.message }, error.status, headers);
+}
+
+function isOAuthJsonEndpoint(request: Request): boolean {
+  if (request.method !== "POST") return false;
+  const pathname = new URL(request.url).pathname;
+  return pathname === "/oauth/register" || pathname === "/oauth/token";
 }
 
 function oauthConsentPage(input: { token: string; clientOrigin: string }): Response {

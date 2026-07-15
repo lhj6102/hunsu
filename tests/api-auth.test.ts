@@ -102,6 +102,8 @@ test("MCP OAuth uses explicit consent, PKCE, shared one-time state, and audience
   authorize.searchParams.set("state", "client-state");
   authorize.searchParams.set("code_challenge", challenge);
   authorize.searchParams.set("code_challenge_method", "S256");
+  authorize.searchParams.append("resource", "https://api.example.test/mcp");
+  authorize.searchParams.append("resource", "https://api.example.test/mcp");
   const sessionToken = "bound-web-session";
   const consent = await oauth.createConsentRequest(authorize, context, sessionToken);
   assert.equal(consent.clientOrigin, "https://client.example.test");
@@ -138,14 +140,16 @@ test("MCP OAuth uses explicit consent, PKCE, shared one-time state, and audience
     code,
     client_id: clientId,
     redirect_uri: "https://client.example.test/callback",
-    code_verifier: "too-short"
+    code_verifier: "too-short",
+    resource: "https://api.example.test/mcp"
   })), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_grant");
   const token = await restartedBeforeExchange.exchange(new URLSearchParams({
     grant_type: "authorization_code",
     code,
     client_id: clientId,
     redirect_uri: "https://client.example.test/callback",
-    code_verifier: verifier
+    code_verifier: verifier,
+    resource: "https://api.example.test/mcp"
   }));
   const authenticated = oauth.authenticate(new Request("https://api.example.test/mcp", {
     headers: { authorization: `Bearer ${String(token.access_token)}` }
@@ -158,7 +162,9 @@ test("MCP OAuth uses explicit consent, PKCE, shared one-time state, and audience
     sessionConfig.secret,
     () => Date.UTC(2026, 6, 13)
   ).issue({
+    v: 1,
     purpose: "mcp-access",
+    clientDigest: createHash("sha256").update(clientId, "utf8").digest("base64url"),
     context: {
       ...context,
       installations: [{ id: 17, accountLogin: "acme", accountType: "organization" }],
@@ -186,7 +192,8 @@ test("MCP OAuth uses explicit consent, PKCE, shared one-time state, and audience
     code,
     client_id: clientId,
     redirect_uri: "https://client.example.test/callback",
-    code_verifier: verifier
+    code_verifier: verifier,
+    resource: "https://api.example.test/mcp"
   })), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_grant");
 
   const differentAudience = new McpOAuthService({
@@ -201,6 +208,196 @@ test("MCP OAuth uses explicit consent, PKCE, shared one-time state, and audience
   assert.equal(oauth.authenticate(new Request("https://api.example.test/mcp", {
     headers: { authorization: `Bearer ${String(token.access_token)}tampered` }
   })), undefined);
+});
+
+test("MCP refresh grants are resource-bound, rotate once, and revoke their family on replay", async () => {
+  let now = Date.UTC(2026, 6, 13, 2, 0, 0);
+  const store = new InMemoryEphemeralStateStore({ now: () => Math.floor(now / 1000) });
+  const oauth = new McpOAuthService({
+    baseUrl: "https://api.example.test",
+    secret: sessionConfig.secret,
+    stateStore: store,
+    refreshTokenTtlSeconds: 7_200,
+    now: () => now
+  });
+  assert.deepEqual(oauth.authorizationServerMetadata().grant_types_supported, [
+    "authorization_code",
+    "refresh_token"
+  ]);
+  assert.throws(() => oauth.register({
+    redirect_uris: [
+      "https://client.example.test/callback",
+      "https://client.example.test/callback"
+    ]
+  }), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_request");
+  assert.throws(() => oauth.register({
+    redirect_uris: Array.from(
+      { length: 17 },
+      (_, index) => `https://client-${index}.example.test/callback`
+    )
+  }), oauthError("invalid_request"));
+  assert.throws(() => oauth.register({
+    redirect_uris: [`https://client.example.test/${"a".repeat(2_048)}`]
+  }), oauthError("invalid_request"));
+  assert.throws(() => oauth.register({
+    redirect_uris: Array.from(
+      { length: 3 },
+      (_, index) => `https://client-${index}.example.test/${"a".repeat(1_400)}`
+    )
+  }), oauthError("invalid_request"));
+  assert.throws(() => oauth.register({
+    redirect_uris: ["https://client.example.test/callback"],
+    grant_types: ["authorization_code"]
+  }), (error: unknown) => error instanceof OAuthProtocolError && error.code === "invalid_request");
+  const registration = oauth.register({
+    redirect_uris: ["https://client.example.test/callback"],
+    grant_types: ["refresh_token", "authorization_code"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none"
+  });
+  assert.deepEqual(registration.grant_types, ["authorization_code", "refresh_token"]);
+  const clientId = String(registration.client_id);
+  const token = await issueAuthorizationCodeGrant({ oauth, store, clientId, code: "refresh-code-one", now });
+  assert.equal(token.expires_in, 3_600);
+  assert.equal(token.scope, "hunsu");
+  assert.equal(typeof token.refresh_token, "string");
+  const signedTokens = new SignedTokenService(sessionConfig.secret, () => now);
+  const accessClaims = signedTokens.verify(String(token.access_token), "mcp-access");
+  assert.deepEqual(Object.keys(accessClaims ?? {}).sort(), [
+    "aud",
+    "clientDigest",
+    "context",
+    "exp",
+    "iat",
+    "purpose",
+    "scope",
+    "v"
+  ]);
+  assert.match(String(accessClaims?.clientDigest), /^[A-Za-z0-9_-]{43}$/u);
+  assert.equal(Object.hasOwn(accessClaims ?? {}, "clientId"), false);
+  assert.equal(Number(accessClaims?.exp) - Number(accessClaims?.iat), 3_600);
+  const initialRefreshClaims = signedTokens.verify(String(token.refresh_token), "mcp-refresh");
+  assert.deepEqual(Object.keys(initialRefreshClaims ?? {}).sort(), [
+    "exp",
+    "familyId",
+    "generation",
+    "iat",
+    "jti",
+    "purpose",
+    "v"
+  ]);
+  assert.equal(initialRefreshClaims?.generation, 0);
+
+  const missingResource = refreshForm(token.refresh_token, clientId);
+  missingResource.delete("resource");
+  await assert.rejects(() => oauth.exchange(missingResource), oauthError("invalid_target"));
+  const wrongResource = refreshForm(token.refresh_token, clientId);
+  wrongResource.set("resource", "https://api.example.test/not-mcp");
+  await assert.rejects(() => oauth.exchange(wrongResource), oauthError("invalid_target"));
+
+  const otherClientId = String(oauth.register({
+    redirect_uris: ["https://other-client.example.test/callback"]
+  }).client_id);
+  await assert.rejects(
+    () => oauth.exchange(refreshForm(token.refresh_token, otherClientId)),
+    oauthError("invalid_grant")
+  );
+  await assert.rejects(
+    () => oauth.exchange(refreshForm(`${String(token.refresh_token)}tampered`, clientId)),
+    oauthError("invalid_grant")
+  );
+  const wrongScope = refreshForm(token.refresh_token, clientId);
+  wrongScope.set("scope", "other");
+  await assert.rejects(() => oauth.exchange(wrongScope), oauthError("invalid_scope"));
+  const duplicateScope = refreshForm(token.refresh_token, clientId);
+  duplicateScope.append("scope", "hunsu");
+  duplicateScope.append("scope", "hunsu");
+  await assert.rejects(() => oauth.exchange(duplicateScope), oauthError("invalid_request"));
+  const duplicateGrantType = refreshForm(token.refresh_token, clientId);
+  duplicateGrantType.append("grant_type", "refresh_token");
+  await assert.rejects(() => oauth.exchange(duplicateGrantType), oauthError("invalid_request"));
+  const withSecret = refreshForm(token.refresh_token, clientId);
+  withSecret.set("client_secret", "forbidden");
+  await assert.rejects(() => oauth.exchange(withSecret), oauthError("invalid_client", 400, null));
+  await assert.rejects(
+    () => oauth.exchange(withSecret, "Basic forbidden"),
+    oauthError("invalid_request", 400, null)
+  );
+  const duplicateSecret = refreshForm(token.refresh_token, clientId);
+  duplicateSecret.append("client_secret", "one");
+  duplicateSecret.append("client_secret", "two");
+  await assert.rejects(() => oauth.exchange(duplicateSecret), oauthError("invalid_request", 400, null));
+  await assert.rejects(
+    () => oauth.exchange(refreshForm(token.refresh_token, clientId), "Basic forbidden"),
+    oauthError("invalid_client", 401, "Basic realm=\"hunsu-oauth\"")
+  );
+
+  now += 3_000_000;
+  const refreshed = await oauth.exchange(refreshForm(token.refresh_token, clientId, 2));
+  assert.equal(refreshed.expires_in, 3_600);
+  assert.notEqual(refreshed.refresh_token, token.refresh_token);
+  assert.equal(oauth.authenticate(new Request("https://api.example.test/mcp", {
+    headers: { authorization: `Bearer ${String(refreshed.access_token)}` }
+  }))?.user.id, context.user.id);
+  const rotatedClaims = signedTokens.verify(String(refreshed.refresh_token), "mcp-refresh");
+  assert.equal(rotatedClaims?.generation, 1);
+  assert.equal(rotatedClaims?.exp, initialRefreshClaims?.exp);
+
+  await assert.rejects(
+    () => oauth.exchange(refreshForm(token.refresh_token, clientId)),
+    oauthError("invalid_grant")
+  );
+  await assert.rejects(
+    () => oauth.exchange(refreshForm(refreshed.refresh_token, clientId)),
+    oauthError("invalid_grant")
+  );
+});
+
+test("refreshed MCP access tokens cannot outlive the refresh family", async () => {
+  let now = Date.UTC(2026, 6, 13, 4, 0, 0);
+  const store = new InMemoryEphemeralStateStore({ now: () => Math.floor(now / 1000) });
+  const oauth = new McpOAuthService({
+    baseUrl: "https://api.example.test",
+    secret: sessionConfig.secret,
+    stateStore: store,
+    refreshTokenTtlSeconds: 3_700,
+    now: () => now
+  });
+  const clientId = String(oauth.register({
+    redirect_uris: ["https://client.example.test/callback"]
+  }).client_id);
+  const initial = await issueAuthorizationCodeGrant({
+    oauth,
+    store,
+    clientId,
+    code: "absolute-expiry-code",
+    now
+  });
+  assert.equal(initial.expires_in, 3_600);
+  const signedTokens = new SignedTokenService(sessionConfig.secret, () => now);
+  const familyExpiresAt = Number(signedTokens.verify(
+    String(initial.refresh_token),
+    "mcp-refresh"
+  )?.exp);
+
+  now += 3_590_000;
+  const refreshed = await oauth.exchange(refreshForm(initial.refresh_token, clientId));
+  assert.equal(refreshed.expires_in, 110);
+  assert.equal(signedTokens.verify(String(refreshed.access_token), "mcp-access")?.exp, familyExpiresAt);
+  assert.equal(signedTokens.verify(String(refreshed.refresh_token), "mcp-refresh")?.exp, familyExpiresAt);
+
+  now += 109_000;
+  assert.equal(oauth.authenticate(new Request("https://api.example.test/mcp", {
+    headers: { authorization: `Bearer ${String(refreshed.access_token)}` }
+  }))?.user.id, context.user.id);
+  now += 1_000;
+  assert.equal(oauth.authenticate(new Request("https://api.example.test/mcp", {
+    headers: { authorization: `Bearer ${String(refreshed.access_token)}` }
+  })), undefined);
+  await assert.rejects(
+    () => oauth.exchange(refreshForm(refreshed.refresh_token, clientId)),
+    oauthError("invalid_grant")
+  );
 });
 
 test("GitHub App installation tokens are short-lived and cached without exposing App credentials", async () => {
@@ -866,6 +1063,61 @@ test("GitHub OAuth paginates every user-authorized repository for an installatio
     "https://github-api.example.test/user/installations/17/repositories?per_page=100&page=2"
   ]);
 });
+
+async function issueAuthorizationCodeGrant(input: {
+  oauth: McpOAuthService;
+  store: InMemoryEphemeralStateStore;
+  clientId: string;
+  code: string;
+  now: number;
+}): Promise<Record<string, unknown>> {
+  const verifier = "v".repeat(43);
+  await input.store.createAuthorizationCode(input.code, {
+    clientId: input.clientId,
+    redirectUri: "https://client.example.test/callback",
+    challenge: createHash("sha256").update(verifier, "ascii").digest("base64url"),
+    audience: "https://api.example.test/mcp",
+    context,
+    expiresAt: Math.floor(input.now / 1000) + 300
+  });
+  const form = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: input.code,
+    client_id: input.clientId,
+    redirect_uri: "https://client.example.test/callback",
+    code_verifier: verifier
+  });
+  form.append("resource", "https://api.example.test/mcp");
+  form.append("resource", "https://api.example.test/mcp");
+  return input.oauth.exchange(form);
+}
+
+function refreshForm(
+  refreshToken: unknown,
+  clientId: string,
+  resourceCount = 1
+): URLSearchParams {
+  const form = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: String(refreshToken),
+    client_id: clientId
+  });
+  for (let index = 0; index < resourceCount; index += 1) {
+    form.append("resource", "https://api.example.test/mcp");
+  }
+  return form;
+}
+
+function oauthError(
+  code: OAuthProtocolError["code"],
+  status?: number,
+  wwwAuthenticate?: string | null
+): (error: unknown) => boolean {
+  return (error: unknown) => error instanceof OAuthProtocolError
+    && error.code === code
+    && (status === undefined || error.status === status)
+    && (wwwAuthenticate === undefined || error.wwwAuthenticate === wwwAuthenticate);
+}
 
 function githubRepository(
   id: number,
