@@ -11,7 +11,8 @@ const FULL_SHA = /^[0-9a-f]{40}$/u;
 const EVENT_ID = /^[0-9a-f]{32}$/u;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const SHARD_INDEX_LIMIT = 9_999_999;
-const MAX_SELECTIONS = 256;
+/** One full Graph page may resolve every card through its keyed SHA locator. */
+const MAX_SELECTIONS = 300;
 
 const READ_MODEL_PATHS: Readonly<Record<ProjectReadModelName, string>> = {
   catalog: "project.json",
@@ -58,8 +59,12 @@ export function exactStateFilePath(selection: StateFileSelection): string {
       return `${STATE_ROOT}/projects/${selection.projectId}/graph/pages/${String(selection.page).padStart(7, "0")}.json`;
     case "graph_node":
       return `${STATE_ROOT}/projects/${selection.projectId}/graph/nodes/${selection.nodeSha}.json`;
-    case "node_activity":
-      return `${STATE_ROOT}/projects/${selection.projectId}/snapshots/nodes/${selection.nodeSha}.json`;
+    case "node_activity_index":
+      return `${STATE_ROOT}/projects/${selection.projectId}/snapshots/nodes/${selection.nodeSha}/latest.json`;
+    case "node_activity_page":
+      return `${STATE_ROOT}/projects/${selection.projectId}/snapshots/nodes/${selection.nodeSha}/${selection.activityKind}/pages/${String(selection.page).padStart(7, "0")}.json`;
+    case "node_activity_record":
+      return `${STATE_ROOT}/projects/${selection.projectId}/snapshots/nodes/${selection.nodeSha}/${selection.activityKind}/by-id/${selection.activityId}.json`;
     case "run_activity":
       return `${STATE_ROOT}/projects/${selection.projectId}/snapshots/runs/${selection.runId}.json`;
     case "event_index_shard":
@@ -79,10 +84,28 @@ function validateSelection(selection: StateFileSelection): TransportResult<void>
       ? { ok: true, value: undefined }
       : invalid("Targeted state read contains an unsupported read-model name.");
   }
-  if (selection.kind === "node_payload" || selection.kind === "graph_node" || selection.kind === "node_activity") {
+  if (selection.kind === "node_payload" || selection.kind === "graph_node" || selection.kind === "node_activity_index"
+    || selection.kind === "node_activity_page" || selection.kind === "node_activity_record") {
+    if (!FULL_SHA.test(selection.nodeSha)) {
+      return invalid("Targeted Node read requires a full lowercase Git SHA.");
+    }
+  }
+  if (selection.kind === "node_payload" || selection.kind === "graph_node" || selection.kind === "node_activity_index") {
     return FULL_SHA.test(selection.nodeSha)
       ? { ok: true, value: undefined }
       : invalid("Targeted Node payload read requires a full lowercase Git SHA.");
+  }
+  if (selection.kind === "node_activity_page") {
+    return Number.isSafeInteger(selection.page) && selection.page >= 0 && selection.page <= SHARD_INDEX_LIMIT
+      && ["runs", "evidence", "comparisons", "decisions", "coaching", "reviews"].includes(selection.activityKind)
+      ? { ok: true, value: undefined }
+      : invalid("Targeted Node activity page requires an exact kind and bounded non-negative page.");
+  }
+  if (selection.kind === "node_activity_record") {
+    return ["comparisons", "coaching", "reviews"].includes(selection.activityKind)
+      && SAFE_ID.test(selection.activityId) && !selection.activityId.includes("..")
+      ? { ok: true, value: undefined }
+      : invalid("Targeted Node activity record requires an exact keyed kind and branch-safe id.");
   }
   if (selection.kind === "graph_page" || selection.kind === "event_index_shard") {
     const index = selection.kind === "graph_page" ? selection.page : selection.shard;

@@ -16,6 +16,7 @@ import {
   type CoachingChildNode,
   type CoachingProposal,
   type CoachingProposalDecision,
+  type CompareAlternativesCommand,
   type CommandMetadata,
   type CompletedRun,
   type DomainActor,
@@ -321,7 +322,7 @@ export function applyDomainEvent(
         : asInvalidEvent(valid);
     }
     case "CoachingProposalConfirmed": {
-      const proposal = findOpenCoachingProposal(state, event.decision.proposalId, event.meta.actor);
+      const proposal = findConfirmableCoachingProposal(state, event.decision.proposalId, event.meta.actor);
       if (!proposal.ok) return asInvalidEvent(proposal);
       const decisionId = validateDecisionId(state, event.decision.id);
       if (!decisionId.ok) return asInvalidEvent(decisionId);
@@ -477,20 +478,39 @@ export function validateNodeGraph(state: ProjectState): Result<true, ProjectDoma
 export function unresolvedDivergenceCount(state: ProjectState, projectId: Project["id"]): number {
   const children = state.nodes.filter((node): node is RunChildNode => node.projectId === projectId && node.type === "run_child");
   const parents = new Set(children.map(node => node.parentSha));
+  const selected = new Set(state.decisions.flatMap(decision => decision.type === "selection" && decision.projectId === projectId ? [decision.selectedNodeSha] : []));
+  const rejected = new Set(state.decisions.flatMap(decision => decision.type === "rejection" && decision.projectId === projectId ? decision.rejectedNodeShas : []));
   let unresolved = 0;
   for (const parentSha of parents) {
     const siblings = children.filter(node => node.parentSha === parentSha);
     if (siblings.length < 2) continue;
-    const selected = new Set(state.decisions.flatMap(decision => decision.type === "selection" && decision.projectId === projectId ? [decision.selectedNodeSha] : []));
-    const rejected = new Set(state.decisions.flatMap(decision => decision.type === "rejection" && decision.projectId === projectId ? decision.rejectedNodeShas : []));
-    const selectedSiblings = siblings.filter(node => selected.has(node.commitSha) && !rejected.has(node.commitSha));
-    const allRejected = siblings.every(node => rejected.has(node.commitSha));
-    const oneSelected = selectedSiblings.length === 1
-      && siblings.every(node => node.commitSha === selectedSiblings[0]!.commitSha || rejected.has(node.commitSha));
-    const fullyDisposed = allRejected || oneSelected;
-    if (!fullyDisposed) unresolved += 1;
+    if (!isCandidateCohortResolved(siblings.map(node => node.commitSha), selected, rejected)) unresolved += 1;
+  }
+
+  const coachedCohorts = new Map<string, Set<GitCommitSha>>();
+  for (const comparison of state.comparisons) {
+    if (comparison.projectId !== projectId || comparison.type !== "coached_how_experiment") continue;
+    const key = comparisonCohortKey(comparison);
+    const nodeShas = coachedCohorts.get(key) ?? new Set<GitCommitSha>();
+    for (const nodeSha of comparison.nodeShas) nodeShas.add(nodeSha);
+    coachedCohorts.set(key, nodeShas);
+  }
+  for (const nodeShas of coachedCohorts.values()) {
+    if (nodeShas.size >= 2 && !isCandidateCohortResolved([...nodeShas], selected, rejected)) unresolved += 1;
   }
   return unresolved;
+}
+
+function isCandidateCohortResolved(
+  nodeShas: readonly GitCommitSha[],
+  selected: ReadonlySet<GitCommitSha>,
+  rejected: ReadonlySet<GitCommitSha>
+): boolean {
+  const selectedCandidates = nodeShas.filter(nodeSha => selected.has(nodeSha) && !rejected.has(nodeSha));
+  const allRejected = nodeShas.every(nodeSha => rejected.has(nodeSha));
+  const oneSelected = selectedCandidates.length === 1
+    && nodeShas.every(nodeSha => nodeSha === selectedCandidates[0] || rejected.has(nodeSha));
+  return allRejected || oneSelected;
 }
 
 function validateProjectCreation(
@@ -708,7 +728,7 @@ function buildCoachingConfirmation(
   command: Extract<ProjectCommand, { type: "ConfirmCoachingProposal" }>,
   integrity: ProjectIntegrityBoundary
 ): Result<Extract<CoachingProposalDecision, { status: "confirmed" }>, ProjectDomainError> {
-  const proposal = findOpenCoachingProposal(state, command.proposalId, command.meta.actor);
+  const proposal = findConfirmableCoachingProposal(state, command.proposalId, command.meta.actor);
   if (!proposal.ok) return proposal;
   const decision = validateDecisionId(state, command.decisionId);
   if (!decision.ok) return decision;
@@ -788,62 +808,238 @@ function findOpenCoachingProposal(state: ProjectState, proposalId: CoachingPropo
     : ok(proposal);
 }
 
-function buildComparison(state: ProjectState, command: Extract<ProjectCommand, { type: "CompareAlternatives" }>): Result<AlternativeComparison, ProjectDomainError> {
+function findConfirmableCoachingProposal(
+  state: ProjectState,
+  proposalId: CoachingProposal["id"],
+  actor: DomainActor
+): Result<CoachingProposal, ProjectDomainError> {
+  const proposal = findOpenCoachingProposal(state, proposalId, actor);
+  if (!proposal.ok) return proposal;
+  return isRejectedNode(state, proposal.value.projectId, proposal.value.sourceNodeSha)
+    ? failure("INVALID_TRANSITION", "Rejected Nodes cannot be coached")
+    : proposal;
+}
+
+function buildComparison(state: ProjectState, command: CompareAlternativesCommand): Result<AlternativeComparison, ProjectDomainError> {
   if (state.comparisons.some(item => item.id === command.comparisonId)) return duplicate("Comparison", command.comparisonId);
-  const nodes = command.nodeShas.map(sha => findNode(state, command.projectId, sha));
-  const failureResult = nodes.find(item => !item.ok);
-  if (failureResult && !failureResult.ok) return failureResult;
-  const values = nodes.flatMap(item => item.ok ? [item.value] : []);
-  if (new Set(values.map(node => node.commitSha)).size !== values.length) return failure("INVARIANT_VIOLATION", "Comparison Node SHAs must be unique");
-  if (!values.every((node): node is RunChildNode => node.type === "run_child")) {
-    return failure("INVARIANT_VIOLATION", "Only completed Run child Nodes can be compared as alternatives");
-  }
-  const parentNodeSha = values[0]!.parentSha;
-  if (!values.every(node => node.parentSha === parentNodeSha)) return failure("INVARIANT_VIOLATION", "Compared alternatives must be sibling Nodes with one shared parent");
-  for (const node of values) {
-    const run = findCompletedRun(state, node.runId);
-    if (!run.ok) return run;
-  }
-  for (const finding of command.findings) {
-    const summaryShas = finding.summaries.map(item => item.nodeSha);
-    if (new Set(summaryShas).size !== summaryShas.length || summaryShas.some(sha => !command.nodeShas.includes(sha))) {
-      return failure("INVARIANT_VIOLATION", "Comparison findings may summarize each compared Node at most once");
+  const candidates = resolveCompletedRunCandidates(state, command.projectId, command.nodeShas);
+  if (!candidates.ok) return candidates;
+  const findings = validateComparisonFindings(command.nodeShas, command.findings);
+  if (!findings.ok) return findings;
+  switch (command.comparisonType) {
+    case "sibling_runs": {
+      const parentNodeSha = candidates.value[0]!.node.parentSha;
+      if (!candidates.value.every(candidate => candidate.node.parentSha === parentNodeSha)) {
+        return failure("INVARIANT_VIOLATION", "Compared sibling Run alternatives must have one shared parent");
+      }
+      const comparison: AlternativeComparison = {
+        type: "sibling_runs",
+        id: command.comparisonId,
+        projectId: command.projectId,
+        parentNodeSha,
+        nodeShas: command.nodeShas,
+        findings: command.findings,
+        summary: command.summary,
+        recordedAt: command.meta.requestedAt
+      };
+      const overlap = validateComparisonCohortOverlap(state, comparison);
+      return overlap.ok ? ok(comparison) : overlap;
+    }
+    case "coached_how_experiment": {
+      const goalDigest = validateCoachedHowExperimentCandidates(state, command.projectId, command.anchorNodeSha, candidates.value);
+      if (!goalDigest.ok) return goalDigest;
+      const comparison: AlternativeComparison = {
+        type: "coached_how_experiment",
+        id: command.comparisonId,
+        projectId: command.projectId,
+        anchorNodeSha: command.anchorNodeSha,
+        goalDigest: goalDigest.value,
+        nodeShas: command.nodeShas,
+        findings: command.findings,
+        summary: command.summary,
+        recordedAt: command.meta.requestedAt
+      };
+      const overlap = validateComparisonCohortOverlap(state, comparison);
+      return overlap.ok ? ok(comparison) : overlap;
+    }
+    default: {
+      const exhaustive: never = command;
+      return exhaustive;
     }
   }
-  return ok({
-    id: command.comparisonId,
-    projectId: command.projectId,
-    parentNodeSha,
-    nodeShas: command.nodeShas,
-    findings: command.findings,
-    summary: command.summary,
-    recordedAt: command.meta.requestedAt
-  });
 }
 
 function validateComparison(state: ProjectState, comparison: AlternativeComparison): Result<void, ProjectDomainError> {
   if (state.comparisons.some(item => item.id === comparison.id)) return duplicate("Comparison", comparison.id);
-  if (new Set(comparison.nodeShas).size !== comparison.nodeShas.length) {
-    return failure("INVARIANT_VIOLATION", "Comparison Node SHAs must be unique");
+  const candidates = resolveCompletedRunCandidates(state, comparison.projectId, comparison.nodeShas);
+  if (!candidates.ok) return candidates;
+  const findings = validateComparisonFindings(comparison.nodeShas, comparison.findings);
+  if (!findings.ok) return findings;
+  switch (comparison.type) {
+    case "sibling_runs":
+      if (!candidates.value.every(candidate => candidate.node.parentSha === comparison.parentNodeSha)) {
+        return failure("INVARIANT_VIOLATION", "Sibling Run comparison must contain completed result Nodes under its declared parent");
+      }
+      return validateComparisonCohortOverlap(state, comparison);
+    case "coached_how_experiment": {
+      const goalDigest = validateCoachedHowExperimentCandidates(state, comparison.projectId, comparison.anchorNodeSha, candidates.value);
+      if (!goalDigest.ok) return goalDigest;
+      if (goalDigest.value !== comparison.goalDigest) {
+        return failure("INVARIANT_VIOLATION", "Coached How experiment Goal digest does not match its completed Runs");
+      }
+      return validateComparisonCohortOverlap(state, comparison);
+    }
+    default: {
+      const exhaustive: never = comparison;
+      return exhaustive;
+    }
   }
-  const nodes = comparison.nodeShas.map(sha => findNode(state, comparison.projectId, sha));
-  const missing = nodes.find(item => !item.ok);
-  if (missing && !missing.ok) return missing;
-  const values = nodes.flatMap(item => item.ok ? [item.value] : []);
-  if (!values.every((node): node is RunChildNode => node.type === "run_child" && node.parentSha === comparison.parentNodeSha)) {
-    return failure("INVARIANT_VIOLATION", "Comparison must contain completed sibling Run Nodes under its declared parent");
-  }
-  for (const node of values) {
-    const run = findCompletedRun(state, node.runId);
+}
+
+type CompletedRunComparisonCandidate = {
+  readonly node: RunChildNode;
+  readonly run: CompletedRun;
+  readonly source: Node;
+};
+
+function resolveCompletedRunCandidates(
+  state: ProjectState,
+  projectId: Project["id"],
+  nodeShas: readonly GitCommitSha[]
+): Result<readonly CompletedRunComparisonCandidate[], ProjectDomainError> {
+  if (nodeShas.length < 2) return failure("INVARIANT_VIOLATION", "An alternative comparison requires at least two result Nodes");
+  if (new Set(nodeShas).size !== nodeShas.length) return failure("INVARIANT_VIOLATION", "Comparison Node SHAs must be unique");
+  const candidates: CompletedRunComparisonCandidate[] = [];
+  for (const nodeSha of nodeShas) {
+    const node = findNode(state, projectId, nodeSha);
+    if (!node.ok) return node;
+    if (node.value.type !== "run_child") {
+      return failure("INVARIANT_VIOLATION", "Only completed Run result Nodes can be compared as alternatives");
+    }
+    const run = findCompletedRun(state, node.value.runId);
     if (!run.ok) return run;
+    if (run.value.projectId !== projectId
+      || run.value.sourceNodeSha !== node.value.parentSha
+      || run.value.resultNodeSha !== node.value.commitSha
+      || run.value.goalDigest !== node.value.consumedGoalDigest
+    ) {
+      return failure("INVARIANT_VIOLATION", "Comparison candidate must bind an actual completed Run to its source and result Node");
+    }
+    const source = findNode(state, projectId, run.value.sourceNodeSha);
+    if (!source.ok) return source;
+    const matchingGoals = source.value.plan.nextGoals.filter(goal => computeGoalDigest(goal) === run.value.goalDigest);
+    if (matchingGoals.length !== 1 || computeGoalDigest(run.value.goal) !== run.value.goalDigest) {
+      return failure("INVARIANT_VIOLATION", "Comparison candidate Run must bind one canonical Goal from its source Node");
+    }
+    if (run.value.runnerDigest !== computeRunnerDigest(run.value.runner)
+      || run.value.runnerDigest !== computeRunnerDigest(source.value.plan.how)
+    ) {
+      return failure("INVARIANT_VIOLATION", "Comparison candidate Run must bind the exact How from its source Node");
+    }
+    candidates.push({ node: node.value, run: run.value, source: source.value });
   }
-  for (const finding of comparison.findings) {
+  return ok(candidates);
+}
+
+function validateCoachedHowExperimentCandidates(
+  state: ProjectState,
+  projectId: Project["id"],
+  anchorNodeSha: GitCommitSha,
+  candidates: readonly CompletedRunComparisonCandidate[]
+): Result<GoalDigest, ProjectDomainError> {
+  const anchor = findNode(state, projectId, anchorNodeSha);
+  if (!anchor.ok) return anchor;
+  const sourceShas = candidates.map(candidate => candidate.source.commitSha);
+  if (new Set(sourceShas).size !== sourceShas.length) {
+    return failure("INVARIANT_VIOLATION", "A Coached How experiment requires one completed Run result per distinct source Node");
+  }
+  const goalDigest = candidates[0]!.run.goalDigest;
+  if (!candidates.every(candidate => candidate.run.goalDigest === goalDigest)) {
+    return failure("INVARIANT_VIOLATION", "Coached How experiment Runs must digest the same canonical Goal");
+  }
+  const anchorPlanDigest = computeNodePlanDigest(anchor.value.plan);
+  if (anchor.value.planDigest !== anchorPlanDigest) {
+    return failure("INVARIANT_VIOLATION", "Coached How experiment anchor must have a valid canonical Node Plan digest");
+  }
+  for (const candidate of candidates) {
+    const source = candidate.source;
+    const sourcePlanDigest = computeNodePlanDigest(source.plan);
+    if (source.planDigest !== sourcePlanDigest) {
+      return failure("INVARIANT_VIOLATION", "Coached How experiment source must have a valid canonical Node Plan digest");
+    }
+    if (source.commitSha !== anchor.value.commitSha) {
+      if (source.type !== "coaching_child" || source.parentSha !== anchor.value.commitSha) {
+        return failure("INVARIANT_VIOLATION", "Coached How experiment sources must be the anchor or its direct Coaching children");
+      }
+      if (source.treeSha !== anchor.value.treeSha) {
+        return failure("INVARIANT_VIOLATION", "Coached How experiment source must preserve the anchor tree SHA");
+      }
+      const proposal = state.coachingProposals.find(item => item.projectId === projectId && item.id === source.proposalId);
+      const decision = state.coachingProposalDecisions.find(item => item.status === "confirmed"
+        && item.proposalId === source.proposalId
+        && item.childNodeSha === source.commitSha);
+      if (!proposal || !decision
+        || proposal.sourceNodeSha !== anchor.value.commitSha
+        || proposal.proposedPlanDigest !== sourcePlanDigest
+        || computeNodePlanDigest(proposal.proposedPlan) !== proposal.proposedPlanDigest
+      ) {
+        return failure("INVARIANT_VIOLATION", "Coached How experiment source must come from a directly confirmed Coaching proposal");
+      }
+    }
+    const planWithAnchorHow: NodePlan = {
+      schema: source.plan.schema,
+      nextGoals: source.plan.nextGoals,
+      how: anchor.value.plan.how
+    };
+    if (computeNodePlanDigest(planWithAnchorHow) !== anchorPlanDigest) {
+      return failure("INVARIANT_VIOLATION", "Coached How experiment source plans must be byte-identical except for How");
+    }
+  }
+  return ok(goalDigest);
+}
+
+function validateComparisonFindings(
+  nodeShas: readonly GitCommitSha[],
+  findings: AlternativeComparison["findings"]
+): Result<void, ProjectDomainError> {
+  for (const finding of findings) {
     const summaryShas = finding.summaries.map(item => item.nodeSha);
-    if (new Set(summaryShas).size !== summaryShas.length || summaryShas.some(sha => !comparison.nodeShas.includes(sha))) {
-      return failure("INVARIANT_VIOLATION", "Comparison findings may summarize each compared Node at most once");
+    if (summaryShas.length !== nodeShas.length
+      || new Set(summaryShas).size !== summaryShas.length
+      || nodeShas.some(sha => !summaryShas.includes(sha))
+    ) {
+      return failure("INVARIANT_VIOLATION", "Every comparison finding must summarize every included result Node exactly once");
     }
   }
   return ok(undefined);
+}
+
+function validateComparisonCohortOverlap(
+  state: ProjectState,
+  comparison: AlternativeComparison
+): Result<void, ProjectDomainError> {
+  const cohortKey = comparisonCohortKey(comparison);
+  for (const existing of state.comparisons) {
+    if (existing.projectId !== comparison.projectId) continue;
+    const overlaps = existing.nodeShas.some(nodeSha => comparison.nodeShas.includes(nodeSha));
+    if (overlaps && comparisonCohortKey(existing) !== cohortKey) {
+      return failure("INVARIANT_VIOLATION", "Overlapping alternative comparisons must use the same explicit cohort key");
+    }
+  }
+  return ok(undefined);
+}
+
+function comparisonCohortKey(comparison: AlternativeComparison): string {
+  switch (comparison.type) {
+    case "sibling_runs":
+      return `${comparison.type}:${comparison.projectId}:${comparison.parentNodeSha}`;
+    case "coached_how_experiment":
+      return `${comparison.type}:${comparison.projectId}:${comparison.anchorNodeSha}:${comparison.goalDigest}`;
+    default: {
+      const exhaustive: never = comparison;
+      return exhaustive;
+    }
+  }
 }
 
 function buildSelection(state: ProjectState, command: Extract<ProjectCommand, { type: "SelectAlternative" }>): Result<SelectionDecision, ProjectDomainError> {
@@ -868,13 +1064,14 @@ function validateSelectionDecision(state: ProjectState, decision: SelectionDecis
   if (!comparison) return notFound("Comparison", decision.comparisonId);
   if (!comparison.nodeShas.includes(decision.selectedNodeSha)) return failure("INVARIANT_VIOLATION", "Selected Node was not part of the comparison");
   if (isRejectedNode(state, decision.projectId, decision.selectedNodeSha)) return failure("INVALID_TRANSITION", "Rejected Node cannot be selected");
-  const siblingSelections = state.decisions.filter((item): item is SelectionDecision => item.type === "selection" && item.projectId === decision.projectId).filter(item => {
+  const cohortKey = comparisonCohortKey(comparison);
+  const cohortSelections = state.decisions.filter((item): item is SelectionDecision => item.type === "selection" && item.projectId === decision.projectId).filter(item => {
     const prior = state.comparisons.find(comparisonItem => comparisonItem.projectId === decision.projectId && comparisonItem.id === item.comparisonId);
-    return prior?.parentNodeSha === comparison.parentNodeSha;
+    return prior !== undefined && comparisonCohortKey(prior) === cohortKey;
   });
-  return siblingSelections.length === 0
+  return cohortSelections.length === 0
     ? ok(undefined)
-    : failure("INVALID_TRANSITION", "Sibling alternatives already have a selected future");
+    : failure("INVALID_TRANSITION", "Alternative cohort already has a selected future");
 }
 
 function buildRejection(state: ProjectState, command: Extract<ProjectCommand, { type: "RejectAlternatives" }>): Result<RejectionDecision, ProjectDomainError> {

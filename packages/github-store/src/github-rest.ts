@@ -1144,7 +1144,9 @@ function exactStateFileByteLimit(selection: StateFileSelection): number {
     case "project_read_model":
     case "graph_page":
     case "graph_node":
-    case "node_activity":
+    case "node_activity_index":
+    case "node_activity_page":
+    case "node_activity_record":
     case "run_activity":
     case "event_index_shard":
     case "event_locator":

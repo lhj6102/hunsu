@@ -1,4 +1,4 @@
 interface:
   display_name: "Hunsu Project"
-  short_description: "Open Commit Node Projects and Events."
-  default_prompt: "Use $hunsu-project to open the Hunsu Project for this repository and inspect its Node Graph."
+  short_description: "Open Projects and discover Runner capabilities."
+  default_prompt: "Use $hunsu-project to open this repository's Hunsu Project, inspect its Node Graph, and resolve an exact Runner capability before bootstrap."

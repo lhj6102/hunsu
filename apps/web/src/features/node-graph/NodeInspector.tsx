@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowRight, Check, ExternalLink, GitCommit, Play, Sparkles, X } from "lucide-react";
 import { apiErrorMessage } from "@/shared/api/client";
@@ -34,11 +34,6 @@ export function NodeInspector({ projectId, nodeSha, onClose }: { projectId: stri
       isActive: data => data.node.activeRuns.length > 0
     })
   });
-  useEffect(() => () => {
-    window.setTimeout(() => {
-      queryClient.removeQueries({ queryKey, exact: true, type: "inactive" });
-    }, 0);
-  }, [nodeSha, projectId, queryClient]);
   const startMutation = useMutation({
     mutationFn: (command: StartRunCommand) => startNodeRun(projectId, nodeSha, {
       ...command,
@@ -145,7 +140,7 @@ function InspectorContent({
 
       {node.integrity.status === "invalid" ? (
         <div role="alert" className="mt-4 rounded-[12px] border border-red-200 bg-red-50 p-3 text-xs leading-5 text-red-900">{node.integrity.message}</div>
-      ) : <p className="mt-4 flex items-center gap-2 text-[10px] text-[color:var(--apple-green)]"><Check className="size-3.5" />Payload, topology, and managed-ref integrity verified</p>}
+      ) : <p className="mt-4 flex items-center gap-2 text-[10px] text-[color:var(--apple-green-contrast)]"><Check className="size-3.5" />Payload, topology, and managed-ref integrity verified</p>}
       {startError ? (
         <div role="alert" className="mt-4 rounded-[12px] border border-red-200 bg-red-50 p-3 text-xs leading-5 text-red-900">
           <p>{startError}</p>
@@ -222,6 +217,11 @@ function InspectorContent({
         <div className="space-y-2 text-[11px] text-muted-foreground">
           <div className="flex items-start gap-2"><GitCommit className="mt-0.5 size-3.5 shrink-0" /><div className="min-w-0"><p>tree SHA</p><p className="mt-1 break-all font-mono text-[9px] text-[color:var(--apple-body)]">{node.treeSha}</p></div></div>
           <p className="truncate font-mono text-[10px]" title={node.managedRef}>{node.managedRef}</p>
+          <details className="rounded-[10px] border bg-white/58 p-2.5 text-[9px]">
+            <summary className="cursor-pointer font-medium text-[color:var(--apple-body)]">Verified content digests</summary>
+            <p className="mt-2 break-all font-mono">payload · {node.payloadDigest}</p>
+            <p className="mt-2 break-all font-mono">plan · {node.planDigest}</p>
+          </details>
           {node.lineage.kind === "root" ? <Badge variant="outline">Root Node</Badge> : (
             <div className="rounded-[10px] border bg-white/58 p-2.5">
               <p className="flex items-center gap-2">
@@ -264,10 +264,66 @@ function InspectorContent({
         </InspectorSection>
       ) : null}
 
+      {node.coachingProposals.length > 0 ? (
+        <InspectorSection title="Coaching proposals" count={node.coachingProposals.length}>
+          <div className="grid gap-2">
+            {node.coachingProposals.map(proposal => (
+              <article key={proposal.id} className="rounded-[12px] border bg-white/72 p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <p className="text-[12px] font-semibold leading-4">{proposal.summary}</p>
+                  <Badge variant={proposal.disposition.type === "confirmed" ? "success" : proposal.disposition.type === "rejected" ? "muted" : "outline"}>
+                    {proposal.disposition.type}
+                  </Badge>
+                </div>
+                <p className="mt-2 text-[10px] leading-4 text-muted-foreground">{proposal.rationale}</p>
+                <details className="mt-2 text-[9px] text-muted-foreground">
+                  <summary className="cursor-pointer font-medium text-foreground">Proposal integrity</summary>
+                  <p className="mt-2 break-all font-mono">source payload · {proposal.sourcePayloadDigest}</p>
+                  <p className="mt-2 break-all font-mono">source plan · {proposal.sourcePlanDigest}</p>
+                  <p className="mt-2 break-all font-mono">proposed plan · {proposal.proposedPlanDigest}</p>
+                </details>
+              </article>
+            ))}
+          </div>
+        </InspectorSection>
+      ) : null}
+
+      {node.coachReviews.length > 0 ? (
+        <InspectorSection title="Coach reviews" count={node.coachReviews.length}>
+          <div className="grid gap-2">
+            {node.coachReviews.map(review => (
+              <article key={review.id} className="rounded-[12px] border bg-white/72 p-3">
+                <p className="text-[12px] font-semibold leading-4">{review.assessment}</p>
+                {review.recommendations.length > 0 ? (
+                  <ul className="mt-2 list-disc space-y-1 pl-4 text-[10px] leading-4 text-muted-foreground">
+                    {review.recommendations.map(recommendation => <li key={recommendation}>{recommendation}</li>)}
+                  </ul>
+                ) : null}
+                <p className="mt-2 text-[9px] text-muted-foreground">{review.target.type} review · {formatTimestamp(review.recordedAt)}</p>
+              </article>
+            ))}
+          </div>
+        </InspectorSection>
+      ) : null}
+
       {node.comparisons.length > 0 || node.decisions.length > 0 ? (
         <InspectorSection title="Alternatives">
           <div className="grid gap-2 text-[11px]">
-            {node.comparisons.map(comparison => <p key={comparison.id} className="rounded-[12px] border bg-white/72 p-3 leading-4">{comparison.summary}</p>)}
+            {node.comparisons.map(comparison => (
+              <article key={comparison.id} className="rounded-[12px] border bg-white/72 p-3 leading-4">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-semibold">{comparison.type === "sibling_runs" ? "Sibling Runs" : "Coached How experiment"}</p>
+                  <Badge variant="outline">{comparison.disposition.type === "undecided" ? "Undecided" : "Decisions recorded"}</Badge>
+                </div>
+                <p className="mt-2 text-muted-foreground">{comparison.summary}</p>
+                <p className="mt-2 text-[9px] text-muted-foreground">{comparison.nodeShas.length} result Nodes · {formatTimestamp(comparison.recordedAt)}</p>
+                {comparison.disposition.type === "decisions_recorded" ? (
+                  <div className="mt-2 space-y-1 border-t pt-2 text-[10px] text-muted-foreground">
+                    {comparison.disposition.decisions.map(decision => <p key={decision.id}><strong className="text-foreground">{decision.type}</strong> · {decision.rationale}</p>)}
+                  </div>
+                ) : null}
+              </article>
+            ))}
             {node.decisions.map(decision => <p key={decision.id} className="rounded-[12px] border bg-white/72 p-3 leading-4"><strong>{decision.kind === "selected" ? "Selected" : "Rejected"}</strong> · {decision.reason}</p>)}
           </div>
         </InspectorSection>

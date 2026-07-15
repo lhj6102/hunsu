@@ -341,6 +341,13 @@ test("has no serious accessibility violations and honors reduced motion", async 
   const transitionDuration = await page.getByRole("button", { name: "Collapse navigation" }).evaluate(element => getComputedStyle(element).transitionDuration);
   expect(Number.parseFloat(transitionDuration)).toBeLessThanOrEqual(0.001);
 
+  await page.getByRole("button", { name: "Show Outline" }).click();
+  await page.getByRole("list", { name: "Node lineage outline" }).getByRole("button").first().click();
+  const inspector = page.getByRole("complementary", { name: "Selected Node" });
+  await expect(inspector).toContainText("Coaching proposals");
+  await expect(inspector).toContainText("Coach reviews");
+  await expect(inspector).toContainText("Coached How experiment");
+
   const results = await new AxeBuilder({ page }).analyze();
   const serious = results.violations.filter(violation => violation.impact === "serious" || violation.impact === "critical");
   expect(serious, serious.map(item => `${item.id}: ${item.help}`).join("\n")).toEqual([]);
@@ -435,6 +442,8 @@ function nodeDetail(sha: string) {
     stateHeadSha,
     node: {
       sha: summary.sha,
+      payloadDigest: `hunsu-node-payload-v1:sha256:${"a".repeat(64)}`,
+      planDigest: `hunsu-node-plan-v1:sha256:${"b".repeat(64)}`,
       title: summary.title,
       commitUrl: `https://github.com/${repository.owner}/${repository.name}/commit/${summary.sha}`,
       treeSha,
@@ -463,8 +472,42 @@ function nodeDetail(sha: string) {
       outgoingEdges: edges.filter(edge => edge.sourceSha === summary.sha),
       activeRuns: [],
       evidence: [],
-      comparisons: [],
-      decisions: []
+      comparisons: summary.sha === rootSha ? [{
+        type: "coached_how_experiment",
+        id: "comparison-browser",
+        anchorNodeSha: rootSha,
+        goalDigest,
+        nodeShas: [runSha, coachingSha],
+        summary: "Compare the same Goal under two verified How values.",
+        disposition: { type: "undecided" },
+        recordedAt: "2026-07-14T00:04:00Z"
+      }] : [],
+      decisions: [],
+      coachingProposals: summary.sha === rootSha ? [{
+        id: "proposal-browser",
+        sourceNodeSha: rootSha,
+        sourcePayloadDigest: `hunsu-node-payload-v1:sha256:${"a".repeat(64)}`,
+        sourcePlanDigest: `hunsu-node-plan-v1:sha256:${"b".repeat(64)}`,
+        proposedPlanDigest: `hunsu-node-plan-v1:sha256:${"f".repeat(64)}`,
+        expectedStateSha: stateHeadSha,
+        summary: "Use the Team How for the same Goal.",
+        rationale: "Measure the Runner change without changing the Goal.",
+        proposedAt: "2026-07-14T00:03:00Z",
+        disposition: {
+          type: "confirmed",
+          decisionId: "decision-browser",
+          childNodeSha: coachingSha,
+          reason: "Approved for production QA.",
+          decidedAt: "2026-07-14T00:03:30Z"
+        }
+      }] : [],
+      coachReviews: summary.sha === rootSha ? [{
+        id: "review-browser",
+        target: { type: "comparison", comparisonId: "comparison-browser" },
+        assessment: "The comparison is ready for an explicit decision.",
+        recommendations: [],
+        recordedAt: "2026-07-14T00:04:30Z"
+      }] : []
     }
   };
 }

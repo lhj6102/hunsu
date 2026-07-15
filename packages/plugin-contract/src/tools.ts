@@ -5,6 +5,8 @@ export type HunsuToolName =
   | "hunsu.projects.get"
   | "hunsu.projects.create"
   | "hunsu.projects.rebuild"
+  | "hunsu.runner_capabilities.list"
+  | "hunsu.runner_capabilities.get"
   | "hunsu.nodes.graph"
   | "hunsu.nodes.get"
   | "hunsu.events.list"
@@ -16,10 +18,16 @@ export type HunsuToolName =
   | "hunsu.runs.complete"
   | "hunsu.runs.fail"
   | "hunsu.runs.cancel"
+  | "hunsu.coach.reviews.list"
+  | "hunsu.coach.reviews.get"
+  | "hunsu.coach.proposals.list"
+  | "hunsu.coach.proposals.get"
   | "hunsu.coach.review"
   | "hunsu.coach.propose_transition"
   | "hunsu.coach.confirm_transition"
   | "hunsu.coach.reject_transition"
+  | "hunsu.alternatives.list"
+  | "hunsu.alternatives.get"
   | "hunsu.alternatives.compare"
   | "hunsu.alternatives.select"
   | "hunsu.alternatives.reject";
@@ -157,6 +165,16 @@ const definitions: HunsuToolDefinition[] = [
     "Show the Project and exact expected state SHA, then ask the user to confirm the CAS rebuild."
   ),
 
+  readTool("hunsu.runner_capabilities.list", "List the trusted Runner capabilities available for one authorized repository using catalog-bound pagination.", {
+    repository,
+    cursor: text,
+    limit: { type: "integer", minimum: 1, maximum: 50 }
+  }, ["repository"]),
+  readTool("hunsu.runner_capabilities.get", "Resolve one exact integrity-locked Runner capability for an authorized repository without exposing executor metadata.", {
+    repository,
+    type: runnerTypeLock
+  }, ["repository", "type"]),
+
   readTool("hunsu.nodes.graph", "Load Commit Node topology and card summaries without decoding every Node payload.", {
     repository,
     projectId: id,
@@ -191,6 +209,33 @@ const definitions: HunsuToolDefinition[] = [
     projectId: id,
     runId: id
   }, ["repository", "projectId", "runId"]),
+
+  readTool("hunsu.coach.reviews.list", "List the complete typed Coach reviews related to one Commit Node at the exact state head.", {
+    repository,
+    projectId: id,
+    nodeSha: sha,
+    cursor: text,
+    limit: { type: "integer", minimum: 1, maximum: 50 }
+  }, ["repository", "projectId", "nodeSha"]),
+  readTool("hunsu.coach.reviews.get", "Load one complete typed Coach review by id from one Commit Node's exact-head activity.", {
+    repository,
+    projectId: id,
+    nodeSha: sha,
+    reviewId: id
+  }, ["repository", "projectId", "nodeSha", "reviewId"]),
+  readTool("hunsu.coach.proposals.list", "List Coaching proposal summaries, digests, and dispositions for one source Commit Node at the exact state head.", {
+    repository,
+    projectId: id,
+    sourceNodeSha: sha,
+    cursor: text,
+    limit: { type: "integer", minimum: 1, maximum: 50 }
+  }, ["repository", "projectId", "sourceNodeSha"]),
+  readTool("hunsu.coach.proposals.get", "Load one Coaching proposal by id with its verified current plan, complete proposed plan, digests, and disposition.", {
+    repository,
+    projectId: id,
+    sourceNodeSha: sha,
+    proposalId: id
+  }, ["repository", "projectId", "sourceNodeSha", "proposalId"]),
   writeTool("hunsu.runs.start", "Start one Run from a source Node for exactly one next Goal and return RunContract v2.", {
     repository,
     projectId: id,
@@ -270,30 +315,25 @@ const definitions: HunsuToolDefinition[] = [
     "Show the exact pending proposal, then ask the user to confirm its rejection."
   ),
 
-  writeTool("hunsu.alternatives.compare", "Record an evidence-based comparison of completed Run child Nodes with one structural parent.", {
+  readTool("hunsu.alternatives.list", "List comparison summaries and decision dispositions related to one Commit Node.", {
     repository,
     projectId: id,
-    sourceNodeSha: sha,
-    comparisonId: id,
-    nodeShas: { type: "array", minItems: 2, uniqueItems: true, items: sha },
-    findings: {
-      type: "array",
-      items: object({
-        criterion: text,
-        summaries: {
-          type: "array",
-          minItems: 2,
-          items: object({ nodeSha: sha, summary: text }, ["nodeSha", "summary"])
-        }
-      }, ["criterion", "summaries"])
-    },
-    summary: text,
-    idempotencyKey,
-    expectedStateSha: stateSha
-  }, ["repository", "projectId", "sourceNodeSha", "comparisonId", "nodeShas", "findings", "summary", "idempotencyKey", "expectedStateSha"]),
+    nodeSha: sha,
+    cursor: text,
+    limit: { type: "integer", minimum: 1, maximum: 50 }
+  }, ["repository", "projectId", "nodeSha"]),
+  unionReadTool("hunsu.alternatives.get", "Load one exact-variant comparison by id with all findings, summary, and decision disposition.", [
+    comparisonGetInputVariant("sibling_runs", "sourceNodeSha"),
+    comparisonGetInputVariant("coached_how_experiment", "anchorNodeSha")
+  ]),
+
+  unionWriteTool("hunsu.alternatives.compare", "Record an evidence-based exact-variant comparison of sibling Runs or coached How experiments.", [
+    comparisonInputVariant("sibling_runs", "sourceNodeSha"),
+    comparisonInputVariant("coached_how_experiment", "anchorNodeSha")
+  ]),
   confirmedTool(
     "hunsu.alternatives.select",
-    "Select a sibling future after comparison and explicit user confirmation.",
+    "Select one result Node from an explicit comparison cohort after user confirmation.",
     {
       ...mutationIdentity("nodeSha"),
       comparisonId: id,
@@ -302,11 +342,11 @@ const definitions: HunsuToolDefinition[] = [
     },
     [...mutationRequired("nodeSha"), "comparisonId", "rationale", "confirmedByUser"],
     "Selecting this Node requires explicit user confirmation.",
-    "Show the sibling comparison and ask the user to confirm the selected Node."
+    "Show the exact comparison cohort and ask the user to confirm the selected Node."
   ),
   confirmedTool(
     "hunsu.alternatives.reject",
-    "Reject one sibling future after comparison and explicit user confirmation.",
+    "Reject one result Node from an explicit comparison cohort after user confirmation.",
     {
       ...mutationIdentity("nodeSha"),
       comparisonId: id,
@@ -315,7 +355,7 @@ const definitions: HunsuToolDefinition[] = [
     },
     [...mutationRequired("nodeSha"), "comparisonId", "rationale", "confirmedByUser"],
     "Rejecting this Node requires explicit user confirmation.",
-    "Show the sibling comparison and ask the user to confirm the rejected Node."
+    "Show the exact comparison cohort and ask the user to confirm the rejected Node."
   )
 ];
 
@@ -354,8 +394,73 @@ function readTool(name: HunsuToolName, description: string, properties: Record<s
   return tool(name, description, properties, required, true, false);
 }
 
+function unionReadTool(name: HunsuToolName, description: string, variants: readonly JsonSchema[]): HunsuToolDefinition {
+  return {
+    name,
+    description,
+    inputSchema: { oneOf: variants },
+    readOnly: true,
+    requiresUserConfirmation: false
+  };
+}
+
 function writeTool(name: HunsuToolName, description: string, properties: Record<string, JsonSchema>, required: string[]): HunsuToolDefinition {
   return tool(name, description, properties, required, false, false);
+}
+
+function unionWriteTool(name: HunsuToolName, description: string, variants: readonly JsonSchema[]): HunsuToolDefinition {
+  return {
+    name,
+    description,
+    inputSchema: { oneOf: variants },
+    readOnly: false,
+    requiresUserConfirmation: false
+  };
+}
+
+function comparisonInputVariant(
+  comparisonType: "sibling_runs" | "coached_how_experiment",
+  anchorField: "sourceNodeSha" | "anchorNodeSha"
+): JsonSchema {
+  const properties = {
+    repository,
+    projectId: id,
+    comparisonType: { const: comparisonType },
+    [anchorField]: sha,
+    comparisonId: id,
+    nodeShas: { type: "array", minItems: 2, uniqueItems: true, items: sha },
+    findings: {
+      type: "array",
+      items: object({
+        criterion: text,
+        summaries: {
+          type: "array",
+          minItems: 2,
+          items: object({ nodeSha: sha, summary: text }, ["nodeSha", "summary"])
+        }
+      }, ["criterion", "summaries"])
+    },
+    summary: text,
+    idempotencyKey,
+    expectedStateSha: stateSha
+  };
+  return object(properties, [
+    "repository", "projectId", "comparisonType", anchorField, "comparisonId", "nodeShas", "findings", "summary",
+    "idempotencyKey", "expectedStateSha"
+  ]);
+}
+
+function comparisonGetInputVariant(
+  comparisonType: "sibling_runs" | "coached_how_experiment",
+  anchorField: "sourceNodeSha" | "anchorNodeSha"
+): JsonSchema {
+  return object({
+    repository,
+    projectId: id,
+    comparisonType: { const: comparisonType },
+    [anchorField]: sha,
+    comparisonId: id
+  }, ["repository", "projectId", "comparisonType", anchorField, "comparisonId"]);
 }
 
 function confirmedTool(

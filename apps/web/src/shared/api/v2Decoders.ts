@@ -1,6 +1,9 @@
 import {
   DOMAIN_EVENT_TYPES,
   type ActiveRunSummary,
+  type CoachReviewSummary,
+  type CoachingProposalSummary,
+  type ComparisonDecisionSummary,
   type ComparisonSummary,
   type DecisionSummary,
   type DomainEventListItem,
@@ -259,10 +262,16 @@ function decodeActiveRun(value: unknown, path: string): ActiveRunSummary {
 }
 
 function decodeNode(value: unknown, path: string): NodeDetail {
-  const dto = exactObject(value, path, ["sha", "title", "commitUrl", "treeSha", "managedRef", "integrity", "status", "lineage", "plan", "outgoingEdges", "activeRuns", "evidence", "comparisons", "decisions"]);
+  const dto = exactObject(value, path, [
+    "sha", "payloadDigest", "planDigest", "title", "commitUrl", "treeSha", "managedRef", "integrity", "status",
+    "lineage", "plan", "outgoingEdges", "activeRuns", "evidence", "comparisons", "decisions",
+    "coachingProposals", "coachReviews"
+  ]);
   const plan = exactObject(dto.plan, `${path}.plan`, ["schema", "nextGoals", "how"]);
   return {
     sha: fullSha(dto.sha, `${path}.sha`),
+    payloadDigest: nodePayloadDigest(dto.payloadDigest, `${path}.payloadDigest`),
+    planDigest: nodePlanDigest(dto.planDigest, `${path}.planDigest`),
     title: textValue(dto.title, `${path}.title`),
     commitUrl: httpUrl(dto.commitUrl, `${path}.commitUrl`),
     treeSha: fullSha(dto.treeSha, `${path}.treeSha`),
@@ -279,7 +288,9 @@ function decodeNode(value: unknown, path: string): NodeDetail {
     activeRuns: arrayOf(dto.activeRuns, `${path}.activeRuns`, decodeActiveRun),
     evidence: arrayOf(dto.evidence, `${path}.evidence`, decodeEvidence),
     comparisons: arrayOf(dto.comparisons, `${path}.comparisons`, decodeComparison),
-    decisions: arrayOf(dto.decisions, `${path}.decisions`, decodeDecision)
+    decisions: arrayOf(dto.decisions, `${path}.decisions`, decodeDecision),
+    coachingProposals: arrayOf(dto.coachingProposals, `${path}.coachingProposals`, decodeCoachingProposal),
+    coachReviews: arrayOf(dto.coachReviews, `${path}.coachReviews`, decodeCoachReview)
   };
 }
 
@@ -326,16 +337,22 @@ function decodeRunnerValue(value: unknown, path: string): RunnerValueSummary {
   const dto = exactObject(value, path, ["schema", "name", "typeKey", "schemaVersion", "digest", "type", "value"]);
   const type = exactObject(dto.type, `${path}.type`, ["origin", "key", "schemaVersion", "integrity"]);
   const runnerValue = canonicalJson(dto.value, `${path}.value`);
+  const typeKey = textValue(dto.typeKey, `${path}.typeKey`);
+  const schemaVersion = semanticVersion(dto.schemaVersion, `${path}.schemaVersion`);
+  const lockedTypeKey = textValue(type.key, `${path}.type.key`);
+  const lockedSchemaVersion = semanticVersion(type.schemaVersion, `${path}.type.schemaVersion`);
+  if (typeKey !== lockedTypeKey) fail(`${path}.typeKey`, "Runner typeKey must match the nested Runner type lock.");
+  if (schemaVersion !== lockedSchemaVersion) fail(`${path}.schemaVersion`, "Runner schemaVersion must match the nested Runner type lock.");
   return {
     schema: exactLiteral(dto.schema, `${path}.schema`, "hunsu.runner-value.v1"),
     name: textValue(dto.name, `${path}.name`),
-    typeKey: textValue(dto.typeKey, `${path}.typeKey`),
-    schemaVersion: semanticVersion(dto.schemaVersion, `${path}.schemaVersion`),
+    typeKey,
+    schemaVersion,
     digest: runnerDigest(dto.digest, `${path}.digest`),
     type: {
       origin: textValue(type.origin, `${path}.type.origin`),
-      key: textValue(type.key, `${path}.type.key`),
-      schemaVersion: semanticVersion(type.schemaVersion, `${path}.type.schemaVersion`),
+      key: lockedTypeKey,
+      schemaVersion: lockedSchemaVersion,
       integrity: runnerTypeIntegrity(type.integrity, `${path}.type.integrity`)
     },
     value: runnerValue
@@ -382,13 +399,139 @@ function decodeEvidence(value: unknown, path: string): EvidenceSummary {
 }
 
 function decodeComparison(value: unknown, path: string): ComparisonSummary {
-  const dto = exactObject(value, path, ["id", "summary", "siblingNodeShas", "recordedAt"]);
-  return {
+  const dto = taggedObject(value, path, "type");
+  const keys = dto.type === "sibling_runs"
+    ? ["type", "id", "parentNodeSha", "nodeShas", "summary", "disposition", "recordedAt"]
+    : dto.type === "coached_how_experiment"
+      ? ["type", "id", "anchorNodeSha", "goalDigest", "nodeShas", "summary", "disposition", "recordedAt"]
+      : fail(`${path}.type`, "Expected sibling_runs or coached_how_experiment comparison type.");
+  exactKeys(dto, path, keys);
+  const id = textValue(dto.id, `${path}.id`);
+  const nodeShas = atLeastTwoUniqueShas(dto.nodeShas, `${path}.nodeShas`);
+  const disposition = decodeComparisonDisposition(dto.disposition, `${path}.disposition`, id);
+  if (disposition.type === "decisions_recorded"
+    && disposition.decisions.some(decision => decision.nodeShas.some(nodeSha => !nodeShas.includes(nodeSha)))) {
+    fail(`${path}.disposition.decisions`, "Every decision Node must belong to this comparison.");
+  }
+  const base = {
     id: textValue(dto.id, `${path}.id`),
     summary: textValue(dto.summary, `${path}.summary`),
-    siblingNodeShas: nonEmptyArray(dto.siblingNodeShas, `${path}.siblingNodeShas`, fullSha),
+    nodeShas,
+    disposition,
     recordedAt: timestamp(dto.recordedAt, `${path}.recordedAt`)
   };
+  return dto.type === "sibling_runs"
+    ? { ...base, type: "sibling_runs", parentNodeSha: fullSha(dto.parentNodeSha, `${path}.parentNodeSha`) }
+    : {
+        ...base,
+        type: "coached_how_experiment",
+        anchorNodeSha: fullSha(dto.anchorNodeSha, `${path}.anchorNodeSha`),
+        goalDigest: goalDigest(dto.goalDigest, `${path}.goalDigest`)
+      };
+}
+
+function decodeComparisonDisposition(value: unknown, path: string, comparisonId: string): ComparisonSummary["disposition"] {
+  const dto = taggedObject(value, path, "type");
+  if (dto.type === "undecided") {
+    exactKeys(dto, path, ["type"]);
+    return { type: "undecided" };
+  }
+  if (dto.type !== "decisions_recorded") fail(`${path}.type`, "Expected undecided or decisions_recorded disposition.");
+  exactKeys(dto, path, ["type", "decisions"]);
+  const decisions = nonEmptyArray(dto.decisions, `${path}.decisions`, decodeComparisonDecision);
+  if (new Set(decisions.map(decision => decision.id)).size !== decisions.length) fail(`${path}.decisions`, "Decision ids must be unique.");
+  if (decisions.some(decision => decision.comparisonId !== comparisonId)) fail(`${path}.decisions`, "Every decision must reference this comparison.");
+  return { type: "decisions_recorded", decisions };
+}
+
+function decodeComparisonDecision(value: unknown, path: string): ComparisonDecisionSummary {
+  const dto = exactObject(value, path, ["id", "type", "comparisonId", "nodeShas", "rationale", "decidedAt"]);
+  const type = oneOf(dto.type, `${path}.type`, ["selection", "rejection"] as const);
+  const nodeShas = uniqueShas(dto.nodeShas, `${path}.nodeShas`);
+  if (type === "selection" && nodeShas.length !== 1) fail(`${path}.nodeShas`, "A selection must contain exactly one Node.");
+  return {
+    id: textValue(dto.id, `${path}.id`),
+    type,
+    comparisonId: textValue(dto.comparisonId, `${path}.comparisonId`),
+    nodeShas,
+    rationale: textValue(dto.rationale, `${path}.rationale`),
+    decidedAt: timestamp(dto.decidedAt, `${path}.decidedAt`)
+  };
+}
+
+function decodeCoachingProposal(value: unknown, path: string): CoachingProposalSummary {
+  const dto = exactObject(value, path, [
+    "id", "sourceNodeSha", "sourcePayloadDigest", "sourcePlanDigest", "proposedPlanDigest", "expectedStateSha",
+    "summary", "rationale", "proposedAt", "disposition"
+  ]);
+  return {
+    id: textValue(dto.id, `${path}.id`),
+    sourceNodeSha: fullSha(dto.sourceNodeSha, `${path}.sourceNodeSha`),
+    sourcePayloadDigest: nodePayloadDigest(dto.sourcePayloadDigest, `${path}.sourcePayloadDigest`),
+    sourcePlanDigest: nodePlanDigest(dto.sourcePlanDigest, `${path}.sourcePlanDigest`),
+    proposedPlanDigest: nodePlanDigest(dto.proposedPlanDigest, `${path}.proposedPlanDigest`),
+    expectedStateSha: fullSha(dto.expectedStateSha, `${path}.expectedStateSha`),
+    summary: textValue(dto.summary, `${path}.summary`),
+    rationale: textValue(dto.rationale, `${path}.rationale`),
+    proposedAt: timestamp(dto.proposedAt, `${path}.proposedAt`),
+    disposition: decodeCoachingDisposition(dto.disposition, `${path}.disposition`)
+  };
+}
+
+function decodeCoachingDisposition(value: unknown, path: string): CoachingProposalSummary["disposition"] {
+  const dto = taggedObject(value, path, "type");
+  if (dto.type === "pending") {
+    exactKeys(dto, path, ["type"]);
+    return { type: "pending" };
+  }
+  if (dto.type === "confirmed") {
+    exactKeys(dto, path, ["type", "decisionId", "childNodeSha", "reason", "decidedAt"]);
+    return {
+      type: "confirmed",
+      decisionId: textValue(dto.decisionId, `${path}.decisionId`),
+      childNodeSha: fullSha(dto.childNodeSha, `${path}.childNodeSha`),
+      reason: textValue(dto.reason, `${path}.reason`),
+      decidedAt: timestamp(dto.decidedAt, `${path}.decidedAt`)
+    };
+  }
+  if (dto.type === "rejected") {
+    exactKeys(dto, path, ["type", "decisionId", "reason", "decidedAt"]);
+    return {
+      type: "rejected",
+      decisionId: textValue(dto.decisionId, `${path}.decisionId`),
+      reason: textValue(dto.reason, `${path}.reason`),
+      decidedAt: timestamp(dto.decidedAt, `${path}.decidedAt`)
+    };
+  }
+  fail(`${path}.type`, "Expected pending, confirmed, or rejected Coaching disposition.");
+}
+
+function decodeCoachReview(value: unknown, path: string): CoachReviewSummary {
+  const dto = exactObject(value, path, ["id", "target", "assessment", "recommendations", "recordedAt"]);
+  return {
+    id: textValue(dto.id, `${path}.id`),
+    target: decodeCoachReviewTarget(dto.target, `${path}.target`),
+    assessment: textValue(dto.assessment, `${path}.assessment`),
+    recommendations: arrayOf(dto.recommendations, `${path}.recommendations`, textValue),
+    recordedAt: timestamp(dto.recordedAt, `${path}.recordedAt`)
+  };
+}
+
+function decodeCoachReviewTarget(value: unknown, path: string): CoachReviewSummary["target"] {
+  const dto = taggedObject(value, path, "type");
+  if (dto.type === "node") {
+    exactKeys(dto, path, ["type", "nodeSha"]);
+    return { type: "node", nodeSha: fullSha(dto.nodeSha, `${path}.nodeSha`) };
+  }
+  if (dto.type === "run") {
+    exactKeys(dto, path, ["type", "runId"]);
+    return { type: "run", runId: textValue(dto.runId, `${path}.runId`) };
+  }
+  if (dto.type === "comparison") {
+    exactKeys(dto, path, ["type", "comparisonId"]);
+    return { type: "comparison", comparisonId: textValue(dto.comparisonId, `${path}.comparisonId`) };
+  }
+  fail(`${path}.type`, "Expected node, run, or comparison Coach review target.");
 }
 
 function decodeDecision(value: unknown, path: string): DecisionSummary {
@@ -545,6 +688,26 @@ function runnerDigest(value: unknown, path: string): string {
 
 function runnerTypeIntegrity(value: unknown, path: string): string {
   return prefixedDigest(value, path, "hunsu-runner-type-v1:sha256:");
+}
+
+function nodePayloadDigest(value: unknown, path: string): string {
+  return prefixedDigest(value, path, "hunsu-node-payload-v1:sha256:");
+}
+
+function nodePlanDigest(value: unknown, path: string): string {
+  return prefixedDigest(value, path, "hunsu-node-plan-v1:sha256:");
+}
+
+function uniqueShas(value: unknown, path: string): readonly string[] {
+  const result = nonEmptyArray(value, path, fullSha);
+  if (new Set(result).size !== result.length) fail(path, "Node SHAs must be unique.");
+  return result;
+}
+
+function atLeastTwoUniqueShas(value: unknown, path: string): readonly string[] {
+  const result = uniqueShas(value, path);
+  if (result.length < 2) fail(path, "Expected at least two unique Node SHAs.");
+  return result;
 }
 
 function timestamp(value: unknown, path: string): string {

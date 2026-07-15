@@ -12,12 +12,15 @@ import {
   decodeDefinitionLock,
   decodeRegistryDefinition,
   decodeRegistryOrigin,
+  decodeRunnerValueSchema,
   decodeRunnerTypeLock
 } from "./decoder.ts";
 import {
   REGISTRY_INTEGRITY_PREFIX,
   REGISTRY_SNAPSHOT_SCHEMA,
   RUNNER_TYPE_INTEGRITY_PREFIX,
+  RUNNER_VALUE_SCHEMA_DIGEST_PREFIX,
+  RUNNER_VALUE_SCHEMA_SCHEMA,
   type DefinitionIntegrity,
   type DefinitionKind,
   type DefinitionLock,
@@ -26,7 +29,10 @@ import {
   type RegistryEntry,
   type RegistryResult,
   type ResolvedRunnerType,
-  type RunnerTypeDefinition
+  type RunnerTypeCapabilityDefinition,
+  type RunnerTypeDefinition,
+  type RunnerValueSchema,
+  type RunnerValueSchemaDigest
 } from "./model.ts";
 import { decodeRunnerValuePayload } from "./runner-value.ts";
 
@@ -34,6 +40,18 @@ export function canonicalizeRegistryDefinition(value: unknown): RegistryResult<s
   const definition = decodeRegistryDefinition(value);
   if (!definition.ok) return definition;
   return canonicalJson(definition.value);
+}
+
+export function canonicalizeRunnerValueSchema(value: unknown): RegistryResult<string> {
+  const schema = decodeRunnerValueSchema(value, "$.valueSchema");
+  if (!schema.ok) return schema;
+  return canonicalJson(schema.value, "$.valueSchema");
+}
+
+export function computeRunnerValueSchemaDigest(value: unknown): RegistryResult<RunnerValueSchemaDigest> {
+  const canonical = canonicalizeRunnerValueSchema(value);
+  if (!canonical.ok) return canonical;
+  return ok(`${RUNNER_VALUE_SCHEMA_DIGEST_PREFIX}${sha256Hex(canonical.value)}` as RunnerValueSchemaDigest);
 }
 
 export function computeDefinitionIntegrity(value: unknown): RegistryResult<DefinitionIntegrity> {
@@ -172,6 +190,32 @@ export function resolveRunnerTypeDefinition(registryValue: unknown, lockValue: u
   return ok({ lock: lock.value, definition: entry.definition });
 }
 
+export function runnerTypeCapabilityDefinition(
+  registryValue: unknown,
+  lockValue: unknown
+): RegistryResult<RunnerTypeCapabilityDefinition> {
+  const resolved = resolveRunnerTypeDefinition(registryValue, lockValue);
+  if (!resolved.ok) return resolved;
+  return capabilityDefinition(resolved.value.lock, resolved.value.definition);
+}
+
+export function listRunnerTypeCapabilityDefinitions(
+  registryValue: unknown
+): RegistryResult<readonly RunnerTypeCapabilityDefinition[]> {
+  const registry = decodeDefinitionRegistry(registryValue, "$.registry");
+  if (!registry.ok) return registry;
+  const capabilities: RunnerTypeCapabilityDefinition[] = [];
+  for (const entry of registry.value.entries) {
+    if (entry.definition.kind !== "runner_type") continue;
+    const lock = definitionLockToRunnerTypeLock(entry.lock);
+    if (!lock.ok) return lock;
+    const capability = capabilityDefinition(lock.value, entry.definition);
+    if (!capability.ok) return capability;
+    capabilities.push(capability.value);
+  }
+  return ok(capabilities.sort((left, right) => runnerTypeIdentity(left.type).localeCompare(runnerTypeIdentity(right.type))));
+}
+
 export function createRunnerValueTypeDecoder(registryValue: unknown, lockValue: unknown): RegistryResult<RunnerValueTypeDecoder> {
   const resolved = resolveRunnerTypeDefinition(registryValue, lockValue);
   if (!resolved.ok) return resolved;
@@ -196,6 +240,37 @@ function decoderFor(lock: RunnerTypeLock, definition: RunnerTypeDefinition): Run
     type: lock,
     decode: (value, path) => decodeRunnerValuePayload(definition.runnerType.valueSchema, value, path)
   };
+}
+
+function capabilityDefinition(
+  lock: RunnerTypeLock,
+  definition: RunnerTypeDefinition
+): RegistryResult<RunnerTypeCapabilityDefinition> {
+  const valueSchema = canonicalRunnerValueSchema(definition.runnerType.valueSchema);
+  if (!valueSchema.ok) return valueSchema;
+  return ok({
+    type: lock,
+    displayName: definition.runnerType.displayName,
+    valueSchema: {
+      schema: RUNNER_VALUE_SCHEMA_SCHEMA,
+      digest: valueSchema.value.digest,
+      root: valueSchema.value.root
+    }
+  });
+}
+
+function canonicalRunnerValueSchema(value: unknown): RegistryResult<{
+  readonly digest: RunnerValueSchemaDigest;
+  readonly root: RunnerValueSchema;
+}> {
+  const root = decodeRunnerValueSchema(value, "$.valueSchema");
+  if (!root.ok) return root;
+  const digest = computeRunnerValueSchemaDigest(root.value);
+  return digest.ok ? ok({ digest: digest.value, root: root.value }) : digest;
+}
+
+function runnerTypeIdentity(lock: RunnerTypeLock): string {
+  return JSON.stringify([lock.key, lock.origin, lock.schemaVersion, lock.integrity]);
 }
 
 function resolveEntry(registry: DefinitionRegistry, lock: DefinitionLock, path: string): RegistryResult<RegistryEntry> {

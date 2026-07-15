@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  HISTORICAL_PROJECT_EVENT_SCHEMA,
   PROJECT_EVENT_SCHEMA,
   PROJECT_STATE_SCHEMA,
   RUNNER_VALUE_SCHEMA,
@@ -20,6 +21,7 @@ import {
   makeAcceptanceCriterion,
   makeCommandFingerprint,
   makeCoachingProposalId,
+  makeComparisonId,
   makeDesiredOutcome,
   makeEventId,
   makeEvidenceId,
@@ -155,7 +157,7 @@ test("canonical JSON decoding preserves __proto__ as data without mutating the o
   assert.deepEqual((decoded.value as Record<string, unknown>).__proto__, { polluted: true });
 });
 
-test("v2 event and state codecs reject v1 schemas and unknown fields", () => {
+test("v3 events and v2 state codecs reject v1 schemas and unknown fields", () => {
   const at = take(makeIsoTimestamp("2026-07-14T00:00:00.000Z"));
   const projectId = take(makeProjectId("project_alpha"));
   const event: DomainEvent = {
@@ -181,6 +183,11 @@ test("v2 event and state codecs reject v1 schemas and unknown fields", () => {
   const encoded = encodeDomainEvent(event);
   assert.match(encoded, new RegExp(`"schema":"${PROJECT_EVENT_SCHEMA.replaceAll(".", "\\.")}"`, "u"));
   assert.deepEqual(decodeDomainEvent(encoded, runnerTypes), ok(event));
+  const historicalUnchangedEvent = JSON.parse(encoded) as { schema: string; event: Record<string, unknown> };
+  historicalUnchangedEvent.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  assert.deepEqual(decodeDomainEvent(JSON.stringify(historicalUnchangedEvent), runnerTypes), ok(event));
+  historicalUnchangedEvent.event.legacy = true;
+  assert.equal(decodeDomainEvent(JSON.stringify(historicalUnchangedEvent), runnerTypes).ok, false);
   assert.equal(decodeDomainEvent(encoded.replace(PROJECT_EVENT_SCHEMA, "hunsu.project-event.v1"), runnerTypes).ok, false);
 
   const rebuilt: DomainEvent = {
@@ -241,7 +248,8 @@ test("v2 event and state codecs reject v1 schemas and unknown fields", () => {
       proposedPlan: coachedPlan,
       proposedPlanDigest: computeNodePlanDigest(coachedPlan),
       expectedStateSha: rootNode.commitSha,
-      reason: take(makeReason("Consume the completed Goal.")),
+      summary: take(makeEvidenceSummary("Remove the completed Goal from the next plan.")),
+      rationale: take(makeReason("Consume the completed Goal.")),
       proposedAt: at
     }
   };
@@ -253,6 +261,127 @@ test("v2 event and state codecs reject v1 schemas and unknown fields", () => {
   const extraBinding = JSON.parse(encodedProposal) as { event: { proposal: Record<string, unknown> } };
   extraBinding.event.proposal.compatibleStateSha = rootNode.commitSha;
   assert.equal(decodeDomainEvent(JSON.stringify(extraBinding), runnerTypes).ok, false);
+  const legacyReason = JSON.parse(encodedProposal) as {
+    schema: string;
+    event: { proposal: Record<string, unknown> };
+  };
+  delete legacyReason.event.proposal.summary;
+  delete legacyReason.event.proposal.rationale;
+  legacyReason.event.proposal.reason = "Legacy combined reason.";
+  assert.equal(decodeDomainEvent(JSON.stringify(legacyReason), runnerTypes).ok, false);
+  legacyReason.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  const decodedLegacyProposal = decodeDomainEvent(JSON.stringify(legacyReason), runnerTypes);
+  assert.equal(decodedLegacyProposal.ok, true);
+  if (decodedLegacyProposal.ok) {
+    assert.equal(decodedLegacyProposal.value.type, "CoachingProposalRecorded");
+    if (decodedLegacyProposal.value.type === "CoachingProposalRecorded") {
+      assert.equal(decodedLegacyProposal.value.proposal.summary, "Legacy combined reason.");
+      assert.equal(decodedLegacyProposal.value.proposal.rationale, "Legacy combined reason.");
+    }
+  }
+  const historicalProposalWithCurrentShape = JSON.parse(encodedProposal) as { schema: string };
+  historicalProposalWithCurrentShape.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  assert.equal(decodeDomainEvent(JSON.stringify(historicalProposalWithCurrentShape), runnerTypes).ok, false);
+  const missingSummary = JSON.parse(encodedProposal) as { event: { proposal: Record<string, unknown> } };
+  delete missingSummary.event.proposal.summary;
+  assert.equal(decodeDomainEvent(JSON.stringify(missingSummary), runnerTypes).ok, false);
+  const missingRationale = JSON.parse(encodedProposal) as { event: { proposal: Record<string, unknown> } };
+  delete missingRationale.event.proposal.rationale;
+  assert.equal(decodeDomainEvent(JSON.stringify(missingRationale), runnerTypes).ok, false);
+
+  const siblingComparisonEvent: DomainEvent = {
+    type: "AlternativesCompared",
+    meta: { ...event.meta, eventId: take(makeEventId("event_sibling_comparison")) },
+    comparison: {
+      type: "sibling_runs",
+      id: take(makeComparisonId("comparison_sibling")),
+      projectId,
+      parentNodeSha: rootNode.commitSha,
+      nodeShas: [take(makeGitCommitSha("c".repeat(40))), take(makeGitCommitSha("d".repeat(40)))],
+      findings: [{
+        subject: take(makeNonEmptyText("Acceptance criterion")),
+        summaries: [
+          { nodeSha: take(makeGitCommitSha("c".repeat(40))), summary: take(makeEvidenceSummary("First result evidence.")) },
+          { nodeSha: take(makeGitCommitSha("d".repeat(40))), summary: take(makeEvidenceSummary("Second result evidence.")) }
+        ]
+      }],
+      summary: take(makeEvidenceSummary("Compare completed sibling Runs.")),
+      recordedAt: at
+    }
+  };
+  const encodedSiblingComparison = encodeDomainEvent(siblingComparisonEvent);
+  assert.deepEqual(decodeDomainEvent(encodedSiblingComparison, runnerTypes), ok(siblingComparisonEvent));
+  const missingComparisonType = JSON.parse(encodedSiblingComparison) as { event: { comparison: Record<string, unknown> } };
+  delete missingComparisonType.event.comparison.type;
+  assert.equal(decodeDomainEvent(JSON.stringify(missingComparisonType), runnerTypes).ok, false);
+  const incompleteFinding = JSON.parse(encodedSiblingComparison) as {
+    event: { comparison: { findings: Array<{ summaries: unknown[] }> } };
+  };
+  incompleteFinding.event.comparison.findings[0]!.summaries.pop();
+  assert.equal(decodeDomainEvent(JSON.stringify(incompleteFinding), runnerTypes).ok, false);
+  const historicalComparison = JSON.parse(encodedSiblingComparison) as {
+    schema: string;
+    event: { comparison: { type?: unknown; findings: Array<{ summaries: unknown[] }> } };
+  };
+  historicalComparison.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  delete historicalComparison.event.comparison.type;
+  historicalComparison.event.comparison.findings[0]!.summaries.pop();
+  const decodedHistoricalComparison = decodeDomainEvent(JSON.stringify(historicalComparison), runnerTypes);
+  assert.equal(decodedHistoricalComparison.ok, true);
+  if (decodedHistoricalComparison.ok) {
+    assert.equal(decodedHistoricalComparison.value.type, "AlternativesCompared");
+    if (decodedHistoricalComparison.value.type === "AlternativesCompared") {
+      assert.equal(decodedHistoricalComparison.value.comparison.type, "sibling_runs");
+      assert.deepEqual(
+        decodedHistoricalComparison.value.comparison.findings[0]?.summaries,
+        [
+          siblingComparisonEvent.comparison.findings[0]!.summaries[0],
+          {
+            nodeSha: siblingComparisonEvent.comparison.nodeShas[1],
+            summary: siblingComparisonEvent.comparison.summary
+          }
+        ]
+      );
+    }
+  }
+  const historicalComparisonWithType = JSON.parse(encodedSiblingComparison) as { schema: string };
+  historicalComparisonWithType.schema = HISTORICAL_PROJECT_EVENT_SCHEMA;
+  assert.equal(decodeDomainEvent(JSON.stringify(historicalComparisonWithType), runnerTypes).ok, false);
+  const historicalDuplicateSummary = structuredClone(historicalComparison);
+  historicalDuplicateSummary.event.comparison.findings[0]!.summaries.push(
+    historicalDuplicateSummary.event.comparison.findings[0]!.summaries[0]
+  );
+  assert.equal(decodeDomainEvent(JSON.stringify(historicalDuplicateSummary), runnerTypes).ok, false);
+  const historicalForeignSummary = structuredClone(historicalComparison);
+  historicalForeignSummary.event.comparison.findings[0]!.summaries[0] = {
+    nodeSha: "9".repeat(40),
+    summary: "Foreign result evidence."
+  };
+  assert.equal(decodeDomainEvent(JSON.stringify(historicalForeignSummary), runnerTypes).ok, false);
+
+  const coachedComparisonEvent: DomainEvent = {
+    type: "AlternativesCompared",
+    meta: { ...event.meta, eventId: take(makeEventId("event_coached_comparison")) },
+    comparison: {
+      type: "coached_how_experiment",
+      id: take(makeComparisonId("comparison_coached")),
+      projectId,
+      anchorNodeSha: rootNode.commitSha,
+      goalDigest: computeGoalDigest(goal),
+      nodeShas: [take(makeGitCommitSha("e".repeat(40))), take(makeGitCommitSha("f".repeat(40)))],
+      findings: [],
+      summary: take(makeEvidenceSummary("Compare Runs from coached How variants.")),
+      recordedAt: at
+    }
+  };
+  const encodedCoachedComparison = encodeDomainEvent(coachedComparisonEvent);
+  assert.deepEqual(decodeDomainEvent(encodedCoachedComparison, runnerTypes), ok(coachedComparisonEvent));
+  const coachedWithSiblingField = JSON.parse(encodedCoachedComparison) as { event: { comparison: Record<string, unknown> } };
+  coachedWithSiblingField.event.comparison.parentNodeSha = rootNode.commitSha;
+  assert.equal(decodeDomainEvent(JSON.stringify(coachedWithSiblingField), runnerTypes).ok, false);
+  const missingGoalDigest = JSON.parse(encodedCoachedComparison) as { event: { comparison: Record<string, unknown> } };
+  delete missingGoalDigest.event.comparison.goalDigest;
+  assert.equal(decodeDomainEvent(JSON.stringify(missingGoalDigest), runnerTypes).ok, false);
 
   const evidenceEvent: DomainEvent = {
     type: "RunEvidenceAttached",

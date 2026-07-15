@@ -9,6 +9,8 @@ import {
   HUNSU_STATE_BRANCH,
   type GitHubTransport,
   type GitHubTransportError,
+  type KeyedNodeActivityKind,
+  type NodeActivityKind,
   type ReconstructedProject,
   type RepositoryGrant,
   type RepositoryLocator,
@@ -23,6 +25,11 @@ import {
   type HunsuToolName,
   type McpToolDispatcher,
   type PluginSafeError,
+  type RunnerCapability,
+  type RunnerCapabilityCatalogDigest,
+  type RunnerCapabilityDetail,
+  type RunnerCapabilityList,
+  type RunnerCapabilityRepositoryIdentity,
   type RunContract,
   type ToolResponse
 } from "@hunsu/plugin-contract";
@@ -45,6 +52,7 @@ import {
   computeRunnerDigest,
   decodeNodePayload,
   decodeNodePlan,
+  decodeRunnerTypeLock,
   makeAcceptanceCriterion,
   makeAtLeastTwo,
   makeCheckpointId,
@@ -79,6 +87,9 @@ import {
   runBranchName,
   type CommandMetadata,
   type ComparisonFinding,
+  type AlternativeComparison,
+  type CoachReview,
+  type CoachingProposal,
   type CoachingChildNode,
   type DomainActor,
   type DomainEvent,
@@ -93,22 +104,29 @@ import {
   type RootNode,
   type Run,
   type RunChildNode,
+  type RunnerTypeLock,
   type RunnerValue,
   type RunnerValueTypeRegistry
 } from "@hunsu/protocol";
 import { createProjectCodec } from "./project-codec.ts";
 import type {
+  CoachingActivityReadModel,
+  ComparisonActivityReadModel,
+  DecisionActivityReadModel,
   EventLogCheckpoint,
   EventIndexEntryReadModel,
   EvidenceActivityReadModel,
   ProjectGraphEdge,
   ProjectGraphNode,
+  ReviewActivityReadModel,
   RunActivityReadModel
 } from "./project-read-models.ts";
 import {
   EVENT_INDEX_SHARD_SIZE,
   GRAPH_PAGE_SIZE,
   MAX_EVENT_SHARDS_PER_PAGE,
+  NODE_ACTIVITY_KINDS,
+  NODE_ACTIVITY_PAGE_SIZE,
   SHARDED_READ_MODEL_PATHS,
   decodeActivityManifest,
   decodeEventLocator,
@@ -117,11 +135,21 @@ import {
   decodeGraphManifest,
   decodeGraphNodeShard,
   decodeGraphPage,
-  decodeNodeActivityShard,
+  decodeNodeActivityIndex,
+  decodeNodeActivityPage,
+  decodeNodeActivityRecord,
   decodeRunActivityShard,
   decodeShardedProjectCatalog,
   scanReverseEventShards,
-  type NodeActivityShardReadModel,
+  validateGraphNodeTopology,
+  validateGraphPageNodeLocators,
+  validateGraphPageTopology,
+  validateNodeActivityPageCommitment,
+  validateNodeActivityRecordMembership,
+  type NodeActivityIndexReadModel,
+  type NodeActivityPageReadModel,
+  type NodeActivityRecordReadModel,
+  type NodeActivitySummaryReadModel,
   type ProjectActivityManifestReadModel,
   type ProjectEventManifestReadModel,
   type ProjectEventShardReadModel,
@@ -192,11 +220,15 @@ type MutationFactory = (state: ProjectState, meta: CommandMetadata) => ProjectCo
 
 export type ProjectionCachePolicy = {
   projectTtlMs: number;
+  nodeAnchorTtlMs: number;
   installationTtlMs: number;
 };
 
 const DEFAULT_CACHE_POLICY: ProjectionCachePolicy = {
-  projectTtlMs: 4_000,
+  // Spans the 10-second active Dashboard poll so adjacent polls do not each
+  // consume a GitHub state-head request when no webhook invalidation occurred.
+  projectTtlMs: 15_000,
+  nodeAnchorTtlMs: 60_000,
   installationTtlMs: 60_000
 };
 
@@ -204,6 +236,10 @@ const FULL_SHA = /^[0-9a-f]{40}$/u;
 const EVENT_CURSOR = /^[1-9][0-9]*$/u;
 const EXACT_EVENT_CURSOR = /^([0-9a-f]{40}):([1-9][0-9]*)$/u;
 const EXACT_GRAPH_CURSOR = /^([0-9a-f]{40}):(0|[1-9][0-9]*)$/u;
+const EXACT_ACTIVITY_CURSOR = /^([0-9a-f]{40}):(0|[1-9][0-9]*)$/u;
+const RUNNER_CAPABILITY_CATALOG_DIGEST_PREFIX = "hunsu-runner-capability-catalog-v1:sha256:" as const;
+const RUNNER_CAPABILITY_CURSOR = /^(hunsu-runner-capability-catalog-v1:sha256:[0-9a-f]{64}):([1-9][0-9]*)$/u;
+const MAX_NODE_ANCHOR_CACHE_ENTRIES = 3_000;
 
 export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   readonly #transport: GitHubTransport;
@@ -218,6 +254,9 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   readonly #readProjects = new Map<string, ReadProjectCache>();
   readonly #readProjectFlights = new Map<string, Promise<ApiResult<readonly ReadProject[]>>>();
   readonly #readStateFilesByHead = new Map<string, string>();
+  readonly #readStateFileFlights = new Map<string, Promise<ApiResult<true>>>();
+  readonly #nodeAnchorVerifications = new Map<string, TimedCache<true>>();
+  readonly #nodeAnchorFlights = new Map<string, Promise<ApiResult<true>>>();
   readonly #installations = new Map<number, TimedCache<readonly RepositoryGrant[]>>();
   readonly #installationFlights = new Map<number, ReturnType<GitHubTransport["listInstallationRepositories"]>>();
   readonly #installationCacheGenerations = new Map<number, number>();
@@ -288,6 +327,18 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
             ? this.#toolMutation(await this.#rebuildProjectMaterializations(repository.value, context, input))
             : repository;
         }
+        case "hunsu.runner_capabilities.list": {
+          const repository = await this.#repositoryFromInput(context, record(input, "repository"), false);
+          return repository.ok
+            ? apiOk({ data: this.#runnerCapabilityList(repository.value, input) })
+            : repository;
+        }
+        case "hunsu.runner_capabilities.get": {
+          const repository = await this.#repositoryFromInput(context, record(input, "repository"), false);
+          if (!repository.ok) return repository;
+          const detail = this.#runnerCapabilityDetail(repository.value, input.type);
+          return detail.ok ? apiOk({ data: detail.value }) : detail;
+        }
         case "hunsu.nodes.graph": {
           const loaded = await this.#loadToolReadProject(input, context);
           if (!loaded.ok) return loaded;
@@ -320,6 +371,59 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
           if (!loaded.ok) return loaded;
           const run = await this.#readRun(loaded.value, requiredString(input, "runId"));
           return run.ok ? apiOk({ data: run.value.run, stateHeadSha: loaded.value.stateHeadSha }) : run;
+        }
+        case "hunsu.coach.reviews.list": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const result = await this.#readCoachReviews(loaded.value, requiredSha(input, "nodeSha"), input);
+          return result.ok ? apiOk({ data: result.value, stateHeadSha: loaded.value.stateHeadSha }) : result;
+        }
+        case "hunsu.coach.reviews.get": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const result = await this.#readCoachReview(
+            loaded.value,
+            requiredSha(input, "nodeSha"),
+            requiredString(input, "reviewId")
+          );
+          return result.ok ? apiOk({ data: result.value, stateHeadSha: loaded.value.stateHeadSha }) : result;
+        }
+        case "hunsu.coach.proposals.list": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const result = await this.#readCoachingProposals(loaded.value, requiredSha(input, "sourceNodeSha"), input);
+          return result.ok ? apiOk({ data: result.value, stateHeadSha: loaded.value.stateHeadSha }) : result;
+        }
+        case "hunsu.coach.proposals.get": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const result = await this.#readCoachingProposal(
+            loaded.value,
+            requiredSha(input, "sourceNodeSha"),
+            requiredString(input, "proposalId")
+          );
+          return result.ok ? apiOk({ data: result.value, stateHeadSha: loaded.value.stateHeadSha }) : result;
+        }
+        case "hunsu.alternatives.list": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const result = await this.#readAlternativeComparisons(loaded.value, requiredSha(input, "nodeSha"), input);
+          return result.ok ? apiOk({ data: result.value, stateHeadSha: loaded.value.stateHeadSha }) : result;
+        }
+        case "hunsu.alternatives.get": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const comparisonType = requiredString(input, "comparisonType");
+          if (comparisonType !== "sibling_runs" && comparisonType !== "coached_how_experiment") {
+            return invalidRequest("comparisonType is unsupported.");
+          }
+          const result = await this.#readAlternativeComparison(
+            loaded.value,
+            comparisonType,
+            comparisonType === "sibling_runs" ? requiredSha(input, "sourceNodeSha") : requiredSha(input, "anchorNodeSha"),
+            requiredString(input, "comparisonId")
+          );
+          return result.ok ? apiOk({ data: result.value, stateHeadSha: loaded.value.stateHeadSha }) : result;
         }
         case "hunsu.runs.start": {
           const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
@@ -382,6 +486,67 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const failure = rows.find(row => !row.ok);
     if (failure && !failure.ok) return failure;
     return apiOk({ repositories: rows.flatMap(row => row.ok ? [row.value] : []) });
+  }
+
+  #runnerCapabilityList(repository: RepositoryGrant, input: JsonRecord): RunnerCapabilityList {
+    const capabilities = this.#publicRunnerCapabilities();
+    const catalogDigest = runnerCapabilityCatalogDigest(capabilities);
+    const requestedLimit = optionalPositiveInteger(input, "limit");
+    if (requestedLimit !== undefined && requestedLimit > 50) {
+      throw boundaryInvalid("limit must be no greater than 50.");
+    }
+    const limit = requestedLimit ?? 50;
+    const cursor = optionalString(input, "cursor");
+    let offset = 0;
+    if (cursor !== undefined) {
+      const match = RUNNER_CAPABILITY_CURSOR.exec(cursor);
+      if (!match?.[1] || !match[2]) throw boundaryInvalid("cursor is not a Runner capability catalog cursor.");
+      if (match[1] !== catalogDigest) {
+        throw boundaryInvalid("cursor belongs to a different Runner capability catalog; restart the listing without a cursor.");
+      }
+      offset = Number(match[2]);
+      if (!Number.isSafeInteger(offset) || offset >= capabilities.length) {
+        throw boundaryInvalid("cursor is outside the Runner capability catalog.");
+      }
+    }
+    const page = capabilities.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    return {
+      repository: runnerCapabilityRepositoryIdentity(repository),
+      catalogDigest,
+      capabilities: page,
+      nextCursor: nextOffset < capabilities.length ? `${catalogDigest}:${nextOffset}` : null
+    };
+  }
+
+  #runnerCapabilityDetail(repository: RepositoryGrant, lockValue: unknown): ApiResult<RunnerCapabilityDetail> {
+    const lock = decodeRunnerTypeLock(lockValue, "type");
+    if (!lock.ok) return invalidRequest(`${lock.error.path}: ${lock.error.message}`);
+    const capability = this.#publicRunnerCapabilities().find(candidate => sameRunnerTypeLock(candidate.type, lock.value));
+    return capability
+      ? apiOk({ repository: runnerCapabilityRepositoryIdentity(repository), capability })
+      : notFound(`Runner capability ${runnerTypeLockLabel(lock.value)} is not available in the trusted runtime.`);
+  }
+
+  #publicRunnerCapabilities(): readonly RunnerCapability[] {
+    return this.#runnerRuntime.runnerCapabilities
+      .map(capability => ({
+        schema: "hunsu.runner-capability.v1" as const,
+        type: {
+          origin: String(capability.type.origin),
+          key: String(capability.type.key),
+          schemaVersion: String(capability.type.schemaVersion),
+          integrity: String(capability.type.integrity) as RunnerCapability["type"]["integrity"]
+        },
+        displayName: capability.displayName,
+        valueSchema: {
+          schema: "hunsu.runner-value-schema.v1" as const,
+          digest: String(capability.valueSchema.digest) as RunnerCapability["valueSchema"]["digest"],
+          root: capability.valueSchema.root
+        },
+        runContractResolution: { status: "available" as const }
+      }))
+      .sort((left, right) => runnerTypeLockIdentity(left.type).localeCompare(runnerTypeLockIdentity(right.type)));
   }
 
   async #readRepositoryContexts(
@@ -551,8 +716,16 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   async webCompareAlternatives(context: AuthContext, projectId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
     return webMutationBoundary(async () => {
       assertExactRecord(input, "request body", [
-        "sourceNodeSha", "comparisonId", "nodeShas", "findings", "summary", "idempotencyKey", "expectedStateSha"
+        "comparisonType", "sourceNodeSha", "anchorNodeSha", "comparisonId", "nodeShas", "findings", "summary",
+        "idempotencyKey", "expectedStateSha"
       ]);
+      const comparisonType = requiredString(input, "comparisonType");
+      if (comparisonType !== "sibling_runs" && comparisonType !== "coached_how_experiment") {
+        return invalidRequest("comparisonType is unsupported.");
+      }
+      assertExactRecord(input, "request body", comparisonType === "sibling_runs"
+        ? ["comparisonType", "sourceNodeSha", "comparisonId", "nodeShas", "findings", "summary", "idempotencyKey", "expectedStateSha"]
+        : ["comparisonType", "anchorNodeSha", "comparisonId", "nodeShas", "findings", "summary", "idempotencyKey", "expectedStateSha"]);
       const loaded = await this.#findProject(context, projectId, true);
       return loaded.ok ? this.#compareAlternatives(loaded.value.repository, context, { ...input, projectId }) : loaded;
     });
@@ -584,6 +757,9 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     this.#readProjects.clear();
     this.#readProjectFlights.clear();
     this.#readStateFilesByHead.clear();
+    this.#readStateFileFlights.clear();
+    this.#nodeAnchorVerifications.clear();
+    this.#nodeAnchorFlights.clear();
     this.#installations.clear();
     this.#installationFlights.clear();
     this.#installationCacheGenerations.clear();
@@ -597,6 +773,13 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     this.#readProjects.delete(key);
     this.#readProjectFlights.delete(key);
     this.#readStateFilesByHead.clear();
+    this.#readStateFileFlights.clear();
+    for (const cacheKey of this.#nodeAnchorVerifications.keys()) {
+      if (cacheKey.startsWith(`${key}:`)) this.#nodeAnchorVerifications.delete(cacheKey);
+    }
+    for (const cacheKey of this.#nodeAnchorFlights.keys()) {
+      if (cacheKey.startsWith(`${key}:`)) this.#nodeAnchorFlights.delete(cacheKey);
+    }
   }
 
   invalidateInstallation(installationId: number): void {
@@ -613,6 +796,13 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
       if (key.startsWith(`${installationId}:`)) this.#repositoryCacheGenerations.delete(key);
     }
     this.#readStateFilesByHead.clear();
+    this.#readStateFileFlights.clear();
+    for (const key of this.#nodeAnchorVerifications.keys()) {
+      if (key.startsWith(`${installationId}:`)) this.#nodeAnchorVerifications.delete(key);
+    }
+    for (const key of this.#nodeAnchorFlights.keys()) {
+      if (key.startsWith(`${installationId}:`)) this.#nodeAnchorFlights.delete(key);
+    }
   }
 
   async #createProject(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<{
@@ -956,8 +1146,9 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (source.payloadDigest !== sourcePayloadDigest) return conflict("The Coaching proposal source payload digest is stale.");
     const at = this.#timestamp();
     const proposedPlanDigest = computeNodePlanDigest(proposedPlan);
-    const rationale = optionalString(input, "rationale") ?? optionalString(input, "summary") ?? "Coach proposed a Node plan transition.";
-    const semantic = { type: "RecordCoachingProposal", projectId, sourceNodeSha, sourcePayloadDigest, proposalId, proposedPlan, rationale };
+    const summary = requiredString(input, "summary");
+    const rationale = requiredString(input, "rationale");
+    const semantic = { type: "RecordCoachingProposal", projectId, sourceNodeSha, sourcePayloadDigest, proposalId, proposedPlan, summary, rationale };
     const applied = await this.#mutate({
       repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
       domainActor: coachActor(context),
@@ -973,7 +1164,8 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
           proposedPlan,
           proposedPlanDigest,
           expectedStateSha: asGitSha(expectedStateSha),
-          reason: asReason(rationale),
+          summary: asEvidenceSummary(summary),
+          rationale: asReason(rationale),
           proposedAt: asTimestamp(at)
         }
       })]
@@ -1061,7 +1253,13 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
 
   async #compareAlternatives(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
     const projectId = requiredString(input, "projectId");
-    const sourceNodeSha = requiredSha(input, "sourceNodeSha");
+    const comparisonType = requiredString(input, "comparisonType");
+    if (comparisonType !== "sibling_runs" && comparisonType !== "coached_how_experiment") {
+      return invalidRequest("comparisonType is unsupported.");
+    }
+    const anchorNodeSha = comparisonType === "sibling_runs"
+      ? requiredSha(input, "sourceNodeSha")
+      : requiredSha(input, "anchorNodeSha");
     const comparisonId = requiredString(input, "comparisonId");
     const nodeShas = requiredShaArray(input, "nodeShas", 2);
     const findings = parseComparisonFindings(input.findings);
@@ -1071,25 +1269,41 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const loaded = await this.#loadProject(repository, projectId, true);
     if (!loaded.ok) return loaded;
     const compared = loaded.value.state.nodes.filter(node => nodeShas.includes(String(node.commitSha)));
-    if (compared.length !== nodeShas.length || compared.some(node => node.type !== "run_child" || node.parentSha !== sourceNodeSha)) {
+    if (comparisonType === "sibling_runs" && (compared.length !== nodeShas.length
+      || compared.some(node => node.type !== "run_child" || node.parentSha !== anchorNodeSha))) {
       return invalidRequest("Compared Nodes must be completed Run siblings of sourceNodeSha.");
     }
     const at = this.#timestamp();
-    const semantic = { type: "CompareAlternatives", projectId, sourceNodeSha, comparisonId, nodeShas, findings, summary };
+    const semantic = { type: "CompareAlternatives", projectId, comparisonType, anchorNodeSha, comparisonId, nodeShas, findings, summary };
     const applied = await this.#mutate({
       repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
       domainActor: coachActor(context),
-      factories: [(_state, meta) => ({
-        type: "CompareAlternatives",
-        meta,
-        comparisonId: asComparisonId(comparisonId),
-        projectId: asProjectId(projectId),
-        nodeShas: asAtLeastTwo(nodeShas.map(asGitSha), "nodeShas"),
-        findings,
-        summary: asEvidenceSummary(summary)
-      })]
+      factories: [(_state, meta) => comparisonType === "sibling_runs"
+        ? {
+            type: "CompareAlternatives",
+            meta,
+            comparisonType,
+            comparisonId: asComparisonId(comparisonId),
+            projectId: asProjectId(projectId),
+            nodeShas: asAtLeastTwo(nodeShas.map(asGitSha), "nodeShas"),
+            findings,
+            summary: asEvidenceSummary(summary)
+          }
+        : {
+            type: "CompareAlternatives",
+            meta,
+            comparisonType,
+            anchorNodeSha: asGitSha(anchorNodeSha),
+            comparisonId: asComparisonId(comparisonId),
+            projectId: asProjectId(projectId),
+            nodeShas: asAtLeastTwo(nodeShas.map(asGitSha), "nodeShas"),
+            findings,
+            summary: asEvidenceSummary(summary)
+          }]
     });
-    return mutationResponse(applied, "hunsu.web.alternatives-compared.v2", { comparisonId, sourceNodeSha, nodeShas });
+    return mutationResponse(applied, "hunsu.web.alternatives-compared.v2", comparisonType === "sibling_runs"
+      ? { comparisonId, comparisonType, sourceNodeSha: anchorNodeSha, nodeShas }
+      : { comparisonId, comparisonType, anchorNodeSha, nodeShas });
   }
 
   async #decideAlternative(
@@ -1283,13 +1497,14 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const card = graphNode.node;
     const payloadError = nodePayloadIntegrityError(loaded, card, payload);
     if (payloadError) return integrityFailure(payloadError);
-    const nodeRunIds = new Set(activity.runs.map(run => run.id));
     const outgoingEdges = graphNode.outgoingEdges.map(readGraphEdge);
     return apiOk({
       schema: "hunsu.web.node-detail.v2",
       stateHeadSha: loaded.stateHeadSha,
       node: {
         sha: card.sha,
+        payloadDigest: card.payloadDigest,
+        planDigest: card.planDigest,
         title: card.commitTitle,
         commitUrl: `https://github.com/${loaded.repository.owner}/${loaded.repository.name}/commit/${card.sha}`,
         treeSha: card.treeSha,
@@ -1319,16 +1534,18 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
         },
         outgoingEdges,
         activeRuns: graphNode.activeRuns,
-        evidence: activity.evidence.filter(item => nodeRunIds.has(item.runId)).map(item => readEvidenceSummary(loaded, activity, item)),
-        comparisons: activity.comparisons.filter(item => item.parentNodeSha === nodeSha || item.nodeShas.includes(nodeSha)).map(item => ({
-          id: item.id, summary: item.summary, siblingNodeShas: item.nodeShas, recordedAt: item.recordedAt
-        })),
+        evidence: activity.evidence.map(item => readEvidenceSummary(loaded, item)),
+        comparisons: activity.comparisons
+          .filter(item => comparisonActivityAnchorSha(item) === nodeSha || item.nodeShas.includes(nodeSha))
+          .map(readComparisonActivity),
         decisions: activity.decisions.flatMap(decision => decision.nodeShas.includes(nodeSha)
           ? [{
               kind: decision.type === "selection" ? "selected" : "rejected",
               id: decision.id, nodeSha, reason: decision.rationale, recordedAt: decision.decidedAt
             }]
-          : [])
+          : []),
+        coachingProposals: activity.coaching.map(readCoachingActivity),
+        coachReviews: activity.reviews.map(readCoachReviewActivity)
       }
     });
   }
@@ -1387,6 +1604,20 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   }
 
   async #readEvent(loaded: ReadProject, eventId: string): Promise<ApiResult<unknown>> {
+    const authoritative = await this.#loadAuthoritativeEvent(loaded, eventId);
+    if (!authoritative.ok) return authoritative;
+    return apiOk({
+      schema: "hunsu.web.event-detail.v2",
+      project: readProjectSummary(loaded),
+      stateHeadSha: loaded.stateHeadSha,
+      event: readEventIndexEntry(authoritative.value.indexed)
+    });
+  }
+
+  async #loadAuthoritativeEvent(loaded: ReadProject, eventId: string): Promise<ApiResult<{
+    indexed: EventIndexEntryReadModel;
+    stored: StoredProjectEvent<DomainEvent>;
+  }>> {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(eventId) || eventId.includes("..")) return invalidRequest("Event id is invalid.");
     const indexed = await this.#loadEventLocator(loaded, eventId);
     if (!indexed.ok) return indexed;
@@ -1401,12 +1632,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (!authoritative.ok) return integrityFailure(`${event.path}: ${authoritative.error.message}`);
     const mismatch = authoritativeEventMismatch(loaded, event, authoritative.value);
     if (mismatch) return integrityFailure(mismatch);
-    return apiOk({
-      schema: "hunsu.web.event-detail.v2",
-      project: readProjectSummary(loaded),
-      stateHeadSha: loaded.stateHeadSha,
-      event: readEventIndexEntry(event)
-    });
+    return apiOk({ indexed: event, stored: authoritative.value });
   }
 
   async #readRun(loaded: ReadProject, runId: string): Promise<ApiResult<{ schema: "hunsu.web.run-detail.v2"; stateHeadSha: string; run: unknown }>> {
@@ -1420,6 +1646,13 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (!goal || String(goal.title) !== run.goalTitle || String(computeRunnerDigest(source.value.payload.plan.how)) !== run.runnerDigest) {
       return integrityFailure(`Run ${runId} does not match its source Node Goal and Runner payload.`);
     }
+    const acceptanceCriteria = new Set(goal.acceptanceCriteria.map(String));
+    const unrelatedEvidence = activity.value.evidence.find(item =>
+      item.target.type === "criterion" && !acceptanceCriteria.has(item.target.criterion)
+    );
+    if (unrelatedEvidence) {
+      return integrityFailure(`Run ${runId} evidence ${unrelatedEvidence.id} targets a criterion outside its exact Goal.`);
+    }
     const domainRun = readDomainRun(loaded, run, goal, source.value.payload.plan.how);
     return apiOk({
       schema: "hunsu.web.run-detail.v2",
@@ -1430,6 +1663,188 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
         sourceNodeTitle: source.value.graphNode.node.commitTitle
       }
     });
+  }
+
+  async #readCoachReviews(loaded: ReadProject, nodeSha: string, query: JsonRecord): Promise<ApiResult<unknown>> {
+    const page = await this.#loadNodeActivityWindow(loaded, nodeSha, "reviews", query);
+    if (!page.ok) return page;
+    return apiOk({
+      schema: "hunsu.coach-review-list.v2",
+      nodeSha,
+      reviews: page.value.entries.map(readCoachReviewActivity),
+      window: page.value.window
+    });
+  }
+
+  async #readCoachReview(loaded: ReadProject, nodeSha: string, reviewId: string): Promise<ApiResult<unknown>> {
+    const record = await this.#loadNodeActivityRecord(loaded, nodeSha, "reviews", reviewId);
+    if (!record.ok) return record;
+    const review = record.value.value;
+    const authoritative = await this.#loadAuthoritativeEvent(loaded, review.eventId);
+    if (!authoritative.ok) return authoritative;
+    const event = authoritative.value.stored.event;
+    if (event.type !== "CoachReviewRecorded" || !coachReviewActivityMatches(review, event.review)) {
+      return integrityFailure(`Coach review ${reviewId} does not match its authoritative Event.`);
+    }
+    return apiOk({ schema: "hunsu.coach-review-detail.v2", review: readCoachReviewActivity(review) });
+  }
+
+  async #readCoachingProposals(loaded: ReadProject, sourceNodeSha: string, query: JsonRecord): Promise<ApiResult<unknown>> {
+    const page = await this.#loadNodeActivityWindow(loaded, sourceNodeSha, "coaching", query);
+    if (!page.ok) return page;
+    return apiOk({
+      schema: "hunsu.coaching-proposal-list.v2",
+      sourceNodeSha,
+      proposals: page.value.entries.map(readCoachingActivity),
+      window: page.value.window
+    });
+  }
+
+  async #readCoachingProposal(loaded: ReadProject, sourceNodeSha: string, proposalId: string): Promise<ApiResult<unknown>> {
+    const [source, record] = await Promise.all([
+      this.#loadGraphNodeAndPayload(loaded, sourceNodeSha),
+      this.#loadNodeActivityRecord(loaded, sourceNodeSha, "coaching", proposalId)
+    ]);
+    if (!source.ok) return source;
+    if (!record.ok) return record;
+    const proposal = record.value.value;
+    const authoritative = await this.#loadAuthoritativeEvent(loaded, proposal.eventId);
+    if (!authoritative.ok) return authoritative;
+    const event = authoritative.value.stored.event;
+    if (event.type !== "CoachingProposalRecorded" || !coachingActivityMatches(proposal, event.proposal)) {
+      return integrityFailure(`Coaching proposal ${proposalId} does not match its authoritative Event.`);
+    }
+    const card = source.value.graphNode.node;
+    if (card.payloadDigest !== proposal.sourcePayloadDigest || card.planDigest !== proposal.sourcePlanDigest
+      || String(computeNodePlanDigest(source.value.payload.plan)) !== proposal.sourcePlanDigest
+      || String(computeNodePlanDigest(event.proposal.proposedPlan)) !== proposal.proposedPlanDigest) {
+      return integrityFailure(`Coaching proposal ${proposalId} plan or payload digests do not match its verified source Node.`);
+    }
+    const disposition = await this.#verifyCoachingProposalDisposition(loaded, proposal, event.proposal.proposedPlan);
+    if (!disposition.ok) return disposition;
+    return apiOk({
+      schema: "hunsu.coaching-proposal-detail.v2",
+      proposal: {
+        ...readCoachingActivity(proposal),
+        source: {
+          nodeSha: sourceNodeSha,
+          payloadDigest: proposal.sourcePayloadDigest,
+          planDigest: proposal.sourcePlanDigest,
+          plan: source.value.payload.plan
+        },
+        proposed: {
+          planDigest: proposal.proposedPlanDigest,
+          plan: event.proposal.proposedPlan
+        }
+      }
+    });
+  }
+
+  async #readAlternativeComparisons(loaded: ReadProject, nodeSha: string, query: JsonRecord): Promise<ApiResult<unknown>> {
+    const page = await this.#loadNodeActivityWindow(loaded, nodeSha, "comparisons", query);
+    if (!page.ok) return page;
+    return apiOk({
+      schema: "hunsu.alternative-comparison-list.v2",
+      nodeSha,
+      comparisons: page.value.entries.map(readComparisonActivity),
+      window: page.value.window
+    });
+  }
+
+  async #readAlternativeComparison(
+    loaded: ReadProject,
+    comparisonType: ComparisonActivityReadModel["type"],
+    anchorNodeSha: string,
+    comparisonId: string
+  ): Promise<ApiResult<unknown>> {
+    const record = await this.#loadNodeActivityRecord(loaded, anchorNodeSha, "comparisons", comparisonId);
+    if (!record.ok) return record;
+    const comparison = record.value.value;
+    if (comparison.type !== comparisonType || comparisonActivityAnchorSha(comparison) !== anchorNodeSha) {
+      return notFound(`Alternative comparison ${comparisonId} was not found for ${comparisonType} anchor Node ${anchorNodeSha}.`);
+    }
+    const authoritative = await this.#loadAuthoritativeEvent(loaded, comparison.eventId);
+    if (!authoritative.ok) return authoritative;
+    const event = authoritative.value.stored.event;
+    if (event.type !== "AlternativesCompared" || !comparisonActivityMatches(comparison, event.comparison)) {
+      return integrityFailure(`Alternative comparison ${comparisonId} does not match its authoritative Event.`);
+    }
+    const disposition = await this.#verifyAlternativeDisposition(loaded, comparison);
+    if (!disposition.ok) return disposition;
+    return apiOk({
+      schema: "hunsu.alternative-comparison-detail.v2",
+      comparison: {
+        ...readComparisonActivity(comparison),
+        findings: event.comparison.findings.map(finding => ({
+          subject: String(finding.subject),
+          summaries: finding.summaries.map(summary => ({ nodeSha: String(summary.nodeSha), summary: String(summary.summary) }))
+        }))
+      }
+    });
+  }
+
+  async #verifyCoachingProposalDisposition(
+    loaded: ReadProject,
+    proposal: CoachingActivityReadModel,
+    proposedPlan: NodePlan
+  ): Promise<ApiResult<true>> {
+    if (proposal.disposition.type === "pending") return apiOk(true);
+    if (proposal.disposition.type === "rejected") {
+      const authoritative = await this.#loadAuthoritativeEvent(loaded, proposal.disposition.decisionEventId);
+      if (!authoritative.ok) return authoritative;
+      const event = authoritative.value.stored.event;
+      return event.type === "CoachingProposalRejected"
+        && rejectedCoachingDecisionMatches(proposal, event.decision)
+        ? apiOk(true)
+        : integrityFailure(`Coaching proposal ${proposal.id} rejection does not match its authoritative Event.`);
+    }
+    const [decision, registration, child] = await Promise.all([
+      this.#loadAuthoritativeEvent(loaded, proposal.disposition.decisionEventId),
+      this.#loadAuthoritativeEvent(loaded, proposal.disposition.childRegistrationEventId),
+      this.#loadGraphNodeAndPayload(loaded, proposal.disposition.childNodeSha)
+    ]);
+    if (!decision.ok) return decision;
+    if (!registration.ok) return registration;
+    if (!child.ok) return child;
+    const decisionEvent = decision.value.stored.event;
+    if (decisionEvent.type !== "CoachingProposalConfirmed"
+      || !confirmedCoachingDecisionMatches(proposal, decisionEvent.decision)) {
+      return integrityFailure(`Coaching proposal ${proposal.id} confirmation does not match its authoritative Event.`);
+    }
+    const registrationEvent = registration.value.stored.event;
+    if (registrationEvent.type !== "CoachingChildNodeRegistered"
+      || !coachingChildRegistrationMatches(loaded, proposal, proposedPlan, registrationEvent, child.value)) {
+      return integrityFailure(`Coaching proposal ${proposal.id} child registration does not match its authoritative Event and Node.`);
+    }
+    return apiOk(true);
+  }
+
+  async #verifyAlternativeDisposition(
+    loaded: ReadProject,
+    comparison: ComparisonActivityReadModel
+  ): Promise<ApiResult<true>> {
+    if (comparison.disposition.type === "undecided") return apiOk(true);
+    const authoritative = await Promise.all(comparison.disposition.decisions.map(decision =>
+      this.#loadAuthoritativeEvent(loaded, decision.eventId)
+    ));
+    const failure = authoritative.find(result => !result.ok);
+    if (failure && !failure.ok) return failure;
+    for (let index = 0; index < comparison.disposition.decisions.length; index += 1) {
+      const decision = comparison.disposition.decisions[index]!;
+      const result = authoritative[index]!;
+      if (!result.ok) return result;
+      const event = result.value.stored.event;
+      if (decision.type === "selection") {
+        if (event.type !== "AlternativeSelected"
+          || !alternativeDecisionMatches(loaded.catalog.project.id, decision, event.decision)) {
+          return integrityFailure(`Alternative selection ${decision.id} does not match its authoritative Event.`);
+        }
+      } else if (event.type !== "AlternativesRejected"
+        || !alternativeDecisionMatches(loaded.catalog.project.id, decision, event.decision)) {
+        return integrityFailure(`Alternative rejection ${decision.id} does not match its authoritative Event.`);
+      }
+    }
+    return apiOk(true);
   }
 
   async #loadGraphWindow(loaded: ReadProject, requestedIndexes: readonly number[]): Promise<ApiResult<{ manifest: ProjectGraphManifestReadModel; pages: readonly ProjectGraphPageReadModel[] }>> {
@@ -1454,39 +1869,252 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
         || page.value.nodes.length !== descriptor.nodeCount || page.value.edges.length !== descriptor.edgeCount
         || materializedEnvelopeDigest(files.value, path) !== descriptor.digest
       ) return integrityFailure(`Graph page ${index} does not match its exact-head manifest.`);
+      const topology = validateGraphPageTopology(manifest.value, page.value);
+      if (!topology.ok) return integrityFailure(topology.error.message);
       pages.push(page.value);
+    }
+    const pageNodes = pages.flatMap(page => page.nodes);
+    const nodeShas = [...new Set(pageNodes.map(node => node.sha))];
+    if (nodeShas.length !== pageNodes.length) {
+      return integrityFailure("Graph pages contain a duplicate full Node SHA.");
+    }
+    const locatorFiles = await this.#readStateFiles(loaded, nodeShas.map(nodeSha => ({
+      kind: "graph_node" as const,
+      projectId: loaded.catalog.project.id,
+      nodeSha
+    })));
+    if (!locatorFiles.ok) return locatorFiles;
+    const locators: ProjectGraphNodeReadModel[] = [];
+    for (const nodeSha of nodeShas) {
+      const path = exactStateFilePath({ kind: "graph_node", projectId: loaded.catalog.project.id, nodeSha });
+      const locator = decodeMaterialized(locatorFiles.value, path, decodeGraphNodeShard);
+      if (!locator.ok) return locator;
+      const error = graphNodeIntegrityError(loaded, manifest.value, locator.value, nodeSha);
+      if (error) return integrityFailure(error);
+      const topology = validateGraphNodeTopology(manifest.value, locator.value);
+      if (!topology.ok) return integrityFailure(topology.error.message);
+      locators.push(locator.value);
+    }
+    const locatorBySha = new Map(locators.map(locator => [locator.node.sha, locator]));
+    for (const page of pages) {
+      const pageLocators = page.nodes.map(node => locatorBySha.get(node.sha));
+      if (pageLocators.some(locator => locator === undefined)) {
+        return integrityFailure(`Graph page ${page.index} is missing an authoritative SHA locator.`);
+      }
+      const integrity = validateGraphPageNodeLocators(
+        manifest.value,
+        page,
+        pageLocators.filter((locator): locator is ProjectGraphNodeReadModel => locator !== undefined)
+      );
+      if (!integrity.ok) return integrityFailure(integrity.error.message);
     }
     return apiOk({ manifest: manifest.value, pages });
   }
 
-  async #loadNodeReadBundle(loaded: ReadProject, nodeSha: string): Promise<ApiResult<{ graphNode: ProjectGraphNodeReadModel; activity: NodeActivityShardReadModel; payload: NodePayload }>> {
+  async #loadNodeActivityIndex(loaded: ReadProject, nodeSha: string): Promise<ApiResult<{
+    manifest: ProjectActivityManifestReadModel;
+    index: NodeActivityIndexReadModel;
+  }>> {
     const files = await this.#readStateFiles(loaded, [
-      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "graph" },
       { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "activity" },
-      { kind: "graph_node", projectId: loaded.catalog.project.id, nodeSha },
-      { kind: "node_activity", projectId: loaded.catalog.project.id, nodeSha },
-      { kind: "node_payload", projectId: loaded.catalog.project.id, nodeSha }
+      { kind: "node_activity_index", projectId: loaded.catalog.project.id, nodeSha }
     ]);
     if (!files.ok) return files;
-    const graphManifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.graphManifest), decodeGraphManifest);
-    if (!graphManifest.ok) return graphManifest;
-    const activityManifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.activityManifest), decodeActivityManifest);
-    if (!activityManifest.ok) return activityManifest;
-    const graphNode = decodeMaterialized(files.value, readModelPath(loaded, `graph/nodes/${nodeSha}.json`), decodeGraphNodeShard);
-    if (!graphNode.ok) return graphNode;
-    const activity = decodeMaterialized(files.value, readModelPath(loaded, `snapshots/nodes/${nodeSha}.json`), decodeNodeActivityShard);
+    const manifest = decodeMaterialized(
+      files.value,
+      readModelPath(loaded, SHARDED_READ_MODEL_PATHS.activityManifest),
+      decodeActivityManifest
+    );
+    if (!manifest.ok) return manifest;
+    const index = decodeMaterialized(
+      files.value,
+      exactStateFilePath({ kind: "node_activity_index", projectId: loaded.catalog.project.id, nodeSha }),
+      decodeNodeActivityIndex
+    );
+    if (!index.ok) return index;
+    const error = activityManifestIntegrityError(loaded, manifest.value)
+      ?? activityIndexIntegrityError(loaded, manifest.value, index.value, nodeSha);
+    return error ? integrityFailure(error) : apiOk({ manifest: manifest.value, index: index.value });
+  }
+
+  async #loadNodeActivityPages<K extends NodeActivityKind>(
+    loaded: ReadProject,
+    index: NodeActivityIndexReadModel,
+    kind: K,
+    pageIndexes: readonly number[]
+  ): Promise<ApiResult<readonly NodeActivityPageReadModel<K>[]>> {
+    const uniqueIndexes = [...new Set(pageIndexes)];
+    if (uniqueIndexes.length === 0) return apiOk([]);
+    if (uniqueIndexes.some(pageIndex => !Number.isSafeInteger(pageIndex)
+      || pageIndex < 0 || pageIndex >= index.categories[kind].pageCount)) {
+      return integrityFailure(`Node activity ${kind} page is missing from its exact-head index.`);
+    }
+    const files = await this.#readStateFiles(loaded, uniqueIndexes.map(page => ({
+      kind: "node_activity_page" as const,
+      projectId: loaded.catalog.project.id,
+      nodeSha: index.nodeSha,
+      activityKind: kind,
+      page
+    })));
+    if (!files.ok) return files;
+    const pages: NodeActivityPageReadModel<K>[] = [];
+    for (let position = 0; position < uniqueIndexes.length; position += 1) {
+      const pageIndex = uniqueIndexes[position]!;
+      const path = exactStateFilePath({
+        kind: "node_activity_page", projectId: loaded.catalog.project.id, nodeSha: index.nodeSha,
+        activityKind: kind, page: pageIndex
+      });
+      const decoded = decodeMaterialized(files.value, path, decodeNodeActivityPage);
+      if (!decoded.ok) return decoded;
+      if (decoded.value.projectId !== loaded.catalog.project.id || decoded.value.nodeSha !== index.nodeSha
+        || decoded.value.kind !== kind || decoded.value.index !== pageIndex
+        || !sameCheckpoint(decoded.value.checkpoint, index.checkpoint)) {
+        return integrityFailure(`Node activity ${kind} page ${pageIndex} does not match its exact-head index.`);
+      }
+      const commitment = validateNodeActivityPageCommitment(index, decoded.value);
+      if (!commitment.ok) return integrityFailure(commitment.error.message);
+      pages.push(decoded.value as NodeActivityPageReadModel<K>);
+    }
+    return apiOk(pages);
+  }
+
+  async #loadNodeActivityWindow<K extends NodeActivityKind>(
+    loaded: ReadProject,
+    nodeSha: string,
+    kind: K,
+    query: JsonRecord
+  ): Promise<ApiResult<{
+    entries: NodeActivityPageReadModel<K>["entries"];
+    window: { readonly limit: number; readonly hasMore: boolean; readonly continuationCursor: string | null };
+  }>> {
+    const requested = activityWindowRequest(loaded.stateHeadSha, query);
+    if (!requested.ok) return requested;
+    const indexed = await this.#loadNodeActivityIndex(loaded, nodeSha);
+    if (!indexed.ok) return indexed;
+    const count = indexed.value.index.categories[kind].count;
+    if (requested.value.offset > count) return invalidRequest("Activity cursor is outside the current exact-head list.");
+    const end = Math.min(count, requested.value.offset + requested.value.limit);
+    const pageIndexes: number[] = [];
+    if (requested.value.offset < end) {
+      const first = Math.floor(requested.value.offset / NODE_ACTIVITY_PAGE_SIZE);
+      const last = Math.floor((end - 1) / NODE_ACTIVITY_PAGE_SIZE);
+      for (let page = first; page <= last; page += 1) pageIndexes.push(page);
+    }
+    const pages = await this.#loadNodeActivityPages(loaded, indexed.value.index, kind, pageIndexes);
+    if (!pages.ok) return pages;
+    type Entry = NodeActivityPageReadModel<K>["entries"][number];
+    const entries = pages.value.flatMap(page => [...page.entries].map((entry, position) => ({
+      offset: page.offset + position,
+      entry: entry as Entry
+    }))).filter(item => item.offset >= requested.value.offset && item.offset < end).map(item => item.entry);
+    const hasMore = end < count;
+    return apiOk({
+      entries: entries as NodeActivityPageReadModel<K>["entries"],
+      window: {
+        limit: requested.value.limit,
+        hasMore,
+        continuationCursor: hasMore ? `${loaded.stateHeadSha}:${end}` : null
+      }
+    });
+  }
+
+  async #loadNodeActivitySummary(loaded: ReadProject, nodeSha: string): Promise<ApiResult<NodeActivitySummaryReadModel>> {
+    const indexed = await this.#loadNodeActivityIndex(loaded, nodeSha);
+    if (!indexed.ok) return indexed;
+    const summary = {
+      runs: [], evidence: [], comparisons: [], decisions: [], coaching: [], reviews: []
+    } as {
+      -readonly [K in NodeActivityKind]: Array<NodeActivityPageReadModel<K>["entries"][number]>;
+    };
+    const requests = NODE_ACTIVITY_KINDS.flatMap(kind => {
+      const pageCount = indexed.value.index.categories[kind].pageCount;
+      const page = pageCount === 0 ? undefined : pageCount - 1;
+      return page === undefined ? [] : [{ kind, page }];
+    });
+    if (requests.length === 0) return apiOk(summary);
+    const files = await this.#readStateFiles(loaded, requests.map(request => ({
+      kind: "node_activity_page" as const,
+      projectId: loaded.catalog.project.id,
+      nodeSha,
+      activityKind: request.kind,
+      page: request.page
+    })));
+    if (!files.ok) return files;
+    for (const request of requests) {
+      const path = exactStateFilePath({
+        kind: "node_activity_page", projectId: loaded.catalog.project.id, nodeSha,
+        activityKind: request.kind, page: request.page
+      });
+      const decoded = decodeMaterialized(files.value, path, decodeNodeActivityPage);
+      if (!decoded.ok) return decoded;
+      if (decoded.value.projectId !== loaded.catalog.project.id || decoded.value.nodeSha !== nodeSha
+        || decoded.value.kind !== request.kind || decoded.value.index !== request.page
+        || !sameCheckpoint(decoded.value.checkpoint, indexed.value.index.checkpoint)) {
+        return integrityFailure(`Recent Node activity ${request.kind} page does not match its exact-head index.`);
+      }
+      const commitment = validateNodeActivityPageCommitment(indexed.value.index, decoded.value);
+      if (!commitment.ok) return integrityFailure(commitment.error.message);
+      (summary[request.kind] as unknown[]).push(...decoded.value.entries);
+    }
+    return apiOk(summary);
+  }
+
+  async #loadNodeActivityRecord<K extends KeyedNodeActivityKind>(
+    loaded: ReadProject,
+    nodeSha: string,
+    kind: K,
+    id: string
+  ): Promise<ApiResult<NodeActivityRecordReadModel<K>>> {
+    const files = await this.#readStateFiles(loaded, [
+      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "activity" },
+      { kind: "node_activity_index", projectId: loaded.catalog.project.id, nodeSha },
+      { kind: "node_activity_record", projectId: loaded.catalog.project.id, nodeSha, activityKind: kind, activityId: id }
+    ]);
+    if (!files.ok) return files;
+    const manifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.activityManifest), decodeActivityManifest);
+    if (!manifest.ok) return manifest;
+    const index = decodeMaterialized(
+      files.value,
+      exactStateFilePath({ kind: "node_activity_index", projectId: loaded.catalog.project.id, nodeSha }),
+      decodeNodeActivityIndex
+    );
+    if (!index.ok) return index;
+    const record = decodeMaterialized(
+      files.value,
+      exactStateFilePath({ kind: "node_activity_record", projectId: loaded.catalog.project.id, nodeSha, activityKind: kind, activityId: id }),
+      decodeNodeActivityRecord
+    );
+    if (!record.ok) return record;
+    const error = activityManifestIntegrityError(loaded, manifest.value)
+      ?? activityIndexIntegrityError(loaded, manifest.value, index.value, nodeSha);
+    if (error || index.value.categories[kind].count === 0 || record.value.projectId !== loaded.catalog.project.id
+      || record.value.nodeSha !== nodeSha || record.value.kind !== kind || record.value.id !== id
+      || !sameCheckpoint(record.value.checkpoint, index.value.checkpoint)) {
+      return integrityFailure(error ?? `Node activity ${kind} record ${id} does not match its exact-head index.`);
+    }
+    const typedRecord = record.value as NodeActivityRecordReadModel<K>;
+    const pages = await this.#loadNodeActivityPages(loaded, index.value, kind, [typedRecord.pageIndex]);
+    if (!pages.ok) return pages;
+    const page = pages.value[0];
+    if (!page) return integrityFailure(`Node activity ${kind} record ${id} has no committed page.`);
+    const membership = validateNodeActivityRecordMembership(index.value, page, typedRecord);
+    return membership.ok
+      ? apiOk(typedRecord)
+      : integrityFailure(membership.error.message);
+  }
+
+  async #loadNodeReadBundle(loaded: ReadProject, nodeSha: string): Promise<ApiResult<{
+    graphNode: ProjectGraphNodeReadModel;
+    activity: NodeActivitySummaryReadModel;
+    payload: NodePayload;
+  }>> {
+    const [node, activity] = await Promise.all([
+      this.#loadGraphNodeAndPayload(loaded, nodeSha),
+      this.#loadNodeActivitySummary(loaded, nodeSha)
+    ]);
+    if (!node.ok) return node;
     if (!activity.ok) return activity;
-    const manifestError = graphManifestIntegrityError(loaded, graphManifest.value)
-      ?? activityManifestIntegrityError(loaded, activityManifest.value)
-      ?? graphNodeIntegrityError(loaded, graphManifest.value, graphNode.value, nodeSha)
-      ?? activityShardIntegrityError(loaded, activityManifest.value, activity.value, nodeSha);
-    if (manifestError) return integrityFailure(manifestError);
-    const payload = decodeNodePayloadFile(files.value, nodePayloadPath(loaded, nodeSha), this.#runnerRuntime.runnerTypes);
-    if (!payload.ok) return payload;
-    const payloadError = nodePayloadIntegrityError(loaded, graphNode.value.node, payload.value);
-    if (payloadError) return integrityFailure(payloadError);
-    const anchor = await this.#verifyNodeAnchor(loaded, graphNode.value.node);
-    return anchor.ok ? apiOk({ graphNode: graphNode.value, activity: activity.value, payload: payload.value }) : anchor;
+    return apiOk({ ...node.value, activity: activity.value });
   }
 
   async #loadGraphNodeAndPayload(loaded: ReadProject, nodeSha: string): Promise<ApiResult<{ graphNode: ProjectGraphNodeReadModel; payload: NodePayload }>> {
@@ -1502,6 +2130,8 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (!graphNode.ok) return graphNode;
     const error = graphManifestIntegrityError(loaded, manifest.value) ?? graphNodeIntegrityError(loaded, manifest.value, graphNode.value, nodeSha);
     if (error) return integrityFailure(error);
+    const topology = validateGraphNodeTopology(manifest.value, graphNode.value);
+    if (!topology.ok) return integrityFailure(topology.error.message);
     const payload = decodeNodePayloadFile(files.value, nodePayloadPath(loaded, nodeSha), this.#runnerRuntime.runnerTypes);
     if (!payload.ok) return payload;
     const payloadError = nodePayloadIntegrityError(loaded, graphNode.value.node, payload.value);
@@ -1585,14 +2215,64 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
 
   async #verifyNodeAnchors(loaded: ReadProject, cards: readonly ProjectGraphNode[]): Promise<ApiResult<true>> {
     if (cards.length === 0) return apiOk(true);
-    const anchors = await this.#transport.readManagedNodeAnchors(loaded.repository, loaded.catalog.project.id, cards.map(card => card.sha));
+    const now = this.#cacheNow();
+    const requested = cards.map(card => ({ card, key: nodeAnchorCacheKey(loaded, card) }));
+    const missing = requested.filter(item => {
+      const cached = this.#nodeAnchorVerifications.get(item.key);
+      if (!cached) return true;
+      if (fresh(cached.cachedAt, now, this.#cachePolicy.nodeAnchorTtlMs)) return false;
+      this.#nodeAnchorVerifications.delete(item.key);
+      return true;
+    });
+    if (missing.length === 0) return apiOk(true);
+
+    const flightKey = missing.map(item => item.key).sort().join("\n");
+    let flight = this.#nodeAnchorFlights.get(flightKey);
+    if (!flight) {
+      flight = this.#fetchAndVerifyNodeAnchors(loaded, missing, this.#readProjectCacheGeneration(loaded.repository));
+      this.#nodeAnchorFlights.set(flightKey, flight);
+    }
+    const activeFlight = flight;
+    try {
+      const verified = await activeFlight;
+      if (!verified.ok) return verified;
+    } finally {
+      if (this.#nodeAnchorFlights.get(flightKey) === activeFlight) this.#nodeAnchorFlights.delete(flightKey);
+    }
+    return apiOk(true);
+  }
+
+  async #fetchAndVerifyNodeAnchors(
+    loaded: ReadProject,
+    requested: readonly { readonly card: ProjectGraphNode; readonly key: string }[],
+    generation: ReadProjectCacheGeneration
+  ): Promise<ApiResult<true>> {
+    const anchors = await this.#transport.readManagedNodeAnchors(
+      loaded.repository,
+      loaded.catalog.project.id,
+      requested.map(item => item.card.sha)
+    );
     if (!anchors.ok) return transportFailure(anchors.error);
     const bySha = new Map(anchors.value.map(anchor => [anchor.nodeSha, anchor]));
-    if (bySha.size !== cards.length) return integrityFailure("Exact managed Node verification returned duplicate or missing anchors.");
-    for (const card of cards) {
-      const anchor = bySha.get(card.sha);
-      if (!anchor || anchor.managedRef !== card.managedRef || anchor.treeSha !== card.treeSha || commitTitle(anchor.commitMessage) !== card.commitTitle) {
-        return integrityFailure(`Managed Node ref ${card.managedRef} does not match its Graph registration metadata.`);
+    if (bySha.size !== requested.length) return integrityFailure("Exact managed Node verification returned duplicate or missing anchors.");
+    for (const item of requested) {
+      const anchor = bySha.get(item.card.sha);
+      if (!anchor || anchor.managedRef !== item.card.managedRef || anchor.treeSha !== item.card.treeSha
+        || commitTitle(anchor.commitMessage) !== item.card.commitTitle
+      ) {
+        return integrityFailure(`Managed Node ref ${item.card.managedRef} does not match its Graph registration metadata.`);
+      }
+    }
+    if (this.#isCurrentReadProjectCacheGeneration(loaded.repository, generation)) {
+      const cachedAt = this.#cacheNow();
+      for (const item of requested) {
+        this.#nodeAnchorVerifications.delete(item.key);
+        this.#nodeAnchorVerifications.set(item.key, { value: true, cachedAt });
+      }
+      while (this.#nodeAnchorVerifications.size > MAX_NODE_ANCHOR_CACHE_ENTRIES) {
+        const oldest = this.#nodeAnchorVerifications.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.#nodeAnchorVerifications.delete(oldest);
       }
     }
     return apiOk(true);
@@ -1605,17 +2285,18 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     const requested = selections.map(selection => ({ selection, path: exactStateFilePath(selection) }));
     const missing = requested.filter(item => !this.#readStateFilesByHead.has(readFileCacheKey(loaded, item.path)));
     if (missing.length > 0) {
-      const read = await this.#transport.readStateFilesAtHead(loaded.repository, loaded.stateHeadSha, missing.map(item => item.selection));
-      if (!read.ok) return read.error.code === "not_found" ? integrityFailure(read.error.message) : transportFailure(read.error);
-      if (read.value.stateHeadSha !== loaded.stateHeadSha) return integrityFailure("Targeted state read returned a different state head.");
-      if (read.value.v2State !== "present") return integrityFailure("Targeted Project read resolved an absent Hunsu v2 state tree.");
-      const returned = Object.keys(read.value.files).sort();
-      const expected = missing.map(item => item.path).sort();
-      if (returned.length !== expected.length || returned.some((path, index) => path !== expected[index])) {
-        return integrityFailure("Targeted state read returned missing or unrequested resources.");
+      const flightKey = missing.map(item => readFileCacheKey(loaded, item.path)).sort().join("\n");
+      let flight = this.#readStateFileFlights.get(flightKey);
+      if (!flight) {
+        flight = this.#fetchMissingStateFiles(loaded, missing);
+        this.#readStateFileFlights.set(flightKey, flight);
       }
-      for (const [path, content] of Object.entries(read.value.files)) {
-        this.#readStateFilesByHead.set(readFileCacheKey(loaded, path), content);
+      const activeFlight = flight;
+      try {
+        const fetched = await activeFlight;
+        if (!fetched.ok) return fetched;
+      } finally {
+        if (this.#readStateFileFlights.get(flightKey) === activeFlight) this.#readStateFileFlights.delete(flightKey);
       }
     }
     const files: Record<string, string> = {};
@@ -1625,6 +2306,29 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
       Object.defineProperty(files, item.path, { value: content, enumerable: true, configurable: true, writable: true });
     }
     return apiOk(files);
+  }
+
+  async #fetchMissingStateFiles(
+    loaded: ReadProject,
+    missing: readonly { readonly selection: StateFileSelection; readonly path: string }[]
+  ): Promise<ApiResult<true>> {
+    const read = await this.#transport.readStateFilesAtHead(
+      loaded.repository,
+      loaded.stateHeadSha,
+      missing.map(item => item.selection)
+    );
+    if (!read.ok) return read.error.code === "not_found" ? integrityFailure(read.error.message) : transportFailure(read.error);
+    if (read.value.stateHeadSha !== loaded.stateHeadSha) return integrityFailure("Targeted state read returned a different state head.");
+    if (read.value.v2State !== "present") return integrityFailure("Targeted Project read resolved an absent Hunsu v2 state tree.");
+    const returned = Object.keys(read.value.files).sort();
+    const expected = missing.map(item => item.path).sort();
+    if (returned.length !== expected.length || returned.some((path, index) => path !== expected[index])) {
+      return integrityFailure("Targeted state read returned missing or unrequested resources.");
+    }
+    for (const [path, content] of Object.entries(read.value.files)) {
+      this.#readStateFilesByHead.set(readFileCacheKey(loaded, path), content);
+    }
+    return apiOk(true);
   }
 
   #projectList(loaded: readonly LoadedProject[]) {
@@ -1843,19 +2547,19 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     generation: ReadProjectCacheGeneration
   ): Promise<ApiResult<readonly ReadProject[]>> {
     const key = repositoryKey(repository);
+    const cached = this.#readProjects.get(key);
+    if (cached && fresh(cached.cachedAt, this.#cacheNow(), this.#cachePolicy.projectTtlMs)) {
+      return apiOk(cached.value);
+    }
     const stateHead = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
     if (!stateHead.ok) return transportFailure(stateHead.error);
     if (stateHead.value === undefined) {
       this.#publishReadProjectCache(repository, key, generation, { value: [], stateHeadSha: undefined, cachedAt: this.#cacheNow() });
       return apiOk([]);
     }
-    const cached = this.#readProjects.get(key);
     // State blobs are immutable at an exact head, but managed Node refs are a
     // separate GitHub authority boundary. Revalidate the root anchor after the
     // bounded Project TTL even when hunsu/state itself has not moved.
-    if (cached?.stateHeadSha === stateHead.value
-      && fresh(cached.cachedAt, this.#cacheNow(), this.#cachePolicy.projectTtlMs)
-    ) return apiOk(cached.value);
     const workspaceSnapshot = await this.#transport.readStateFilesAtHead(repository, stateHead.value, [{ kind: "workspace" }]);
     if (!workspaceSnapshot.ok) {
       return workspaceSnapshot.error.code === "not_found"
@@ -2094,9 +2798,15 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     generation: ReadProjectCacheGeneration,
     cache: ReadProjectCache
   ): void {
-    if (this.#isCurrentInstallationCacheGeneration(repository.installationId, generation)
-      && generation.repository === (this.#repositoryCacheGenerations.get(key) ?? 0)
-    ) this.#readProjects.set(key, cache);
+    if (this.#isCurrentReadProjectCacheGeneration(repository, generation)) this.#readProjects.set(key, cache);
+  }
+
+  #isCurrentReadProjectCacheGeneration(
+    repository: RepositoryGrant,
+    generation: ReadProjectCacheGeneration
+  ): boolean {
+    return this.#isCurrentInstallationCacheGeneration(repository.installationId, generation)
+      && generation.repository === (this.#repositoryCacheGenerations.get(repositoryKey(repository)) ?? 0);
   }
 
   #timestamp(): string {
@@ -2453,8 +3163,7 @@ function readNodeLineage(node: ProjectGraphNode) {
       : { kind: "coaching_child" as const, parentSha: node.lineage.parentSha, proposalId: node.lineage.proposalId };
 }
 
-function readEvidenceSummary(loaded: ReadProject, activity: Pick<NodeActivityShardReadModel, "runs">, evidence: EvidenceActivityReadModel) {
-  const run = activity.runs.find(item => item.id === evidence.runId);
+function readEvidenceSummary(loaded: ReadProject, evidence: EvidenceActivityReadModel) {
   const kind = evidence.kind === "diff" ? "commit"
     : evidence.kind === "check" ? "check"
       : evidence.kind === "report" ? "report"
@@ -2464,8 +3173,8 @@ function readEvidenceSummary(loaded: ReadProject, activity: Pick<NodeActivitySha
     kind,
     title: evidence.summary,
     summary: evidence.summary,
-    criterion: evidence.target.type === "criterion" && run
-      ? { kind: "linked" as const, goalDigest: run.goalDigest, criterion: evidence.target.criterion }
+    criterion: evidence.target.type === "criterion"
+      ? { kind: "linked" as const, goalDigest: evidence.goalDigest, criterion: evidence.target.criterion }
       : { kind: "unlinked" as const },
     location: evidence.location.type === "url"
       ? { kind: "url" as const, url: evidence.location.url }
@@ -2474,6 +3183,217 @@ function readEvidenceSummary(loaded: ReadProject, activity: Pick<NodeActivitySha
         : { kind: "none" as const },
     createdAt: evidence.recordedAt
   };
+}
+
+function readCoachReviewActivity(review: ReviewActivityReadModel) {
+  return {
+    id: review.id,
+    target: review.targetType === "node"
+      ? { type: "node" as const, nodeSha: review.targetId }
+      : review.targetType === "run"
+        ? { type: "run" as const, runId: review.targetId }
+        : { type: "comparison" as const, comparisonId: review.targetId },
+    assessment: review.assessment,
+    recommendations: review.recommendations,
+    recordedAt: review.recordedAt
+  };
+}
+
+function activityWindowRequest(
+  stateHeadSha: string,
+  query: JsonRecord
+): ApiResult<{ readonly limit: number; readonly offset: number }> {
+  const limit = optionalPositiveInteger(query, "limit") ?? 50;
+  if (limit > 50) return invalidRequest("Activity list limit cannot exceed 50.");
+  const rawCursor = optionalString(query, "cursor");
+  const match = rawCursor?.match(EXACT_ACTIVITY_CURSOR);
+  if (rawCursor !== undefined && (!match || match[1] !== stateHeadSha)) {
+    return invalidRequest("Activity cursor must be bound to this exact state head and a non-negative offset.");
+  }
+  const offset = match?.[2] === undefined ? 0 : Number(match[2]);
+  if (!Number.isSafeInteger(offset) || offset < 0) return invalidRequest("Activity cursor is invalid.");
+  return apiOk({ limit, offset });
+}
+
+function readCoachingActivity(proposal: CoachingActivityReadModel) {
+  return {
+    id: proposal.id,
+    sourceNodeSha: proposal.sourceNodeSha,
+    sourcePayloadDigest: proposal.sourcePayloadDigest,
+    sourcePlanDigest: proposal.sourcePlanDigest,
+    proposedPlanDigest: proposal.proposedPlanDigest,
+    expectedStateSha: proposal.expectedStateSha,
+    summary: proposal.summary,
+    rationale: proposal.rationale,
+    proposedAt: proposal.proposedAt,
+    disposition: proposal.disposition.type === "pending"
+      ? { type: "pending" as const }
+      : proposal.disposition.type === "confirmed"
+        ? {
+            type: "confirmed" as const,
+            decisionId: proposal.disposition.decisionId,
+            childNodeSha: proposal.disposition.childNodeSha,
+            reason: proposal.disposition.reason,
+            decidedAt: proposal.disposition.decidedAt
+          }
+        : {
+            type: "rejected" as const,
+            decisionId: proposal.disposition.decisionId,
+            reason: proposal.disposition.reason,
+            decidedAt: proposal.disposition.decidedAt
+          }
+  };
+}
+
+function readComparisonActivity(comparison: ComparisonActivityReadModel) {
+  const base = {
+    id: comparison.id,
+    nodeShas: comparison.nodeShas,
+    summary: comparison.summary,
+    recordedAt: comparison.recordedAt,
+    disposition: comparison.disposition.type === "undecided"
+      ? { type: "undecided" as const }
+      : {
+          type: "decisions_recorded" as const,
+          decisions: comparison.disposition.decisions.map(readDecisionActivity)
+        }
+  };
+  return comparison.type === "sibling_runs"
+    ? { ...base, type: "sibling_runs" as const, parentNodeSha: comparison.parentNodeSha }
+    : {
+        ...base,
+        type: "coached_how_experiment" as const,
+        anchorNodeSha: comparison.anchorNodeSha,
+        goalDigest: comparison.goalDigest
+      };
+}
+
+function readDecisionActivity(decision: DecisionActivityReadModel) {
+  return {
+    id: decision.id,
+    type: decision.type,
+    comparisonId: decision.comparisonId,
+    nodeShas: decision.nodeShas,
+    rationale: decision.rationale,
+    decidedAt: decision.decidedAt
+  };
+}
+
+function coachReviewActivityMatches(activity: ReviewActivityReadModel, review: CoachReview): boolean {
+  const targetId = review.target.type === "node"
+    ? String(review.target.nodeSha)
+    : review.target.type === "run"
+      ? String(review.target.runId)
+      : String(review.target.comparisonId);
+  return activity.id === String(review.id)
+    && activity.targetType === review.target.type
+    && activity.targetId === targetId
+    && activity.assessment === String(review.assessment)
+    && canonicalJson(activity.recommendations) === canonicalJson(review.recommendations.map(String))
+    && activity.recordedAt === String(review.recordedAt);
+}
+
+function coachingActivityMatches(activity: CoachingActivityReadModel, proposal: CoachingProposal): boolean {
+  return activity.id === String(proposal.id)
+    && activity.sourceNodeSha === String(proposal.sourceNodeSha)
+    && activity.sourcePayloadDigest === String(proposal.sourcePayloadDigest)
+    && activity.sourcePlanDigest === String(proposal.sourcePlanDigest)
+    && activity.proposedPlanDigest === String(proposal.proposedPlanDigest)
+    && activity.expectedStateSha === String(proposal.expectedStateSha)
+    && activity.summary === String(proposal.summary)
+    && activity.rationale === String(proposal.rationale)
+    && activity.proposedAt === String(proposal.proposedAt);
+}
+
+function confirmedCoachingDecisionMatches(
+  activity: CoachingActivityReadModel,
+  decision: Extract<DomainEvent, { type: "CoachingProposalConfirmed" }>["decision"]
+): boolean {
+  const disposition = activity.disposition;
+  return disposition.type === "confirmed"
+    && disposition.decisionId === String(decision.id)
+    && activity.id === String(decision.proposalId)
+    && disposition.childNodeSha === String(decision.childNodeSha)
+    && disposition.reason === String(decision.reason)
+    && disposition.decidedAt === String(decision.decidedAt);
+}
+
+function rejectedCoachingDecisionMatches(
+  activity: CoachingActivityReadModel,
+  decision: Extract<DomainEvent, { type: "CoachingProposalRejected" }>["decision"]
+): boolean {
+  const disposition = activity.disposition;
+  return disposition.type === "rejected"
+    && disposition.decisionId === String(decision.id)
+    && activity.id === String(decision.proposalId)
+    && disposition.reason === String(decision.reason)
+    && disposition.decidedAt === String(decision.decidedAt);
+}
+
+function coachingChildRegistrationMatches(
+  loaded: ReadProject,
+  activity: CoachingActivityReadModel,
+  proposedPlan: NodePlan,
+  event: Extract<DomainEvent, { type: "CoachingChildNodeRegistered" }>,
+  child: { graphNode: ProjectGraphNodeReadModel; payload: NodePayload }
+): boolean {
+  const disposition = activity.disposition;
+  if (disposition.type !== "confirmed") return false;
+  const node = event.node;
+  const card = child.graphNode.node;
+  return node.type === "coaching_child"
+    && String(node.projectId) === loaded.catalog.project.id
+    && String(node.commitSha) === disposition.childNodeSha
+    && String(node.parentSha) === activity.sourceNodeSha
+    && String(node.proposalId) === activity.id
+    && String(node.treeSha) === card.treeSha
+    && String(node.managedRef) === card.managedRef
+    && String(node.commitTitle) === card.commitTitle
+    && String(node.planDigest) === card.planDigest
+    && String(node.payloadDigest) === card.payloadDigest
+    && String(node.registeredAt) === card.registeredAt
+    && event.payload.digest === node.payloadDigest
+    && card.type === "coaching_child"
+    && card.lineage.type === "coaching"
+    && card.lineage.parentSha === activity.sourceNodeSha
+    && card.lineage.proposalId === activity.id
+    && String(child.payload.projectId) === loaded.catalog.project.id
+    && String(child.payload.commitSha) === disposition.childNodeSha
+    && String(child.payload.treeSha) === card.treeSha
+    && canonicalJsonValue(node.plan) === canonicalJsonValue(proposedPlan)
+    && canonicalJsonValue(node.plan) === canonicalJsonValue(child.payload.plan);
+}
+
+function alternativeDecisionMatches(
+  projectId: string,
+  activity: DecisionActivityReadModel,
+  decision: Extract<DomainEvent, { type: "AlternativeSelected" | "AlternativesRejected" }>["decision"]
+): boolean {
+  if (activity.type !== decision.type
+    || activity.id !== String(decision.id)
+    || projectId !== String(decision.projectId)
+    || activity.comparisonId !== String(decision.comparisonId)
+    || activity.rationale !== String(decision.rationale)
+    || activity.decidedAt !== String(decision.decidedAt)) return false;
+  const nodeShas = decision.type === "selection"
+    ? [String(decision.selectedNodeSha)]
+    : decision.rejectedNodeShas.map(String);
+  return canonicalJsonValue(activity.nodeShas) === canonicalJsonValue(nodeShas);
+}
+
+function comparisonActivityAnchorSha(comparison: ComparisonActivityReadModel): string {
+  return comparison.type === "sibling_runs" ? comparison.parentNodeSha : comparison.anchorNodeSha;
+}
+
+function comparisonActivityMatches(activity: ComparisonActivityReadModel, comparison: AlternativeComparison): boolean {
+  return activity.type === comparison.type
+    && activity.id === String(comparison.id)
+    && comparisonActivityAnchorSha(activity) === String(comparison.type === "sibling_runs" ? comparison.parentNodeSha : comparison.anchorNodeSha)
+    && (activity.type !== "coached_how_experiment" || comparison.type !== "coached_how_experiment"
+      || activity.goalDigest === String(comparison.goalDigest))
+    && canonicalJson(activity.nodeShas) === canonicalJson(comparison.nodeShas.map(String))
+    && activity.summary === String(comparison.summary)
+    && activity.recordedAt === String(comparison.recordedAt);
 }
 
 function readEventIndexEntry(entry: EventIndexEntryReadModel) {
@@ -2538,6 +3458,18 @@ function nodePayloadPath(loaded: ReadProject, nodeSha: string): string {
 
 function readFileCacheKey(loaded: ReadProject, path: string): string {
   return `${repositoryKey(loaded.repository)}:${loaded.stateHeadSha}:${path}`;
+}
+
+function nodeAnchorCacheKey(loaded: ReadProject, card: ProjectGraphNode): string {
+  return [
+    repositoryKey(loaded.repository),
+    loaded.catalog.project.id,
+    loaded.stateHeadSha,
+    card.sha,
+    card.treeSha,
+    card.managedRef,
+    card.commitTitle
+  ].join(":");
 }
 
 function decodeMaterialized<T>(
@@ -2631,7 +3563,9 @@ function authoritativeEventSummary(event: DomainEvent): string {
     case "CoachingProposalConfirmed": return `Confirmed Coaching transition ${event.decision.proposalId}`;
     case "CoachingChildNodeRegistered": return `Registered Coaching child Node ${String(event.node.commitSha).slice(0, 8)}`;
     case "CoachingProposalRejected": return `Rejected Coaching transition ${event.decision.proposalId}`;
-    case "AlternativesCompared": return `Compared ${event.comparison.nodeShas.length} sibling Nodes`;
+    case "AlternativesCompared": return event.comparison.type === "sibling_runs"
+      ? `Compared ${event.comparison.nodeShas.length} sibling Nodes`
+      : `Compared ${event.comparison.nodeShas.length} coached How experiment Nodes`;
     case "AlternativeSelected": return `Selected Node ${String(event.decision.selectedNodeSha).slice(0, 8)}`;
     case "AlternativesRejected": return `Rejected ${event.decision.rejectedNodeShas.length} Node alternative(s)`;
   }
@@ -2661,7 +3595,9 @@ function eventReferenceMatchesAuthoritative(indexed: EventIndexEntryReadModel, e
     case "CoachingProposalRecorded": return reference.kind === "node" && reference.nodeSha === String(event.proposal.sourceNodeSha);
     case "CoachingProposalConfirmed": return reference.kind === "node" && reference.nodeSha === String(event.decision.childNodeSha);
     case "CoachingProposalRejected": return reference.kind === "node" || reference.kind === "project";
-    case "AlternativesCompared": return reference.kind === "node" && reference.nodeSha === String(event.comparison.parentNodeSha);
+    case "AlternativesCompared": return reference.kind === "node" && reference.nodeSha === String(
+      event.comparison.type === "sibling_runs" ? event.comparison.parentNodeSha : event.comparison.anchorNodeSha
+    );
     case "AlternativeSelected": return reference.kind === "node" && reference.nodeSha === String(event.decision.selectedNodeSha);
     case "AlternativesRejected": return reference.kind === "node" && reference.nodeSha === String(event.decision.rejectedNodeShas[0]);
   }
@@ -2729,14 +3665,14 @@ function graphNodeIntegrityError(
   return undefined;
 }
 
-function activityShardIntegrityError(
+function activityIndexIntegrityError(
   loaded: ReadProject,
   manifest: ProjectActivityManifestReadModel,
-  shard: NodeActivityShardReadModel,
+  index: NodeActivityIndexReadModel,
   nodeSha: string
 ): string | undefined {
-  return shard.projectId !== loaded.catalog.project.id || shard.nodeSha !== nodeSha || !sameCheckpoint(shard.checkpoint, manifest.checkpoint)
-    ? `Node activity shard ${nodeSha} does not match its exact-head snapshot manifest.`
+  return index.projectId !== loaded.catalog.project.id || index.nodeSha !== nodeSha || !sameCheckpoint(index.checkpoint, manifest.checkpoint)
+    ? `Node activity index ${nodeSha} does not match its exact-head snapshot manifest.`
     : undefined;
 }
 
@@ -2831,6 +3767,35 @@ function projectIdOf(state: ProjectState): string {
 
 function repositoryKey(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): string {
   return `${repository.installationId}:${repository.repositoryId}`;
+}
+
+function runnerCapabilityRepositoryIdentity(repository: RepositoryGrant): RunnerCapabilityRepositoryIdentity {
+  return {
+    installationId: repository.installationId,
+    repositoryId: repository.repositoryId,
+    owner: repository.owner,
+    name: repository.name,
+    defaultBranch: repository.defaultBranch
+  };
+}
+
+function runnerCapabilityCatalogDigest(capabilities: readonly RunnerCapability[]): RunnerCapabilityCatalogDigest {
+  return `${RUNNER_CAPABILITY_CATALOG_DIGEST_PREFIX}${hashHex(canonicalJsonValue(capabilities))}`;
+}
+
+function sameRunnerTypeLock(left: RunnerCapability["type"], right: RunnerTypeLock): boolean {
+  return left.origin === String(right.origin)
+    && left.key === String(right.key)
+    && left.schemaVersion === String(right.schemaVersion)
+    && left.integrity === String(right.integrity);
+}
+
+function runnerTypeLockIdentity(lock: RunnerCapability["type"]): string {
+  return canonicalJsonValue([lock.key, lock.origin, lock.schemaVersion, lock.integrity]);
+}
+
+function runnerTypeLockLabel(lock: RunnerTypeLock): string {
+  return `${lock.origin}/${lock.key}@${lock.schemaVersion}`;
 }
 
 function nextCacheGeneration(value: number): number {
@@ -2992,8 +3957,25 @@ function assertExactToolMutationInput(name: string, input: JsonRecord): void {
   const tool = findHunsuTool(name);
   if (!tool || tool.readOnly) return;
   const properties = tool.inputSchema.properties;
-  if (!isRecord(properties)) throw new Error(`Tool ${name} has no object properties schema.`);
-  assertExactRecord(input, "arguments", Object.keys(properties));
+  if (isRecord(properties)) {
+    assertExactRecord(input, "arguments", Object.keys(properties));
+    return;
+  }
+  if (!Array.isArray(tool.inputSchema.oneOf)) throw new Error(`Tool ${name} has no exact object schema.`);
+  const objectVariants = tool.inputSchema.oneOf.filter(isRecord);
+  const unionKeys = new Set(objectVariants.flatMap(variant => isRecord(variant.properties) ? Object.keys(variant.properties) : []));
+  const unknown = Object.keys(input).filter(key => !unionKeys.has(key));
+  if (unknown.length > 0) throw boundaryInvalid(`arguments contains unsupported fields: ${unknown.join(", ")}.`);
+  const variants = objectVariants.filter(variant => {
+    if (!isRecord(variant.properties)) return false;
+    return Object.entries(variant.properties).every(([key, schema]) => !isRecord(schema)
+      || schema.const === undefined
+      || input[key] === schema.const);
+  });
+  if (variants.length !== 1 || !isRecord(variants[0]?.properties)) {
+    throw boundaryInvalid(`arguments must identify exactly one ${name} variant.`);
+  }
+  assertExactRecord(input, "arguments", Object.keys(variants[0].properties));
 }
 
 function boundaryInvalid(message: string): BoundaryError {

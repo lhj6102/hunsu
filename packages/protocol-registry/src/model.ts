@@ -13,12 +13,17 @@ export const REGISTRY_DEFINITION_SCHEMA = "hunsu.registry-definition.v2" as cons
 export const REGISTRY_SNAPSHOT_SCHEMA = "hunsu.registry-snapshot.v2" as const;
 export const REGISTRY_INTEGRITY_PREFIX = "hunsu-registry-definition-v2:sha256:" as const;
 export const RUNNER_TYPE_INTEGRITY_PREFIX = "hunsu-runner-type-v1:sha256:" as const;
+export const RUNNER_VALUE_SCHEMA_SCHEMA = "hunsu.runner-value-schema.v1" as const;
+export const RUNNER_VALUE_SCHEMA_DIGEST_PREFIX = "hunsu-runner-value-schema-v1:sha256:" as const;
 
 export type RegistryOrigin = string & { readonly [registryBrand]: "RegistryOrigin" };
 export type RegistryKey = string & { readonly [registryBrand]: "RegistryKey" };
 export type RegistryVersion = string & { readonly [registryBrand]: "RegistryVersion" };
 export type RegistryIntegrity = `${typeof REGISTRY_INTEGRITY_PREFIX}${string}` & {
   readonly [registryBrand]: "RegistryIntegrity";
+};
+export type RunnerValueSchemaDigest = `${typeof RUNNER_VALUE_SCHEMA_DIGEST_PREFIX}${string}` & {
+  readonly [registryBrand]: "RunnerValueSchemaDigest";
 };
 export type DefinitionIntegrity = RegistryIntegrity | RunnerTypeIntegrity;
 
@@ -39,19 +44,29 @@ type DefinitionHeader<Kind extends DefinitionKind> = {
   readonly version: RegistryVersion;
 };
 
+export type RunnerObjectValueSchema = {
+  readonly type: "object";
+  readonly properties: Readonly<Record<string, RunnerValueSchema>>;
+  readonly required: readonly string[];
+  readonly additionalProperties: false;
+};
+
 export type RunnerValueSchema =
-  | {
-      readonly type: "object";
-      readonly properties: Readonly<Record<string, RunnerValueSchema>>;
-      readonly required: readonly string[];
-      readonly additionalProperties: false;
-    }
+  | RunnerObjectValueSchema
   | {
       readonly type: "array";
       readonly items: RunnerValueSchema;
       readonly minItems: number;
       readonly maxItems: number;
       readonly uniqueItems: boolean;
+    }
+  | {
+      readonly type: "contiguous_ordered_array";
+      readonly items: RunnerObjectValueSchema;
+      readonly minItems: number;
+      readonly maxItems: number;
+      readonly orderField: string;
+      readonly startAt: number;
     }
   | {
       readonly type: "string";
@@ -86,6 +101,21 @@ export type RunnerTypeDefinition = DefinitionHeader<"runner_type"> & {
     readonly displayName: string;
     readonly valueSchema: RunnerValueSchema;
     readonly executor: RunnerExecutorContract;
+  };
+};
+
+/**
+ * The public, non-executable portion of one integrity-locked Runner type.
+ * Executor resources, entrypoints, Coach prompts, and Skill instructions are
+ * deliberately absent from this DTO.
+ */
+export type RunnerTypeCapabilityDefinition = {
+  readonly type: RunnerTypeLock;
+  readonly displayName: string;
+  readonly valueSchema: {
+    readonly schema: typeof RUNNER_VALUE_SCHEMA_SCHEMA;
+    readonly digest: RunnerValueSchemaDigest;
+    readonly root: RunnerValueSchema;
   };
 };
 

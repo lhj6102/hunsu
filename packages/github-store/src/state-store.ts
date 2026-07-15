@@ -11,6 +11,7 @@ import type {
   StateActor,
   StoreError,
   StoredProjectEvent,
+  VerifiedStoredProjectEvent,
   StoreResult
 } from "./types.ts";
 import { HUNSU_STATE_BRANCH } from "./types.ts";
@@ -140,7 +141,15 @@ export class GitHubProjectStore<Event, State> {
     if (!decision.ok) return decision;
     if (decision.value.length === 0) return failure({ code: "invalid_event", message: "A mutation must emit at least one event." });
 
-    const stored = decision.value.map((event, index): StoredProjectEvent<Event> => ({
+    const encodedEvents: unknown[] = [];
+    for (const event of decision.value) {
+      const encoded = this.#codec.encodeEvent(event);
+      if (!encoded.ok) return encoded;
+      const safeEvent = ensureSafeValue(encoded.value, "event");
+      if (!safeEvent.ok) return safeEvent;
+      encodedEvents.push(encoded.value);
+    }
+    const stored = decision.value.map((event, index): VerifiedStoredProjectEvent<Event> => ({
       schema: EVENT_SCHEMA,
       eventId: storedEventId(command.projectId, idempotencyKeyHash, commandHash, index),
       projectId: command.projectId,
@@ -157,16 +166,9 @@ export class GitHubProjectStore<Event, State> {
       sequence: decoded.value.length + index + 1,
       actor: structuredClone(command.actor),
       occurredAt: command.occurredAt,
-      event
+      event,
+      encodedEvent: { type: "verified", value: encodedEvents[index] }
     }));
-    const encodedEvents: unknown[] = [];
-    for (const entry of stored) {
-      const encoded = this.#codec.encodeEvent(entry.event);
-      if (!encoded.ok) return encoded;
-      const safeEvent = ensureSafeValue(encoded.value, "event");
-      if (!safeEvent.ok) return safeEvent;
-      encodedEvents.push(encoded.value);
-    }
 
     const allEvents = [...decoded.value, ...stored];
     const next = this.#replay(allEvents);
@@ -183,7 +185,7 @@ export class GitHubProjectStore<Event, State> {
     for (const [index, entry] of stored.entries()) {
       const path = eventPath(entry);
       if (branch.files[path] !== undefined) return failure({ code: "invalid_event", message: `Event path ${path} already exists.` });
-      updates.push({ path, content: `${canonicalJson({ ...entry, event: encodedEvents[index] })}\n` });
+      updates.push({ path, content: `${canonicalJson(storedEventFileValue(entry))}\n` });
     }
     const prefix = projectRoot(command.projectId);
     for (const [relativePath, value] of Object.entries(materialized.value)) {
@@ -444,9 +446,9 @@ export class GitHubProjectStore<Event, State> {
     files: Readonly<Record<string, string>>,
     repository: RepositoryLocator,
     projectId: string
-  ): StoreResult<StoredProjectEvent<Event>[]> {
+  ): StoreResult<VerifiedStoredProjectEvent<Event>[]> {
     const prefix = `${projectRoot(projectId)}/events/`;
-    const events: StoredProjectEvent<Event>[] = [];
+    const events: VerifiedStoredProjectEvent<Event>[] = [];
     for (const path of Object.keys(files).filter(path => {
       if (!path.startsWith(prefix)) return false;
       return /^\d{4}\/\d{2}\/[0-9a-f]{32}\.json$/u.test(path.slice(prefix.length));
@@ -476,7 +478,7 @@ export class GitHubProjectStore<Event, State> {
     return batches.ok ? ok(events) : batches;
   }
 
-  #replay(events: readonly StoredProjectEvent<Event>[]): StoreResult<State> {
+  #replay(events: readonly VerifiedStoredProjectEvent<Event>[]): StoreResult<State> {
     return this.#codec.replay(events.map(entry => entry.event));
   }
 }
@@ -485,7 +487,7 @@ export class GitHubProjectStore<Event, State> {
 export function decodeStoredProjectEventEnvelope<Event, State>(
   input: unknown,
   codec: ProjectStateCodec<Event, State>
-): StoreResult<StoredProjectEvent<Event>> {
+): StoreResult<VerifiedStoredProjectEvent<Event>> {
   if (!isRecord(input)
     || !hasExactKeys(input, STORED_EVENT_KEYS)
     || input.schema !== EVENT_SCHEMA
@@ -538,7 +540,8 @@ export function decodeStoredProjectEventEnvelope<Event, State>(
     sequence: input.sequence as number,
     actor: input.actor,
     occurredAt: input.occurredAt,
-    event: event.value
+    event: event.value,
+    encodedEvent: { type: "verified", value: structuredClone(input.event) }
   });
 }
 
@@ -557,6 +560,23 @@ function eventPath<Event>(event: StoredProjectEvent<Event>): string {
   const year = String(date.getUTCFullYear()).padStart(4, "0");
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
   return `${projectRoot(event.projectId)}/events/${year}/${month}/${event.eventId}.json`;
+}
+
+function storedEventFileValue<Event>(event: VerifiedStoredProjectEvent<Event>): unknown {
+  return {
+    schema: event.schema,
+    eventId: event.eventId,
+    projectId: event.projectId,
+    repository: event.repository,
+    idempotencyKeyHash: event.idempotencyKeyHash,
+    commandHash: event.commandHash,
+    previousStateSha: event.previousStateSha,
+    commandEventCount: event.commandEventCount,
+    sequence: event.sequence,
+    actor: event.actor,
+    occurredAt: event.occurredAt,
+    event: event.encodedEvent.value
+  };
 }
 
 function storedEventId(projectId: string, idempotencyKeyHash: string, commandHash: string, index: number): string {

@@ -22,6 +22,7 @@ import {
   type RegistryResult,
   type RegistryVersion,
   type ResourceDefinition,
+  type RunnerObjectValueSchema,
   type RunnerExecutorContract,
   type RunnerTypeDefinition,
   type RunnerValueSchema,
@@ -30,7 +31,17 @@ import {
 
 const DEFINITION_KINDS = ["runner_type", "coach", "skill", "resource"] as const;
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
-const RUNNER_SCHEMA_TYPES = ["object", "array", "string", "string_enum", "integer", "number", "boolean", "null"] as const;
+const RUNNER_SCHEMA_TYPES = [
+  "object",
+  "array",
+  "contiguous_ordered_array",
+  "string",
+  "string_enum",
+  "integer",
+  "number",
+  "boolean",
+  "null"
+] as const;
 const MAX_SCHEMA_DEPTH = 32;
 const MAX_SCHEMA_PROPERTIES = 256;
 const MAX_RUNNER_COLLECTION_ITEMS = 10_000;
@@ -103,7 +114,7 @@ export function decodeRunnerValueSchema(value: unknown, path = "$", depth = 0): 
       if (propertyKeys.length > MAX_SCHEMA_PROPERTIES) return invalid(`${path}.properties`, `properties cannot exceed ${MAX_SCHEMA_PROPERTIES} fields`);
       const properties: Record<string, RunnerValueSchema> = {};
       for (const key of propertyKeys.sort()) {
-        if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/u.test(key)) return invalid(`${path}.properties`, `invalid property key ${JSON.stringify(key)}`);
+        if (!isSchemaPropertyKey(key)) return invalid(`${path}.properties`, `invalid property key ${JSON.stringify(key)}`);
         const property = decodeRunnerValueSchema(record.value.properties[key], `${path}.properties.${key}`, depth + 1);
         if (!property.ok) return property;
         Object.defineProperty(properties, key, {
@@ -129,6 +140,54 @@ export function decodeRunnerValueSchema(value: unknown, path = "$", depth = 0): 
       if (!bounds.ok) return bounds;
       if (typeof record.value.uniqueItems !== "boolean") return invalid(`${path}.uniqueItems`, "uniqueItems must be boolean");
       return ok({ type: "array", items: items.value, ...bounds.value, uniqueItems: record.value.uniqueItems });
+    }
+    case "contiguous_ordered_array": {
+      const record = exactRecord(value, path, ["type", "items", "minItems", "maxItems", "orderField", "startAt"]);
+      if (!record.ok) return record;
+      const items = decodeRunnerValueSchema(record.value.items, `${path}.items`, depth + 1);
+      if (!items.ok) return items;
+      if (items.value.type !== "object") {
+        return invalid(`${path}.items.type`, "contiguous ordered array items must use an object schema");
+      }
+      const bounds = collectionBounds(record.value.minItems, record.value.maxItems, path);
+      if (!bounds.ok) return bounds;
+      if (typeof record.value.orderField !== "string" || !isSchemaPropertyKey(record.value.orderField)) {
+        return invalid(`${path}.orderField`, "orderField must be a valid schema property key");
+      }
+      const orderField = record.value.orderField;
+      const orderSchema = items.value.properties[orderField];
+      if (!orderSchema) {
+        return invalid(`${path}.orderField`, `orderField ${JSON.stringify(orderField)} is not defined by items.properties`);
+      }
+      if (orderSchema.type !== "integer") {
+        return invalid(`${path}.items.properties.${orderField}`, "orderField must use an integer schema");
+      }
+      if (!items.value.required.includes(orderField)) {
+        return invalid(`${path}.items.required`, "orderField must be required");
+      }
+      if (!Number.isSafeInteger(record.value.startAt)) {
+        return invalid(`${path}.startAt`, "startAt must be a safe integer");
+      }
+      const startAt = Number(record.value.startAt);
+      if (bounds.value.maxItems > 0) {
+        const lastOrder = startAt + bounds.value.maxItems - 1;
+        if (!Number.isSafeInteger(lastOrder)) {
+          return invalid(`${path}.startAt`, "startAt plus maxItems must remain within the safe integer range");
+        }
+        if (orderSchema.minimum > startAt || orderSchema.maximum < lastOrder) {
+          return invalid(
+            `${path}.items.properties.${orderField}`,
+            `orderField integer bounds must include every value from ${startAt} through ${lastOrder}`
+          );
+        }
+      }
+      return ok({
+        type: "contiguous_ordered_array",
+        items: items.value as RunnerObjectValueSchema,
+        ...bounds.value,
+        orderField,
+        startAt
+      });
     }
     case "string": {
       const record = exactRecord(value, path, ["type", "minLength", "maxLength"]);
@@ -389,6 +448,10 @@ function oneOf<const Values extends readonly string[]>(value: unknown, values: V
 
 function lockIdentity(lock: Pick<DefinitionLock, "origin" | "kind" | "key" | "version">): string {
   return `${lock.origin}/${lock.kind}/${lock.key}@${lock.version}`;
+}
+
+function isSchemaPropertyKey(value: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/u.test(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

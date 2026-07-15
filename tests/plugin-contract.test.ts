@@ -11,11 +11,14 @@ import {
 
 const expectedTools = [
   "hunsu.projects.list", "hunsu.projects.get", "hunsu.projects.create", "hunsu.projects.rebuild",
+  "hunsu.runner_capabilities.list", "hunsu.runner_capabilities.get",
   "hunsu.nodes.graph", "hunsu.nodes.get",
   "hunsu.events.list", "hunsu.events.get",
-  "hunsu.runs.get", "hunsu.runs.start", "hunsu.runs.checkpoint", "hunsu.runs.attach_evidence", "hunsu.runs.complete", "hunsu.runs.fail", "hunsu.runs.cancel",
+  "hunsu.runs.get",
+  "hunsu.coach.reviews.list", "hunsu.coach.reviews.get", "hunsu.coach.proposals.list", "hunsu.coach.proposals.get",
+  "hunsu.runs.start", "hunsu.runs.checkpoint", "hunsu.runs.attach_evidence", "hunsu.runs.complete", "hunsu.runs.fail", "hunsu.runs.cancel",
   "hunsu.coach.review", "hunsu.coach.propose_transition", "hunsu.coach.confirm_transition", "hunsu.coach.reject_transition",
-  "hunsu.alternatives.compare", "hunsu.alternatives.select", "hunsu.alternatives.reject"
+  "hunsu.alternatives.list", "hunsu.alternatives.get", "hunsu.alternatives.compare", "hunsu.alternatives.select", "hunsu.alternatives.reject"
 ];
 
 test("plugin contract exposes only the v2 Commit Node tool surface", () => {
@@ -24,16 +27,83 @@ test("plugin contract exposes only the v2 Commit Node tool surface", () => {
   assert.equal(HUNSU_MCP_TOOLS.some(tool => tool.name.startsWith("hunsu.goals.")), false);
   assert.equal(HUNSU_MCP_TOOLS.some(tool => tool.name.startsWith("hunsu.runners.")), false);
   for (const tool of HUNSU_MCP_TOOLS) {
-    assert.equal(tool.inputSchema.type, "object");
-    assert.equal(tool.inputSchema.additionalProperties, false);
+    if (Array.isArray(tool.inputSchema.oneOf)) {
+      assert.ok(tool.inputSchema.oneOf.length >= 2);
+      for (const variant of tool.inputSchema.oneOf as Array<Record<string, unknown>>) {
+        assert.equal(variant.type, "object");
+        assert.equal(variant.additionalProperties, false);
+      }
+    } else {
+      assert.equal(tool.inputSchema.type, "object");
+      assert.equal(tool.inputSchema.additionalProperties, false);
+    }
   }
   assert.equal(tool("hunsu.nodes.graph").readOnly, true);
+  assert.equal(tool("hunsu.runner_capabilities.list").readOnly, true);
+  assert.equal(tool("hunsu.runner_capabilities.get").readOnly, true);
   assert.equal(tool("hunsu.events.list").readOnly, true);
+  assert.equal(tool("hunsu.coach.reviews.list").readOnly, true);
+  assert.equal(tool("hunsu.coach.proposals.get").readOnly, true);
+  assert.equal(tool("hunsu.alternatives.get").readOnly, true);
   assert.equal(tool("hunsu.projects.rebuild").readOnly, false);
   assert.deepEqual(tool("hunsu.projects.rebuild").inputSchema.required, [
     "repository", "projectId", "idempotencyKey", "expectedStateSha", "confirmedByUser"
   ]);
   assert.equal(tool("hunsu.alternatives.compare").readOnly, false);
+  assert.deepEqual(tool("hunsu.coach.proposals.get").inputSchema.required, [
+    "repository", "projectId", "sourceNodeSha", "proposalId"
+  ]);
+  assert.deepEqual(tool("hunsu.runner_capabilities.list").inputSchema.required, ["repository"]);
+  assert.equal(
+    ((tool("hunsu.runner_capabilities.list").inputSchema.properties as Record<string, Record<string, unknown>>).limit?.maximum),
+    50
+  );
+  assert.deepEqual(tool("hunsu.runner_capabilities.get").inputSchema.required, ["repository", "type"]);
+  const capabilityType = (tool("hunsu.runner_capabilities.get").inputSchema.properties as Record<string, Record<string, unknown>>).type!;
+  assert.deepEqual(capabilityType.required, ["origin", "key", "schemaVersion", "integrity"]);
+  assert.equal(capabilityType.additionalProperties, false);
+});
+
+test("comparison write and detail reads use exact tagged anchor variants", () => {
+  for (const name of ["hunsu.alternatives.compare", "hunsu.alternatives.get"] as const) {
+    const variants = tool(name).inputSchema.oneOf as Array<Record<string, any>>;
+    assert.equal(variants.length, 2);
+    const sibling = variants.find(variant => variant.properties.comparisonType.const === "sibling_runs")!;
+    const coached = variants.find(variant => variant.properties.comparisonType.const === "coached_how_experiment")!;
+    assert.ok(sibling.required.includes("sourceNodeSha"));
+    assert.equal(sibling.properties.anchorNodeSha, undefined);
+    assert.ok(coached.required.includes("anchorNodeSha"));
+    assert.equal(coached.properties.sourceNodeSha, undefined);
+  }
+});
+
+test("comparison transport rejects ambiguous or mismatched anchor variants", async () => {
+  let calls = 0;
+  const dispatcher: McpToolDispatcher<undefined> = {
+    async call(): Promise<ToolResponse<unknown>> {
+      calls += 1;
+      return { ok: true, data: {} };
+    }
+  };
+  const common = {
+    repository: { owner: "hunsu", name: "sample" },
+    projectId: "project-a",
+    comparisonType: "sibling_runs",
+    sourceNodeSha: "a".repeat(40),
+    comparisonId: "comparison-a"
+  };
+  const ambiguous = await call("hunsu.alternatives.get", {
+    ...common,
+    anchorNodeSha: "b".repeat(40)
+  }, dispatcher);
+  assert.equal(ambiguous && "error" in ambiguous && ambiguous.error.code, -32602);
+
+  const mismatched = await call("hunsu.alternatives.get", {
+    ...common,
+    comparisonType: "coached_how_experiment"
+  }, dispatcher);
+  assert.equal(mismatched && "error" in mismatched && mismatched.error.code, -32602);
+  assert.equal(calls, 0);
 });
 
 test("Run start selects one Goal digest and cannot override the Node Runner or base", () => {

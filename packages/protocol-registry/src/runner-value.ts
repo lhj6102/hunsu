@@ -50,6 +50,39 @@ export function decodeRunnerValuePayload(
       }
       return ok(decoded);
     }
+    case "contiguous_ordered_array": {
+      if (!Array.isArray(value)) return invalid(path, "value must be an array");
+      if (value.length < schema.minItems || value.length > schema.maxItems) {
+        return invalid(path, `array length must be between ${schema.minItems} and ${schema.maxItems}`);
+      }
+      const decoded: CanonicalJsonValue[] = [];
+      const orders = new Set<number>();
+      for (let index = 0; index < value.length; index += 1) {
+        const item = decodeRunnerValuePayload(schema.items, value[index]!, `${path}[${index}]`);
+        if (!item.ok) return item;
+        if (!isRecord(item.value)) return invalid(`${path}[${index}]`, "value must be an object");
+        const orderValue = item.value[schema.orderField];
+        if (!Number.isSafeInteger(orderValue)) {
+          return invalid(`${path}[${index}].${schema.orderField}`, "order value must be a safe integer");
+        }
+        const order = Number(orderValue);
+        if (orders.has(order)) {
+          return invalid(`${path}[${index}].${schema.orderField}`, "order values must be unique");
+        }
+        orders.add(order);
+        decoded.push(item.value);
+      }
+      for (let offset = 0; offset < decoded.length; offset += 1) {
+        const expected = schema.startAt + offset;
+        if (!orders.has(expected)) {
+          return invalid(
+            path,
+            `order values must form a contiguous sequence from ${schema.startAt}; missing ${expected}`
+          );
+        }
+      }
+      return ok(decoded);
+    }
     case "string":
       return typeof value === "string" && value.length >= schema.minLength && value.length <= schema.maxLength
         ? ok(value)

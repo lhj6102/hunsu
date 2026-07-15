@@ -6,6 +6,9 @@ const SHA = "1".repeat(40);
 const STATE_SHA = "2".repeat(40);
 const RUNNER_DIGEST = `hunsu-runner-v1:sha256:${"a".repeat(64)}`;
 const RUNNER_INTEGRITY = `hunsu-runner-type-v1:sha256:${"b".repeat(64)}`;
+const NODE_PAYLOAD_DIGEST = `hunsu-node-payload-v1:sha256:${"c".repeat(64)}`;
+const NODE_PLAN_DIGEST = `hunsu-node-plan-v1:sha256:${"d".repeat(64)}`;
+const GOAL_DIGEST = `hunsu-goal-v1:sha256:${"e".repeat(64)}`;
 
 test("v2 Graph presentation DTO decoding is exact", () => {
   const valid = projectGraphDto();
@@ -82,6 +85,77 @@ test("Runner Value decoding accepts arbitrary canonical JSON and rejects an unpr
   const result = decodeNodeDetail(invalid);
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error.path, "$.node.plan.how.digest");
+
+  const mismatchedTypeKey = nodeDetailDto();
+  mismatchedTypeKey.node.plan.how.typeKey = "qa/other";
+  const typeKeyResult = decodeNodeDetail(mismatchedTypeKey);
+  assert.equal(typeKeyResult.ok, false);
+  if (!typeKeyResult.ok) assert.equal(typeKeyResult.error.path, "$.node.plan.how.typeKey");
+
+  const mismatchedSchemaVersion = nodeDetailDto();
+  mismatchedSchemaVersion.node.plan.how.schemaVersion = "2.0.0";
+  const schemaVersionResult = decodeNodeDetail(mismatchedSchemaVersion);
+  assert.equal(schemaVersionResult.ok, false);
+  if (!schemaVersionResult.ok) assert.equal(schemaVersionResult.error.path, "$.node.plan.how.schemaVersion");
+});
+
+test("Node activity decoding preserves exact Coaching and comparison recovery summaries", () => {
+  const valid = nodeDetailDto();
+  valid.node.coachingProposals.push({
+    id: "proposal-a",
+    sourceNodeSha: SHA,
+    sourcePayloadDigest: NODE_PAYLOAD_DIGEST,
+    sourcePlanDigest: NODE_PLAN_DIGEST,
+    proposedPlanDigest: `hunsu-node-plan-v1:sha256:${"f".repeat(64)}`,
+    expectedStateSha: STATE_SHA,
+    summary: "Use the verified Team How.",
+    rationale: "Compare the same Goal under another How.",
+    proposedAt: "2026-07-14T07:00:00.000Z",
+    disposition: { type: "confirmed", decisionId: "decision-a", childNodeSha: "4".repeat(40), reason: "Approved.", decidedAt: "2026-07-14T07:01:00.000Z" }
+  });
+  valid.node.coachReviews.push({
+    id: "review-a",
+    target: { type: "node", nodeSha: SHA },
+    assessment: "Evidence is complete.",
+    recommendations: ["Compare both results."],
+    recordedAt: "2026-07-14T07:02:00.000Z"
+  });
+  valid.node.comparisons.push({
+    type: "coached_how_experiment",
+    id: "comparison-a",
+    anchorNodeSha: SHA,
+    goalDigest: GOAL_DIGEST,
+    nodeShas: ["5".repeat(40), "6".repeat(40)],
+    summary: "Team produced stronger retry evidence.",
+    disposition: {
+      type: "decisions_recorded",
+      decisions: [{
+        id: "decision-b",
+        type: "selection",
+        comparisonId: "comparison-a",
+        nodeShas: ["6".repeat(40)],
+        rationale: "Prefer the complete evidence.",
+        decidedAt: "2026-07-14T07:03:00.000Z"
+      }]
+    },
+    recordedAt: "2026-07-14T07:02:30.000Z"
+  });
+  const decoded = decodeNodeDetail(valid);
+  assert.equal(decoded.ok, true);
+  if (decoded.ok) {
+    assert.equal(decoded.value.node.coachingProposals[0]?.disposition.type, "confirmed");
+    assert.equal(decoded.value.node.comparisons[0]?.type, "coached_how_experiment");
+  }
+
+  const reviewWithoutRecommendations = structuredClone(valid) as any;
+  reviewWithoutRecommendations.node.coachReviews[0].recommendations = [];
+  assert.equal(decodeNodeDetail(reviewWithoutRecommendations).ok, true);
+
+  const invalid = structuredClone(valid) as any;
+  invalid.node.coachingProposals[0].reason = "legacy alias";
+  const invalidResult = decodeNodeDetail(invalid);
+  assert.equal(invalidResult.ok, false);
+  if (!invalidResult.ok) assert.equal(invalidResult.error.path, "$.node.coachingProposals[0].reason");
 });
 
 test("Events accept only protocol DomainEvent discriminants", () => {
@@ -126,6 +200,8 @@ function nodeDetailDto() {
     stateHeadSha: STATE_SHA,
     node: {
       sha: SHA,
+      payloadDigest: NODE_PAYLOAD_DIGEST,
+      planDigest: NODE_PLAN_DIGEST,
       title: "Root Node",
       commitUrl: `https://github.com/hunsu/product/commit/${SHA}`,
       treeSha: "3".repeat(40),
@@ -154,8 +230,10 @@ function nodeDetailDto() {
       outgoingEdges: [],
       activeRuns: [],
       evidence: [],
-      comparisons: [],
-      decisions: []
+      comparisons: [] as Record<string, any>[],
+      decisions: [],
+      coachingProposals: [] as Record<string, any>[],
+      coachReviews: [] as Record<string, any>[]
     }
   };
 }
