@@ -49,7 +49,7 @@ const edges = [
     sourceSha: rootSha,
     targetSha: runSha,
     runId: "run-browser",
-    goal: { digest: goalDigest, title: "Verify production evidence" },
+    goal: { digest: goalDigest, title: "Verify production evidence across the complete immutable release checkpoint and deployment trace" },
     completedAt: "2026-07-14T00:01:00Z"
   },
   {
@@ -160,11 +160,56 @@ test("lays Run children to the right and Coaching children below", async ({ page
   await expect(root).toContainText("Release Train");
 
   const [rootBox, runBox, coachingBox] = await Promise.all([root.boundingBox(), run.boundingBox(), coaching.boundingBox()]);
+  const [runLabelBox, coachingLabelBox] = await Promise.all([
+    page.locator('[data-graph-edge-label="edge-run"]').boundingBox(),
+    page.locator('[data-graph-edge-label="edge-coaching"]').boundingBox()
+  ]);
   expect(rootBox).not.toBeNull();
   expect(runBox).not.toBeNull();
   expect(coachingBox).not.toBeNull();
+  expect(runLabelBox).not.toBeNull();
+  expect(coachingLabelBox).not.toBeNull();
   expect(runBox!.x).toBeGreaterThan(rootBox!.x + rootBox!.width / 2);
   expect(coachingBox!.y).toBeGreaterThan(rootBox!.y + rootBox!.height / 2);
+  expect(runLabelBox!.x).toBeGreaterThanOrEqual(rootBox!.x + rootBox!.width + 12);
+  expect(runLabelBox!.x + runLabelBox!.width).toBeLessThanOrEqual(runBox!.x - 12);
+  expect(coachingLabelBox!.y).toBeGreaterThanOrEqual(rootBox!.y + rootBox!.height + 12);
+  expect(coachingLabelBox!.y + coachingLabelBox!.height).toBeLessThanOrEqual(coachingBox!.y - 12);
+
+  await run.click();
+  const inspector = page.getByRole("complementary", { name: "Selected Node" });
+  const flow = page.locator(".react-flow");
+  await expect(inspector).toBeVisible();
+  await expectSelectedRunClearance();
+
+  const expandedCanvasWidth = (await flow.boundingBox())!.width;
+  await page.getByRole("button", { name: "Collapse navigation" }).click();
+  await expect(page.getByRole("button", { name: "Expand navigation" })).toBeVisible();
+  await expect.poll(async () => (await flow.boundingBox())?.width ?? 0)
+    .toBeGreaterThanOrEqual(expandedCanvasWidth + 175);
+  await expectSelectedRunClearance();
+
+  await page.getByRole("button", { name: "Expand navigation" }).click();
+  await expect(page.getByRole("button", { name: "Collapse navigation" })).toBeVisible();
+  await expect.poll(async () => (await flow.boundingBox())?.width ?? Number.POSITIVE_INFINITY)
+    .toBeLessThanOrEqual(expandedCanvasWidth + 1);
+  await expectSelectedRunClearance();
+
+  async function expectSelectedRunClearance() {
+    await expect.poll(async () => {
+      const [focusedRunBox, inspectorBox] = await Promise.all([run.boundingBox(), inspector.boundingBox()]);
+      if (!focusedRunBox || !inspectorBox) return Number.NEGATIVE_INFINITY;
+      return inspectorBox.x - (focusedRunBox.x + focusedRunBox.width);
+    }).toBeGreaterThanOrEqual(12);
+    await expect.poll(async () => {
+      const [focusedLabelBox, inspectorBox] = await Promise.all([
+        page.locator('[data-graph-edge-label="edge-run"]').boundingBox(),
+        inspector.boundingBox()
+      ]);
+      if (!focusedLabelBox || !inspectorBox) return Number.NEGATIVE_INFINITY;
+      return inspectorBox.x - (focusedLabelBox.x + focusedLabelBox.width);
+    }).toBeGreaterThanOrEqual(12);
+  }
 });
 
 test("requests at most 300 initial summaries and loads continuation branches without losing page integrity", async ({ page }) => {

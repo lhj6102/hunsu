@@ -15,11 +15,17 @@ import {
   type Edge,
   type EdgeProps,
   type Node,
-  type NodeProps
+  type NodeProps,
+  type ReactFlowInstance
 } from "@xyflow/react";
 import { AlertTriangle, CheckCircle2, Expand, List, Loader2, Network, Search } from "lucide-react";
 import { projectGraphPath, projectNodePath, pushAppPath } from "@/app/routes";
 import { graphEdgeLabel, validateGraphTopology, type GraphTopologyResult } from "@/features/node-graph/graphModel";
+import {
+  GRAPH_EDGE_LABEL_MAX_WIDTH,
+  GRAPH_NODE_HEIGHT,
+  GRAPH_NODE_WIDTH
+} from "@/features/node-graph/layoutMetrics";
 import { fallbackGraphLayout } from "@/features/node-graph/fallbackGraphLayout";
 import { startGraphLayout } from "@/features/node-graph/graphLayout";
 import type { GraphLayoutRequest, PositionedGraphNode } from "@/features/node-graph/layoutTypes";
@@ -43,6 +49,7 @@ type HunsuFlowEdge = Edge<HunsuEdgeData, "hunsuEdge">;
 
 const nodeTypes = { hunsuNode: HunsuNodeCard };
 const edgeTypes = { hunsuEdge: HunsuGraphEdge };
+const DESKTOP_INSPECTOR_FIT_PADDING = "430px";
 
 export function NodeGraphScreen({ projectId, selectedNodeSha }: { projectId: string; selectedNodeSha: string | null }) {
   const [view, setView] = useState<GraphView>("canvas");
@@ -178,6 +185,9 @@ function GraphCanvas({
 }) {
   const layoutInput = useMemo<GraphLayoutRequest>(() => ({ nodes, edges }), [nodes, edges]);
   const positions = useGraphLayout(layoutInput);
+  const [instance, setInstance] = useState<ReactFlowInstance<HunsuFlowNode, HunsuFlowEdge> | null>(null);
+  const [viewportRevision, setViewportRevision] = useState(0);
+  const canvasRef = useRef<HTMLDivElement>(null);
   const flowNodes = useMemo<readonly HunsuFlowNode[]>(() => {
     if (!positions) return [];
     const bySha = new Map(positions.map(position => [position.sha, position]));
@@ -204,11 +214,47 @@ function GraphCanvas({
     ariaLabel: edge.kind === "run" ? `Run: ${edge.goal.title}` : `Coaching: ${edge.summary}`
   })), [edges]);
 
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!instance || !canvas || !selectedNodeSha) return;
+    let resizeTimer: number | undefined;
+    const observer = new ResizeObserver(() => {
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => setViewportRevision(revision => revision + 1), 80);
+    });
+    observer.observe(canvas);
+    return () => {
+      observer.disconnect();
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+    };
+  }, [instance, selectedNodeSha]);
+
+  useEffect(() => {
+    if (!instance) return;
+    const frame = window.requestAnimationFrame(() => {
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const desktop = window.matchMedia("(min-width: 768px)").matches;
+      void instance.fitView(selectedNodeSha ? {
+        nodes: [{ id: selectedNodeSha }],
+        padding: desktop
+          ? { top: "64px", right: DESKTOP_INSPECTOR_FIT_PADDING, bottom: "64px", left: "48px" }
+          : 0.4,
+        maxZoom: 1.15,
+        duration: reducedMotion ? 0 : 180
+      } : {
+        padding: 0.22,
+        maxZoom: 1.15,
+        duration: reducedMotion ? 0 : 180
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [instance, selectedNodeSha, viewportRevision]);
+
   if (!positions) {
     return <div className="flex size-full items-center justify-center gap-2 bg-white/60 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />Laying out Nodes…</div>;
   }
   return (
-    <div className="relative size-full bg-[radial-gradient(circle_at_center,rgba(245,245,247,0)_0,rgba(245,245,247,.22)_100%)]">
+    <div ref={canvasRef} className="relative size-full bg-[radial-gradient(circle_at_center,rgba(245,245,247,0)_0,rgba(245,245,247,.22)_100%)]">
       <ReactFlow
         nodes={[...flowNodes]}
         edges={[...flowEdges]}
@@ -221,6 +267,7 @@ function GraphCanvas({
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable
+        onInit={setInstance}
         onNodeClick={(_, node) => onSelectNode(node.id)}
         proOptions={{ hideAttribution: true }}
       >
@@ -236,10 +283,10 @@ function HunsuNodeCard({ data, selected }: NodeProps<HunsuFlowNode>) {
   const node = data.summary;
   return (
     <article className={cn(
-      "h-[112px] w-[184px] rounded-[13px] border bg-white/96 p-3.5 text-left shadow-[0_8px_24px_rgba(29,29,31,.07)] transition-shadow",
+      "rounded-[13px] border bg-white/96 p-3.5 text-left shadow-[0_8px_24px_rgba(29,29,31,.07)] transition-shadow",
       selected ? "border-[color:var(--apple-blue)] ring-2 ring-[color:var(--apple-blue)]/16" : "border-[color:var(--apple-hairline)]",
       node.status === "rejected" && "opacity-55"
-    )}>
+    )} style={{ height: GRAPH_NODE_HEIGHT, width: GRAPH_NODE_WIDTH }}>
       <Handle id="run-in" type="target" position={Position.Left} className="!size-1.5 !border-0 !bg-transparent" />
       <Handle id="run-out" type="source" position={Position.Right} className="!size-1.5 !border-0 !bg-[color:var(--apple-blue)]" />
       <Handle id="coaching-in" type="target" position={Position.Top} className="!size-1.5 !border-0 !bg-transparent" />
@@ -279,8 +326,12 @@ function HunsuGraphEdge(props: EdgeProps<HunsuFlowEdge>) {
       />
       <EdgeLabelRenderer>
         <div
-          className={cn("pointer-events-none absolute max-w-[180px] truncate rounded-full bg-white/92 px-2 py-1 text-[9px] font-medium shadow-sm", coaching ? "text-emerald-700" : "text-[color:var(--apple-blue)]")}
-          style={{ transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px)` }}
+          data-graph-edge-label={props.id}
+          className={cn("pointer-events-none absolute truncate rounded-full bg-white/92 px-2 py-1 text-[9px] font-medium shadow-sm", coaching ? "text-emerald-700" : "text-[color:var(--apple-blue)]")}
+          style={{
+            maxWidth: GRAPH_EDGE_LABEL_MAX_WIDTH,
+            transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px)`
+          }}
         >
           {coaching ? "↓ " : "→ "}{props.data?.label}
         </div>

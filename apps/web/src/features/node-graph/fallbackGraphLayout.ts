@@ -1,7 +1,5 @@
+import { GRAPH_COACHING_GAP, GRAPH_RUN_GAP } from "./layoutMetrics.ts";
 import type { GraphLayoutRequest, PositionedGraphNode } from "./layoutTypes.ts";
-
-const RUN_GAP = 286;
-const COACHING_GAP = 196;
 
 export function fallbackGraphLayout(input: GraphLayoutRequest): readonly PositionedGraphNode[] {
   const incoming = new Map(input.nodes.map(node => [node.sha, 0]));
@@ -16,7 +14,7 @@ export function fallbackGraphLayout(input: GraphLayoutRequest): readonly Positio
   const roots = input.nodes.filter(node => (incoming.get(node.sha) ?? 0) === 0);
   const queue: string[] = [];
   roots.forEach((node, index) => {
-    const position = { sha: node.sha, x: 0, y: index * COACHING_GAP * 2 };
+    const position = { sha: node.sha, x: 0, y: index * GRAPH_COACHING_GAP * 2 };
     positions.set(node.sha, position);
     occupied.add(coordinate(position.x, position.y));
     queue.push(node.sha);
@@ -32,11 +30,11 @@ export function fallbackGraphLayout(input: GraphLayoutRequest): readonly Positio
     const edges = [...(outgoing.get(sourceSha) ?? [])].sort((left, right) => left.kind.localeCompare(right.kind) || left.targetSha.localeCompare(right.targetSha));
     for (const edge of edges) {
       if (positions.has(edge.targetSha)) continue;
-      let x = source.x + (edge.kind === "run" ? RUN_GAP : coachingIndex * RUN_GAP);
-      let y = source.y + (edge.kind === "coaching" ? COACHING_GAP : runIndex * COACHING_GAP);
+      let x = source.x + (edge.kind === "run" ? GRAPH_RUN_GAP : coachingIndex * GRAPH_RUN_GAP);
+      let y = source.y + (edge.kind === "coaching" ? GRAPH_COACHING_GAP : runIndex * GRAPH_COACHING_GAP);
       while (occupied.has(coordinate(x, y))) {
-        if (edge.kind === "run") y += COACHING_GAP;
-        else x += RUN_GAP;
+        if (edge.kind === "run") y += GRAPH_COACHING_GAP;
+        else x += GRAPH_RUN_GAP;
       }
       const position = { sha: edge.targetSha, x, y };
       positions.set(edge.targetSha, position);
@@ -49,7 +47,7 @@ export function fallbackGraphLayout(input: GraphLayoutRequest): readonly Positio
 
   for (const node of input.nodes) {
     if (positions.has(node.sha)) continue;
-    const y = positions.size * COACHING_GAP;
+    const y = positions.size * GRAPH_COACHING_GAP;
     positions.set(node.sha, { sha: node.sha, x: 0, y });
   }
   return input.nodes.map(node => positions.get(node.sha)!);
