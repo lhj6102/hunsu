@@ -34,6 +34,9 @@ const MAX_EXACT_STATE_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_INSTALLATION_COOLDOWNS = 128;
 const TRANSIENT_FAILURE_COOLDOWN_SECONDS = 5;
 const AUTHORITY_FORBIDDEN_COOLDOWN_SECONDS = 30;
+const DEFAULT_GITHUB_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
+const SAFE_PROJECT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 type StateTreeBlob = { path: string; sha: string; size?: number };
@@ -57,6 +60,7 @@ export type GitHubRestTransportOptions = {
   fetch?: FetchLike;
   apiBaseUrl?: string;
   now?: () => number;
+  requestTimeoutMs?: number;
 };
 
 type InstallationCooldown = {
@@ -64,12 +68,20 @@ type InstallationCooldown = {
   error: GitHubTransportError;
 };
 
+class GitHubRequestTimeoutError extends Error {
+  constructor() {
+    super("GitHub request exceeded its deadline.");
+    this.name = "GitHubRequestTimeoutError";
+  }
+}
+
 export class GitHubRestTransport implements GitHubTransport {
   readonly #authorityProvider: InstallationAuthorityProvider;
   readonly #invalidateAuthority: InstallationAuthorityInvalidator | undefined;
   readonly #fetch: FetchLike;
   readonly #apiBaseUrl: string;
   readonly #now: () => number;
+  readonly #requestTimeoutMs: number;
   readonly #installationRequestTails = new Map<number, Promise<void>>();
   readonly #installationCooldowns = new Map<number, InstallationCooldown>();
   readonly #exactStateReadFlights = new Map<string, Promise<TransportResult<StateFileSnapshot>>>();
@@ -85,6 +97,12 @@ export class GitHubRestTransport implements GitHubTransport {
       : (request, init) => globalThis.fetch(request, init);
     this.#apiBaseUrl = (options.apiBaseUrl ?? "https://api.github.com").replace(/\/$/u, "");
     this.#now = options.now ?? (() => Date.now());
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_GITHUB_REQUEST_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.#requestTimeoutMs) || this.#requestTimeoutMs < 1
+      || this.#requestTimeoutMs > MAX_TIMER_TIMEOUT_MS
+    ) {
+      throw new Error(`GitHub request timeout must be between 1 and ${MAX_TIMER_TIMEOUT_MS} milliseconds.`);
+    }
   }
 
   async listInstallationRepositories(installationId: number): Promise<TransportResult<RepositoryGrant[]>> {
@@ -270,7 +288,7 @@ export class GitHubRestTransport implements GitHubTransport {
   }
 
   async listManagedNodeAnchors(repository: RepositoryLocator, projectId: string): Promise<TransportResult<ManagedNodeAnchorSnapshot[]>> {
-    if (!/^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u.test(projectId)) {
+    if (!SAFE_PROJECT_ID.test(projectId)) {
       return invalidResponse("Managed Node anchor listing requires a safe Project id.");
     }
     const refPrefix = `refs/tags/hunsu/node/${projectId}/`;
@@ -295,7 +313,15 @@ export class GitHubRestTransport implements GitHubTransport {
         const qualifiedName = isRecord(node) && typeof node.prefix === "string" && typeof node.name === "string"
           ? `${node.prefix}${node.name}`
           : undefined;
-        if (!isRecord(node) || typeof node.name !== "string" || node.prefix !== "refs/tags/" || !isRecord(node.target)
+        const targetOid = isRecord(node) && isRecord(node.target) && typeof node.target.oid === "string"
+          ? node.target.oid
+          : undefined;
+        const hasExactKnownRefSplit = isRecord(node) && typeof node.prefix === "string" && typeof node.name === "string"
+          && targetOid !== undefined && (
+            (node.prefix === "refs/tags/" && node.name === `hunsu/node/${projectId}/${targetOid}`)
+            || (node.prefix === refPrefix && node.name === targetOid)
+          );
+        if (!isRecord(node) || typeof node.name !== "string" || !hasExactKnownRefSplit || !isRecord(node.target)
           || node.target.__typename !== "Commit" || typeof node.target.oid !== "string"
           || !isFullSha(node.target.oid) || typeof node.target.message !== "string" || node.target.message.trim() === ""
           || !isRecord(node.target.tree) || typeof node.target.tree.oid !== "string" || !isFullSha(node.target.tree.oid)
@@ -327,7 +353,7 @@ export class GitHubRestTransport implements GitHubTransport {
     projectId: string,
     nodeShas: readonly string[]
   ): Promise<TransportResult<ManagedNodeAnchorSnapshot[]>> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(projectId)
+    if (!SAFE_PROJECT_ID.test(projectId)
       || nodeShas.length === 0 || nodeShas.length > 300
       || new Set(nodeShas).size !== nodeShas.length
       || nodeShas.some(sha => !isFullSha(sha))
@@ -734,57 +760,66 @@ export class GitHubRestTransport implements GitHubTransport {
     if (cooldown) return failure(cooldown);
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const authority = await this.#authorityProvider(installationId);
-        const response = await this.#fetch(`${this.#apiBaseUrl}${path}`, {
-          ...init,
-          headers: {
-            accept: "application/vnd.github+json",
-            authorization: `Bearer ${authority.token}`,
-            "content-type": "application/json",
-            "user-agent": GITHUB_USER_AGENT,
-            "x-github-api-version": GITHUB_API_VERSION,
-            ...init.headers
+        const deadline = requestDeadline(init.signal, this.#requestTimeoutMs);
+        try {
+          const authority = await deadline.waitFor(this.#authorityProvider(installationId));
+          const response = await deadline.waitFor(this.#fetch(`${this.#apiBaseUrl}${path}`, {
+            ...init,
+            signal: deadline.signal,
+            headers: {
+              accept: "application/vnd.github+json",
+              authorization: `Bearer ${authority.token}`,
+              "content-type": "application/json",
+              "user-agent": GITHUB_USER_AGENT,
+              "x-github-api-version": GITHUB_API_VERSION,
+              ...init.headers
+            }
+          }));
+          if (response.ok) {
+            const body = await deadline.waitFor(response.json()) as T;
+            const graphQlRateLimit = path === "/graphql" ? graphQlRateLimitMessage(body) : undefined;
+            if (graphQlRateLimit) return this.#recordRateLimit(installationId, response, graphQlRateLimit);
+            return ok(body);
           }
-        });
-        if (response.ok) {
-          const body = await response.json() as T;
-          const graphQlRateLimit = path === "/graphql" ? graphQlRateLimitMessage(body) : undefined;
-          if (graphQlRateLimit) return this.#recordRateLimit(installationId, response, graphQlRateLimit);
-          return ok(body);
-        }
 
-        if (response.status === 401 && attempt === 0 && this.#invalidateAuthority) {
-          this.#invalidateAuthority(installationId, authority.token);
-          continue;
-        }
+          if (response.status === 401 && attempt === 0 && this.#invalidateAuthority) {
+            this.#invalidateAuthority(installationId, authority.token);
+            continue;
+          }
 
-        const message = await readErrorMessage(response);
-        if (response.status === 404 && allowNotFound) return notFound(message);
-        if (conflictOnValidation && (response.status === 409 || response.status === 422)) return conflict(message, response.status);
-        if (isGitHubRateLimitResponse(response, message)) return this.#recordRateLimit(installationId, response, message);
-        if (response.status === 401 || response.status === 403) return failure({ code: "forbidden", message, status: response.status });
-        if (response.status === 404) return notFound(message);
-        if (response.status === 409 || response.status === 422) return conflict(message, response.status);
-        if (response.status >= 500) {
-          const retryAfterSeconds = githubRetryAfterSeconds(
-            response.headers,
-            this.#now(),
-            TRANSIENT_FAILURE_COOLDOWN_SECONDS
-          );
-          const requestId = response.headers.get("x-github-request-id");
-          return this.#recordInstallationCooldown(
-            installationId,
-            {
-              code: "invalid_response",
-              message,
-              status: response.status,
-              retryAfterSeconds,
-              ...(requestId ? { requestId } : {})
-            },
-            retryAfterSeconds
-          );
+          const message = await deadline.waitFor(readErrorMessage(response));
+          if (response.status === 404 && allowNotFound) return notFound(message);
+          if (conflictOnValidation && (response.status === 409 || response.status === 422)) return conflict(message, response.status);
+          if (isGitHubRateLimitResponse(response, message)) return this.#recordRateLimit(installationId, response, message);
+          if (response.status === 401 || response.status === 403) return failure({ code: "forbidden", message, status: response.status });
+          if (response.status === 404) return notFound(message);
+          if (response.status === 409 || response.status === 422) return conflict(message, response.status);
+          if (response.status >= 500) {
+            const retryAfterSeconds = githubRetryAfterSeconds(
+              response.headers,
+              this.#now(),
+              TRANSIENT_FAILURE_COOLDOWN_SECONDS
+            );
+            const requestId = response.headers.get("x-github-request-id");
+            return this.#recordInstallationCooldown(
+              installationId,
+              {
+                code: "invalid_response",
+                message,
+                status: response.status,
+                retryAfterSeconds,
+                ...(requestId ? { requestId } : {})
+              },
+              retryAfterSeconds
+            );
+          }
+          return failure({ code: "invalid_response", message, status: response.status });
+        } catch (error) {
+          if (deadline.didTimeout()) throw new GitHubRequestTimeoutError();
+          throw error;
+        } finally {
+          deadline.dispose();
         }
-        return failure({ code: "invalid_response", message, status: response.status });
       }
       return invalidResponse("GitHub authority refresh did not produce a usable response.");
     } catch (error) {
@@ -794,6 +829,17 @@ export class GitHubRestTransport implements GitHubTransport {
             ? AUTHORITY_FORBIDDEN_COOLDOWN_SECONDS
             : TRANSIENT_FAILURE_COOLDOWN_SECONDS);
         return this.#recordInstallationCooldown(installationId, error.transportError, cooldownSeconds);
+      }
+      if (error instanceof GitHubRequestTimeoutError) {
+        return this.#recordInstallationCooldown(
+          installationId,
+          {
+            code: "network",
+            message: "GitHub request timed out before receiving a complete response.",
+            retryAfterSeconds: TRANSIENT_FAILURE_COOLDOWN_SECONDS
+          },
+          TRANSIENT_FAILURE_COOLDOWN_SECONDS
+        );
       }
       const transportError: GitHubTransportError = {
         code: "network",
@@ -1023,6 +1069,37 @@ function graphqlExactManagedNodeRefsRequest(
 
 function repositoryPath(repository: RepositoryLocator): string {
   return `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}`;
+}
+
+function requestDeadline(source: AbortSignal | null | undefined, timeoutMs: number): {
+  signal: AbortSignal;
+  waitFor<T>(operation: Promise<T>): Promise<T>;
+  didTimeout(): boolean;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  let rejectTimeout!: (reason: GitHubRequestTimeoutError) => void;
+  const expired = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const forwardAbort = () => controller.abort(source?.reason);
+  if (source?.aborted) forwardAbort();
+  else source?.addEventListener("abort", forwardAbort, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+    rejectTimeout(new GitHubRequestTimeoutError());
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    waitFor: operation => Promise.race([operation, expired]),
+    didTimeout: () => timedOut,
+    dispose: () => {
+      clearTimeout(timeout);
+      source?.removeEventListener("abort", forwardAbort);
+    }
+  };
 }
 
 function encodeRef(ref: string): string {

@@ -172,6 +172,15 @@ type ReadProjectCache = TimedCache<readonly ReadProject[]> & {
   stateHeadSha: string | undefined;
 };
 
+type InstallationCacheGeneration = {
+  global: number;
+  installation: number;
+};
+
+type ReadProjectCacheGeneration = InstallationCacheGeneration & {
+  repository: number;
+};
+
 type MutationApplied = {
   state: ProjectState;
   stateHeadSha: string;
@@ -207,8 +216,13 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   readonly #cachePolicy: ProjectionCachePolicy;
   readonly #projects = new Map<string, TimedCache<readonly LoadedProject[]>>();
   readonly #readProjects = new Map<string, ReadProjectCache>();
+  readonly #readProjectFlights = new Map<string, Promise<ApiResult<readonly ReadProject[]>>>();
   readonly #readStateFilesByHead = new Map<string, string>();
   readonly #installations = new Map<number, TimedCache<readonly RepositoryGrant[]>>();
+  readonly #installationFlights = new Map<number, ReturnType<GitHubTransport["listInstallationRepositories"]>>();
+  readonly #installationCacheGenerations = new Map<number, number>();
+  readonly #repositoryCacheGenerations = new Map<string, number>();
+  #globalCacheGeneration = 0;
 
   constructor(input: {
     transport: GitHubTransport;
@@ -565,22 +579,39 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   }
 
   invalidateAll(): void {
+    this.#globalCacheGeneration = nextCacheGeneration(this.#globalCacheGeneration);
     this.#projects.clear();
     this.#readProjects.clear();
+    this.#readProjectFlights.clear();
     this.#readStateFilesByHead.clear();
     this.#installations.clear();
+    this.#installationFlights.clear();
+    this.#installationCacheGenerations.clear();
+    this.#repositoryCacheGenerations.clear();
   }
 
   invalidateRepository(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): void {
-    this.#projects.delete(repositoryKey(repository));
-    this.#readProjects.delete(repositoryKey(repository));
+    const key = repositoryKey(repository);
+    this.#repositoryCacheGenerations.set(key, nextCacheGeneration(this.#repositoryCacheGenerations.get(key) ?? 0));
+    this.#projects.delete(key);
+    this.#readProjects.delete(key);
+    this.#readProjectFlights.delete(key);
     this.#readStateFilesByHead.clear();
   }
 
   invalidateInstallation(installationId: number): void {
+    this.#installationCacheGenerations.set(
+      installationId,
+      nextCacheGeneration(this.#installationCacheGenerations.get(installationId) ?? 0)
+    );
     this.#installations.delete(installationId);
+    this.#installationFlights.delete(installationId);
     for (const key of this.#projects.keys()) if (key.startsWith(`${installationId}:`)) this.#projects.delete(key);
     for (const key of this.#readProjects.keys()) if (key.startsWith(`${installationId}:`)) this.#readProjects.delete(key);
+    for (const key of this.#readProjectFlights.keys()) if (key.startsWith(`${installationId}:`)) this.#readProjectFlights.delete(key);
+    for (const key of this.#repositoryCacheGenerations.keys()) {
+      if (key.startsWith(`${installationId}:`)) this.#repositoryCacheGenerations.delete(key);
+    }
     this.#readStateFilesByHead.clear();
   }
 
@@ -1795,10 +1826,27 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
 
   async #loadRepositoryReadProjects(repository: RepositoryGrant): Promise<ApiResult<readonly ReadProject[]>> {
     const key = repositoryKey(repository);
+    const active = this.#readProjectFlights.get(key);
+    if (active) return active;
+    const generation = this.#readProjectCacheGeneration(repository);
+    const flight = this.#loadRepositoryReadProjectsUncoalesced(repository, generation);
+    this.#readProjectFlights.set(key, flight);
+    try {
+      return await flight;
+    } finally {
+      if (this.#readProjectFlights.get(key) === flight) this.#readProjectFlights.delete(key);
+    }
+  }
+
+  async #loadRepositoryReadProjectsUncoalesced(
+    repository: RepositoryGrant,
+    generation: ReadProjectCacheGeneration
+  ): Promise<ApiResult<readonly ReadProject[]>> {
+    const key = repositoryKey(repository);
     const stateHead = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
     if (!stateHead.ok) return transportFailure(stateHead.error);
     if (stateHead.value === undefined) {
-      this.#readProjects.set(key, { value: [], stateHeadSha: undefined, cachedAt: this.#cacheNow() });
+      this.#publishReadProjectCache(repository, key, generation, { value: [], stateHeadSha: undefined, cachedAt: this.#cacheNow() });
       return apiOk([]);
     }
     const cached = this.#readProjects.get(key);
@@ -1816,7 +1864,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     }
     if (workspaceSnapshot.value.stateHeadSha !== stateHead.value) return integrityFailure("Hunsu workspace was read from a different state head.");
     if (workspaceSnapshot.value.v2State === "absent") {
-      this.#readProjects.set(key, { value: [], stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
+      this.#publishReadProjectCache(repository, key, generation, { value: [], stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
       return apiOk([]);
     }
     const workspace = decodeWorkspace(
@@ -1825,7 +1873,7 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     );
     if (!workspace.ok) return workspace;
     if (workspace.value.projectIds.length === 0) {
-      this.#readProjects.set(key, { value: [], stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
+      this.#publishReadProjectCache(repository, key, generation, { value: [], stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
       return apiOk([]);
     }
     const snapshot = await this.#transport.readStateFilesAtHead(repository, stateHead.value, workspace.value.projectIds.map(projectId => ({
@@ -1866,7 +1914,11 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     if (projects.length !== workspace.value.projectIds.length
       || projects.some((project, index) => project.catalog.project.id !== workspace.value.projectIds[index])
     ) return integrityFailure("Hunsu workspace Project ids do not exactly match the catalog materializations.");
-    this.#readProjects.set(key, { value: projects, stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
+    this.#publishReadProjectCache(repository, key, generation, {
+      value: projects,
+      stateHeadSha: stateHead.value,
+      cachedAt: this.#cacheNow()
+    });
     return apiOk(projects);
   }
 
@@ -1984,10 +2036,13 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
     for (const installation of installations) {
       let repositories = this.#installations.get(installation.id);
       if (!repositories || !fresh(repositories.cachedAt, this.#cacheNow(), this.#cachePolicy.installationTtlMs)) {
-        const listed = await this.#transport.listInstallationRepositories(installation.id);
+        const generation = this.#installationCacheGeneration(installation.id);
+        const listed = await this.#listInstallationRepositories(installation.id);
         if (!listed.ok) return transportFailure(listed.error);
         repositories = { value: listed.value, cachedAt: this.#cacheNow() };
-        this.#installations.set(installation.id, repositories);
+        if (this.#isCurrentInstallationCacheGeneration(installation.id, generation)) {
+          this.#installations.set(installation.id, repositories);
+        }
       }
       const authorized = new Map(installation.repositories.map(item => [item.repositoryId, item.permissions.contents]));
       for (const repository of repositories.value) {
@@ -1997,6 +2052,51 @@ export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
       }
     }
     return apiOk(collected);
+  }
+
+  async #listInstallationRepositories(installationId: number) {
+    const active = this.#installationFlights.get(installationId);
+    if (active) return active;
+    const flight = this.#transport.listInstallationRepositories(installationId);
+    this.#installationFlights.set(installationId, flight);
+    try {
+      return await flight;
+    } finally {
+      if (this.#installationFlights.get(installationId) === flight) this.#installationFlights.delete(installationId);
+    }
+  }
+
+  #installationCacheGeneration(installationId: number): InstallationCacheGeneration {
+    return {
+      global: this.#globalCacheGeneration,
+      installation: this.#installationCacheGenerations.get(installationId) ?? 0
+    };
+  }
+
+  #readProjectCacheGeneration(repository: RepositoryGrant): ReadProjectCacheGeneration {
+    return {
+      ...this.#installationCacheGeneration(repository.installationId),
+      repository: this.#repositoryCacheGenerations.get(repositoryKey(repository)) ?? 0
+    };
+  }
+
+  #isCurrentInstallationCacheGeneration(
+    installationId: number,
+    generation: InstallationCacheGeneration
+  ): boolean {
+    return generation.global === this.#globalCacheGeneration
+      && generation.installation === (this.#installationCacheGenerations.get(installationId) ?? 0);
+  }
+
+  #publishReadProjectCache(
+    repository: RepositoryGrant,
+    key: string,
+    generation: ReadProjectCacheGeneration,
+    cache: ReadProjectCache
+  ): void {
+    if (this.#isCurrentInstallationCacheGeneration(repository.installationId, generation)
+      && generation.repository === (this.#repositoryCacheGenerations.get(key) ?? 0)
+    ) this.#readProjects.set(key, cache);
   }
 
   #timestamp(): string {
@@ -2731,6 +2831,10 @@ function projectIdOf(state: ProjectState): string {
 
 function repositoryKey(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): string {
   return `${repository.installationId}:${repository.repositoryId}`;
+}
+
+function nextCacheGeneration(value: number): number {
+  return value === Number.MAX_SAFE_INTEGER ? 0 : value + 1;
 }
 
 function generatedId(prefix: string, idempotencyKey: string): string {

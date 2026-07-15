@@ -127,6 +127,103 @@ test("Project discovery periodically revalidates the root managed Node anchor at
   assert.equal(transport.exactAnchorReads, 2);
 });
 
+test("concurrent Project shell and Graph reads share installation and repository projection flights", async () => {
+  class TrackingMemoryTransport extends MemoryGitHubTransport {
+    installationLists = 0;
+    branchHeadReads = 0;
+    exactAnchorReads = 0;
+
+    override async listInstallationRepositories(...args: Parameters<MemoryGitHubTransport["listInstallationRepositories"]>) {
+      this.installationLists += 1;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return super.listInstallationRepositories(...args);
+    }
+
+    override async readBranchHead(...args: Parameters<MemoryGitHubTransport["readBranchHead"]>) {
+      this.branchHeadReads += 1;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return super.readBranchHead(...args);
+    }
+
+    override async readManagedNodeAnchors(...args: Parameters<MemoryGitHubTransport["readManagedNodeAnchors"]>) {
+      this.exactAnchorReads += 1;
+      return super.readManagedNodeAnchors(...args);
+    }
+  }
+  const transport = new TrackingMemoryTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  await mutation(service, "hunsu.projects.create", {
+    repository: repositoryInput,
+    projectId: "project-concurrent-read",
+    title: "Concurrent Project read trial",
+    rootNodeSha: INITIAL_SHA,
+    initialPlan,
+    idempotencyKey: "create-project-concurrent-read",
+    expectedStateSha: INITIAL_SHA,
+    confirmedByUser: true
+  });
+  service.invalidateAll();
+  transport.installationLists = 0;
+  transport.branchHeadReads = 0;
+  transport.exactAnchorReads = 0;
+
+  const [projects, graph] = await Promise.all([
+    service.webProjects(auth),
+    service.webGraph(auth, "project-concurrent-read", {})
+  ]);
+  assert.equal(projects.ok, true);
+  assert.equal(graph.ok, true);
+  assert.equal(transport.installationLists, 1);
+  assert.equal(transport.branchHeadReads, 1);
+  assert.equal(transport.exactAnchorReads, 1);
+});
+
+test("an invalidated installation flight cannot republish stale repository grants", async () => {
+  let resolveFirst!: (result: TransportResult<RepositoryGrant[]>) => void;
+  let resolveSecond!: (result: TransportResult<RepositoryGrant[]>) => void;
+  const firstResponse = new Promise<TransportResult<RepositoryGrant[]>>(resolve => {
+    resolveFirst = resolve;
+  });
+  const secondResponse = new Promise<TransportResult<RepositoryGrant[]>>(resolve => {
+    resolveSecond = resolve;
+  });
+  class DeferredInstallationTransport extends MemoryGitHubTransport {
+    installationLists = 0;
+
+    override async listInstallationRepositories(): Promise<TransportResult<RepositoryGrant[]>> {
+      this.installationLists += 1;
+      if (this.installationLists === 1) return firstResponse;
+      if (this.installationLists === 2) return secondResponse;
+      throw new Error("A stale installation flight forced an unexpected third repository listing.");
+    }
+  }
+  const transport = new DeferredInstallationTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+
+  const stale = service.sessionRepositories(auth);
+  await Promise.resolve();
+  assert.equal(transport.installationLists, 1);
+  service.invalidateInstallation(repository.installationId);
+  const fresh = service.sessionRepositories(auth);
+  await Promise.resolve();
+  assert.equal(transport.installationLists, 2);
+
+  resolveSecond({ ok: true, value: [] });
+  const freshResult = await fresh;
+  assert.equal(freshResult.ok, true);
+  if (freshResult.ok) assert.deepEqual(freshResult.value.repositories, []);
+
+  resolveFirst({ ok: true, value: [repository] });
+  const staleResult = await stale;
+  assert.equal(staleResult.ok, true);
+  if (staleResult.ok) assert.equal(staleResult.value.repositories.length, 1);
+
+  const current = await service.sessionRepositories(auth);
+  assert.equal(current.ok, true);
+  if (current.ok) assert.deepEqual(current.value.repositories, []);
+  assert.equal(transport.installationLists, 2);
+});
+
 test("application service executes the v2 Node lifecycle with idempotent GitHub-backed mutations", async () => {
   const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
   let tick = 0;

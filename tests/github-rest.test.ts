@@ -461,6 +461,109 @@ test("GitHub REST suppresses queued calls during upstream 5xx and network cooldo
   }
 });
 
+test("GitHub REST times out a stalled fetch and releases queued installation requests", async () => {
+  assert.throws(() => new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("installation-token"),
+    requestTimeoutMs: 2_147_483_648
+  }), /between 1 and 2147483647 milliseconds/u);
+  let now = Date.UTC(2026, 6, 14, 8, 0, 0);
+  let authorityRequests = 0;
+  let githubRequests = 0;
+  const transport = new GitHubRestTransport({
+    now: () => now,
+    requestTimeoutMs: 20,
+    authorityProvider: async () => {
+      authorityRequests += 1;
+      return verifiedAuthority("installation-token");
+    },
+    fetch: async (_input, init = {}) => {
+      githubRequests += 1;
+      if (githubRequests > 1) return json({ object: { sha: "a".repeat(40) } });
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal;
+        if (!signal) {
+          reject(new Error("A GitHub request deadline signal was not provided."));
+          return;
+        }
+        const aborted = () => reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+        if (signal.aborted) aborted();
+        else signal.addEventListener("abort", aborted, { once: true });
+      });
+    }
+  });
+
+  const results = await Promise.race([
+    Promise.all([
+      transport.readBranchHead(repository, "hunsu/state"),
+      transport.readBranchHead(repository, "hunsu/state")
+    ]),
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Queued GitHub request lock was not released.")), 500))
+  ]);
+  assert.equal(githubRequests, 1);
+  assert.equal(authorityRequests, 1);
+  for (const result of results) {
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "network");
+      assert.equal(result.error.message, "GitHub request timed out before receiving a complete response.");
+      assert.equal(result.error.retryAfterSeconds, 5);
+    }
+  }
+
+  now += 5_000;
+  assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), {
+    ok: true,
+    value: "a".repeat(40)
+  });
+  assert.equal(githubRequests, 2);
+  assert.equal(authorityRequests, 2);
+});
+
+test("GitHub REST times out a stalled installation authority and releases its request lock", async () => {
+  let now = Date.UTC(2026, 6, 14, 8, 0, 0);
+  let authorityRequests = 0;
+  let githubRequests = 0;
+  const transport = new GitHubRestTransport({
+    now: () => now,
+    requestTimeoutMs: 20,
+    authorityProvider: async () => {
+      authorityRequests += 1;
+      if (authorityRequests === 1) return new Promise(() => {});
+      return verifiedAuthority("recovered-installation-token");
+    },
+    fetch: async () => {
+      githubRequests += 1;
+      return json({ object: { sha: "a".repeat(40) } });
+    }
+  });
+
+  const results = await Promise.race([
+    Promise.all([
+      transport.readBranchHead(repository, "hunsu/state"),
+      transport.readBranchHead(repository, "hunsu/state")
+    ]),
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Stalled authority kept the request lock.")), 500))
+  ]);
+  assert.equal(authorityRequests, 1);
+  assert.equal(githubRequests, 0);
+  for (const result of results) {
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "network");
+      assert.equal(result.error.message, "GitHub request timed out before receiving a complete response.");
+      assert.equal(result.error.retryAfterSeconds, 5);
+    }
+  }
+
+  now += 5_000;
+  assert.deepEqual(await transport.readBranchHead(repository, "hunsu/state"), {
+    ok: true,
+    value: "a".repeat(40)
+  });
+  assert.equal(authorityRequests, 2);
+  assert.equal(githubRequests, 1);
+});
+
 test("GitHub REST invalidates a rejected installation token and retries once", async () => {
   let authorityVersion = 1;
   const authorizationHeaders: string[] = [];
@@ -577,6 +680,79 @@ test("GitHub REST batches managed Node anchor verification by paginated ref conn
     treeSha: commits[0]!.target.tree.oid,
     commitMessage: commits[0]!.target.message
   });
+});
+
+test("GitHub REST accepts GitHub's scoped prefix split for managed Node refs", async () => {
+  const projectId = "Project_Alpha";
+  const nodeSha = "b".repeat(40);
+  const treeSha = "c".repeat(40);
+  const refPrefix = `refs/tags/hunsu/node/${projectId}/`;
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async () => json({
+      data: {
+        repository: {
+          refs: {
+            nodes: [{
+              prefix: refPrefix,
+              name: nodeSha,
+              target: {
+                __typename: "Commit",
+                oid: nodeSha,
+                message: "Production root",
+                tree: { oid: treeSha }
+              }
+            }],
+            pageInfo: { hasNextPage: false, endCursor: null }
+          }
+        }
+      }
+    })
+  });
+
+  assert.deepEqual(await transport.listManagedNodeAnchors(repository, projectId), {
+    ok: true,
+    value: [{
+      managedRef: `${refPrefix}${nodeSha}`,
+      nodeSha,
+      treeSha,
+      commitMessage: "Production root"
+    }]
+  });
+});
+
+test("GitHub REST rejects arbitrary managed Node ref splits even when they concatenate to the expected ref", async () => {
+  const projectId = "project-alpha";
+  const nodeSha = "b".repeat(40);
+  const transport = new GitHubRestTransport({
+    authorityProvider: async () => verifiedAuthority("verified-contents-write-token"),
+    fetch: async () => json({
+      data: {
+        repository: {
+          refs: {
+            nodes: [{
+              prefix: "refs/tags/hunsu/",
+              name: `node/${projectId}/${nodeSha}`,
+              target: {
+                __typename: "Commit",
+                oid: nodeSha,
+                message: "Production root",
+                tree: { oid: "c".repeat(40) }
+              }
+            }],
+            pageInfo: { hasNextPage: false, endCursor: null }
+          }
+        }
+      }
+    })
+  });
+
+  const result = await transport.listManagedNodeAnchors(repository, projectId);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "invalid_response");
+    assert.match(result.error.message, /invalid managed Node ref or commit/u);
+  }
 });
 
 test("GitHub REST verifies only requested managed Node anchors in bounded exact batches", async () => {
