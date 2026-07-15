@@ -339,6 +339,53 @@ test("GitHub App installation token mint failures remain retryable after coalesc
   assert.equal(calls, 2);
 });
 
+test("GitHub App installation token minting times out, clears its flight, and retries", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  assert.throws(() => new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKeyPem,
+    requestTimeoutMs: 2_147_483_648
+  }), /between 1 and 2147483647 milliseconds/u);
+  const now = Date.UTC(2026, 6, 13);
+  let calls = 0;
+  const provider = new GitHubAppTokenProvider({
+    appId: 42,
+    privateKey: privateKeyPem,
+    apiBaseUrl: "https://github-api.example.test",
+    now: () => now,
+    requestTimeoutMs: 20,
+    fetch: async () => {
+      calls += 1;
+      if (calls === 1) return new Promise<Response>(() => {});
+      return jsonResponse({
+        token: "recovered-after-timeout",
+        expires_at: new Date(now + 3_600_000).toISOString(),
+        permissions: { contents: "write" }
+      }, 201);
+    }
+  });
+
+  const failures = await Promise.allSettled(Array.from({ length: 8 }, () => provider.getAuthority(17)));
+  assert.equal(calls, 1);
+  for (const result of failures) {
+    assert.equal(result.status, "rejected");
+    if (result.status === "rejected") {
+      assert.equal(result.reason instanceof GitHubAuthorityError, true);
+      if (result.reason instanceof GitHubAuthorityError) {
+        assert.deepEqual(result.reason.transportError, {
+          code: "network",
+          message: "GitHub installation token request timed out before receiving a complete response.",
+          retryAfterSeconds: 5
+        });
+      }
+    }
+  }
+
+  assert.equal((await provider.getAuthority(17)).token, "recovered-after-timeout");
+  assert.equal(calls, 2);
+});
+
 test("GitHub App installation token HTTP failures preserve typed transport diagnostics", async t => {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const now = Date.UTC(2026, 6, 13);

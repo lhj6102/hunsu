@@ -18,6 +18,8 @@ const GITHUB_USER_AGENT = "hunsu-plugin-production";
 const INSTALLATION_TOKEN_REFRESH_SKEW_SECONDS = 60;
 const INSTALLATION_TOKEN_CACHE_MAX_ENTRIES = 128;
 const INSTALLATION_TOKEN_TRANSIENT_RETRY_SECONDS = 5;
+const INSTALLATION_TOKEN_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 
 type CachedInstallationAuthority = {
   authority: ContentsWriteInstallationAuthority;
@@ -32,6 +34,7 @@ export class GitHubAppTokenProvider {
   readonly #apiBaseUrl: string;
   readonly #now: () => number;
   readonly #cacheMaxEntries: number;
+  readonly #requestTimeoutMs: number;
   readonly #cache = new Map<number, CachedInstallationAuthority>();
   readonly #inFlight = new Map<number, Promise<ContentsWriteInstallationAuthority>>();
   readonly #cacheGenerations = new Map<number, number>();
@@ -44,6 +47,7 @@ export class GitHubAppTokenProvider {
     apiBaseUrl?: string;
     now?: () => number;
     cacheMaxEntries?: number;
+    requestTimeoutMs?: number;
   }) {
     this.#appId = input.appId;
     this.#privateKey = input.privateKey;
@@ -58,6 +62,12 @@ export class GitHubAppTokenProvider {
       throw new Error("GitHub installation token cache capacity must be a positive safe integer.");
     }
     this.#cacheMaxEntries = cacheMaxEntries;
+    this.#requestTimeoutMs = input.requestTimeoutMs ?? INSTALLATION_TOKEN_REQUEST_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.#requestTimeoutMs) || this.#requestTimeoutMs < 1
+      || this.#requestTimeoutMs > MAX_TIMER_TIMEOUT_MS
+    ) {
+      throw new Error(`GitHub installation token request timeout must be between 1 and ${MAX_TIMER_TIMEOUT_MS} milliseconds.`);
+    }
   }
 
   getAuthority = async (installationId: number): Promise<ContentsWriteInstallationAuthority> => {
@@ -96,9 +106,12 @@ export class GitHubAppTokenProvider {
     generation: number
   ): Promise<ContentsWriteInstallationAuthority> {
     let response: Response;
+    let body: unknown;
+    const deadline = tokenRequestDeadline(this.#requestTimeoutMs);
     try {
-      response = await this.#fetch(`${this.#apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
+      response = await deadline.waitFor(this.#fetch(`${this.#apiBaseUrl}/app/installations/${installationId}/access_tokens`, {
         method: "POST",
+        signal: deadline.signal,
         headers: {
           accept: "application/vnd.github+json",
           authorization: `Bearer ${this.#appJwt(now)}`,
@@ -107,15 +120,19 @@ export class GitHubAppTokenProvider {
           "x-github-api-version": GITHUB_API_VERSION
         },
         body: JSON.stringify({ permissions: { contents: "write" } })
-      });
+      }));
+      body = await deadline.waitFor(readJson(response));
     } catch {
       throw new GitHubAuthorityError({
         code: "network",
-        message: "GitHub installation token request failed before receiving a response.",
+        message: deadline.didTimeout()
+          ? "GitHub installation token request timed out before receiving a complete response."
+          : "GitHub installation token request failed before receiving a response.",
         retryAfterSeconds: INSTALLATION_TOKEN_TRANSIENT_RETRY_SECONDS
       });
+    } finally {
+      deadline.dispose();
     }
-    const body = await readJson(response);
     if (!response.ok) {
       throw new GitHubAuthorityError(installationTokenHttpError(response, body, now * 1_000));
     }
@@ -181,6 +198,31 @@ export class GitHubAppTokenProvider {
     signer.end();
     return `${input}.${signer.sign(this.#privateKey).toString("base64url")}`;
   }
+}
+
+function tokenRequestDeadline(timeoutMs: number): {
+  signal: AbortSignal;
+  waitFor<T>(operation: Promise<T>): Promise<T>;
+  didTimeout(): boolean;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  let rejectTimeout!: (reason: Error) => void;
+  const expired = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+    rejectTimeout(new Error("GitHub installation token request exceeded its deadline."));
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    waitFor: operation => Promise.race([operation, expired]),
+    didTimeout: () => timedOut,
+    dispose: () => clearTimeout(timeout)
+  };
 }
 
 export type GitHubOAuthIdentity = {
