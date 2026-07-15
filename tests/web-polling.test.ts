@@ -7,10 +7,18 @@ import {
   readQueryOptions
 } from "../apps/web/src/shared/api/polling.ts";
 
-test("polling reads do not retry and pause after an error until success", () => {
+test("polling reads pause after ordinary errors and honor bounded provider Retry-After", () => {
   const options = pollingQueryOptions(5_000);
   const freshPending = { state: { data: undefined, status: "pending" as const, errorUpdateCount: 0 } };
   const failed = { state: { data: { value: 1 }, status: "error" as const, errorUpdateCount: 1 } };
+  const rateLimited = {
+    state: {
+      data: { value: 1 },
+      status: "error" as const,
+      errorUpdateCount: 1,
+      error: { problem: { retryable: true, retryAfterSeconds: 73 } }
+    }
+  };
   const retrying = { state: { data: undefined, status: "pending" as const, errorUpdateCount: 1 } };
   const recovered = { state: { data: { value: 2 }, status: "success" as const, errorUpdateCount: 1 } };
 
@@ -19,6 +27,7 @@ test("polling reads do not retry and pause after an error until success", () => 
   assert.equal(options.refetchIntervalInBackground, false);
   assert.equal(options.refetchInterval(freshPending), 5_000);
   assert.equal(options.refetchInterval(failed), false);
+  assert.equal(options.refetchInterval(rateLimited), 73_000);
   assert.equal(options.refetchOnMount(failed), false);
   assert.equal(options.refetchOnReconnect(failed), false);
   assert.equal(options.refetchInterval(retrying), false);

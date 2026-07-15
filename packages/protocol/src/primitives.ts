@@ -7,22 +7,21 @@ export type Brand<T, Name extends string> = T & {
 };
 
 export type ProjectId = Brand<string, "ProjectId">;
-export type GoalId = Brand<string, "GoalId">;
-export type RunnerId = Brand<string, "RunnerId">;
-export type CoachId = Brand<string, "CoachId">;
+export type GoalKey = Brand<string, "GoalKey">;
 export type RunId = Brand<string, "RunId">;
 export type WorkspaceId = Brand<string, "WorkspaceId">;
 export type EventId = Brand<string, "EventId">;
 export type EvidenceId = Brand<string, "EvidenceId">;
 export type CheckpointId = Brand<string, "CheckpointId">;
 export type CoachReviewId = Brand<string, "CoachReviewId">;
-export type CoachProposalId = Brand<string, "CoachProposalId">;
-export type DivergenceId = Brand<string, "DivergenceId">;
+export type CoachingProposalId = Brand<string, "CoachingProposalId">;
 export type ComparisonId = Brand<string, "ComparisonId">;
 export type DecisionId = Brand<string, "DecisionId">;
 export type IdempotencyKey = Brand<string, "IdempotencyKey">;
 export type CommandFingerprint = Brand<string, "CommandFingerprint">;
 export type GitCommitSha = Brand<string, "GitCommitSha">;
+export type GitTreeSha = Brand<string, "GitTreeSha">;
+export type GitTreePath = Brand<string, "GitTreePath">;
 export type GitRef = Brand<string, "GitRef">;
 export type GitBranchName = Brand<string, "GitBranchName">;
 export type RepositoryOwner = Brand<string, "RepositoryOwner">;
@@ -30,7 +29,6 @@ export type RepositoryName = Brand<string, "RepositoryName">;
 export type IsoTimestamp = Brand<string, "IsoTimestamp">;
 export type NonEmptyText = Brand<string, "NonEmptyText">;
 export type ProjectTitle = Brand<string, "ProjectTitle">;
-export type ProjectObjective = Brand<string, "ProjectObjective">;
 export type GoalTitle = Brand<string, "GoalTitle">;
 export type DesiredOutcome = Brand<string, "DesiredOutcome">;
 export type AcceptanceCriterion = Brand<string, "AcceptanceCriterion">;
@@ -39,9 +37,19 @@ export type PromptTemplate = Brand<string, "PromptTemplate">;
 export type EvidenceSummary = Brand<string, "EvidenceSummary">;
 export type ResourceName = Brand<string, "ResourceName">;
 export type Reason = Brand<string, "Reason">;
+export type RunnerTypeOrigin = Brand<string, "RunnerTypeOrigin">;
+export type RunnerTypeKey = Brand<string, "RunnerTypeKey">;
+export type RunnerSchemaVersion = Brand<string, "RunnerSchemaVersion">;
+export type RunnerTypeIntegrity = Brand<string, "RunnerTypeIntegrity">;
+export type GoalDigest = Brand<string, "GoalDigest">;
+export type RunnerDigest = Brand<string, "RunnerDigest">;
+export type NodePlanDigest = Brand<string, "NodePlanDigest">;
+export type NodePayloadDigest = Brand<string, "NodePayloadDigest">;
+export type Base64Payload = Brand<string, "Base64Payload">;
 export type PositiveInteger = Brand<number, "PositiveInteger">;
 export type NonNegativeInteger = Brand<number, "NonNegativeInteger">;
 export type NonEmptyArray<T> = readonly [T, ...T[]];
+export type AtLeastTwo<T> = readonly [T, T, ...T[]];
 
 export type PrimitiveError = {
   readonly type: "PrimitiveError";
@@ -53,16 +61,8 @@ export function makeProjectId(value: unknown): Result<ProjectId, PrimitiveError>
   return makeId(value, "projectId");
 }
 
-export function makeGoalId(value: unknown): Result<GoalId, PrimitiveError> {
-  return makeId(value, "goalId");
-}
-
-export function makeRunnerId(value: unknown): Result<RunnerId, PrimitiveError> {
-  return makeId(value, "runnerId");
-}
-
-export function makeCoachId(value: unknown): Result<CoachId, PrimitiveError> {
-  return makeId(value, "coachId");
+export function makeGoalKey(value: unknown): Result<GoalKey, PrimitiveError> {
+  return makeId(value, "goalKey");
 }
 
 export function makeRunId(value: unknown): Result<RunId, PrimitiveError> {
@@ -89,12 +89,8 @@ export function makeCoachReviewId(value: unknown): Result<CoachReviewId, Primiti
   return makeId(value, "coachReviewId");
 }
 
-export function makeCoachProposalId(value: unknown): Result<CoachProposalId, PrimitiveError> {
-  return makeId(value, "coachProposalId");
-}
-
-export function makeDivergenceId(value: unknown): Result<DivergenceId, PrimitiveError> {
-  return makeId(value, "divergenceId");
+export function makeCoachingProposalId(value: unknown): Result<CoachingProposalId, PrimitiveError> {
+  return makeId(value, "coachingProposalId");
 }
 
 export function makeComparisonId(value: unknown): Result<ComparisonId, PrimitiveError> {
@@ -106,24 +102,53 @@ export function makeDecisionId(value: unknown): Result<DecisionId, PrimitiveErro
 }
 
 export function makeIdempotencyKey(value: unknown): Result<IdempotencyKey, PrimitiveError> {
-  if (typeof value !== "string" || !/^(?:sha256:)?[0-9a-f]{64}$/iu.test(value)) {
-    return invalid("idempotencyKey", "idempotencyKey must be a SHA-256 hexadecimal digest");
-  }
-  return ok(value.toLowerCase() as IdempotencyKey);
+  return makeSha256(value, "idempotencyKey") as Result<IdempotencyKey, PrimitiveError>;
 }
 
 export function makeCommandFingerprint(value: unknown): Result<CommandFingerprint, PrimitiveError> {
-  if (typeof value !== "string" || !/^(?:sha256:)?[0-9a-f]{64}$/iu.test(value)) {
-    return invalid("commandFingerprint", "commandFingerprint must be a SHA-256 hexadecimal digest");
-  }
-  return ok(value.toLowerCase() as CommandFingerprint);
+  return makeSha256(value, "commandFingerprint") as Result<CommandFingerprint, PrimitiveError>;
+}
+
+export function makeGoalDigest(value: unknown): Result<GoalDigest, PrimitiveError> {
+  return makePrefixedDigest(value, "goalDigest", "hunsu-goal-v1:sha256:") as Result<GoalDigest, PrimitiveError>;
+}
+
+export function makeRunnerDigest(value: unknown): Result<RunnerDigest, PrimitiveError> {
+  return makePrefixedDigest(value, "runnerDigest", "hunsu-runner-v1:sha256:") as Result<RunnerDigest, PrimitiveError>;
+}
+
+export function makeNodePlanDigest(value: unknown): Result<NodePlanDigest, PrimitiveError> {
+  return makePrefixedDigest(value, "nodePlanDigest", "hunsu-node-plan-v1:sha256:") as Result<NodePlanDigest, PrimitiveError>;
+}
+
+export function makeNodePayloadDigest(value: unknown): Result<NodePayloadDigest, PrimitiveError> {
+  return makePrefixedDigest(value, "nodePayloadDigest", "hunsu-node-payload-v1:sha256:") as Result<NodePayloadDigest, PrimitiveError>;
 }
 
 export function makeGitCommitSha(value: unknown, field = "sha"): Result<GitCommitSha, PrimitiveError> {
-  if (typeof value !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(value)) {
-    return invalid(field, field + " must be a 40- or 64-character hexadecimal Git commit SHA");
+  return makeGitSha(value, field) as Result<GitCommitSha, PrimitiveError>;
+}
+
+export function makeGitTreeSha(value: unknown, field = "treeSha"): Result<GitTreeSha, PrimitiveError> {
+  return makeGitSha(value, field) as Result<GitTreeSha, PrimitiveError>;
+}
+
+export function makeGitTreePath(value: unknown, field = "path"): Result<GitTreePath, PrimitiveError> {
+  if (typeof value !== "string"
+    || value.length === 0
+    || value.length > 4096
+    || value.startsWith("/")
+    || value.endsWith("/")
+    || value.includes("\\")
+    || /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    return invalid(field, field + " must be a normalized commit-relative Git tree path");
   }
-  return ok(value.toLowerCase() as GitCommitSha);
+  const segments = value.split("/");
+  if (segments.some(segment => segment === "" || segment === "." || segment === "..")) {
+    return invalid(field, field + " must be a normalized commit-relative Git tree path");
+  }
+  return ok(value as GitTreePath);
 }
 
 export function makeGitRef(value: unknown, field = "ref"): Result<GitRef, PrimitiveError> {
@@ -172,10 +197,6 @@ export function makeProjectTitle(value: unknown): Result<ProjectTitle, Primitive
   return makeTextBrand(value, "title");
 }
 
-export function makeProjectObjective(value: unknown): Result<ProjectObjective, PrimitiveError> {
-  return makeTextBrand(value, "objective");
-}
-
 export function makeGoalTitle(value: unknown): Result<GoalTitle, PrimitiveError> {
   return makeTextBrand(value, "title");
 }
@@ -208,6 +229,38 @@ export function makeReason(value: unknown, field = "reason"): Result<Reason, Pri
   return makeTextBrand(value, field);
 }
 
+export function makeRunnerTypeOrigin(value: unknown, field = "runner.type.origin"): Result<RunnerTypeOrigin, PrimitiveError> {
+  if (typeof value !== "string" || !/^[a-z0-9](?:[a-z0-9._-]{0,127})$/u.test(value)) {
+    return invalid(field, field + " must be a lowercase committed origin");
+  }
+  return ok(value as RunnerTypeOrigin);
+}
+
+export function makeRunnerTypeKey(value: unknown, field = "runner.type.key"): Result<RunnerTypeKey, PrimitiveError> {
+  if (typeof value !== "string" || value.length > 192 || !/^[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?$/u.test(value) || value.includes("//")) {
+    return invalid(field, field + " must be a lowercase stable type key");
+  }
+  return ok(value as RunnerTypeKey);
+}
+
+export function makeRunnerSchemaVersion(value: unknown, field = "runner.type.schemaVersion"): Result<RunnerSchemaVersion, PrimitiveError> {
+  if (typeof value !== "string" || !SEMVER.test(value)) {
+    return invalid(field, field + " must be an exact semantic version");
+  }
+  return ok(value as RunnerSchemaVersion);
+}
+
+export function makeRunnerTypeIntegrity(value: unknown, field = "runner.type.integrity"): Result<RunnerTypeIntegrity, PrimitiveError> {
+  return makePrefixedDigest(value, field, "hunsu-runner-type-v1:sha256:") as Result<RunnerTypeIntegrity, PrimitiveError>;
+}
+
+export function makeBase64Payload(value: unknown, field = "data"): Result<Base64Payload, PrimitiveError> {
+  if (typeof value !== "string" || value.length === 0 || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
+    return invalid(field, field + " must be canonical padded base64");
+  }
+  return ok(value as Base64Payload);
+}
+
 export function makePositiveInteger(value: unknown, field = "number"): Result<PositiveInteger, PrimitiveError> {
   if (!Number.isSafeInteger(value) || Number(value) < 1) {
     return invalid(field, field + " must be a positive safe integer");
@@ -228,8 +281,14 @@ export function makeNonEmptyArray<T>(value: readonly T[], field = "items"): Resu
     : invalid(field, field + " must contain at least one item");
 }
 
+export function makeAtLeastTwo<T>(value: readonly T[], field = "items"): Result<AtLeastTwo<T>, PrimitiveError> {
+  return value.length >= 2
+    ? ok(value as AtLeastTwo<T>)
+    : invalid(field, field + " must contain at least two items");
+}
+
 function makeId<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveError> {
-  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(value)) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(value) || value.includes("..")) {
     return invalid(field, field + " must be a branch-safe identifier");
   }
   return ok(value as Brand<string, T>);
@@ -240,13 +299,36 @@ function makeTextBrand<T extends string>(value: unknown, field: string): Result<
   return text.ok ? ok(text.value as Brand<string, T>) : text;
 }
 
+function makeSha256<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveError> {
+  if (typeof value !== "string" || !/^(?:sha256:)?[0-9a-f]{64}$/u.test(value)) {
+    return invalid(field, field + " must be a lowercase SHA-256 hexadecimal digest");
+  }
+  return ok(value as Brand<string, T>);
+}
+
+function makePrefixedDigest<T extends string>(value: unknown, field: string, prefix: string): Result<Brand<string, T>, PrimitiveError> {
+  if (typeof value !== "string" || !value.startsWith(prefix) || !/^[0-9a-f]{64}$/u.test(value.slice(prefix.length))) {
+    return invalid(field, field + " must use " + prefix + " followed by 64 lowercase hexadecimal characters");
+  }
+  return ok(value as Brand<string, T>);
+}
+
+function makeGitSha<T extends string>(value: unknown, field: string): Result<Brand<string, T>, PrimitiveError> {
+  if (typeof value !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value)) {
+    return invalid(field, field + " must be a lowercase 40- or 64-character hexadecimal Git object SHA");
+  }
+  return ok(value as Brand<string, T>);
+}
+
 function isValidRefName(value: string): boolean {
   if (value.length > 1024 || value.endsWith("/") || value.endsWith(".") || value.endsWith(".lock")) return false;
   if (value.includes("..") || value.includes("@{") || value.includes("//")) return false;
-  if (/[\u0000-\u0020\u007f~^:?*\\[\\\\]/u.test(value)) return false;
+  if (/[\u0000-\u0020\u007f~^:?*\[\\]/u.test(value)) return false;
   return value.split("/").every(part => part !== "" && part !== "." && part !== ".." && !part.startsWith(".") && !part.endsWith(".lock"));
 }
 
 function invalid(field: string, message: string): Result<never, PrimitiveError> {
   return err({ type: "PrimitiveError", field, message });
 }
+
+const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;

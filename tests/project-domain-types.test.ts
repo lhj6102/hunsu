@@ -1,88 +1,76 @@
 import type {
   AcceptanceCriterion,
-  ActiveGoal,
   CompletedRun,
   DesiredOutcome,
   GitBranchName,
   GitCommitSha,
-  Goal,
-  GoalId,
+  GoalDigest,
+  GoalKey,
   GoalTitle,
   IsoTimestamp,
+  Node,
+  NodePlan,
+  NonEmptyText,
   NonNegativeInteger,
-  PlayerSnapshot,
+  ProjectCommand,
   ProjectId,
   Run,
   RunId,
-  Runner,
-  RunnerId,
+  RunnerDigest,
+  RunnerSchemaVersion,
+  RunnerTypeIntegrity,
+  RunnerTypeKey,
+  RunnerTypeOrigin,
+  RunnerValue,
   RunningRun
 } from "../packages/protocol/src/index.ts";
 
 const projectId = "project_alpha" as ProjectId;
-const goalId = "goal_alpha" as GoalId;
 const runId = "run_alpha" as RunId;
-const playerId = "player_alpha" as RunnerId;
-const at = "2026-07-13T00:00:00.000Z" as IsoTimestamp;
-const baseSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as GitCommitSha;
-const branch = "hunsu/run/project_alpha/goal_alpha/run_alpha" as GitBranchName;
+const at = "2026-07-14T00:00:00.000Z" as IsoTimestamp;
+const sourceSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as GitCommitSha;
+const resultSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as GitCommitSha;
+const branch = "hunsu/run/project_alpha/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/run_alpha" as GitBranchName;
+const goalDigest = `hunsu-goal-v1:sha256:${"1".repeat(64)}` as GoalDigest;
+const runnerDigest = `hunsu-runner-v1:sha256:${"2".repeat(64)}` as RunnerDigest;
 
 // @ts-expect-error Project identifiers must be smart-constructed or explicitly decoded.
 const rawProjectId: ProjectId = "project_alpha";
 
-const activeGoal: ActiveGoal = {
-  id: goalId,
-  projectId,
-  title: "Ship the vertical slice" as GoalTitle,
-  desiredOutcome: "A verified result is visible." as DesiredOutcome,
-  acceptanceCriteria: ["The result commit is verified." as AcceptanceCriterion],
-  constraints: [],
-  priority: 1 as NonNegativeInteger,
-  assignment: { type: "assigned", runnerId: playerId },
-  relation: { type: "root" },
-  status: "active",
-  createdAt: at,
-  updatedAt: at
+const runner: RunnerValue = {
+  schema: "hunsu.runner-value.v1",
+  type: {
+    origin: "hunsu" as RunnerTypeOrigin,
+    key: "custom/qa-swarm" as RunnerTypeKey,
+    schemaVersion: "1.0.0" as RunnerSchemaVersion,
+    integrity: `hunsu-runner-type-v1:sha256:${"3".repeat(64)}` as RunnerTypeIntegrity
+  },
+  name: "QA swarm" as NonEmptyText,
+  value: { workers: 3, mode: "coordinated" }
 };
 
-// @ts-expect-error Completed Goals always identify the selected Run.
-const completedGoalWithoutSelection: Goal = {
-  ...activeGoal,
-  status: "completed",
-  completedAt: at
-};
-
-const playerSnapshot: PlayerSnapshot = {
-  kind: "player",
-  id: playerId,
-  projectId,
-  promptTemplate: "Perform the work." as PlayerSnapshot["promptTemplate"],
-  resources: [],
-  runtimePolicy: { fileAccess: "project_write", network: "denied", approval: "user" },
-  capturedAt: at
+const plan: NodePlan = {
+  schema: "hunsu.node-plan.v1",
+  nextGoals: [{
+    key: "goal_alpha" as GoalKey,
+    title: "Ship the vertical slice" as GoalTitle,
+    desiredOutcome: "A verified result is visible." as DesiredOutcome,
+    acceptanceCriteria: ["The result commit is verified." as AcceptanceCriterion],
+    constraints: [],
+    priority: 1 as NonNegativeInteger
+  }],
+  how: runner
 };
 
 const runBase = {
   id: runId,
   projectId,
-  goalId,
-  runnerId: playerId,
-  baseSha,
+  sourceNodeSha: sourceSha,
+  goal: plan.nextGoals[0]!,
+  goalDigest,
+  runner,
+  runnerDigest,
   branch,
-  origin: { type: "primary" as const },
-  goalSnapshot: {
-    id: goalId,
-    projectId,
-    title: activeGoal.title,
-    desiredOutcome: activeGoal.desiredOutcome,
-    acceptanceCriteria: activeGoal.acceptanceCriteria,
-    constraints: activeGoal.constraints,
-    priority: activeGoal.priority,
-    assignment: activeGoal.assignment,
-    relation: activeGoal.relation,
-    capturedAt: at
-  },
-  runnerSnapshot: playerSnapshot,
   checkpoints: [],
   evidenceIds: [],
   startedAt: at
@@ -90,21 +78,29 @@ const runBase = {
 
 const runningRun: RunningRun = { ...runBase, status: "running" };
 
-// @ts-expect-error Running Runs cannot expose a result SHA.
-const runningRunWithResult: Run = { ...runningRun, resultSha: baseSha };
+// @ts-expect-error Running Runs cannot expose a result Node SHA.
+const runningRunWithResult: Run = { ...runningRun, resultNodeSha: resultSha };
 
-// @ts-expect-error Completed Runs require a verified result and terminal timestamps.
+// @ts-expect-error Completed Runs require all verified terminal fields.
 const completedRunWithoutResult: CompletedRun = { ...runBase, status: "completed" };
 
-const unsupportedRunner: Runner = {
-  // @ts-expect-error Runner is exactly Team or Player.
-  kind: "service",
-  id: playerId,
-  projectId
+// @ts-expect-error Root Nodes cannot have a structural parent.
+const rootWithParent: Node = { type: "root", parentSha: sourceSha };
+
+const runWithRunnerOverride: ProjectCommand = {
+  type: "StartRun",
+  meta: null as unknown as ProjectCommand["meta"],
+  runId,
+  projectId,
+  sourceNodeSha: sourceSha,
+  goalDigest,
+  branch,
+  // @ts-expect-error StartRun cannot override its source Node Runner.
+  runner,
 };
 
 void rawProjectId;
-void completedGoalWithoutSelection;
 void runningRunWithResult;
 void completedRunWithoutResult;
-void unsupportedRunner;
+void rootWithParent;
+void runWithRunnerOverride;

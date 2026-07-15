@@ -20,6 +20,85 @@ export type BranchSnapshot = {
   files: Readonly<Record<string, string>>;
 };
 
+export type ProjectReadModelName = "catalog" | "graph" | "activity" | "event_index";
+
+/**
+ * A closed set of state resources that ordinary read paths may request. Keeping
+ * this structural (rather than accepting arbitrary paths or prefixes) prevents a
+ * dashboard read from accidentally turning into a full event-stream download.
+ */
+export type StateFileSelection =
+  | { readonly kind: "workspace" }
+  | {
+      readonly kind: "project_read_model";
+      readonly projectId: string;
+      readonly model: ProjectReadModelName;
+    }
+  | {
+      readonly kind: "node_payload";
+      readonly projectId: string;
+      readonly nodeSha: string;
+    }
+  | {
+      readonly kind: "graph_page";
+      readonly projectId: string;
+      readonly page: number;
+    }
+  | {
+      readonly kind: "graph_node";
+      readonly projectId: string;
+      readonly nodeSha: string;
+    }
+  | {
+      readonly kind: "node_activity";
+      readonly projectId: string;
+      readonly nodeSha: string;
+    }
+  | {
+      readonly kind: "run_activity";
+      readonly projectId: string;
+      readonly runId: string;
+    }
+  | {
+      readonly kind: "event_index_shard";
+      readonly projectId: string;
+      readonly shard: number;
+    }
+  | {
+      readonly kind: "event_locator";
+      readonly projectId: string;
+      readonly eventId: string;
+    }
+  | {
+      readonly kind: "event";
+      readonly projectId: string;
+      readonly year: number;
+      readonly month: number;
+      readonly eventId: string;
+    };
+
+export type StateFileSnapshot = {
+  /** The exact commit supplied by the caller; this API never resolves latest. */
+  readonly stateHeadSha: string;
+  /** Whether this exact commit contains the v2 state root. */
+  readonly v2State: "absent" | "present";
+  readonly files: Readonly<Record<string, string>>;
+};
+
+export type CommitSnapshot = {
+  sha: string;
+  treeSha: string;
+  parentShas: readonly string[];
+  message: string;
+};
+
+export type ManagedNodeAnchorSnapshot = {
+  managedRef: string;
+  nodeSha: string;
+  treeSha: string;
+  commitMessage: string;
+};
+
 export type FileUpdate = {
   path: string;
   content: string;
@@ -59,7 +138,28 @@ export interface GitHubTransport {
   listInstallationRepositories(installationId: number): Promise<TransportResult<RepositoryGrant[]>>;
   readBranchHead(repository: RepositoryLocator, branch: string): Promise<TransportResult<string | undefined>>;
   readBranch(repository: RepositoryLocator, branch: string): Promise<TransportResult<BranchSnapshot | undefined>>;
+  readStateFilesAtHead(
+    repository: RepositoryLocator,
+    stateHeadSha: string,
+    selections: readonly StateFileSelection[]
+  ): Promise<TransportResult<StateFileSnapshot>>;
   createBranch(repository: RepositoryLocator, branch: string, fromSha: string): Promise<TransportResult<BranchSnapshot>>;
+  listManagedNodeAnchors(repository: RepositoryLocator, projectId: string): Promise<TransportResult<ManagedNodeAnchorSnapshot[]>>;
+  readManagedNodeAnchors(
+    repository: RepositoryLocator,
+    projectId: string,
+    nodeShas: readonly string[]
+  ): Promise<TransportResult<ManagedNodeAnchorSnapshot[]>>;
+  readRef(repository: RepositoryLocator, ref: string): Promise<TransportResult<string | undefined>>;
+  createRef(repository: RepositoryLocator, ref: string, sha: string): Promise<TransportResult<string>>;
+  readCommit(repository: RepositoryLocator, sha: string): Promise<TransportResult<CommitSnapshot | undefined>>;
+  createCommit(input: {
+    repository: RepositoryLocator;
+    parentSha: string;
+    treeSha: string;
+    message: string;
+    timestamp: string;
+  }): Promise<TransportResult<CommitSnapshot>>;
   commitFiles(input: {
     repository: RepositoryLocator;
     branch: string;
@@ -77,7 +177,7 @@ export type StateActor =
   | { kind: "system"; operation: "reconcile" | "rebuild" };
 
 export type StoredProjectEvent<Event> = {
-  schema: "hunsu.project-event.v1";
+  schema: "hunsu.project-event.v2";
   eventId: string;
   projectId: string;
   repository: {
@@ -89,6 +189,7 @@ export type StoredProjectEvent<Event> = {
   idempotencyKeyHash: string;
   commandHash: string;
   previousStateSha: string;
+  commandEventCount: number;
   sequence: number;
   actor: StateActor;
   occurredAt: string;
@@ -101,6 +202,7 @@ export type StoreError = {
     | "project_not_found"
     | "stale_state"
     | "idempotency_conflict"
+    | "integrity"
     | "invalid_event"
     | "unsafe_state"
     | "transport";
@@ -114,18 +216,31 @@ export type StoreResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: StoreError };
 
+export type NodeStateAnchor = {
+  projectId: string;
+  nodeSha: string;
+  treeSha: string;
+  managedRef: string;
+  commitTitle: string;
+};
+
 export type ProjectStateCodec<Event, State> = {
   projectId(state: State): string;
+  nodeAnchors(state: State): readonly NodeStateAnchor[];
+  encodeEvent(event: Event): StoreResult<unknown>;
   decodeEvent(input: unknown): StoreResult<Event>;
   replay(events: readonly Event[]): StoreResult<State>;
-  materialize(state: State): Readonly<Record<string, unknown>>;
+  materialize(
+    state: State,
+    events: readonly StoredProjectEvent<Event>[]
+  ): StoreResult<Readonly<Record<string, unknown>>>;
 };
 
 export type AppendProjectCommand<Event, State> = {
   repository: RepositoryLocator;
   projectId: string;
   baseSha: string;
-  expectedHeadSha?: string;
+  expectedHeadSha: string;
   idempotencyKey: string;
   occurredAt: string;
   actor: StateActor;
@@ -139,13 +254,14 @@ export type AppendProjectResult<State> = {
   idempotentReplay: boolean;
 };
 
-export type ReconstructedProject<State> = {
+export type ReconstructedProject<State, Event = unknown> = {
   state: State;
   stateHeadSha: string;
   eventCount: number;
+  events: readonly StoredProjectEvent<Event>[];
 };
 
-export type ReconstructedRepository<State> =
+export type ReconstructedRepository<State, Event = unknown> =
   | {
       kind: "state_branch_missing";
       projects: readonly [];
@@ -153,5 +269,5 @@ export type ReconstructedRepository<State> =
   | {
       kind: "state_branch";
       stateHeadSha: string;
-      projects: readonly ReconstructedProject<State>[];
+      projects: readonly ReconstructedProject<State, Event>[];
     };

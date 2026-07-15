@@ -1,13 +1,21 @@
 # Product vision
 
-Hunsu helps a team explore more than one plausible implementation future without losing the evidence needed to choose among them.
+Hunsu makes the implementation history itself coachable. A Project identifies a repository and one root commit, while each immutable commit Node owns the Goals that may be run next and one integrity-locked Runner Value describing how work should be executed.
 
-The primary workflow should feel familiar: authorize GitHub, open a Project, define an outcome-oriented Goal, assign a Player or Team, and inspect Runs. The differentiator appears when uncertainty matters: preserve the original future, start a sibling from the same base, compare results against explicit criteria, and let a user decide which future continues.
+The primary workflow is a sparse lineage graph:
 
-Three commitments shape the product:
+1. Select an existing commit as the Project root and explicitly confirm its initial Node Plan.
+2. Run exactly one Node-owned Goal with that Node's Runner Value, producing a child Node to the right only after GitHub result and evidence verification.
+3. Coach a Node by proposing a replacement Node Plan and, after a separate confirmation, producing a same-tree metadata child below it.
+4. Compare completed sibling Run Nodes and explicitly select or reject alternatives without merging their structural lineage.
 
-1. GitHub refs and commits are durable truth, so Project history survives application-cache loss.
-2. Codex is the worker through a guided repository-scoped plugin, so Hunsu does not operate a second execution runtime.
-3. Coach recommendations remain proposals, so evidence and explicit human authority govern consequential decisions.
+Four commitments shape the product:
 
-The product stays intentionally smaller than a general issue tracker. Project, Goal, Runner, Run, Coach, evidence, divergence, comparison, and selection are sufficient for the initial hypothesis.
+1. GitHub events, commits, and managed tags are durable truth, so the Graph survives application-cache loss.
+2. Every non-root Node has one structural parent. Branching preserves alternatives; Hunsu never invents convergence edges.
+3. Codex performs work through a repository-scoped plugin. Hunsu stores no executable Runner code and operates no second execution runtime.
+4. Coaching, comparison, selection, and rejection preserve explicit human authority. A proposal or recommendation never mutates the Graph by itself.
+
+The dashboard stays intentionally small. After choosing a Project, users see only the Node graph and append-only Events. Node details expose Goals, the actual Runner Value, active Runs, evidence, Coaching, comparisons, and decisions in context instead of recreating standalone Goal, Runner, Coach, or Run directories.
+
+Hunsu v2 is a clean protocol break. It reads only `.hunsu/v2`, leaves v1 state untouched, and provides no decoder, migration, alias, redirect, or dual-write compatibility path.

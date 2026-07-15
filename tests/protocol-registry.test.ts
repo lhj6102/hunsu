@@ -1,30 +1,34 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import type { Result } from "../packages/protocol/src/index.ts";
+import type { Result, RunnerTypeLock } from "../packages/protocol/src/index.ts";
 import {
+  BUNDLED_PLAYER_TYPE_KEY,
+  BUNDLED_TEAM_TYPE_KEY,
   REGISTRY_DEFINITION_SCHEMA,
   REGISTRY_INTEGRITY_PREFIX,
   REGISTRY_SNAPSHOT_SCHEMA,
+  RUNNER_TYPE_INTEGRITY_PREFIX,
   canonicalizeRegistryDefinition,
-  computeRegistryIntegrity,
-  createDefinitionLock,
+  computeDefinitionIntegrity,
+  createBundledDefinitionRegistry,
   createDefinitionRegistry,
   createRegistryEntry,
+  createRunnerValueTypeDecoder,
+  createRunnerValueTypeRegistry,
   decodeDefinitionRegistry,
   decodeRegistryDefinition,
-  resolveRegistryDefinition,
-  resolveRunnerDefinition,
-  validateTeamMembership,
-  verifyRegistryIntegrity,
+  definitionLockToRunnerTypeLock,
+  resolveRunnerTypeDefinition,
+  verifyDefinitionIntegrity,
   type DefinitionLock,
   type DefinitionRegistry,
-  type RegistryDefinition,
-  type RegistryEntry,
-  type RegistryError
+  type RegistryError,
+  type RegistryResult,
+  type RunnerTypeDefinition
 } from "../packages/protocol-registry/src/index.ts";
 
-test("registry canonical integrity is deterministic and verified without stored integrity fields", () => {
+test("definition integrity is deterministic and Runner types use their protocol lock prefix", () => {
   const resource = pluginResourceDefinition();
   const reordered = {
     resource: { version: "2.1.0", name: "github", type: "plugin" },
@@ -34,102 +38,168 @@ test("registry canonical integrity is deterministic and verified without stored 
     schema: REGISTRY_DEFINITION_SCHEMA
   };
   const canonical = value(canonicalizeRegistryDefinition(resource));
-  const reorderedCanonical = value(canonicalizeRegistryDefinition(reordered));
-  const integrity = value(computeRegistryIntegrity(resource));
+  assert.equal(canonical, value(canonicalizeRegistryDefinition(reordered)));
+  assert.equal(
+    value(computeDefinitionIntegrity(resource)),
+    `${REGISTRY_INTEGRITY_PREFIX}${createHash("sha256").update(canonical, "utf8").digest("hex")}`
+  );
 
-  assert.equal(canonical, reorderedCanonical);
-  assert.equal(integrity, `${REGISTRY_INTEGRITY_PREFIX}${createHash("sha256").update(canonical, "utf8").digest("hex")}`);
-  assert.equal(value(verifyRegistryIntegrity(reordered, integrity)), true);
-
-  const changed = pluginResourceDefinition({ resource: { type: "plugin", name: "github", version: "2.2.0" } });
-  const mismatch = verifyRegistryIntegrity(changed, integrity);
-  assert.equal(mismatch.ok, false);
-  if (!mismatch.ok) assert.equal(mismatch.error.type, "RegistryIntegrityError");
-});
-
-test("registry resolves exact locked Player, Team, Coach, Skill, and resource definitions", () => {
   const fixture = completeRegistry();
-
-  const player = value(resolveRunnerDefinition(fixture.registry, fixture.player.lock));
-  const team = value(resolveRunnerDefinition(fixture.registry, fixture.team.lock));
-  const coach = value(resolveRegistryDefinition(fixture.registry, fixture.coach.lock));
-  const skill = value(resolveRegistryDefinition(fixture.registry, fixture.skill.lock));
-  const resource = value(resolveRegistryDefinition(fixture.registry, fixture.resource.lock));
-
-  assert.equal(player.kind, "player");
-  assert.equal(team.kind, "team");
-  assert.equal(coach.kind, "coach");
-  assert.equal(skill.kind, "skill");
-  assert.equal(resource.kind, "resource");
-  assert.equal(value(validateTeamMembership(fixture.team.definition, fixture.registry)), true);
+  assert.equal(fixture.runner.lock.integrity.startsWith(RUNNER_TYPE_INTEGRITY_PREFIX), true);
+  assert.equal(value(verifyDefinitionIntegrity(fixture.runner.definition, fixture.runner.lock.integrity)), true);
+  const runner = fixture.runner.definition as RunnerTypeDefinition;
+  assert.equal(runner.runnerType.valueSchema.type, "object");
+  if (runner.runnerType.valueSchema.type === "object") {
+    const reorderedRequired = {
+      ...runner,
+      runnerType: {
+        ...runner.runnerType,
+        valueSchema: {
+          ...runner.runnerType.valueSchema,
+          required: [...runner.runnerType.valueSchema.required].reverse()
+        }
+      }
+    };
+    assert.equal(value(computeDefinitionIntegrity(reorderedRequired)), fixture.runner.lock.integrity);
+  }
 });
 
-test("registry exact resolution rejects a changed version or integrity", () => {
+test("registry resolves an extensible Runner type through an exact type lock", () => {
   const fixture = completeRegistry();
-  const changedVersion = { ...fixture.player.lock, version: "1.0.1" };
-  const missing = resolveRegistryDefinition(fixture.registry, changedVersion);
-  assert.equal(missing.ok, false);
-  if (!missing.ok) assert.equal(missing.error.type, "RegistryResolutionError");
-
-  const changedIntegrity = { ...fixture.player.lock, integrity: `${REGISTRY_INTEGRITY_PREFIX}${"0".repeat(64)}` };
-  const mismatch = resolveRegistryDefinition(fixture.registry, changedIntegrity);
-  assert.equal(mismatch.ok, false);
-  if (!mismatch.ok) assert.equal(mismatch.error.type, "RegistryIntegrityError");
+  const lock = value(definitionLockToRunnerTypeLock(fixture.runner.lock));
+  const resolved = value(resolveRunnerTypeDefinition(fixture.registry, lock));
+  assert.equal(resolved.definition.kind, "runner_type");
+  assert.equal(resolved.definition.runnerType.displayName, "Release Train");
+  assert.equal(resolved.definition.runnerType.executor.entrypoint, "custom.release-train.v1");
+  assert.deepEqual(resolved.lock, lock);
 });
 
-test("strict decoders reject unknown schemas, keys, values, and partial locks", () => {
+test("bundled Player and Team are ordinary Runner type entries, not a closed union", () => {
+  const registry = value(createBundledDefinitionRegistry());
+  const runnerTypes = registry.entries.filter(entry => entry.definition.kind === "runner_type");
+  assert.deepEqual(runnerTypes.map(entry => entry.definition.key), [BUNDLED_PLAYER_TYPE_KEY, BUNDLED_TEAM_TYPE_KEY]);
+
+  const decoders = value(createRunnerValueTypeRegistry(registry));
+  assert.equal(decoders.length, 2);
+  const player = decoders.find(decoder => decoder.type.key === BUNDLED_PLAYER_TYPE_KEY);
+  const team = decoders.find(decoder => decoder.type.key === BUNDLED_TEAM_TYPE_KEY);
+  assert.ok(player);
+  assert.ok(team);
+
+  const playerValue = {
+    promptTemplate: "Implement one Goal.",
+    resources: [],
+    runtimePolicy: { filesystem: "worktree_write", network: "enabled", approvals: "on_request" }
+  } as const;
+  assert.equal(player.decode(playerValue, "$.value").ok, true);
+  assert.equal(player.decode({ ...playerValue, unknown: true }, "$.value").ok, false);
+
+  const teamValue = {
+    strategy: { mode: "sequence", promptTemplate: "Coordinate.", maxRounds: 2 },
+    players: [{
+      name: "Builder",
+      role: "build",
+      order: 1,
+      promptTemplate: "Build.",
+      resources: [],
+      runtimePolicy: { filesystem: "worktree_write", network: "enabled", approvals: "on_request" }
+    }]
+  } as const;
+  assert.equal(team.decode(teamValue, "$.value").ok, true);
+  assert.equal(team.decode({ ...teamValue, strategy: { ...teamValue.strategy, mode: "unknown" } }, "$.value").ok, false);
+});
+
+test("custom Runner payload decoder rejects extras, missing fields, wrong variants, and duplicates", () => {
+  const fixture = completeRegistry();
+  const lock = value(definitionLockToRunnerTypeLock(fixture.runner.lock));
+  const decoder = value(createRunnerValueTypeDecoder(fixture.registry, lock));
+  assert.equal(decoder.decode({ stages: ["build", "verify"], strict: true }, "$.value").ok, true);
+
+  const invalid = [
+    { stages: ["build"], strict: true, extra: "no" },
+    { stages: ["build"] },
+    { stages: [], strict: true },
+    { stages: ["build", "build"], strict: true },
+    { stages: ["build"], strict: "yes" }
+  ] as const;
+  for (const candidate of invalid) assert.equal(decoder.decode(candidate, "$.value").ok, false);
+});
+
+test("custom Runner payloads preserve __proto__ as an own canonical JSON field", () => {
+  const executor = entry(pluginResourceDefinition());
+  const definition = JSON.parse(JSON.stringify({
+    schema: REGISTRY_DEFINITION_SCHEMA,
+    kind: "runner_type",
+    key: "runner.opaque-map",
+    version: "1.0.0",
+    runnerType: {
+      displayName: "Opaque map",
+      valueSchema: {
+        type: "object",
+        properties: { placeholder: { type: "boolean" } },
+        required: ["__proto__"],
+        additionalProperties: false
+      },
+      executor: {
+        schema: "hunsu.runner-executor.v1",
+        resource: executor.lock,
+        entrypoint: "custom.opaque-map.v1"
+      }
+    }
+  }).replace('"placeholder"', '"__proto__"'));
+  const runner = entry(definition);
+  const registry = value(createDefinitionRegistry([executor, runner]));
+  const lock = value(definitionLockToRunnerTypeLock(runner.lock));
+  const decoder = value(createRunnerValueTypeDecoder(registry, lock));
+  const decoded = decoder.decode(JSON.parse('{"__proto__":true}'), "$.value");
+
+  assert.equal(decoded.ok, true);
+  if (!decoded.ok || typeof decoded.value !== "object" || decoded.value === null || Array.isArray(decoded.value)) return;
+  const record = decoded.value as { readonly [key: string]: import("../packages/protocol/src/index.ts").CanonicalJsonValue };
+  assert.equal(Object.hasOwn(record, "__proto__"), true);
+  assert.equal(record["__proto__"], true);
+  assert.equal(Object.getPrototypeOf(decoded.value), Object.prototype);
+});
+
+test("strict v2 decoders reject v1 schemas, extra keys, partial locks, and tampering", () => {
   const definition = pluginResourceDefinition();
   const cases: unknown[] = [
-    { ...definition, schema: "hunsu.registry-definition.v2" },
+    { ...definition, schema: "hunsu.registry-definition.v1" },
     { ...definition, extra: true },
-    { ...definition, kind: "unknown" },
+    { ...definition, kind: "player" },
     { ...definition, version: "latest" },
-    { ...definition, version: "1.0.0-01" },
     { ...definition, resource: { ...definition.resource, extra: true } }
   ];
-  for (const candidate of cases) {
-    const decoded = decodeRegistryDefinition(candidate);
-    assert.equal(decoded.ok, false);
-    if (!decoded.ok) assert.equal(decoded.error.type, "RegistryDecodeError");
-  }
+  for (const candidate of cases) assert.equal(decodeRegistryDefinition(candidate).ok, false);
 
-  const partialSnapshot = decodeDefinitionRegistry({ schema: REGISTRY_SNAPSHOT_SCHEMA, entries: [{ definition }] });
+  const partialSnapshot = decodeDefinitionRegistry({
+    schema: REGISTRY_SNAPSHOT_SCHEMA,
+    entries: [{ definition }]
+  });
   assert.equal(partialSnapshot.ok, false);
-  if (!partialSnapshot.ok) assert.equal(partialSnapshot.error.type, "RegistryDecodeError");
-});
 
-test("Team validation rejects duplicate and unresolved Player membership", () => {
-  const player = value(createRegistryEntry("official", playerDefinition([])));
-  const duplicateTeam = teamDefinition(player.lock, [
-    { player: player.lock, role: "build", order: 1 },
-    { player: player.lock, role: "review", order: 2 }
-  ]);
-  const duplicate = createRegistryEntry("official", duplicateTeam);
-  assert.equal(duplicate.ok, false);
-  if (!duplicate.ok) assert.equal(duplicate.error.type, "TeamMembershipError");
-
-  const team = value(createRegistryEntry("official", teamDefinition(player.lock)));
-  const unresolved = createDefinitionRegistry([team]);
-  assert.equal(unresolved.ok, false);
-  if (!unresolved.ok) assert.equal(unresolved.error.type, "TeamMembershipError");
-});
-
-test("registry snapshots reject lock identity drift, duplicate identities, and tampered definitions", () => {
   const fixture = completeRegistry();
-  const identityDrift = {
-    ...fixture.resource,
-    lock: { ...fixture.resource.lock, key: "resource.different" }
+  const changedIntegrity: RunnerTypeLock = {
+    ...value(definitionLockToRunnerTypeLock(fixture.runner.lock)),
+    integrity: `${RUNNER_TYPE_INTEGRITY_PREFIX}${"0".repeat(64)}` as RunnerTypeLock["integrity"]
   };
-  const drift = createDefinitionRegistry([identityDrift]);
-  assert.equal(drift.ok, false);
-  if (!drift.ok) assert.equal(drift.error.type, "RegistryIdentityError");
+  const mismatch = resolveRunnerTypeDefinition(fixture.registry, changedIntegrity);
+  assert.equal(mismatch.ok, false);
+  if (!mismatch.ok) assert.equal(mismatch.error.type, "RegistryIntegrityError");
+});
 
-  const duplicate = createDefinitionRegistry([fixture.resource, fixture.resource]);
+test("registry rejects unresolved executor resources and duplicate identities", () => {
+  const fixture = completeRegistry();
+  const unresolved = createDefinitionRegistry([fixture.runner]);
+  assert.equal(unresolved.ok, false);
+  if (!unresolved.ok) assert.equal(unresolved.error.type, "RegistryResolutionError");
+
+  const duplicate = createDefinitionRegistry([fixture.executor, fixture.executor]);
   assert.equal(duplicate.ok, false);
   if (!duplicate.ok) assert.equal(duplicate.error.type, "RegistryIdentityError");
 
   const tampered = {
-    lock: fixture.resource.lock,
+    lock: fixture.executor.lock,
     definition: pluginResourceDefinition({ resource: { type: "plugin", name: "github", version: "9.0.0" } })
   };
   const integrity = createDefinitionRegistry([tampered]);
@@ -139,19 +209,12 @@ test("registry snapshots reject lock identity drift, duplicate identities, and t
 
 function completeRegistry(): {
   readonly registry: DefinitionRegistry;
-  readonly resource: RegistryEntry;
-  readonly skill: RegistryEntry;
-  readonly player: RegistryEntry;
-  readonly team: RegistryEntry;
-  readonly coach: RegistryEntry;
+  readonly executor: ReturnType<typeof entry>;
+  readonly runner: ReturnType<typeof entry>;
 } {
-  const resource = value(createRegistryEntry("official", pluginResourceDefinition()));
-  const skill = value(createRegistryEntry("official", skillDefinition(resource.lock)));
-  const player = value(createRegistryEntry("official", playerDefinition([skill.lock, resource.lock])));
-  const team = value(createRegistryEntry("official", teamDefinition(player.lock)));
-  const coach = value(createRegistryEntry("official", coachDefinition([skill.lock])));
-  const registry = value(createDefinitionRegistry([resource, skill, player, team, coach]));
-  return { registry, resource, skill, player, team, coach };
+  const executor = entry(pluginResourceDefinition());
+  const runner = entry(customRunnerTypeDefinition(executor.lock));
+  return { registry: value(createDefinitionRegistry([executor, runner])), executor, runner };
 }
 
 function pluginResourceDefinition(overrides: { readonly resource?: { readonly type: "plugin"; readonly name: string; readonly version: string } } = {}) {
@@ -165,57 +228,44 @@ function pluginResourceDefinition(overrides: { readonly resource?: { readonly ty
   };
 }
 
-function skillDefinition(resource: DefinitionLock): unknown {
+function customRunnerTypeDefinition(executor: DefinitionLock): unknown {
   return {
     schema: REGISTRY_DEFINITION_SCHEMA,
-    kind: "skill",
-    key: "skill.repository-review",
+    kind: "runner_type",
+    key: "runner.release-train",
     version: "1.0.0",
-    skill: { name: "repository-review", instructions: "Review the repository and report evidence.", resources: [resource] }
-  };
-}
-
-function playerDefinition(resources: readonly DefinitionLock[]): unknown {
-  return {
-    schema: REGISTRY_DEFINITION_SCHEMA,
-    kind: "player",
-    key: "player.builder",
-    version: "1.0.0",
-    player: {
-      promptTemplate: "Implement the selected Goal.",
-      resources,
-      runtimePolicy: { fileAccess: "project_write", network: "denied", approval: "user" }
+    runnerType: {
+      displayName: "Release Train",
+      valueSchema: {
+        type: "object",
+        properties: {
+          stages: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 128 },
+            minItems: 1,
+            maxItems: 16,
+            uniqueItems: true
+          },
+          strict: { type: "boolean" }
+        },
+        required: ["stages", "strict"],
+        additionalProperties: false
+      },
+      executor: {
+        schema: "hunsu.runner-executor.v1",
+        resource: executor,
+        entrypoint: "custom.release-train.v1"
+      }
     }
   };
 }
 
-function teamDefinition(player: DefinitionLock, players = [{ player, role: "build", order: 1 }]): unknown {
-  return {
-    schema: REGISTRY_DEFINITION_SCHEMA,
-    kind: "team",
-    key: "team.delivery",
-    version: "1.0.0",
-    team: {
-      strategy: { mode: "sequence", promptTemplate: "Coordinate the Players.", maxRounds: 2 },
-      players
-    }
-  };
+function entry(definition: unknown) {
+  return value(createRegistryEntry("official", definition));
 }
 
-function coachDefinition(resources: readonly DefinitionLock[]): unknown {
-  return {
-    schema: REGISTRY_DEFINITION_SCHEMA,
-    kind: "coach",
-    key: "coach.product",
-    version: "1.0.0",
-    coach: {
-      promptTemplate: "Review evidence and propose the next Goal change.",
-      resources,
-      policy: { goalChanges: "propose_only", runnerChanges: "propose_only", hunsu: "propose_only", selection: "user_only" }
-    }
-  };
-}
-
+function value<T>(result: Result<T, RegistryError>): T;
+function value<T>(result: RegistryResult<T>): T;
 function value<T>(result: Result<T, RegistryError>): T {
   assert.equal(result.ok, true, result.ok ? undefined : `${result.error.type} at ${result.error.path}`);
   if (!result.ok) throw new Error("unreachable");

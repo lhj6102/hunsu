@@ -1,8 +1,8 @@
 # Hunsu Codex plugin
 
-This repository-scoped plugin turns Codex into the execution surface for GitHub-backed Hunsu Projects. It bundles Project, Goal, Run, Coach, and divergence workflows and connects them to the authenticated Hunsu MCP service.
+This repository-scoped plugin turns Codex into the execution surface for GitHub-backed Hunsu Commit Node Projects. It bundles Project bootstrap, Node-scoped Run, Coaching transition, Events, and sibling-decision workflows and connects them to the authenticated Hunsu MCP service.
 
-Durable state remains on the repository's `hunsu/state` branch. The plugin never writes that branch directly and never stores GitHub installation credentials.
+Durable v2 Events and Node payload materializations remain on the repository's `hunsu/state` branch. The plugin never writes that branch directly, never adds `.hunsu` files to source branches, and never stores GitHub installation credentials.
 
 Install the repository marketplace, authenticate the Hunsu MCP server, and start a new Codex task before invoking a bundled skill.
 

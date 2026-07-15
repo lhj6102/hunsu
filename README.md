@@ -1,41 +1,40 @@
 # Hunsu
 
-Hunsu is GitHub-backed divergent project management for Codex. It combines familiar Project and Goal views with an execution model that preserves several possible futures until a user compares the evidence and chooses one.
+Hunsu is a GitHub-backed Commit-Node graph for Codex. Each immutable commit Node owns its next Goals and one Runner Value, while Runs and Coaching create explicit child Nodes and preserve alternative futures until a user compares their evidence.
 
-GitHub owns durable Project truth. The Hunsu API validates commands and builds disposable query projections. The repository-scoped Codex plugin supplies the execution workflow, and Hunsu Web presents Project, Goal, Runner, Run, Coach, and comparison views.
+GitHub owns durable Project truth. The Hunsu API validates commands and builds disposable Graph and Events projections. The repository-scoped Codex plugin supplies Run, Coaching, and alternative-decision workflows, and Hunsu Web presents only the Node graph and append-only Events.
 
 ## Product loop
 
 ```text
 authorize GitHub
   -> create a Hunsu Project for a repository
-  -> define an outcome-oriented Goal
-  -> assign a Player or Team Runner
-  -> start a Run through the Codex plugin
+  -> confirm a root commit, its next Goals, and one Runner Value
+  -> start a singular-Goal Run from a Node
   -> push a result commit and attach evidence
-  -> let the API verify the GitHub branch and commit
-  -> review the completed Run in Web
-  -> create and compare a same-base alternative
-  -> explicitly select the future that continues
+  -> register the verified result as a Run child Node
+  -> propose and separately confirm Coaching changes as a same-tree child Node
+  -> compare completed sibling Run Nodes
+  -> explicitly reject and select alternatives
 ```
 
 No local daemon, pairing ceremony, command-line setup, or workflow job is part of product execution.
 
 ## Domain
 
-- A **Project** is one initiative in one GitHub repository.
-- A **Goal** is a desired outcome with acceptance criteria and constraints.
-- A **Runner** is exactly a **Player** or **Team**.
-- A **Run** is one immutable execution of a Runner against a Goal snapshot.
-- A **Coach** reviews evidence and proposes changes; it cannot confirm consequential choices.
-- **Hunsu** creates an intentional sibling future from the same base commit.
-- A **Decision** records the user's explicit selection or rejection after comparison.
+- A **Project** defines one repository boundary and exactly one Graph root.
+- A **Node** is identified by its full commit SHA and owns `nextGoals[]` plus exactly one `How`.
+- A **Runner Value** is immutable and integrity-locked; Player and Team are bundled examples, not an exhaustive union.
+- A **Run** digests exactly one Goal and creates a child Node only after verified completion.
+- **Coaching** proposes a full replacement Node Plan and creates a metadata-only child commit only after separate confirmation.
+- Every non-root Node has one structural parent. Branching is allowed; merging is not.
+- A **Decision** decorates sibling alternatives without creating convergence edges.
 
 See [Domain language](docs/domain-language.md) for the complete contract.
 
 ## Durable state
 
-Each authorized repository can have an application-managed `hunsu/state` branch. Append-only events under `.hunsu/projects/<project-id>/events/` are authoritative. Materialized JSON and Web query projections are derived and may be rebuilt.
+Each authorized repository can have an application-managed `hunsu/state` branch. Append-only events under `.hunsu/v2/projects/<project-id>/events/` are authoritative. Encoded Node payloads, Graph snapshots, and Web projections are derived and may be rebuilt. The v2 runtime never decodes or converts v1 state.
 
 Every write uses an idempotency key and compare-and-swap against the observed state head. Run completion additionally verifies that the reported result commit exists, descends from the recorded base, and is reachable from the expected Run branch.
 
@@ -53,7 +52,7 @@ packages/core            pure decisions, transitions, and invariants
 packages/github-store    GitHub refs, append-only writes, CAS, reconstruction
 packages/projections     disposable Web query models
 packages/plugin-contract MCP schemas and immutable RunContract
-packages/protocol-registry exact versioned Runner, Coach, Skill, and resource locks
+packages/protocol-registry exact Runner type locks, payload decoders, and trusted executors
 packages/config          validated environment configuration
 plugins/hunsu            repository-scoped Codex plugin and skills
 ```
@@ -99,7 +98,7 @@ Production is delivered as one Cloudflare Worker serving Web, API, OAuth, and MC
 
 ## Codex plugin
 
-The repository marketplace at `.agents/plugins/marketplace.json` exposes `plugins/hunsu`. The plugin bundles five focused skills and an OAuth-authenticated MCP server definition. It never holds permanent GitHub credentials and never mutates `hunsu/state` directly.
+The repository marketplace at `.agents/plugins/marketplace.json` exposes `plugins/hunsu`. The plugin bundles four focused v2 skills and an OAuth-authenticated MCP server definition. It never holds permanent GitHub credentials and never mutates `hunsu/state` directly.
 
 Validate it with:
 

@@ -1,6 +1,6 @@
 {
   "name": "@hunsu/workspace",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "GitHub-backed divergent project management for Codex.",
@@ -11,6 +11,7 @@
     "dev:web": "pnpm --filter @hunsu/web dev",
     "build": "turbo run build",
     "test": "node --conditions=development --test tests/*.test.ts",
+    "test:browser": "playwright test --config playwright.config.ts",
     "test:cloudflare": "vitest run --config vitest.cloudflare.config.ts",
     "typecheck": "tsc -p tsconfig.json && turbo run typecheck",
     "plugin:validate": "node scripts/validate-plugin.mjs",
@@ -23,7 +24,9 @@
     "node": ">=24.18"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "@cloudflare/vitest-pool-workers": "0.18.4",
+    "@playwright/test": "^1.61.1",
     "@types/node": "^24.13.3",
     "turbo": "^2.6.1",
     "typescript": "^5.8.3",

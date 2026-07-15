@@ -1,15 +1,15 @@
 ---
 name: hunsu-diverge
-description: Propose, create, compare, select, or reject deliberate Hunsu alternatives. Use when a Goal needs competing Runs from one base SHA, a user asks to give Hunsu, or completed sibling futures need an evidence-based decision.
+description: Create, compare, select, or reject sibling Hunsu Run-result Nodes from one structural parent. Use when a source Node needs competing executions of one Goal, a user asks to create alternatives, or completed sibling futures need an evidence-based decision.
 ---
 
 # Hunsu Diverge
 
-1. Load the source Run and ask the Coach for a Hunsu proposal when none exists.
-2. Show the proposed Goal or Runner difference and require explicit user confirmation before starting a sibling Run.
-3. Start the alternative from the source Run's exact base SHA. Never branch from its result commit. When the Coach proposal is still open and no divergence exists, pass its exact `coachProposalId` and `confirmedByUser: true` to `hunsu.runs.start`; that one call records the user's acceptance and starts the sibling atomically. Never pass either field without a confirmation obtained in the current conversation.
-4. When Web already confirmed the divergence, start the sibling with `alternativeOfRunId` and the normal Run protocol; do not attempt to accept the Coach proposal again.
-5. Call `hunsu.alternatives.compare` with a fresh idempotency key only after the alternatives have sufficient evidence. Record criterion-by-criterion findings across every included Run, plus constraints, checks, risks, and result commits.
-6. Present the comparison and ask the user to choose. Call `hunsu.alternatives.select` or `hunsu.alternatives.reject` only with explicit confirmation.
+1. Load the source with `hunsu.nodes.get` and its topology with `hunsu.nodes.graph`. Alternatives must be completed Run child Nodes with that exact source as their single structural parent.
+2. Create alternatives by starting independent singular-Goal Runs from the same `sourceNodeSha`. Like-for-like experiments normally consume the same Goal, but sibling identity is defined by the shared parent, not by a fixed Goal digest. Each Run uses the source Node's immutable Runner Value. Do not branch from another result Node or use Coaching as a Run alternative.
+3. After every candidate completes with sufficient evidence, call `hunsu.alternatives.compare` with at least two unique sibling `nodeShas`. Record criterion-by-criterion summaries for every included Node, plus checks, risks, constraints, and result commits.
+4. Present the comparison without applying a decision. Ask for a separate explicit confirmation of the Node to select; only then call `hunsu.alternatives.select` with `confirmedByUser: true`.
+5. Present each proposed rejection separately and obtain another explicit confirmation before each `hunsu.alternatives.reject` call with `confirmedByUser: true`.
+6. Keep rejected Nodes readable but do not continue Run or Coaching work from them. Selection and rejection never create merge commits or convergence edges.
 
-Do not collapse alternatives into a single path before the decision is recorded. Never select on Coach authority alone.
+Never compare Nodes with different structural parents, infer a selection from Coach authority, or reuse one confirmation for both selection and rejection.

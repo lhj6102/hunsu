@@ -3,4 +3,6 @@ export * from "./github-rest.ts";
 export * from "./in-memory.ts";
 export * from "./state-store.ts";
 export * from "./types.ts";
+export * from "./node-envelope.ts";
+export * from "./state-files.ts";
 export * from "./webhook.ts";

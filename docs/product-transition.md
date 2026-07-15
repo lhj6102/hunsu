@@ -1,119 +1,72 @@
-# GitHub-backed Hunsu product hypothesis
+# Commit-Node Graph v2 product transition
 
 ## Hypothesis
 
-Hunsu can make deliberate product divergence accessible when it combines familiar project-management concepts with GitHub-owned durable state and a Codex plugin that performs work. A user should move from GitHub connection to a completed, evidence-backed Run without installing a daemon or learning a command-line control plane.
+Hunsu can make implementation strategy visible and coachable when every Git commit Node carries one immutable `How` and a set of next Goals, and when Runs and Coaching form a single-parent lineage graph backed by GitHub state.
 
-The product is intentionally narrow: Project, Goal, Runner, Run, Coach, evidence, divergence, comparison, and selection. It is not a general issue tracker.
+The product succeeds when users can understand the graph without learning an internal CRUD model, execute one Goal at a time from Codex, preserve sibling alternatives, and make evidence-backed decisions without Hunsu changing the repository's main branch.
 
 ## Product loop
 
 ```text
 Connect GitHub
-  -> create a Project
-  -> define an outcome-oriented Goal
-  -> select a Player or Team Runner
-  -> start a Run from the Codex plugin
-  -> push a result commit and evidence
-  -> verify the result in GitHub
-  -> review it in Web with the Coach
-  -> continue or create a Hunsu alternative
-  -> compare sibling futures
-  -> explicitly select one future
+  -> create a Project from one existing root commit
+  -> confirm the root Node Plan
+  -> run one Goal from a Node
+  -> attach criterion-linked evidence and verify the result commit
+  -> register a Run child Node to the right
+  -> propose and separately confirm Coaching below a Node
+  -> execute sibling alternatives
+  -> compare their evidence
+  -> separately confirm rejection and selection decisions
 ```
 
 ## Authority boundaries
 
-- GitHub refs and commits own durable Project truth.
-- The API validates commands, performs compare-and-swap writes, verifies Run results, and rebuilds disposable projections.
-- The Codex plugin owns the execution interaction; Codex is the worker.
-- Web owns presentation and explicit user confirmation for consequential decisions.
-- Neither the plugin nor Web writes the state ref directly.
+- GitHub's `hunsu/state` branch owns append-only `.hunsu/v2` events and replayable materializations.
+- Immutable managed tags anchor every registered Node commit.
+- The API validates exact commands, performs compare-and-swap writes, verifies commits and refs, and reconstructs projections.
+- The Codex plugin owns the execution interaction; callers cannot override a Node's Goal source, base SHA, or Runner Value.
+- Web presents the Node graph and Events and collects explicit confirmations. It never writes state refs directly.
 - GitHub Actions may run ordinary repository CI, but never starts, evaluates, or transitions a Hunsu Run.
+- No v2 component decodes v1 state or offers a compatibility route.
 
-This branch is a clean cutover. It intentionally carries no compatibility API, local-daemon operating mode, migration reader, or alternate state authority.
+## Production QA gate
 
-## Success measures
+The v2 release is accepted only after one authorized live repository completes this sequence from the same deployed source SHA:
 
-The vertical slice records:
+1. initialize a fresh Project from a full root commit SHA using the exact repository-context `expectedStateSha`, and retry the lost response idempotently;
+2. start a Run for exactly one Goal, attach criterion-linked evidence, complete it, and retry completion without duplication;
+3. propose a changed Node Plan and verify that no commit or edge exists before confirmation;
+4. explicitly confirm Coaching and verify a direct same-tree child with one Git parent and a managed tag;
+5. complete at least two sibling Run alternatives from the same source;
+6. request Coach review and advisory comparison;
+7. show the comparison before obtaining separate confirmation for rejection and selection;
+8. reconstruct the exact final state and verify zero active Runs, zero unresolved divergence, valid payload/ref/event integrity, and an unchanged main branch.
 
-- time from GitHub connection to first Project;
-- time from plugin installation to first Run;
-- completed Runs visible in Web without a manual reload;
-- complete reconstruction after deleting disposable projections;
-- compare-and-swap conflict and idempotent-replay behavior;
-- Goals with criterion-linked evidence;
-- Goals with independently executed same-base alternatives;
-- Coach proposals accepted or rejected by users;
-- workflows requiring a CLI or manual state-branch edit.
+The deployment must come from the exact protected `main` SHA described in the production runbook. A branch build or locally installed plugin is controlled engineering evidence, not production evidence.
 
-The hypothesis fails if GitHub cannot reconstruct every durable object, if the plugin is only a shortcut, if users cannot distinguish Runner from Run or Player from Team, or if divergent futures cannot be compared and explicitly selected.
+## Required evidence
 
-## Evaluation decision
-
-**Decision: Adjust**
-
-The engineering hypothesis is supported in a controlled GitHub commit-graph harness, but the product hypothesis still needs an authorized live pilot before it can proceed. The adjustment is to keep the GitHub-backed architecture and run one installation/onboarding study against a real granted repository before treating the interaction model as validated.
-
-### Phase 9 execution status
-
-On 2026-07-13, a read-only preflight was attempted for the prescribed live-repository study. It could not advance into usage: this environment has no configured Hunsu GitHub App installation context, installation-backed session, webhook/public URL configuration, or Web/API/MCP deployment serving this branch. The deployed endpoints available to the environment are not this branch and therefore cannot provide evidence for it.
-
-The preflight did not create or update any remote ref, application state, installation, webhook, or repository content. All results below come from controlled automated tests that use in-memory GitHub implementations or mocked HTTP, session, webhook, and MCP transports. They demonstrate implementation behavior, not real GitHub traffic, onboarding, or user usage.
-
-### Observed evidence
-
-| Measure | Observed result | Evidence boundary |
-| --- | --- | --- |
-| Completed Runs reflected in Web | 2/2 completed same-base Runs, including evidence and result SHAs | Application-service vertical test and rebuilt Goal projection |
-| Project reconstruction | 1/1 complete vertical state rebuild after dropping the projection cache; lower-level reconstruction also ignores a damaged derived snapshot | Application-service and GitHub-store tests |
-| Idempotent lost-response retries | 8/8 representative retries preserved the state head, including start after both the Run branch and Project base advanced | Application-service vertical test |
-| Web logical submissions | All 8 Web mutation paths retain one semantic-command key across a lost response, including when polling refreshes the expected state head; focused tests cover retry, changed input, success, and abandonment | Web mutation-key tests and production typecheck |
-| Concurrent stale write handling | 1/1 forced stale write returned a structured conflict with the actual state head | HTTP and GitHub-store tests |
-| GitHub result verification | Both completed alternatives required an existing commit, base ancestry, and expected Run-branch reachability | Vertical test and Run verification tests |
-| Evidence quality gate | 1/1 completed Goal retained evidence for every immutable acceptance criterion; Run completion rejects missing criterion coverage | Vertical, core, and application-service tests |
-| Meaningful divergence | 1 Goal produced a Player result and a changed Team alternative from the same base, followed by comparison and explicit selection | Vertical test |
-| Coach decisions | 1 accepted Team-change proposal applied only after a user decision; acceptance and rejection behavior are both covered, and the Coach projection displays advisory comparison and selection recommendations | Vertical, core, and projection tests |
-| Web/MCP command parity | Equivalent Goal updates produced identical domain event payloads after metadata normalization | Application-service parity test |
-| Plugin package | Manifest, repository marketplace, OAuth MCP binding, and 5/5 bundled Skills passed both repository and Codex validators | Plugin validation commands |
-| Product runtime independence | 0 repository workflow files can operate the Hunsu lifecycle; the Web and API production builds complete without a local daemon or local durable authority | Boundary tests and nine-package build |
-
-The full automated suite passes 66/66 tests. Typechecking and production builds pass for all nine runtime packages; the Web build produces its six Project routes and embedded same-base comparison view. These are controlled engineering results and must not be reported as live Phase 9 results.
-
-### Next real-repository experiment
-
-Run a fresh study from one immutable commit of this branch. Before inviting participants:
-
-1. Register a dedicated GitHub App with the documented minimum permissions, callback, session, and webhook configuration.
-2. Deploy Web, API, and MCP from that same commit at public URLs, and pin the repository marketplace plugin source to the same commit SHA.
-3. Grant the App only non-production study repositories and record the installation, repository, build SHA, and state-ref starting heads.
-4. Instrument authoritative timestamps for authorization, Project creation, plugin installation, Run transitions, webhook receipt, projection visibility, comparisons, Coach decisions, conflicts, retries, and reconstruction. Do not infer these timestamps from test logs.
-
-Use at least two first-time internal participants, each with a different granted repository. Without implementation coaching, each participant must:
-
-1. authorize GitHub, create a Hunsu Project, define a Goal with acceptance criteria, and choose a Runner in Web;
-2. install the repository plugin and use it to start, execute, checkpoint, and complete a Run with criterion-linked evidence and a pushed result commit;
-3. observe the completed Run in Web through the normal webhook/projection path without manually refreshing state or editing the state ref;
-4. accept or reject a Coach proposal, explicitly confirm a Hunsu alternative, and independently execute a same-base alternative with a changed Goal or Runner;
-5. inspect the recorded comparison and explicitly select an alternative;
-6. repeat reconstruction after the disposable projection is removed, and exercise one controlled concurrent write so conflict recovery can be observed without risking participant work; and
-7. describe what Project, Goal, Runner, Player, Team, Run, and Coach mean, while the observer records every user-required CLI, daemon, and manual Git step. Git operations performed by Codex as part of execution are not counted as user-required manual Git.
-
-Capture and report every Phase 9 measure with its denominator and raw observations:
-
-| Required measure | Live-study definition |
+| Gate | Required observation |
 | --- | --- |
-| Time from GitHub connection to first Project | Elapsed time from successful installation authorization/session establishment to the first accepted Project-creation command, per participant. |
-| Time from plugin installation to first Run | Elapsed time from confirmed marketplace installation to the first accepted plugin-driven Run start, per participant. |
-| Runs successfully reflected in Web | Terminal Runs visible with matching status, result SHA, and evidence through the webhook/projection path divided by all terminal Runs; also report visibility latency. |
-| Project reconstruction rate | Reconstruction attempts whose durable Projects, Goals, Runners, Runs, evidence, decisions, comparisons, and selections match the pre-deletion authoritative state divided by all attempts. |
-| Stale or conflicting state-write rate | Structured stale/conflict responses divided by all mutation attempts; separately report successful retry count, recovery latency, and any lost or duplicated event. |
-| Goals producing meaningful alternatives | Count and percentage of Goals with independently executed same-base Runs that differ by Goal or Runner and reach a recorded comparison and explicit selection. |
-| Coach recommendation acceptance rate | User-accepted proposals divided by all proposals explicitly decided by users; report rejections and participant rationale as well, since a high acceptance rate alone is not success. |
-| Terminology distinction | Count and percentage of participants who can correctly distinguish Runner from Run, Player from Team, and Coach from a Runner without implementation coaching; retain the teach-back notes. |
-| Workflows requiring CLI or manual Git | Count every participant step that requires a CLI, daemon operation, direct ref edit, or manual Git command; report the workflow and reason. |
-| Criterion-linked Goal evidence | Completed Goals whose every acceptance criterion is covered by persisted evidence divided by all completed Goals. |
+| State opacity | Source branches and the main tree contain no `.hunsu` files; Node and event bodies in `hunsu/state` are deterministic encoded envelopes without secrets. |
+| Exact reconstruction | Graph, selected Node, and Events agree at one exact state head; malformed or stale materializations return an integrity error rather than silently repairing data. |
+| Efficient reads | Project list and Graph reads do not download or decode all authoritative event or Node payload files; a Node detail reads only its selected payload. |
+| Single-parent graph | One root exists; every non-root Node has exactly one incoming Hunsu edge; no self-edge, cycle, target reuse, or convergence edge is accepted. |
+| Run singularity | Each Run contract contains exactly one Goal and the source Node's immutable Runner Value. Failed or canceled Runs create no Node. |
+| Coaching authority | A proposal is non-mutating; only a separately confirmed proposal creates its deterministic same-tree child. |
+| Decision authority | Comparison is advisory. Selection and rejection are separate confirmed commands and remain decorations, not structural edges. |
+| Idempotency | Lost-response retries duplicate no Node, edge, event, evidence, proposal, comparison, or decision. |
+| Bootstrap context | Repository discovery identifies v2 as initialized or uninitialized and returns the exact default-branch or state-branch CAS base without decoding v1 files. |
+| Web surface | Project navigation contains only Node graph and Events; Run edges move right and Coaching edges move down; integrity faults are visible. |
+| Accessibility | The same Graph data is usable through keyboard and screen-reader Outline navigation, and Events form a semantic ordered list. |
+| Repository safety | Production QA leaves the repository's main ref unchanged until an independently authorized merge. |
 
-For this small pilot, `Proceed` requires complete GitHub reconstruction, every terminal Run reflected in Web, no lost or duplicated durable event, no user-required daemon/CLI/direct-state workflow, successful meaningful divergence and selection in each repository, and correct terminology teach-back from every participant. Structured conflicts are acceptable only when they are visible and recover without data loss. Report the two elapsed-time distributions and Coach acceptance rate as baselines rather than inventing synthetic thresholds. Use `Adjust` when the architecture holds but onboarding, latency, execution friction, or terminology needs revision. Use `Reject` if GitHub cannot recover durable truth, the plugin is only a shortcut, or the product cannot execute, compare, and select divergent futures.
+## Decision rule
 
-Until that experiment is run, there is no live evidence for authorization-to-Project time, plugin-to-Run time, webhook latency, real conflict frequency, terminology comprehension, or CLI-free usage. Reporting controlled timings or mock-transport behavior as user evidence would overstate the result.
+- **Proceed** only when all production QA gates pass and the final exact-head reconstruction reports active Runs `0`, unresolved divergence `0`, and valid state integrity.
+- **Adjust** when the state model remains sound but latency, onboarding, graph comprehension, accessibility, or plugin guidance needs another implementation loop.
+- **Reject** when GitHub cannot reconstruct authoritative truth, a retry duplicates durable state, a Node can acquire multiple structural parents, or a consequential mutation bypasses explicit confirmation.
+
+Until the protected deployment and live lifecycle are complete, automated tests and local browser checks must be reported as controlled engineering evidence rather than production validation.

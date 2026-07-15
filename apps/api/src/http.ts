@@ -134,71 +134,132 @@ export class HunsuHttpApp {
       return resultResponse(await this.#service.webCreateProject(context, await mutationBody(request)), 201);
     }
 
-    const project = matchPath(url.pathname, /^\/api\/projects\/([^/]+)$/u, ["projectId"]);
-    if (project && request.method === "GET") return resultResponse(await this.#service.webProject(context, project.projectId));
-
-    const rebuild = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/rebuild$/u, ["projectId"]);
-    if (rebuild && request.method === "POST") {
-      this.#requireWebMutation(request);
-      await mutationBody(request);
-      return resultResponse(await this.#service.webRebuildProject(context, rebuild.projectId));
+    const projectContext = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/context$/u, ["projectId"]);
+    if (projectContext && request.method === "GET") {
+      return resultResponse(await this.#service.webProjectContext(context, projectContext.projectId));
     }
 
-    const goals = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/goals$/u, ["projectId"]);
-    if (goals && request.method === "POST") {
-      this.#requireWebMutation(request);
-      return resultResponse(await this.#service.webCreateGoal(context, goals.projectId, await mutationBody(request)), 201);
-    }
-    const goal = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/goals\/([^/]+)$/u, ["projectId", "goalId"]);
-    if (goal && request.method === "GET") return resultResponse(await this.#service.webGoal(context, goal.projectId, goal.goalId));
-    if (goal && request.method === "PATCH") {
-      this.#requireWebMutation(request);
-      return resultResponse(await this.#service.webUpdateGoal(context, goal.projectId, goal.goalId, await mutationBody(request)));
-    }
-    const hunsu = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/goals\/([^/]+)\/hunsu$/u, ["projectId", "goalId"]);
-    if (hunsu && request.method === "POST") {
-      this.#requireWebMutation(request);
-      return resultResponse(await this.#service.webConfirmHunsu(context, hunsu.projectId, hunsu.goalId, await mutationBody(request)));
-    }
-    const alternative = matchPath(
-      url.pathname,
-      /^\/api\/projects\/([^/]+)\/goals\/([^/]+)\/alternatives\/([^/]+)\/(select|reject)$/u,
-      ["projectId", "goalId", "runId", "kind"]
-    );
-    if (alternative && request.method === "POST") {
-      this.#requireWebMutation(request);
-      return resultResponse(await this.#service.webDecideAlternative(
-        context,
-        alternative.projectId,
-        alternative.goalId,
-        alternative.runId,
-        alternative.kind as "select" | "reject",
-        await mutationBody(request)
-      ));
+    const graph = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/graph$/u, ["projectId"]);
+    if (graph && request.method === "GET") {
+      return resultResponse(await this.#service.webGraph(context, graph.projectId, graphQuery(url.searchParams)));
     }
 
-    const runners = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/runners$/u, ["projectId"]);
-    if (runners && request.method === "GET") return resultResponse(await this.#service.webRunners(context, runners.projectId));
+    const node = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/nodes\/([^/]+)$/u, ["projectId", "nodeSha"]);
+    if (node && request.method === "GET") {
+      return resultResponse(await this.#service.webNode(context, node.projectId, node.nodeSha));
+    }
+
+    const events = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/events$/u, ["projectId"]);
+    if (events && request.method === "GET") {
+      return resultResponse(await this.#service.webEvents(context, events.projectId, eventQuery(url.searchParams)));
+    }
+
+    const event = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/events\/([^/]+)$/u, ["projectId", "eventId"]);
+    if (event && request.method === "GET") {
+      return resultResponse(await this.#service.webEvent(context, event.projectId, event.eventId));
+    }
+
     const run = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/runs\/([^/]+)$/u, ["projectId", "runId"]);
-    if (run && request.method === "GET") return resultResponse(await this.#service.webRun(context, run.projectId, run.runId));
-    const coach = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/coach$/u, ["projectId"]);
-    if (coach && request.method === "GET") return resultResponse(await this.#service.webCoach(context, coach.projectId));
-    const coachReview = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/coach\/review$/u, ["projectId"]);
-    if (coachReview && request.method === "POST") {
-      this.#requireWebMutation(request);
-      return resultResponse(await this.#service.webCoachReview(context, coachReview.projectId, await mutationBody(request)));
+    if (run && request.method === "GET") {
+      return resultResponse(await this.#service.webRun(context, run.projectId, run.runId));
     }
-    const proposal = matchPath(
+
+    const startRun = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/nodes\/([^/]+)\/runs$/u, ["projectId", "nodeSha"]);
+    if (startRun && request.method === "POST") {
+      this.#requireWebMutation(request);
+      return resultResponse(await this.#service.webStartRun(
+        context,
+        startRun.projectId,
+        startRun.nodeSha,
+        await mutationBody(request)
+      ), 201);
+    }
+
+    const runCheckpoint = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/runs\/([^/]+)\/checkpoints$/u, ["projectId", "runId"]);
+    if (runCheckpoint && request.method === "POST") {
+      this.#requireWebMutation(request);
+      return resultResponse(await this.#service.webCheckpointRun(
+        context,
+        runCheckpoint.projectId,
+        runCheckpoint.runId,
+        await mutationBody(request)
+      ), 201);
+    }
+
+    const runEvidence = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/runs\/([^/]+)\/evidence$/u, ["projectId", "runId"]);
+    if (runEvidence && request.method === "POST") {
+      this.#requireWebMutation(request);
+      return resultResponse(await this.#service.webAttachRunEvidence(
+        context,
+        runEvidence.projectId,
+        runEvidence.runId,
+        await mutationBody(request)
+      ), 201);
+    }
+
+    const runTerminal = matchPath(
       url.pathname,
-      /^\/api\/projects\/([^/]+)\/coach\/proposals\/([^/]+)\/(confirm|reject)$/u,
-      ["projectId", "proposalId", "kind"]
+      /^\/api\/projects\/([^/]+)\/runs\/([^/]+)\/(complete|fail|cancel)$/u,
+      ["projectId", "runId", "outcome"]
     );
-    if (proposal && request.method === "POST") {
+    if (runTerminal && request.method === "POST") {
       this.#requireWebMutation(request);
       const body = await mutationBody(request);
-      return resultResponse(proposal.kind === "confirm"
-        ? await this.#service.webConfirmCoachProposal(context, proposal.projectId, proposal.proposalId, body)
-        : await this.#service.webRejectCoachProposal(context, proposal.projectId, proposal.proposalId, body));
+      switch (runTerminal.outcome) {
+        case "complete":
+          return resultResponse(await this.#service.webCompleteRun(context, runTerminal.projectId, runTerminal.runId, body));
+        case "fail":
+          return resultResponse(await this.#service.webFailRun(context, runTerminal.projectId, runTerminal.runId, body));
+        case "cancel":
+          return resultResponse(await this.#service.webCancelRun(context, runTerminal.projectId, runTerminal.runId, body));
+      }
+    }
+
+    const coachingProposal = matchPath(
+      url.pathname,
+      /^\/api\/projects\/([^/]+)\/nodes\/([^/]+)\/coaching\/proposals$/u,
+      ["projectId", "nodeSha"]
+    );
+    if (coachingProposal && request.method === "POST") {
+      this.#requireWebMutation(request);
+      return resultResponse(await this.#service.webCreateCoachingProposal(
+        context,
+        coachingProposal.projectId,
+        coachingProposal.nodeSha,
+        await mutationBody(request)
+      ), 201);
+    }
+
+    const coachingDecision = matchPath(
+      url.pathname,
+      /^\/api\/projects\/([^/]+)\/coaching\/proposals\/([^/]+)\/(confirm|reject)$/u,
+      ["projectId", "proposalId", "decision"]
+    );
+    if (coachingDecision && request.method === "POST") {
+      this.#requireWebMutation(request);
+      const body = await mutationBody(request);
+      return resultResponse(coachingDecision.decision === "confirm"
+        ? await this.#service.webConfirmCoachingProposal(context, coachingDecision.projectId, coachingDecision.proposalId, body)
+        : await this.#service.webRejectCoachingProposal(context, coachingDecision.projectId, coachingDecision.proposalId, body));
+    }
+
+    const comparisons = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/comparisons$/u, ["projectId"]);
+    if (comparisons && request.method === "POST") {
+      this.#requireWebMutation(request);
+      return resultResponse(await this.#service.webCompareAlternatives(
+        context,
+        comparisons.projectId,
+        await mutationBody(request)
+      ), 201);
+    }
+
+    const decision = matchPath(url.pathname, /^\/api\/projects\/([^/]+)\/decisions\/(select|reject)$/u, ["projectId", "kind"]);
+    if (decision && request.method === "POST") {
+      this.#requireWebMutation(request);
+      const body = await mutationBody(request);
+      return resultResponse(decision.kind === "select"
+        ? await this.#service.webSelectAlternative(context, decision.projectId, body)
+        : await this.#service.webRejectAlternative(context, decision.projectId, body));
     }
 
     return problem({ code: "not_found", message: "API route not found.", status: 404, retryable: false });
@@ -327,7 +388,7 @@ export class HunsuHttpApp {
       headers: {
         "access-control-allow-origin": this.#webOrigin,
         "access-control-allow-credentials": "true",
-        "access-control-allow-methods": "GET, POST, PATCH, OPTIONS",
+        "access-control-allow-methods": "GET, POST, OPTIONS",
         "access-control-allow-headers": "content-type, idempotency-key",
         vary: "Origin"
       }
@@ -364,13 +425,71 @@ function githubOAuthRetryable(failure: GitHubOAuthCallbackFailure): boolean {
   }
 }
 
+function graphQuery(search: URLSearchParams): JsonRecord {
+  assertKnownQuery(search, ["cursor", "limit"]);
+  return {
+    limit: queryLimit(search, 300),
+    ...(queryValue(search, "cursor") !== undefined ? { cursor: queryValue(search, "cursor") } : {})
+  };
+}
+
+function eventQuery(search: URLSearchParams): JsonRecord {
+  assertKnownQuery(search, ["cursor", "limit", "type", "nodeSha", "actor", "from", "to", "search"]);
+  return {
+    limit: queryLimit(search, 50),
+    ...queryFields(search, ["cursor", "type", "nodeSha", "actor", "from", "to", "search"])
+  };
+}
+
+function assertKnownQuery(search: URLSearchParams, allowed: readonly string[]): void {
+  const seen = new Set<string>();
+  for (const key of search.keys()) {
+    if (!allowed.includes(key)) throw inputProblem(`Unknown query parameter ${key}.`);
+    if (seen.has(key)) throw inputProblem(`Query parameter ${key} must not be repeated.`);
+    seen.add(key);
+  }
+}
+
+function queryLimit(search: URLSearchParams, maximum: number): number {
+  const raw = queryValue(search, "limit");
+  if (raw === undefined) return maximum;
+  if (!/^[1-9][0-9]*$/u.test(raw)) throw inputProblem("Query parameter limit must be a positive integer.");
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed > maximum) {
+    throw inputProblem(`Query parameter limit must not exceed ${maximum}.`);
+  }
+  return parsed;
+}
+
+function queryFields(search: URLSearchParams, keys: readonly string[]): JsonRecord {
+  const result: JsonRecord = {};
+  for (const key of keys) {
+    const value = queryValue(search, key);
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
+
+function queryValue(search: URLSearchParams, key: string): string | undefined {
+  const value = search.get(key);
+  if (value === null) return undefined;
+  if (value.length === 0) throw inputProblem(`Query parameter ${key} must not be empty.`);
+  return value;
+}
+
 async function mutationBody(request: Request): Promise<JsonRecord> {
   const body = assertRecord(await readJson(request, MAX_JSON_BYTES));
   const headerKey = request.headers.get("idempotency-key");
+  if (Object.hasOwn(body, "idempotencyKey") && typeof body.idempotencyKey !== "string") {
+    throw inputProblem("idempotencyKey must be a string.");
+  }
   const bodyKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey : undefined;
   if (headerKey && bodyKey && headerKey !== bodyKey) throw inputProblem("Idempotency-Key header and body value must match.");
   const key = headerKey ?? bodyKey;
   if (!key) throw inputProblem("An Idempotency-Key header or idempotencyKey body field is required.");
+  if (typeof body.expectedStateSha !== "string" || !/^[0-9a-f]{40}$/u.test(body.expectedStateSha)) {
+    throw inputProblem("expectedStateSha must be a full lowercase Git commit SHA.");
+  }
   return { ...body, idempotencyKey: key };
 }
 

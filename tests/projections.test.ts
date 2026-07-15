@@ -1,982 +1,763 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 import {
-  applyProjectCommand,
-  emptyProjectState
-} from "../packages/core/src/index.ts";
-import {
-  alternativeComparisonProjection,
-  coachViewProjection,
-  goalDetailProjection,
+  eventListProjection,
+  nodeDetailProjection,
+  projectGraphProjection,
   projectListProjection,
-  projectOverviewProjection,
   runDetailProjection,
-  runnerDirectoryProjection,
   type ProjectionContext,
   type ProjectionResult
 } from "../packages/projections/src/index.ts";
 import {
+  NODE_PLAN_SCHEMA,
+  NODE_PAYLOAD_SCHEMA,
+  RUNNER_VALUE_SCHEMA,
+  computeGoalDigest,
+  computeNodePayloadDigest,
+  computeNodePlanDigest,
+  computeRunnerDigest,
   makeAcceptanceCriterion,
-  makeCheckpointId,
-  makeCoachId,
-  makeCoachProposalId,
-  makeCoachReviewId,
+  makeCoachingProposalId,
   makeCommandFingerprint,
   makeComparisonId,
   makeDecisionId,
   makeDesiredOutcome,
-  makeDivergenceId,
+  makeEventId,
   makeEvidenceId,
   makeEvidenceSummary,
-  makeEventId,
   makeGitCommitSha,
   makeGitRef,
+  makeGitTreeSha,
   makeGoalConstraint,
-  makeGoalId,
+  makeGoalKey,
   makeGoalTitle,
   makeIdempotencyKey,
   makeIsoTimestamp,
   makeNonEmptyText,
   makeNonNegativeInteger,
-  makePositiveInteger,
   makeProjectId,
-  makeProjectObjective,
   makeProjectTitle,
-  makePromptTemplate,
   makeReason,
   makeRepositoryName,
   makeRepositoryOwner,
-  makeResourceName,
   makeRunId,
-  makeRunnerId,
+  makeRunnerSchemaVersion,
+  makeRunnerTypeIntegrity,
+  makeRunnerTypeKey,
+  makeRunnerTypeOrigin,
   makeWorkspaceId,
+  managedNodeRef,
   runBranchName,
-  type ActiveGoal,
-  type Coach,
+  type AlternativeComparison,
+  type CoachingChildNode,
+  type CoachingProposal,
+  type CompletedRun,
+  type ConfirmedCoachingProposalDecision,
   type DomainActor,
-  type Player,
+  type DomainEvent,
+  type EventMetadata,
+  type EvidenceRef,
+  type GoalValue,
+  type NodePlan,
   type Project,
-  type ProjectCommand,
   type ProjectState,
+  type RejectionDecision,
   type Result,
-  type Team
+  type RootNode,
+  type RunChildNode,
+  type RunnerValue,
+  type RunningRun,
+  type SelectionDecision
 } from "../packages/protocol/src/index.ts";
 
 const fixture = buildFixture();
 
-test("Project list and overview isolate repository-backed Project data", () => {
-  const items = projectListProjection([{ state: fixture.state, context: fixture.context }]);
-  assert.equal(items.length, 2);
-
-  const item = items.find(candidate => candidate.id === fixture.project.id);
-  assert.ok(item);
-  assert.equal(item.repository.url, "https://github.com/openai/hunsu");
-  assert.equal(item.repository.defaultBranch, "main");
-  assert.equal(item.activeGoalCount, 0);
-  assert.equal(item.activeRunCount, 0);
-  assert.equal(item.latestResult?.runId, fixture.alternativeRunId);
-  assert.equal(item.latestResult?.status, "completed");
-  assert.equal(item.coachReviewStatus, "changes_recommended");
-  assert.equal(item.unresolvedAlternativeCount, 0);
-  assert.equal(item.synchronizedAt, fixture.context.health.synchronizedAt);
-
-  const overview = projectionValue(projectOverviewProjection(
+test("Graph projects one root, rightward Run edges, downward Coaching edges, and no active-Run edge", () => {
+  const graph = projectionValue(projectGraphProjection(
     fixture.state,
     fixture.project.id,
+    fixture.context,
+    { limit: 300, cursor: null }
+  ));
+
+  assert.equal(graph.project.rootNodeSha, fixture.root.commitSha);
+  assert.deepEqual(
+    fixture.state.nodes.filter(node => node.type === "root").map(node => node.commitSha),
+    [fixture.root.commitSha]
+  );
+  assert.equal(graph.integrity.status, "valid");
+  assert.equal(graph.nodes.length, 4);
+
+  const runEdges = graph.edges.filter(edge => edge.kind === "run");
+  assert.deepEqual(runEdges.map(edge => [edge.sourceSha, edge.targetSha]), [
+    [fixture.root.commitSha, fixture.runChildA.commitSha],
+    [fixture.root.commitSha, fixture.runChildB.commitSha]
+  ]);
+  assert.ok(runEdges.every(edge => edge.goal.digest === computeGoalDigest(fixture.goalA)));
+
+  const coachingEdge = graph.edges.find(edge => edge.kind === "coaching");
+  assert.deepEqual(coachingEdge && {
+    sourceSha: coachingEdge.sourceSha,
+    targetSha: coachingEdge.targetSha,
+    proposalId: coachingEdge.proposalId
+  }, {
+    sourceSha: fixture.root.commitSha,
+    targetSha: fixture.coachingChild.commitSha,
+    proposalId: fixture.proposal.id
+  });
+
+  assert.deepEqual(graph.activeRuns.map(run => run.id), [fixture.activeRun.id]);
+  assert.equal(graph.edges.some(edge => edge.id.includes(String(fixture.activeRun.id))), false);
+});
+
+test("Graph pagination returns deterministic, non-overlapping Node windows", () => {
+  const first = projectionValue(projectGraphProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.context,
+    { limit: 2, cursor: null }
+  ));
+  assert.equal(first.window.limit, 2);
+  assert.equal(first.window.hasMore, true);
+  assert.equal(first.window.continuationCursor, "2");
+
+  const second = projectionValue(projectGraphProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.context,
+    { limit: 2, cursor: first.window.continuationCursor }
+  ));
+  assert.equal(second.window.hasMore, false);
+  assert.equal(second.window.continuationCursor, null);
+
+  const allShas = [...first.nodes, ...second.nodes].map(node => node.sha);
+  assert.equal(new Set(allShas).size, 4);
+  assert.deepEqual(allShas, [
+    fixture.root.commitSha,
+    fixture.runChildA.commitSha,
+    fixture.runChildB.commitSha,
+    fixture.coachingChild.commitSha
+  ]);
+});
+
+test("Node detail exposes the actual immutable Runner Value and Node-scoped activity", () => {
+  const detail = projectionValue(nodeDetailProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.coachingChild.commitSha,
     fixture.context
   ));
-  assert.equal(overview.id, fixture.project.id);
-  assert.equal(overview.goals.length, 1);
-  assert.equal(overview.runs.length, 2);
-  assert.equal(overview.recentEvidence.length, 2);
-  assert.equal(overview.recentEvidence[0]?.id, fixture.alternativeEvidenceId);
-  assert.equal(overview.alternatives[0]?.status, "selected");
-  assert.deepEqual(overview.alternatives[0]?.runIds, [
-    fixture.sourceRunId,
-    fixture.alternativeRunId
-  ]);
 
-  assert.deepEqual(overview.decisions.map(decision => decision.id), [
-    fixture.rejectionDecisionId,
-    fixture.selectionDecisionId
-  ]);
-  assert.equal(
-    overview.decisions.some(decision => decision.id === fixture.foreignSelectionDecisionId),
-    false,
-    "another Project's alternative decision must not leak into this overview"
-  );
+  assert.equal(detail.lineage.kind, "coaching_child");
+  assert.equal(detail.plan.how.name, "Custom Matrix Runner");
+  assert.equal(detail.plan.how.typeKey, "matrix/orchestrator");
+  assert.equal(detail.plan.how.schemaVersion, "2.3.0");
+  assert.equal(detail.plan.how.digest, computeRunnerDigest(fixture.customRunner));
+  assert.deepEqual(detail.plan.how.value, {
+    concurrency: 3,
+    strategy: "evidence-first"
+  });
+  assert.deepEqual(detail.plan.nextGoals.map(goal => goal.title), [fixture.goalC.title]);
+  assert.deepEqual(detail.activeRuns.map(run => run.id), [fixture.activeRun.id]);
+  assert.equal(detail.outgoingEdges.length, 0, "an active Run is inspector state, not a dangling edge");
 });
 
-test("Goal and Run projections expose immutable snapshots, checkpoints, and evidence", () => {
-  const goal = projectionValue(goalDetailProjection(
-    fixture.state,
-    fixture.project.id,
-    fixture.goal.id
-  ));
-  assert.equal(goal.title, fixture.updatedGoalTitle);
-  assert.equal(goal.status, "completed");
-  assert.equal(goal.priority, "high");
-  assert.equal(goal.runner?.id, fixture.player.id);
-  assert.equal(goal.runs.length, 2);
-  assert.equal(goal.evidence.length, 2);
-  assert.equal(goal.coachReview?.status, "changes_recommended");
-  assert.equal(goal.decision?.recommendedRunId, fixture.alternativeRunId);
-
-  const run = projectionValue(runDetailProjection(
-    fixture.state,
-    fixture.project.id,
-    fixture.sourceRunId
-  ));
-  assert.equal(run.status, "completed");
-  assert.equal(run.resultSha, fixture.sourceResultSha);
-  assert.equal(run.goalSnapshot.title, fixture.originalGoalTitle);
-  assert.notEqual(run.goalSnapshot.title, goal.title);
-  assert.deepEqual(run.goalSnapshot.acceptanceCriteria, [fixture.criterion]);
-  assert.deepEqual(run.goalSnapshot.constraints, [fixture.constraint]);
-  assert.equal(run.runnerSnapshot.kind, "player");
-  if (run.runnerSnapshot.kind === "player") {
-    assert.deepEqual(run.runnerSnapshot.runtimePolicy, {
-      filesystem: "worktree_write",
-      network: "disabled",
-      approvals: "on_request"
-    });
-    assert.deepEqual(run.runnerSnapshot.resources, [{
-      id: "skill:typescript",
-      kind: "skill",
-      name: "typescript",
-      reference: "skill://typescript"
-    }, {
-      id: "plugin:eslint",
-      kind: "plugin",
-      name: "eslint",
-      reference: "1.2.3"
-    }]);
-  }
-  assert.equal(run.instructions, fixture.player.promptTemplate);
-  assert.equal(run.checkpoints.length, 1);
-  assert.equal(run.checkpoints[0]?.commitSha, fixture.sourceResultSha);
-  assert.equal(run.evidenceCount, 1);
-  assert.equal(run.evidence[0]?.id, fixture.sourceEvidenceId);
-  assert.equal(run.evidence[0]?.kind, "check");
-  assert.equal(run.evidence[0]?.criterion, fixture.criterion);
-  assert.equal(
-    run.evidence[0]?.url,
-    `https://github.com/openai/hunsu/blob/${fixture.sourceResultSha}/reports/acceptance.json`
-  );
-
-  assert.equal(
-    goal.evidence.find(item => item.id === fixture.sourceEvidenceId)?.criterion,
-    fixture.criterion
-  );
-});
-
-test("Runner and Coach projections preserve closed Runner variants and proposal dispositions", () => {
-  const runners = projectionValue(runnerDirectoryProjection(fixture.state, fixture.project.id));
-  assert.equal(runners.length, 3);
-
-  const player = runners.find(candidate => candidate.id === fixture.player.id);
-  assert.ok(player);
-  assert.equal(player.kind, "player");
-  if (player.kind === "player") {
-    assert.equal(player.runtimePolicy.filesystem, "worktree_write");
-    assert.equal(player.runtimePolicy.network, "disabled");
-    assert.equal(player.runtimePolicy.approvals, "on_request");
-    assert.deepEqual(player.resources, [{
-      id: "skill:typescript",
-      kind: "skill",
-      name: "typescript",
-      reference: "skill://typescript"
-    }, {
-      id: "plugin:eslint",
-      kind: "plugin",
-      name: "eslint",
-      reference: "1.2.3"
-    }]);
-    assert.equal(player.goalCount, 1);
-    assert.equal(player.recentResults.length, 2);
-  }
-
-  const team = runners.find(candidate => candidate.id === fixture.team.id);
-  assert.ok(team);
-  assert.equal(team.kind, "team");
-  if (team.kind === "team") {
-    assert.deepEqual(team.strategy, {
-      mode: "sequence",
-      promptTemplate: "Run the Player in order.",
-      maxRounds: 1
-    });
-    assert.deepEqual(team.players, [{
-      playerId: fixture.player.id,
-      playerName: fixture.player.id,
-      role: "builder",
-      order: 1
-    }]);
-    assert.equal(team.goalCount, 0);
-  }
-
-  const coach = projectionValue(coachViewProjection(fixture.state, fixture.project.id));
-  assert.equal(coach.assessment.summary, "The verified result should be compared with a focused alternative.");
-  assert.equal(coach.weakGoals.length, 0);
-  assert.equal(coach.stalledRuns.length, 0);
-  assert.equal(coach.proposals.length, 3);
-  assert.equal(coach.comparisonRecommendations.length, 1);
-  assert.deepEqual(coach.comparisonRecommendations[0], {
-    id: `comparison-recommendation:${fixture.divergenceId}`,
-    divergenceId: fixture.divergenceId,
-    goalId: fixture.goal.id,
-    goalTitle: fixture.updatedGoalTitle,
-    baseSha: fixture.baseSha,
-    runIds: [fixture.sourceRunId, fixture.alternativeRunId],
-    completedRunCount: 2,
-    status: "comparison_recorded",
-    recommendation: "Review the recorded criterion-by-criterion comparison before deciding: The focused alternative is preferred.",
-    comparisonId: fixture.comparisonId
-  });
-  assert.equal(coach.selectionRecommendations.length, 1);
-  assert.deepEqual(coach.selectionRecommendations[0], {
-    id: `selection-recommendation:${fixture.comparisonId}`,
-    comparisonId: fixture.comparisonId,
-    goalId: fixture.goal.id,
-    goalTitle: fixture.updatedGoalTitle,
-    runIds: [fixture.sourceRunId, fixture.alternativeRunId],
-    status: "decision_recorded",
-    action: "select",
-    recommendation: "The user confirmed this selection: Prefer the focused verified result.",
-    basis: "recorded_decision",
-    recommendedRunId: fixture.alternativeRunId,
-    requiresUserConfirmation: true
-  });
-  const pendingCoach = projectionValue(coachViewProjection({
+test("A target SHA represented with two structural parents is surfaced as an integrity error", () => {
+  const duplicateTargetWithAnotherParent: RunChildNode = {
+    ...fixture.runChildA,
+    parentSha: fixture.coachingChild.commitSha
+  };
+  const invalidState: ProjectState = {
     ...fixture.state,
-    decisions: fixture.state.decisions.filter(decision => decision.comparisonId !== fixture.comparisonId)
-  }, fixture.project.id));
-  assert.equal(pendingCoach.selectionRecommendations[0]?.status, "awaiting_user");
-  assert.equal(pendingCoach.selectionRecommendations[0]?.action, "review_selection");
-  assert.equal(pendingCoach.selectionRecommendations[0]?.requiresUserConfirmation, true);
+    nodes: [...fixture.state.nodes, duplicateTargetWithAnotherParent]
+  };
+  assert.equal(invalidState.nodes.length, 5);
+  assert.equal(invalidState.nodes[1]?.commitSha, invalidState.nodes[4]?.commitSha);
   assert.equal(
-    coach.proposals.find(proposal => proposal.id === fixture.acceptedProposalId)?.status,
-    "confirmed"
+    invalidState.nodes.filter(node => node.projectId === fixture.project.id).length,
+    5
   );
-  assert.equal(
-    coach.proposals.find(proposal => proposal.id === fixture.rejectedProposalId)?.status,
-    "rejected"
-  );
-  const goalProposal = coach.proposals.find(proposal => proposal.id === fixture.acceptedProposalId);
-  assert.equal(goalProposal?.kind, "goal_change");
-  if (goalProposal?.kind === "goal_change") assert.equal(goalProposal.change.title, fixture.updatedGoalTitle);
-  const runnerProposal = coach.proposals.find(proposal => proposal.id === fixture.rejectedProposalId);
-  assert.equal(runnerProposal?.kind, "runner_change");
-  if (runnerProposal?.kind === "runner_change") {
-    assert.equal(runnerProposal.change.from.type, "assigned");
-    assert.equal(runnerProposal.change.from.type === "assigned" ? runnerProposal.change.from.runnerId : undefined, fixture.player.id);
-    assert.equal(runnerProposal.change.to.runnerId, fixture.alternatePlayerId);
+  const item = projectListProjection([{ state: invalidState, context: fixture.context }])[0];
+  assert.equal(item?.integrity.status, "invalid");
+  if (item?.integrity.status === "invalid") assert.equal(item.integrity.code, "duplicate_node");
+
+  const graph = projectionValue(projectGraphProjection(
+    invalidState,
+    fixture.project.id,
+    fixture.context,
+    { limit: 300, cursor: null }
+  ));
+  assert.equal(graph.integrity.status, "invalid");
+  if (graph.integrity.status === "invalid") {
+    assert.equal(graph.integrity.code, "duplicate_node");
+    assert.match(graph.integrity.message, /registered more than once/u);
   }
-  const hunsuProposal = coach.proposals.find(proposal => proposal.id === fixture.hunsuProposalId);
-  assert.equal(hunsuProposal?.kind, "hunsu");
-  if (hunsuProposal?.kind === "hunsu") {
-    assert.equal(hunsuProposal.sourceRun.id, fixture.sourceRunId);
-    assert.equal(hunsuProposal.sourceRun.status, "completed");
-    assert.equal(hunsuProposal.sourceRun.resultSha, fixture.sourceResultSha);
-    assert.equal(hunsuProposal.alternative.type, "goal_change");
-    if (hunsuProposal.alternative.type === "goal_change") {
-      assert.deepEqual(hunsuProposal.alternative.change, {
-        desiredOutcome: "Compare the implementation and review outcomes.",
-        acceptanceCriteria: [fixture.criterion],
-        constraints: [fixture.constraint],
-        priority: 80,
-        assignment: {
-          type: "assigned",
-          runnerId: fixture.team.id,
-          runner: { id: fixture.team.id, kind: "team", name: fixture.team.id }
-        }
-      });
-    }
-  }
+
 });
 
-test("same-base alternative projections show comparison evidence and explicit selection", () => {
-  const comparison = projectionValue(alternativeComparisonProjection(
+test("Sibling Run Nodes count as unresolved divergence until decisions decorate them", () => {
+  const undecidedState: ProjectState = { ...fixture.state, decisions: [] };
+  const undecided = projectListProjection([{ state: undecidedState, context: fixture.context }])[0];
+  assert.equal(undecided?.unresolvedDivergenceCount, 1);
+
+  const selectedWithoutRejections: ProjectState = { ...fixture.state, decisions: [fixture.selection] };
+  const partiallyDecided = projectListProjection([{ state: selectedWithoutRejections, context: fixture.context }])[0];
+  assert.equal(
+    partiallyDecided?.unresolvedDivergenceCount,
+    1,
+    "selection alone does not dispose the remaining sibling alternatives"
+  );
+
+  const resolved = projectListProjection([{ state: fixture.state, context: fixture.context }])[0];
+  assert.equal(resolved?.unresolvedDivergenceCount, 0);
+
+  const graph = projectionValue(projectGraphProjection(
     fixture.state,
     fixture.project.id,
-    fixture.comparisonId
+    fixture.context,
+    { limit: 300, cursor: null }
   ));
-  assert.equal(comparison.baseSha, fixture.baseSha);
-  assert.equal(comparison.id, fixture.comparisonId);
-  assert.equal(comparison.divergenceId, fixture.divergenceId);
-  assert.equal(comparison.summary, "The focused alternative is preferred.");
-  assert.deepEqual(comparison.runIds, [fixture.sourceRunId, fixture.alternativeRunId]);
-  assert.deepEqual(comparison.findings, [{
-    criterion: fixture.criterion,
-    summaries: [
-      { runId: fixture.sourceRunId, summary: "The broad Run passes with extra surface area." },
-      { runId: fixture.alternativeRunId, summary: "The focused Run passes with a smaller change." }
-    ]
-  }]);
-  assert.equal(comparison.alternatives.length, 2);
-  assert.ok(comparison.alternatives.every(alternative => alternative.run.baseSha === fixture.baseSha));
+  assert.equal(graph.nodes.find(node => node.sha === fixture.runChildA.commitSha)?.status, "rejected");
+  assert.equal(graph.nodes.find(node => node.sha === fixture.runChildB.commitSha)?.status, "selected");
 
-  const source = comparison.alternatives.find(alternative => alternative.run.id === fixture.sourceRunId);
-  const alternative = comparison.alternatives.find(candidate => candidate.run.id === fixture.alternativeRunId);
-  assert.ok(source);
-  assert.ok(alternative);
-  assert.equal(source.selected, false);
-  assert.equal(source.rejected, true);
-  assert.equal(source.summary, "The broad Run passes with extra surface area.");
-  assert.equal(source.evidence[0]?.id, fixture.sourceEvidenceId);
-  assert.equal(alternative.selected, true);
-  assert.equal(alternative.rejected, false);
-  assert.equal(alternative.summary, "The focused Run passes with a smaller change.");
-  assert.equal(alternative.evidence[0]?.id, fixture.alternativeEvidenceId);
-  assert.deepEqual(alternative.strengths, [fixture.criterion]);
+  const rejected = projectionValue(nodeDetailProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.runChildA.commitSha,
+    fixture.context
+  ));
+  assert.deepEqual(rejected.decisions.map(decision => decision.kind), ["rejected"]);
 
-  const goal = projectionValue(goalDetailProjection(fixture.state, fixture.project.id, fixture.goal.id));
-  assert.equal(goal.comparisons.length, 1);
-  assert.equal(goal.comparisons[0]?.id, fixture.comparisonId);
-  assert.deepEqual(goal.comparisons[0]?.findings, comparison.findings);
-  const selected = goal.alternatives.find(candidate => candidate.run.id === fixture.alternativeRunId);
-  const rejected = goal.alternatives.find(candidate => candidate.run.id === fixture.sourceRunId);
-  assert.equal(selected?.selected, true);
-  assert.equal(rejected?.rejected, true);
+  const selected = projectionValue(nodeDetailProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.runChildB.commitSha,
+    fixture.context
+  ));
+  assert.deepEqual(selected.decisions.map(decision => decision.kind), ["selected"]);
+  assert.deepEqual(selected.comparisons.map(comparison => comparison.id), [fixture.comparison.id]);
 });
 
-test("Goal decision prefers a later valid selection over a prior partial rejection", () => {
-  const projected = projectionValue(goalDetailProjection(fixture.state, fixture.project.id, fixture.goal.id));
-  assert.equal(projected.decision?.id, fixture.selectionDecisionId);
-  assert.equal(projected.decision?.status, "confirmed");
-  assert.equal(projected.decision?.recommendedRunId, fixture.alternativeRunId);
+test("decisions are scoped by Project when repositories share the same commit SHAs", () => {
+  const projectId = must(makeProjectId("production-trial-copy"));
+  const project: Project = {
+    ...fixture.project,
+    id: projectId,
+    title: must(makeProjectTitle("Production Trial Copy"))
+  };
+  const nodes = fixture.state.nodes.map(node => ({
+    ...node,
+    projectId,
+    managedRef: managedNodeRef(projectId, node.commitSha),
+    payloadDigest: computeNodePayloadDigest({
+      schema: NODE_PAYLOAD_SCHEMA,
+      projectId,
+      commitSha: node.commitSha,
+      treeSha: node.treeSha,
+      plan: node.plan
+    })
+  }));
+  const state: ProjectState = {
+    ...fixture.state,
+    projects: [fixture.project, project],
+    nodes: [...fixture.state.nodes, ...nodes]
+  };
+
+  const graph = projectionValue(projectGraphProjection(
+    state,
+    projectId,
+    fixture.context,
+    { limit: 300, cursor: null }
+  ));
+  assert.equal(graph.nodes.find(node => node.sha === fixture.runChildA.commitSha)?.status, "available");
+  assert.equal(graph.nodes.find(node => node.sha === fixture.runChildB.commitSha)?.status, "available");
+
+  const item = projectListProjection([{ state, context: fixture.context }])
+    .find(candidate => candidate.id === projectId);
+  assert.equal(item?.unresolvedDivergenceCount, 1);
+
+  const detail = projectionValue(nodeDetailProjection(
+    state,
+    projectId,
+    fixture.runChildA.commitSha,
+    fixture.context
+  ));
+  assert.deepEqual(detail.decisions, []);
+});
+
+test("Run detail binds the one Goal snapshot, source Node, and immutable evidence", () => {
+  const detail = projectionValue(runDetailProjection(
+    fixture.state,
+    fixture.project.id,
+    fixture.completedRunA.id
+  ));
+
+  assert.equal(detail.run.status, "completed");
+  assert.equal(detail.sourceNodeTitle, fixture.root.commitTitle);
+  assert.equal(detail.run.goalDigest, computeGoalDigest(fixture.goalA));
+  assert.equal(detail.run.runnerDigest, computeRunnerDigest(fixture.defaultRunner));
+  assert.deepEqual(detail.evidence.map(evidence => evidence.id), [fixture.evidence.id]);
+  assert.equal(detail.evidence[0]?.target.type, "criterion");
+});
+
+test("Event projection preserves sequence, typed summaries, actors, and Graph deep-link targets", () => {
+  const user: DomainActor = { type: "user", id: text("qa-user") };
+  const plugin: DomainActor = { type: "plugin", id: text("hunsu-plugin") };
+  const events: readonly { sequence: number; event: DomainEvent; actor: DomainActor }[] = [
+    {
+      sequence: 41,
+      actor: plugin,
+      event: {
+        type: "RunStarted",
+        meta: eventMeta("event-run-started", "c", fixture.activeRun.startedAt, plugin),
+        run: fixture.activeRun
+      }
+    },
+    {
+      sequence: 42,
+      actor: plugin,
+      event: {
+        type: "RunCompleted",
+        meta: eventMeta("event-run-completed", "d", fixture.completedRunA.completedAt, plugin),
+        result: {
+          runId: fixture.completedRunA.id,
+          branch: fixture.completedRunA.branch,
+          resultSha: fixture.completedRunA.resultNodeSha,
+          verifiedAt: fixture.completedRunA.verifiedAt
+        }
+      }
+    },
+    {
+      sequence: 43,
+      actor: user,
+      event: {
+        type: "AlternativeSelected",
+        meta: eventMeta("event-alternative-selected", "e", fixture.selection.decidedAt, user),
+        decision: fixture.selection
+      }
+    }
+  ];
+
+  const projected = eventListProjection(fixture.state, events);
+  assert.deepEqual(projected.map(event => event.sequence), [41, 42, 43]);
+  assert.deepEqual(projected.map(event => event.type), [
+    "RunStarted",
+    "RunCompleted",
+    "AlternativeSelected"
+  ]);
+  assert.deepEqual(projected.map(event => event.actor.label), ["Plugin", "Plugin", "User"]);
+  assert.deepEqual(projected[0]?.reference, {
+    kind: "run",
+    runId: fixture.activeRun.id,
+    sourceNodeSha: fixture.coachingChild.commitSha,
+    target: { kind: "pending" }
+  });
+  assert.deepEqual(projected[1]?.reference, {
+    kind: "run",
+    runId: fixture.completedRunA.id,
+    sourceNodeSha: fixture.root.commitSha,
+    target: { kind: "registered", nodeSha: fixture.runChildA.commitSha }
+  });
+  assert.deepEqual(projected[2]?.reference, {
+    kind: "node",
+    nodeSha: fixture.runChildB.commitSha
+  });
+  assert.match(projected[2]?.summary ?? "", /^Selected Node /u);
 });
 
 function buildFixture() {
-  let state = emptyProjectState();
-  let commandIndex = 1;
-  const execute = (command: ProjectCommand): void => {
-    state = accept(state, command);
-  };
-  const nextMetadata = (actor: DomainActor = userActor()): ProjectCommand["meta"] => metadata(commandIndex++, actor);
+  const projectId = must(makeProjectId("production-trial"));
+  const workspaceId = must(makeWorkspaceId("workspace-qa"));
+  const rootSha = sha("1");
+  const runChildASha = sha("2");
+  const runChildBSha = sha("3");
+  const coachingChildSha = sha("4");
+  const rootTreeSha = tree("a");
+  const runChildATreeSha = tree("b");
+  const runChildBTreeSha = tree("c");
+  const t0 = timestamp("2026-07-15T00:00:00Z");
+  const t1 = timestamp("2026-07-15T00:01:00Z");
+  const t2 = timestamp("2026-07-15T00:02:00Z");
+  const t3 = timestamp("2026-07-15T00:03:00Z");
+  const t4 = timestamp("2026-07-15T00:04:00Z");
+  const t5 = timestamp("2026-07-15T00:05:00Z");
+  const t6 = timestamp("2026-07-15T00:06:00Z");
 
-  const projectId = take(makeProjectId("project_alpha"));
-  const coachId = take(makeCoachId("coach_alpha"));
-  const playerId = take(makeRunnerId("player_alpha"));
-  const alternatePlayerId = take(makeRunnerId("player_beta"));
-  const teamId = take(makeRunnerId("team_alpha"));
-  const createdAt = time(0);
+  const goalA = goal("validate-production", "Validate production evidence", 100);
+  const goalB = goal("improve-retry", "Improve retry resilience", 80);
+  const goalC = goal("verify-coaching", "Verify coached strategy", 90);
+  const defaultRunner = runner(
+    "Default QA Runner",
+    "bundled",
+    "team/sequence",
+    "1.0.0",
+    "a",
+    { mode: "sequence", maxRounds: 2 }
+  );
+  const customRunner = runner(
+    "Custom Matrix Runner",
+    "acme.qa",
+    "matrix/orchestrator",
+    "2.3.0",
+    "b",
+    { concurrency: 3, strategy: "evidence-first" }
+  );
+  const rootPlan: NodePlan = {
+    schema: NODE_PLAN_SCHEMA,
+    nextGoals: [goalA, goalB],
+    how: defaultRunner
+  };
+  const runChildPlan: NodePlan = {
+    schema: NODE_PLAN_SCHEMA,
+    nextGoals: [goalB],
+    how: defaultRunner
+  };
+  const coachingPlan: NodePlan = {
+    schema: NODE_PLAN_SCHEMA,
+    nextGoals: [goalC],
+    how: customRunner
+  };
+
   const project: Project = {
     id: projectId,
-    workspaceId: take(makeWorkspaceId("workspace_alpha")),
+    workspaceId,
     repository: {
-      owner: take(makeRepositoryOwner("openai")),
-      name: take(makeRepositoryName("hunsu"))
+      owner: must(makeRepositoryOwner("lhj6102")),
+      name: must(makeRepositoryName("hunsu-production-trial"))
     },
-    baseRef: take(makeGitRef("refs/heads/main")),
-    title: take(makeProjectTitle("Hunsu")),
-    objective: take(makeProjectObjective("Prove a GitHub-backed product flow.")),
-    coachId,
-    goalIds: [],
-    runnerIds: [],
-    createdAt,
-    updatedAt: createdAt
+    baseRef: must(makeGitRef("refs/heads/main")),
+    title: must(makeProjectTitle("Production Trial")),
+    rootNodeSha: rootSha,
+    createdAt: t0
   };
-  const coach: Coach = {
-    id: coachId,
+  const root: RootNode = {
+    type: "root",
     projectId,
-    promptTemplate: take(makePromptTemplate("Review evidence and propose deliberate changes.")),
-    resources: [],
-    policy: {
-      goalChanges: "propose_only",
-      runnerChanges: "propose_only",
-      hunsu: "propose_only",
-      selection: "user_only"
-    },
-    createdAt,
-    updatedAt: createdAt
+    commitSha: rootSha,
+    treeSha: rootTreeSha,
+    managedRef: managedNodeRef(projectId, rootSha),
+    commitTitle: text("Base node"),
+    plan: rootPlan,
+    planDigest: computeNodePlanDigest(rootPlan),
+    payloadDigest: computeNodePayloadDigest({
+      schema: NODE_PAYLOAD_SCHEMA,
+      projectId,
+      commitSha: rootSha,
+      treeSha: rootTreeSha,
+      plan: rootPlan
+    }),
+    registeredAt: t0
   };
-  execute({ type: "CreateProject", meta: nextMetadata(), project, coach });
 
-  const player: Player = {
-    kind: "player",
-    id: playerId,
+  const completedRunAId = must(makeRunId("run-a"));
+  const completedRunBId = must(makeRunId("run-b"));
+  const evidenceId = must(makeEvidenceId("evidence-a"));
+  const completedRunA: CompletedRun = {
+    id: completedRunAId,
     projectId,
-    promptTemplate: take(makePromptTemplate("Implement the smallest verified change.")),
-    resources: [{
-      type: "skill",
-      name: take(makeResourceName("typescript")),
-      source: take(makeNonEmptyText("skill://typescript"))
-    }, {
-      type: "plugin",
-      name: take(makeResourceName("eslint")),
-      version: take(makeNonEmptyText("1.2.3"))
-    }],
-    runtimePolicy: { fileAccess: "project_write", network: "denied", approval: "user" },
-    createdAt,
-    updatedAt: createdAt
+    sourceNodeSha: rootSha,
+    goal: goalA,
+    goalDigest: computeGoalDigest(goalA),
+    runner: defaultRunner,
+    runnerDigest: computeRunnerDigest(defaultRunner),
+    branch: runBranchName(projectId, rootSha, completedRunAId),
+    checkpoints: [],
+    evidenceIds: [evidenceId],
+    startedAt: t1,
+    status: "completed",
+    resultNodeSha: runChildASha,
+    verifiedAt: t2,
+    completedAt: t2
   };
-  const alternatePlayer: Player = {
-    ...player,
-    id: alternatePlayerId,
-    promptTemplate: take(makePromptTemplate("Implement a broader alternative."))
+  const completedRunB: CompletedRun = {
+    id: completedRunBId,
+    projectId,
+    sourceNodeSha: rootSha,
+    goal: goalA,
+    goalDigest: computeGoalDigest(goalA),
+    runner: defaultRunner,
+    runnerDigest: computeRunnerDigest(defaultRunner),
+    branch: runBranchName(projectId, rootSha, completedRunBId),
+    checkpoints: [],
+    evidenceIds: [],
+    startedAt: t1,
+    status: "completed",
+    resultNodeSha: runChildBSha,
+    verifiedAt: t3,
+    completedAt: t3
   };
-  execute({ type: "CreatePlayer", meta: nextMetadata(), player });
-  execute({ type: "CreatePlayer", meta: nextMetadata(), player: alternatePlayer });
-
-  const team: Team = {
-    kind: "team",
-    id: teamId,
+  const runChildA = runChild(
     projectId,
-    strategy: {
-      mode: "sequence",
-      promptTemplate: take(makePromptTemplate("Run the Player in order.")),
-      maxRounds: take(makePositiveInteger(1))
-    },
-    players: [{
-      playerId,
-      role: take(makeNonEmptyText("builder")),
-      order: take(makePositiveInteger(1))
-    }],
-    createdAt,
-    updatedAt: createdAt
+    runChildASha,
+    runChildATreeSha,
+    rootSha,
+    completedRunAId,
+    goalA,
+    runChildPlan,
+    "Verified result A",
+    t1
+  );
+  const runChildB = runChild(
+    projectId,
+    runChildBSha,
+    runChildBTreeSha,
+    rootSha,
+    completedRunBId,
+    goalA,
+    runChildPlan,
+    "Verified result B",
+    t2
+  );
+
+  const proposalId = must(makeCoachingProposalId("coach-transition"));
+  const proposal: CoachingProposal = {
+    id: proposalId,
+    projectId,
+    sourceNodeSha: rootSha,
+    sourcePayloadDigest: root.payloadDigest,
+    sourcePlanDigest: root.planDigest,
+    proposedPlan: coachingPlan,
+    proposedPlanDigest: computeNodePlanDigest(coachingPlan),
+    expectedStateSha: sha("f"),
+    reason: must(makeReason("Use a custom evidence-first matrix Runner.")),
+    proposedAt: t2
   };
-  execute({ type: "CreateTeam", meta: nextMetadata(), team });
-
-  const originalGoalTitle = take(makeGoalTitle("Deliver the verified Project slice"));
-  const updatedGoalTitle = take(makeGoalTitle("Deliver the verified Project slice with comparison"));
-  const criterion = take(makeAcceptanceCriterion("The result is verified against the Run branch."));
-  const constraint = take(makeGoalConstraint("Keep repository state free of credentials."));
-  const goal: ActiveGoal = {
-    id: take(makeGoalId("goal_alpha")),
+  const coachingChild: CoachingChildNode = {
+    type: "coaching_child",
     projectId,
-    title: originalGoalTitle,
-    desiredOutcome: take(makeDesiredOutcome("A verified Run appears in the Project.")),
-    acceptanceCriteria: [criterion],
-    constraints: [constraint],
-    priority: take(makeNonNegativeInteger(70)),
-    assignment: { type: "assigned", runnerId: playerId },
-    relation: { type: "root" },
-    status: "active",
-    createdAt,
-    updatedAt: createdAt
+    commitSha: coachingChildSha,
+    treeSha: rootTreeSha,
+    managedRef: managedNodeRef(projectId, coachingChildSha),
+    commitTitle: text("Coach QA strategy"),
+    plan: coachingPlan,
+    planDigest: computeNodePlanDigest(coachingPlan),
+    payloadDigest: computeNodePayloadDigest({
+      schema: NODE_PAYLOAD_SCHEMA,
+      projectId,
+      commitSha: coachingChildSha,
+      treeSha: rootTreeSha,
+      plan: coachingPlan
+    }),
+    registeredAt: t3,
+    parentSha: rootSha,
+    proposalId
   };
-  execute({ type: "CreateGoal", meta: nextMetadata(), goal });
+  const coachingDecision: ConfirmedCoachingProposalDecision = {
+    status: "confirmed",
+    id: must(makeDecisionId("confirm-coaching")),
+    proposalId,
+    childNodeSha: coachingChildSha,
+    reason: must(makeReason("Confirmed after reviewing the complete plan.")),
+    decidedAt: t3
+  };
 
-  const baseSha = take(makeGitCommitSha("a".repeat(40)));
-  const sourceResultSha = take(makeGitCommitSha("b".repeat(40)));
-  const alternativeResultSha = take(makeGitCommitSha("c".repeat(40)));
-  const sourceRunId = take(makeRunId("run_source"));
-  const alternativeRunId = take(makeRunId("run_alternative"));
-  execute({
-    type: "StartRun",
-    meta: nextMetadata(pluginActor()),
-    runId: sourceRunId,
+  const activeRunId = must(makeRunId("run-active"));
+  const activeRun: RunningRun = {
+    id: activeRunId,
     projectId,
-    goalId: goal.id,
-    runnerId: playerId,
-    baseSha,
-    branch: runBranchName(projectId, goal.id, sourceRunId),
-    origin: { type: "primary" }
-  });
-  execute({
-    type: "CheckpointRun",
-    meta: nextMetadata(pluginActor()),
-    checkpoint: {
-      id: take(makeCheckpointId("checkpoint_source")),
-      runId: sourceRunId,
-      summary: take(makeEvidenceSummary("Acceptance check committed.")),
-      commitSha: sourceResultSha,
-      recordedAt: time(commandIndex)
-    }
-  });
+    sourceNodeSha: coachingChildSha,
+    goal: goalC,
+    goalDigest: computeGoalDigest(goalC),
+    runner: customRunner,
+    runnerDigest: computeRunnerDigest(customRunner),
+    branch: runBranchName(projectId, coachingChildSha, activeRunId),
+    checkpoints: [],
+    evidenceIds: [],
+    startedAt: t4,
+    status: "running"
+  };
 
-  const sourceEvidenceId = take(makeEvidenceId("evidence_source"));
-  execute({
-    type: "AttachRunEvidence",
-    meta: nextMetadata(pluginActor()),
-    evidence: {
-      id: sourceEvidenceId,
-      projectId,
-      runId: sourceRunId,
-      criterion,
-      kind: "check",
-      summary: take(makeEvidenceSummary("Acceptance check passed.")),
-      location: {
-        type: "git",
-        commitSha: sourceResultSha,
-        path: take(makeNonEmptyText("reports/acceptance.json"))
-      },
-      recordedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "CompleteRun",
-    meta: nextMetadata(pluginActor()),
-    result: {
-      runId: sourceRunId,
-      branch: runBranchName(projectId, goal.id, sourceRunId),
-      resultSha: sourceResultSha,
-      verifiedAt: time(commandIndex)
-    }
-  });
-
-  execute({
-    type: "RecordCoachReview",
-    meta: nextMetadata(coachActor(coachId)),
-    review: {
-      id: take(makeCoachReviewId("review_alpha")),
-      projectId,
-      coachId,
-      target: { type: "run", runId: sourceRunId },
-      assessment: take(makeNonEmptyText("The verified result should be compared with a focused alternative.")),
-      recommendations: [take(makeNonEmptyText("Compare a smaller implementation."))],
-      recordedAt: time(commandIndex)
-    }
-  });
-
-  const acceptedProposalId = take(makeCoachProposalId("proposal_goal_change"));
-  execute({
-    type: "RecordCoachProposal",
-    meta: nextMetadata(coachActor(coachId)),
-    proposal: {
-      type: "goal_change",
-      id: acceptedProposalId,
-      projectId,
-      coachId,
-      goalId: goal.id,
-      change: { title: updatedGoalTitle },
-      reason: take(makeReason("Make the comparison requirement explicit.")),
-      proposedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "AcceptCoachProposal",
-    meta: nextMetadata(),
-    proposalId: acceptedProposalId,
-    reason: take(makeReason("The clarification is useful.")),
-    application: { type: "apply_change" }
-  });
-
-  const rejectedProposalId = take(makeCoachProposalId("proposal_runner_change"));
-  execute({
-    type: "RecordCoachProposal",
-    meta: nextMetadata(coachActor(coachId)),
-    proposal: {
-      type: "runner_change",
-      id: rejectedProposalId,
-      projectId,
-      coachId,
-      goalId: goal.id,
-      runnerId: alternatePlayerId,
-      reason: take(makeReason("Use the broader Player.")),
-      proposedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "RejectCoachProposal",
-    meta: nextMetadata(),
-    proposalId: rejectedProposalId,
-    reason: take(makeReason("Keep the focused Player."))
-  });
-
-  const hunsuProposalId = take(makeCoachProposalId("proposal_hunsu_goal_change"));
-  execute({
-    type: "RecordCoachProposal",
-    meta: nextMetadata(coachActor(coachId)),
-    proposal: {
-      type: "hunsu",
-      id: hunsuProposalId,
-      projectId,
-      coachId,
-      goalId: goal.id,
-      sourceRunId,
-      alternative: {
-        type: "goal_change",
-        change: {
-          desiredOutcome: take(makeDesiredOutcome("Compare the implementation and review outcomes.")),
-          acceptanceCriteria: [criterion],
-          constraints: [constraint],
-          priority: take(makeNonNegativeInteger(80)),
-          assignment: { type: "assigned", runnerId: teamId }
-        }
-      },
-      reason: take(makeReason("Compare an explicitly coordinated Goal alternative.")),
-      proposedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "RejectCoachProposal",
-    meta: nextMetadata(),
-    proposalId: hunsuProposalId,
-    reason: take(makeReason("Keep the user-created divergence for this fixture."))
-  });
-
-  const divergenceId = take(makeDivergenceId("divergence_alpha"));
-  execute({
-    type: "ConfirmHunsu",
-    meta: nextMetadata(),
-    divergenceId,
+  const evidence: EvidenceRef = {
+    id: evidenceId,
     projectId,
-    goalId: goal.id,
-    sourceRunId,
-    basis: { type: "user", reason: take(makeReason("Compare a focused sibling.")) }
-  });
-  execute({
-    type: "StartRun",
-    meta: nextMetadata(pluginActor()),
-    runId: alternativeRunId,
+    runId: completedRunAId,
+    target: { type: "criterion", criterion: goalA.acceptanceCriteria[0] },
+    kind: "check",
+    summary: must(makeEvidenceSummary("Production acceptance check passed.")),
+    location: { type: "url", url: text("https://example.test/evidence/acceptance") },
+    recordedAt: t2
+  };
+  const comparison: AlternativeComparison = {
+    id: must(makeComparisonId("comparison-ab")),
     projectId,
-    goalId: goal.id,
-    runnerId: playerId,
-    baseSha,
-    branch: runBranchName(projectId, goal.id, alternativeRunId),
-    origin: { type: "hunsu_alternative", divergenceId, sourceRunId }
-  });
-
-  const alternativeEvidenceId = take(makeEvidenceId("evidence_alternative"));
-  execute({
-    type: "AttachRunEvidence",
-    meta: nextMetadata(pluginActor()),
-    evidence: {
-      id: alternativeEvidenceId,
-      projectId,
-      runId: alternativeRunId,
-      criterion,
-      kind: "report",
-      summary: take(makeEvidenceSummary("Focused implementation report.")),
-      location: {
-        type: "url",
-        url: take(makeNonEmptyText("https://example.test/reports/focused"))
-      },
-      recordedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "CompleteRun",
-    meta: nextMetadata(pluginActor()),
-    result: {
-      runId: alternativeRunId,
-      branch: runBranchName(projectId, goal.id, alternativeRunId),
-      resultSha: alternativeResultSha,
-      verifiedAt: time(commandIndex)
-    }
-  });
-
-  const comparisonId = take(makeComparisonId("comparison_alpha"));
-  execute({
-    type: "CompareAlternatives",
-    meta: nextMetadata(),
-    comparisonId,
-    divergenceId,
-    runIds: [sourceRunId, alternativeRunId],
+    parentNodeSha: rootSha,
+    nodeShas: [runChildASha, runChildBSha],
     findings: [{
-      criterion,
+      subject: text("Acceptance evidence"),
       summaries: [
-        { runId: sourceRunId, summary: take(makeEvidenceSummary("The broad Run passes with extra surface area.")) },
-        { runId: alternativeRunId, summary: take(makeEvidenceSummary("The focused Run passes with a smaller change.")) }
+        { nodeSha: runChildASha, summary: must(makeEvidenceSummary("Complete but broad.")) },
+        { nodeSha: runChildBSha, summary: must(makeEvidenceSummary("Complete and focused.")) }
       ]
     }],
-    summary: take(makeEvidenceSummary("The focused alternative is preferred."))
-  });
-  const rejectionDecisionId = take(makeDecisionId("decision_reject_source"));
-  execute({
-    type: "RejectAlternatives",
-    meta: nextMetadata(),
-    decisionId: rejectionDecisionId,
-    comparisonId,
-    rejectedRunIds: [sourceRunId],
-    rationale: take(makeReason("The source Run carries unnecessary surface area."))
-  });
-  const selectionDecisionId = take(makeDecisionId("decision_alpha"));
-  execute({
-    type: "SelectAlternative",
-    meta: nextMetadata(),
-    decisionId: selectionDecisionId,
-    comparisonId,
-    selectedRunId: alternativeRunId,
-    rationale: take(makeReason("Prefer the focused verified result."))
-  });
-  execute({
-    type: "CompleteGoal",
-    meta: nextMetadata(),
-    goalId: goal.id,
-    selectedRunId: alternativeRunId
-  });
+    summary: must(makeEvidenceSummary("Result B is the focused alternative.")),
+    recordedAt: t5
+  };
+  const rejection: RejectionDecision = {
+    type: "rejection",
+    id: must(makeDecisionId("reject-result-a")),
+    projectId,
+    comparisonId: comparison.id,
+    rejectedNodeShas: [runChildASha],
+    rationale: must(makeReason("Result A changes unnecessary files.")),
+    decidedAt: t6
+  };
+  const selection: SelectionDecision = {
+    type: "selection",
+    id: must(makeDecisionId("select-result-b")),
+    projectId,
+    comparisonId: comparison.id,
+    selectedNodeSha: runChildBSha,
+    rationale: must(makeReason("Result B has the smallest verified surface.")),
+    decidedAt: t6
+  };
 
-  const foreign = addForeignProject(state, commandIndex);
-  state = foreign.state;
-
+  const state: ProjectState = {
+    projects: [project],
+    nodes: [root, runChildA, runChildB, coachingChild],
+    runs: [completedRunA, completedRunB, activeRun],
+    evidence: [evidence],
+    coachReviews: [],
+    coachingProposals: [proposal],
+    coachingProposalDecisions: [coachingDecision],
+    comparisons: [comparison],
+    decisions: [rejection, selection],
+    processedCommands: []
+  };
   const context: ProjectionContext = {
-    health: {
-      repositoryAccess: "healthy",
-      stateRef: "healthy",
-      stateRefName: "hunsu/state",
-      stateHeadSha: "f".repeat(40),
-      projection: "current",
-      synchronizedAt: "2026-07-13T01:00:00.000Z"
-    }
+    defaultBranch: "main",
+    stateHeadSha: "f".repeat(40),
+    synchronizedAt: "2026-07-15T00:07:00Z",
+    digestGoal: goalValue => String(computeGoalDigest(goalValue)),
+    digestRunner: runnerValue => String(computeRunnerDigest(runnerValue))
   };
 
   return {
     state,
     context,
     project,
-    coach,
-    player,
-    alternatePlayerId,
-    team,
-    goal,
-    originalGoalTitle,
-    updatedGoalTitle,
-    criterion,
-    constraint,
-    baseSha,
-    sourceResultSha,
-    sourceRunId,
-    alternativeRunId,
-    sourceEvidenceId,
-    alternativeEvidenceId,
-    acceptedProposalId,
-    rejectedProposalId,
-    hunsuProposalId,
-    divergenceId,
-    comparisonId,
-    rejectionDecisionId,
-    selectionDecisionId,
-    foreignSelectionDecisionId: foreign.selectionDecisionId
+    root,
+    runChildA,
+    runChildB,
+    coachingChild,
+    completedRunA,
+    activeRun,
+    evidence,
+    proposal,
+    comparison,
+    selection,
+    goalA,
+    goalC,
+    defaultRunner,
+    customRunner
   };
 }
 
-function addForeignProject(initial: ProjectState, firstCommandIndex: number) {
-  let state = initial;
-  let commandIndex = firstCommandIndex;
-  const execute = (command: ProjectCommand): void => {
-    state = accept(state, command);
-  };
-  const nextMetadata = (actor: DomainActor = userActor()): ProjectCommand["meta"] => metadata(commandIndex++, actor);
-
-  const projectId = take(makeProjectId("project_foreign"));
-  const coachId = take(makeCoachId("coach_foreign"));
-  const playerId = take(makeRunnerId("player_foreign"));
-  const at = time(commandIndex);
-  const project: Project = {
-    id: projectId,
-    workspaceId: take(makeWorkspaceId("workspace_foreign")),
-    repository: {
-      owner: take(makeRepositoryOwner("openai")),
-      name: take(makeRepositoryName("foreign"))
-    },
-    baseRef: take(makeGitRef("refs/heads/main")),
-    title: take(makeProjectTitle("Foreign Project")),
-    objective: take(makeProjectObjective("Prove Project decision isolation.")),
-    coachId,
-    goalIds: [],
-    runnerIds: [],
-    createdAt: at,
-    updatedAt: at
-  };
-  const coach: Coach = {
-    id: coachId,
-    projectId,
-    promptTemplate: take(makePromptTemplate("Review the foreign Project.")),
-    resources: [],
-    policy: {
-      goalChanges: "propose_only",
-      runnerChanges: "propose_only",
-      hunsu: "propose_only",
-      selection: "user_only"
-    },
-    createdAt: at,
-    updatedAt: at
-  };
-  const player: Player = {
-    kind: "player",
-    id: playerId,
-    projectId,
-    promptTemplate: take(makePromptTemplate("Build the foreign result.")),
-    resources: [],
-    runtimePolicy: { fileAccess: "project_write", network: "denied", approval: "user" },
-    createdAt: at,
-    updatedAt: at
-  };
-  const goal: ActiveGoal = {
-    id: take(makeGoalId("goal_foreign")),
-    projectId,
-    title: take(makeGoalTitle("Deliver a foreign result")),
-    desiredOutcome: take(makeDesiredOutcome("A foreign decision exists.")),
-    acceptanceCriteria: [take(makeAcceptanceCriterion("The foreign result is verified."))],
-    constraints: [],
-    priority: take(makeNonNegativeInteger(30)),
-    assignment: { type: "assigned", runnerId: playerId },
-    relation: { type: "root" },
-    status: "active",
-    createdAt: at,
-    updatedAt: at
-  };
-
-  execute({ type: "CreateProject", meta: nextMetadata(), project, coach });
-  execute({ type: "CreatePlayer", meta: nextMetadata(), player });
-  execute({ type: "CreateGoal", meta: nextMetadata(), goal });
-
-  const baseSha = take(makeGitCommitSha("d".repeat(40)));
-  const sourceResultSha = take(makeGitCommitSha("e".repeat(40)));
-  const alternativeResultSha = take(makeGitCommitSha("f".repeat(40)));
-  const criterion = goal.acceptanceCriteria[0];
-  const sourceRunId = take(makeRunId("run_foreign_source"));
-  const alternativeRunId = take(makeRunId("run_foreign_alternative"));
-  execute({
-    type: "StartRun",
-    meta: nextMetadata(pluginActor()),
-    runId: sourceRunId,
-    projectId,
-    goalId: goal.id,
-    runnerId: playerId,
-    baseSha,
-    branch: runBranchName(projectId, goal.id, sourceRunId),
-    origin: { type: "primary" }
-  });
-  execute({
-    type: "AttachRunEvidence",
-    meta: nextMetadata(pluginActor()),
-    evidence: {
-      id: take(makeEvidenceId("evidence_foreign_source")),
-      projectId,
-      runId: sourceRunId,
-      criterion,
-      kind: "check",
-      summary: take(makeEvidenceSummary("The foreign source result is verified.")),
-      location: { type: "git", commitSha: sourceResultSha, path: take(makeNonEmptyText("reports/source.json")) },
-      recordedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "CompleteRun",
-    meta: nextMetadata(pluginActor()),
-    result: {
-      runId: sourceRunId,
-      branch: runBranchName(projectId, goal.id, sourceRunId),
-      resultSha: sourceResultSha,
-      verifiedAt: time(commandIndex)
-    }
-  });
-
-  const divergenceId = take(makeDivergenceId("divergence_foreign"));
-  execute({
-    type: "ConfirmHunsu",
-    meta: nextMetadata(),
-    divergenceId,
-    projectId,
-    goalId: goal.id,
-    sourceRunId,
-    basis: { type: "user", reason: take(makeReason("Compare a foreign sibling.")) }
-  });
-  execute({
-    type: "UpdatePlayer",
-    meta: nextMetadata(),
-    player: {
-      ...player,
-      promptTemplate: take(makePromptTemplate("Build the foreign sibling with a narrower approach.")),
-      updatedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "StartRun",
-    meta: nextMetadata(pluginActor()),
-    runId: alternativeRunId,
-    projectId,
-    goalId: goal.id,
-    runnerId: playerId,
-    baseSha,
-    branch: runBranchName(projectId, goal.id, alternativeRunId),
-    origin: { type: "hunsu_alternative", divergenceId, sourceRunId }
-  });
-  execute({
-    type: "AttachRunEvidence",
-    meta: nextMetadata(pluginActor()),
-    evidence: {
-      id: take(makeEvidenceId("evidence_foreign_alternative")),
-      projectId,
-      runId: alternativeRunId,
-      criterion,
-      kind: "check",
-      summary: take(makeEvidenceSummary("The foreign alternative result is verified.")),
-      location: { type: "git", commitSha: alternativeResultSha, path: take(makeNonEmptyText("reports/alternative.json")) },
-      recordedAt: time(commandIndex)
-    }
-  });
-  execute({
-    type: "CompleteRun",
-    meta: nextMetadata(pluginActor()),
-    result: {
-      runId: alternativeRunId,
-      branch: runBranchName(projectId, goal.id, alternativeRunId),
-      resultSha: alternativeResultSha,
-      verifiedAt: time(commandIndex)
-    }
-  });
-
-  const comparisonId = take(makeComparisonId("comparison_foreign"));
-  execute({
-    type: "CompareAlternatives",
-    meta: nextMetadata(),
-    comparisonId,
-    divergenceId,
-    runIds: [sourceRunId, alternativeRunId],
-    findings: [{
-      criterion,
-      summaries: [
-        { runId: sourceRunId, summary: take(makeEvidenceSummary("The foreign source satisfies the criterion.")) },
-        { runId: alternativeRunId, summary: take(makeEvidenceSummary("The foreign alternative satisfies the criterion.")) }
-      ]
-    }],
-    summary: take(makeEvidenceSummary("The foreign alternative is preferred."))
-  });
-  const selectionDecisionId = take(makeDecisionId("decision_foreign"));
-  execute({
-    type: "SelectAlternative",
-    meta: nextMetadata(),
-    decisionId: selectionDecisionId,
-    comparisonId,
-    selectedRunId: alternativeRunId,
-    rationale: take(makeReason("Select the foreign alternative."))
-  });
-
-  return { state, selectionDecisionId };
-}
-
-function accept(state: ProjectState, command: ProjectCommand): ProjectState {
-  const applied = applyProjectCommand(state, command);
-  if (!applied.ok) throw new Error(applied.error.code + ": " + applied.error.message);
-  return applied.value.state;
-}
-
-function metadata(index: number, actor: DomainActor): ProjectCommand["meta"] {
+function runChild(
+  projectId: Project["id"],
+  commitSha: RootNode["commitSha"],
+  treeSha: RootNode["treeSha"],
+  parentSha: RootNode["commitSha"],
+  runId: CompletedRun["id"],
+  consumedGoal: GoalValue,
+  plan: NodePlan,
+  commitTitle: string,
+  registeredAt: RootNode["registeredAt"]
+): RunChildNode {
   return {
-    eventId: take(makeEventId("event_projection_" + index)),
-    idempotencyKey: take(makeIdempotencyKey(index.toString(16).padStart(64, "0"))),
-    fingerprint: take(makeCommandFingerprint((index + 4096).toString(16).padStart(64, "0"))),
-    actor,
-    requestedAt: time(index)
+    type: "run_child",
+    projectId,
+    commitSha,
+    treeSha,
+    managedRef: managedNodeRef(projectId, commitSha),
+    commitTitle: text(commitTitle),
+    plan,
+    planDigest: computeNodePlanDigest(plan),
+    payloadDigest: computeNodePayloadDigest({
+      schema: NODE_PAYLOAD_SCHEMA,
+      projectId,
+      commitSha,
+      treeSha,
+      plan
+    }),
+    registeredAt,
+    parentSha,
+    runId,
+    consumedGoalDigest: computeGoalDigest(consumedGoal)
   };
 }
 
-function userActor(): DomainActor {
-  return { type: "user", id: take(makeNonEmptyText("user-alpha")) };
+function goal(key: string, title: string, priority: number): GoalValue {
+  return {
+    key: must(makeGoalKey(key)),
+    title: must(makeGoalTitle(title)),
+    desiredOutcome: must(makeDesiredOutcome(`${title} is demonstrably complete.`)),
+    acceptanceCriteria: [must(makeAcceptanceCriterion(`${title} passes its acceptance check.`))],
+    constraints: [must(makeGoalConstraint("Do not change main."))],
+    priority: must(makeNonNegativeInteger(priority))
+  };
 }
 
-function pluginActor(): DomainActor {
-  return { type: "plugin", id: take(makeNonEmptyText("hunsu-plugin")) };
+function runner(
+  name: string,
+  origin: string,
+  key: string,
+  schemaVersion: string,
+  integritySeed: string,
+  value: RunnerValue["value"]
+): RunnerValue {
+  return {
+    schema: RUNNER_VALUE_SCHEMA,
+    type: {
+      origin: must(makeRunnerTypeOrigin(origin)),
+      key: must(makeRunnerTypeKey(key)),
+      schemaVersion: must(makeRunnerSchemaVersion(schemaVersion)),
+      integrity: must(makeRunnerTypeIntegrity(
+        `hunsu-runner-type-v1:sha256:${integritySeed.repeat(64)}`
+      ))
+    },
+    name: text(name),
+    value
+  };
 }
 
-function coachActor(coachId: Coach["id"]): DomainActor {
-  return { type: "coach", coachId };
+function eventMeta(
+  id: string,
+  digestSeed: string,
+  recordedAt: EventMetadata["recordedAt"],
+  actor: DomainActor
+): EventMetadata {
+  return {
+    eventId: must(makeEventId(id)),
+    idempotencyKey: must(makeIdempotencyKey(digestSeed.repeat(64))),
+    fingerprint: must(makeCommandFingerprint(digestSeed.repeat(64))),
+    actor,
+    recordedAt
+  };
 }
 
-function time(index: number) {
-  return take(makeIsoTimestamp("2026-07-13T00:00:" + String(index).padStart(2, "0") + ".000Z"));
+function sha(seed: string) {
+  return must(makeGitCommitSha(seed.repeat(40)));
+}
+
+function tree(seed: string) {
+  return must(makeGitTreeSha(seed.repeat(40)));
+}
+
+function timestamp(value: string) {
+  return must(makeIsoTimestamp(value));
+}
+
+function text(value: string) {
+  return must(makeNonEmptyText(value));
 }
 
 function projectionValue<T>(result: ProjectionResult<T>): T {
-  if (!result.ok) throw new Error(result.error.code + ": " + result.error.message);
+  if (!result.ok) assert.fail(result.error.message);
   return result.value;
 }
 
-function take<T, E>(result: Result<T, E>): T {
-  if (!result.ok) throw new Error("Fixture construction failed");
+function must<T, E>(result: Result<T, E>): T {
+  if (!result.ok) throw new Error(`Fixture primitive was invalid: ${JSON.stringify(result.error)}`);
   return result.value;
 }

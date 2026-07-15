@@ -1,23 +1,34 @@
-import { err, ok } from "@hunsu/protocol";
+import {
+  err,
+  ok,
+  type RunnerTypeIntegrity,
+  type RunnerTypeLock,
+  type RunnerValueTypeDecoder,
+  type RunnerValueTypeRegistry
+} from "@hunsu/protocol";
 import { canonicalJson, sha256Hex } from "./canonical.ts";
 import {
+  decodeDefinitionIntegrity,
   decodeDefinitionLock,
   decodeRegistryDefinition,
-  decodeRegistryIntegrity,
-  decodeRegistryOrigin
+  decodeRegistryOrigin,
+  decodeRunnerTypeLock
 } from "./decoder.ts";
 import {
   REGISTRY_INTEGRITY_PREFIX,
   REGISTRY_SNAPSHOT_SCHEMA,
+  RUNNER_TYPE_INTEGRITY_PREFIX,
+  type DefinitionIntegrity,
+  type DefinitionKind,
   type DefinitionLock,
   type DefinitionRegistry,
   type RegistryDefinition,
   type RegistryEntry,
-  type RegistryIntegrity,
   type RegistryResult,
-  type RunnerDefinition,
-  type TeamDefinition
+  type ResolvedRunnerType,
+  type RunnerTypeDefinition
 } from "./model.ts";
+import { decodeRunnerValuePayload } from "./runner-value.ts";
 
 export function canonicalizeRegistryDefinition(value: unknown): RegistryResult<string> {
   const definition = decodeRegistryDefinition(value);
@@ -25,16 +36,21 @@ export function canonicalizeRegistryDefinition(value: unknown): RegistryResult<s
   return canonicalJson(definition.value);
 }
 
-export function computeRegistryIntegrity(value: unknown): RegistryResult<RegistryIntegrity> {
-  const canonical = canonicalizeRegistryDefinition(value);
+export function computeDefinitionIntegrity(value: unknown): RegistryResult<DefinitionIntegrity> {
+  const definition = decodeRegistryDefinition(value);
+  if (!definition.ok) return definition;
+  const canonical = canonicalJson(definition.value);
   if (!canonical.ok) return canonical;
-  return ok(`${REGISTRY_INTEGRITY_PREFIX}${sha256Hex(canonical.value)}` as RegistryIntegrity);
+  const prefix = definition.value.kind === "runner_type" ? RUNNER_TYPE_INTEGRITY_PREFIX : REGISTRY_INTEGRITY_PREFIX;
+  return ok(`${prefix}${sha256Hex(canonical.value)}` as DefinitionIntegrity);
 }
 
-export function verifyRegistryIntegrity(value: unknown, expectedValue: unknown): RegistryResult<true> {
-  const expected = decodeRegistryIntegrity(expectedValue, "$.integrity");
+export function verifyDefinitionIntegrity(value: unknown, expectedValue: unknown): RegistryResult<true> {
+  const definition = decodeRegistryDefinition(value);
+  if (!definition.ok) return definition;
+  const expected = decodeDefinitionIntegrity(expectedValue, definition.value.kind, "$.integrity");
   if (!expected.ok) return expected;
-  const actual = computeRegistryIntegrity(value);
+  const actual = computeDefinitionIntegrity(definition.value);
   if (!actual.ok) return actual;
   return expected.value === actual.value
     ? ok(true)
@@ -46,7 +62,7 @@ export function createDefinitionLock(originValue: unknown, definitionValue: unkn
   if (!origin.ok) return origin;
   const definition = decodeRegistryDefinition(definitionValue, "$.definition");
   if (!definition.ok) return definition;
-  const integrity = computeRegistryIntegrity(definition.value);
+  const integrity = computeDefinitionIntegrity(definition.value);
   if (!integrity.ok) return integrity;
   return ok({
     origin: origin.value,
@@ -90,7 +106,7 @@ export function decodeDefinitionRegistry(value: unknown, path = "$" ): RegistryR
     if (lock.value.kind !== definition.value.kind || lock.value.key !== definition.value.key || lock.value.version !== definition.value.version) {
       return identityError(entryPath, "lock kind, key, and version must exactly match the definition");
     }
-    const actual = computeRegistryIntegrity(definition.value);
+    const actual = computeDefinitionIntegrity(definition.value);
     if (!actual.ok) return actual;
     if (lock.value.integrity !== actual.value) {
       return integrityError(`${entryPath}.lock.integrity`, lock.value.integrity, actual.value);
@@ -104,14 +120,11 @@ export function decodeDefinitionRegistry(value: unknown, path = "$" ): RegistryR
   const registry: DefinitionRegistry = { schema: REGISTRY_SNAPSHOT_SCHEMA, entries };
   for (let index = 0; index < entries.length; index += 1) {
     const references = definitionReferences(entries[index]!.definition);
-    for (let referenceIndex = 0; referenceIndex < references.length; referenceIndex += 1) {
-      const reference = references[referenceIndex]!;
+    for (const reference of references) {
       const resolved = resolveEntry(registry, reference.lock, `${path}.entries[${index}].definition.${reference.path}`);
-      if (!resolved.ok) {
-        if (entries[index]!.definition.kind === "team") {
-          return teamError(resolved.error.path, describeError(resolved.error));
-        }
-        return resolved;
+      if (!resolved.ok) return resolved;
+      if (resolved.value.definition.kind !== reference.lock.kind) {
+        return resolutionError(reference.path, `definition must resolve to kind ${reference.lock.kind}`);
       }
     }
   }
@@ -127,31 +140,62 @@ export function resolveRegistryDefinition(registryValue: unknown, lockValue: unk
   return entry.ok ? ok(entry.value.definition) : entry;
 }
 
-export function resolveRunnerDefinition(registryValue: unknown, lockValue: unknown): RegistryResult<RunnerDefinition> {
+export function definitionLockToRunnerTypeLock(lockValue: unknown): RegistryResult<RunnerTypeLock> {
   const lock = decodeDefinitionLock(lockValue, "$.lock");
   if (!lock.ok) return lock;
-  if (lock.value.kind !== "player" && lock.value.kind !== "team") {
-    return resolutionError("$.lock.kind", "Runner definition lock must target a Player or Team");
-  }
-  const definition = resolveRegistryDefinition(registryValue, lock.value);
-  if (!definition.ok) return definition;
-  return definition.value.kind === "player" || definition.value.kind === "team"
-    ? ok(definition.value)
-    : resolutionError("$.lock.kind", "resolved definition is not a Runner");
+  if (lock.value.kind !== "runner_type") return resolutionError("$.lock.kind", "definition lock must target a Runner type");
+  return decodeRunnerTypeLock({
+    origin: lock.value.origin,
+    key: lock.value.key,
+    schemaVersion: lock.value.version,
+    integrity: lock.value.integrity
+  }, "$.lock");
 }
 
-export function validateTeamMembership(teamValue: unknown, registryValue: unknown): RegistryResult<true> {
-  const team = decodeRegistryDefinition(teamValue, "$.team");
-  if (!team.ok) return team;
-  if (team.value.kind !== "team") return teamError("$.team.kind", "definition must be a Team");
+export function resolveRunnerTypeDefinition(registryValue: unknown, lockValue: unknown): RegistryResult<ResolvedRunnerType> {
   const registry = decodeDefinitionRegistry(registryValue, "$.registry");
   if (!registry.ok) return registry;
-  for (let index = 0; index < team.value.team.players.length; index += 1) {
-    const resolved = resolveEntry(registry.value, team.value.team.players[index]!.player, `$.team.team.players[${index}].player`);
-    if (!resolved.ok) return teamError(resolved.error.path, describeError(resolved.error));
-    if (resolved.value.definition.kind !== "player") return teamError(`$.team.team.players[${index}].player`, "Team membership must resolve to a Player");
+  const lock = decodeRunnerTypeLock(lockValue, "$.lock");
+  if (!lock.ok) return lock;
+  const entry = registry.value.entries.find(candidate =>
+    candidate.lock.kind === "runner_type"
+    && String(candidate.lock.origin) === String(lock.value.origin)
+    && String(candidate.lock.key) === String(lock.value.key)
+    && String(candidate.lock.version) === String(lock.value.schemaVersion)
+  );
+  if (!entry || entry.definition.kind !== "runner_type") {
+    return resolutionError("$.lock", `Runner type not found: ${lock.value.origin}/${lock.value.key}@${lock.value.schemaVersion}`);
   }
-  return ok(true);
+  if (entry.lock.integrity !== lock.value.integrity) {
+    return integrityError("$.lock.integrity", lock.value.integrity, entry.lock.integrity);
+  }
+  return ok({ lock: lock.value, definition: entry.definition });
+}
+
+export function createRunnerValueTypeDecoder(registryValue: unknown, lockValue: unknown): RegistryResult<RunnerValueTypeDecoder> {
+  const resolved = resolveRunnerTypeDefinition(registryValue, lockValue);
+  if (!resolved.ok) return resolved;
+  return ok(decoderFor(resolved.value.lock, resolved.value.definition));
+}
+
+export function createRunnerValueTypeRegistry(registryValue: unknown): RegistryResult<RunnerValueTypeRegistry> {
+  const registry = decodeDefinitionRegistry(registryValue, "$.registry");
+  if (!registry.ok) return registry;
+  const decoders: RunnerValueTypeDecoder[] = [];
+  for (const entry of registry.value.entries) {
+    if (entry.definition.kind !== "runner_type") continue;
+    const lock = definitionLockToRunnerTypeLock(entry.lock);
+    if (!lock.ok) return lock;
+    decoders.push(decoderFor(lock.value, entry.definition));
+  }
+  return ok(decoders);
+}
+
+function decoderFor(lock: RunnerTypeLock, definition: RunnerTypeDefinition): RunnerValueTypeDecoder {
+  return {
+    type: lock,
+    decode: (value, path) => decodeRunnerValuePayload(definition.runnerType.valueSchema, value, path)
+  };
 }
 
 function resolveEntry(registry: DefinitionRegistry, lock: DefinitionLock, path: string): RegistryResult<RegistryEntry> {
@@ -163,10 +207,8 @@ function resolveEntry(registry: DefinitionRegistry, lock: DefinitionLock, path: 
 
 function definitionReferences(definition: RegistryDefinition): readonly { readonly path: string; readonly lock: DefinitionLock }[] {
   switch (definition.kind) {
-    case "player":
-      return definition.player.resources.map((lock, index) => ({ path: `player.resources[${index}]`, lock }));
-    case "team":
-      return definition.team.players.map((playerSlot, index) => ({ path: `team.players[${index}].player`, lock: playerSlot.player }));
+    case "runner_type":
+      return [{ path: "runnerType.executor.resource", lock: definition.runnerType.executor.resource }];
     case "coach":
       return definition.coach.resources.map((lock, index) => ({ path: `coach.resources[${index}]`, lock }));
     case "skill":
@@ -203,20 +245,10 @@ function identityError(path: string, message: string): RegistryResult<never> {
   return err({ type: "RegistryIdentityError", path, message });
 }
 
-function integrityError(path: string, expected: RegistryIntegrity, actual: RegistryIntegrity): RegistryResult<never> {
+function integrityError(path: string, expected: DefinitionIntegrity, actual: DefinitionIntegrity): RegistryResult<never> {
   return err({ type: "RegistryIntegrityError", path, expected, actual });
 }
 
 function resolutionError(path: string, message: string): RegistryResult<never> {
   return err({ type: "RegistryResolutionError", path, message });
-}
-
-function teamError(path: string, message: string): RegistryResult<never> {
-  return err({ type: "TeamMembershipError", path, message });
-}
-
-function describeError(error: Exclude<RegistryResult<never>, { ok: true }>["error"]): string {
-  return error.type === "RegistryIntegrityError"
-    ? `integrity mismatch: expected ${error.expected}, actual ${error.actual}`
-    : error.message;
 }

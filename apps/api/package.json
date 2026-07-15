@@ -1,6 +1,6 @@
 {
   "name": "@hunsu/api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -23,6 +23,8 @@
     "@hunsu/github-store": "workspace:*",
     "@hunsu/plugin-contract": "workspace:*",
     "@hunsu/projections": "workspace:*",
-    "@hunsu/protocol": "workspace:*"
+    "@hunsu/protocol": "workspace:*",
+    "@hunsu/protocol-registry": "workspace:*",
+    "fflate": "^0.8.2"
   }
 }

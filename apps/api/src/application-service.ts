@@ -1,95 +1,136 @@
 import { createHash } from "node:crypto";
-import { applyProjectCommand, emptyProjectState } from "@hunsu/core";
+import { applyProjectCommand, emptyProjectState, inheritRunChildPlan, type ProjectIntegrityBoundary } from "@hunsu/core";
 import {
+  decodeNodeEnvelope,
+  decodeStoredProjectEventEnvelope,
+  encodeNodeEnvelope,
+  exactStateFilePath,
   GitHubProjectStore,
   HUNSU_STATE_BRANCH,
   type GitHubTransport,
   type GitHubTransportError,
+  type ReconstructedProject,
   type RepositoryGrant,
   type RepositoryLocator,
   type StateActor,
+  type StateFileSelection,
   type StoreError,
-  type StoreResult
+  type StoredProjectEvent
 } from "@hunsu/github-store";
-import type {
-  EvidenceInput,
-  McpToolDispatcher,
-  PluginSafeError,
-  RunContract,
-  ToolResponse
+import {
+  findHunsuTool,
+  isRetiredHunsuV1Tool,
+  type HunsuToolName,
+  type McpToolDispatcher,
+  type PluginSafeError,
+  type RunContract,
+  type ToolResponse
 } from "@hunsu/plugin-contract";
 import {
-  alternativeComparisonProjection,
-  coachViewProjection,
-  goalDetailProjection,
+  eventListProjection,
+  nodeDetailProjection,
+  projectGraphProjection,
   projectListProjection,
-  projectOverviewProjection,
   runDetailProjection,
-  runnerDirectoryProjection,
   type ProjectionContext,
-  type ProjectionResult
+  type ProjectionResult,
+  type SequencedDomainEvent
 } from "@hunsu/projections";
 import {
+  NODE_PAYLOAD_SCHEMA,
   canonicalJson,
+  computeGoalDigest,
+  computeNodePayloadDigest,
+  computeNodePlanDigest,
+  computeRunnerDigest,
+  decodeNodePayload,
+  decodeNodePlan,
   makeAcceptanceCriterion,
+  makeAtLeastTwo,
   makeCheckpointId,
-  makeCoachId,
-  makeCoachProposalId,
   makeCoachReviewId,
+  makeCoachingProposalId,
   makeCommandFingerprint,
   makeComparisonId,
   makeDecisionId,
-  makeDesiredOutcome,
-  makeDivergenceId,
   makeEventId,
   makeEvidenceId,
   makeEvidenceSummary,
   makeGitBranchName,
   makeGitCommitSha,
   makeGitRef,
-  makeGoalConstraint,
-  makeGoalId,
-  makeGoalTitle,
+  makeGitTreePath,
+  makeGitTreeSha,
+  makeGoalDigest,
   makeIdempotencyKey,
   makeIsoTimestamp,
+  makeNodePayloadDigest,
+  makeNodePlanDigest,
   makeNonEmptyArray,
   makeNonEmptyText,
-  makeNonNegativeInteger,
-  makePositiveInteger,
   makeProjectId,
-  makeProjectObjective,
   makeProjectTitle,
-  makePromptTemplate,
   makeReason,
   makeRepositoryName,
   makeRepositoryOwner,
-  makeResourceName,
   makeRunId,
-  makeRunnerId,
   makeWorkspaceId,
+  managedNodeRef,
   runBranchName,
-  type ActiveGoal,
-  type Coach,
-  type CoachProposal,
   type CommandMetadata,
+  type ComparisonFinding,
+  type CoachingChildNode,
   type DomainActor,
   type DomainEvent,
   type EvidenceRef,
-  type Goal,
-  type GoalPatch,
-  type HunsuProposal,
-  type Player,
+  type GitCommitSha,
+  type Node,
+  type NodePayload,
+  type NodePlan,
   type Project,
   type ProjectCommand,
-  type ProjectPatch,
   type ProjectState,
-  type ResourceBinding,
+  type RootNode,
   type Run,
-  type Runner,
-  type RuntimePolicy,
-  type Team
+  type RunChildNode,
+  type RunnerValue,
+  type RunnerValueTypeRegistry
 } from "@hunsu/protocol";
-import { projectStateCodec } from "./project-codec.ts";
+import { createProjectCodec } from "./project-codec.ts";
+import type {
+  EventLogCheckpoint,
+  EventIndexEntryReadModel,
+  EvidenceActivityReadModel,
+  ProjectGraphEdge,
+  ProjectGraphNode,
+  RunActivityReadModel
+} from "./project-read-models.ts";
+import {
+  EVENT_INDEX_SHARD_SIZE,
+  GRAPH_PAGE_SIZE,
+  MAX_EVENT_SHARDS_PER_PAGE,
+  SHARDED_READ_MODEL_PATHS,
+  decodeActivityManifest,
+  decodeEventLocator,
+  decodeEventManifest,
+  decodeEventShard,
+  decodeGraphManifest,
+  decodeGraphNodeShard,
+  decodeGraphPage,
+  decodeNodeActivityShard,
+  decodeRunActivityShard,
+  decodeShardedProjectCatalog,
+  scanReverseEventShards,
+  type NodeActivityShardReadModel,
+  type ProjectActivityManifestReadModel,
+  type ProjectEventManifestReadModel,
+  type ProjectEventShardReadModel,
+  type ProjectGraphManifestReadModel,
+  type ProjectGraphNodeReadModel,
+  type ProjectGraphPageReadModel,
+  type RunActivityShardReadModel,
+  type ShardedProjectCatalogReadModel
+} from "./sharded-read-models.ts";
 import {
   apiFailure,
   apiOk,
@@ -97,2708 +138,2679 @@ import {
   type ApiError,
   type ApiResult,
   type AuthContext,
-  type MutationResult
+  type RepositoryV2InitializationState
 } from "./types.ts";
+import {
+  bundledRunnerRuntime,
+  type RunnerExecution,
+  type TrustedRunnerRuntime
+} from "./runner-runtime.ts";
 
 type JsonRecord = Record<string, unknown>;
 
-type CachedProject = {
-  repository: RepositoryLocator;
-  state: ProjectState;
-  stateHeadSha: string;
-  synchronizedAt: string;
-  cachedAt: number;
-  lastAccessedAt: number;
-  lastAccessOrder: number;
-  sizeBytes: number;
-};
-
-type AuthorizedProject = {
+type LoadedProject = {
   repository: RepositoryGrant;
   state: ProjectState;
   stateHeadSha: string;
   synchronizedAt: string;
-  cachedAt: number;
+  events: ReconstructedProject<ProjectState, DomainEvent>["events"];
 };
 
-type CachedRepositoryCatalog = {
-  repository: RepositoryLocator;
-  stateHeadSha: string | undefined;
-  projectIds: readonly string[];
+type ReadProject = {
+  repository: RepositoryGrant;
+  stateHeadSha: string;
   synchronizedAt: string;
+  catalog: ShardedProjectCatalogReadModel;
+};
+
+type TimedCache<T> = {
+  value: T;
   cachedAt: number;
-  lastAccessedAt: number;
-  lastAccessOrder: number;
-  sizeBytes: number;
 };
 
-type CachedInstallationRepositories = {
-  installationId: number;
-  repositories: readonly RepositoryGrant[];
-  cachedAt: number;
-  lastAccessedAt: number;
-  lastAccessOrder: number;
-  sizeBytes: number;
+type ReadProjectCache = TimedCache<readonly ReadProject[]> & {
+  stateHeadSha: string | undefined;
 };
 
-type CacheGeneration = {
-  generation: number;
-  lastAccessedAt: number;
-  lastAccessOrder: number;
+type MutationApplied = {
+  state: ProjectState;
+  stateHeadSha: string;
+  synchronizedAt: string;
+  idempotentReplay: boolean;
 };
 
-type CacheGenerationToken = {
-  repositoryKey: string;
-  generation: number;
-};
-
-type InstallationCacheGenerationToken = {
-  installationKey: string;
-  generation: number;
-};
-
-type InstallationRepositoryFlight = {
-  generation: number;
-  promise: Promise<ApiResult<readonly RepositoryGrant[]>>;
-};
+type MutationFactory = (state: ProjectState, meta: CommandMetadata) => ProjectCommand;
 
 export type ProjectionCachePolicy = {
-  idleTtlMs: number;
-  maxProjectEntries: number;
-  maxProjectBytes: number;
-  maxCatalogEntries: number;
-  maxCatalogBytes: number;
+  projectTtlMs: number;
   installationTtlMs: number;
-  maxInstallationEntries: number;
-  maxInstallationBytes: number;
-  maxGenerationEntries: number;
 };
 
-const PROJECTION_CACHE_TTL_MS = 4_000;
-const UTF8_ENCODER = new TextEncoder();
-const DEFAULT_PROJECTION_CACHE_POLICY: ProjectionCachePolicy = {
-  idleTtlMs: 5 * 60_000,
-  maxProjectEntries: 128,
-  maxProjectBytes: 16 * 1024 * 1024,
-  maxCatalogEntries: 256,
-  maxCatalogBytes: 2 * 1024 * 1024,
-  installationTtlMs: 60_000,
-  maxInstallationEntries: 128,
-  maxInstallationBytes: 4 * 1024 * 1024,
-  maxGenerationEntries: 512
+const DEFAULT_CACHE_POLICY: ProjectionCachePolicy = {
+  projectTtlMs: 4_000,
+  installationTtlMs: 60_000
 };
 
-type MutationCommandFactory = (state: ProjectState, meta: CommandMetadata) => ProjectCommand;
+const FULL_SHA = /^[0-9a-f]{40}$/u;
+const EVENT_CURSOR = /^[1-9][0-9]*$/u;
+const EXACT_EVENT_CURSOR = /^([0-9a-f]{40}):([1-9][0-9]*)$/u;
+const EXACT_GRAPH_CURSOR = /^([0-9a-f]{40}):(0|[1-9][0-9]*)$/u;
 
 export class HunsuApplicationService implements McpToolDispatcher<AuthContext> {
   readonly #transport: GitHubTransport;
   readonly #store: GitHubProjectStore<DomainEvent, ProjectState>;
+  readonly #runnerRuntime: TrustedRunnerRuntime;
+  readonly #projectIntegrityBoundary: ProjectIntegrityBoundary;
+  readonly #projectStateCodec: ReturnType<typeof createProjectCodec>["projectStateCodec"];
   readonly #now: () => Date;
   readonly #cacheNow: () => number;
   readonly #cachePolicy: ProjectionCachePolicy;
-  readonly #cache = new Map<string, CachedProject>();
-  readonly #catalogCache = new Map<string, CachedRepositoryCatalog>();
-  readonly #installationCache = new Map<string, CachedInstallationRepositories>();
-  readonly #cacheGenerations = new Map<string, CacheGeneration>();
-  readonly #installationCacheGenerations = new Map<string, CacheGeneration>();
-  readonly #installationRepositoryFlights = new Map<string, InstallationRepositoryFlight>();
-  #nextCacheGeneration = 1;
-  #nextCacheAccessOrder = 1;
+  readonly #projects = new Map<string, TimedCache<readonly LoadedProject[]>>();
+  readonly #readProjects = new Map<string, ReadProjectCache>();
+  readonly #readStateFilesByHead = new Map<string, string>();
+  readonly #installations = new Map<number, TimedCache<readonly RepositoryGrant[]>>();
 
   constructor(input: {
     transport: GitHubTransport;
     now?: () => Date;
     cacheNow?: () => number;
     projectionCachePolicy?: Partial<ProjectionCachePolicy>;
+    runnerRuntime?: TrustedRunnerRuntime;
   }) {
     this.#transport = input.transport;
-    this.#store = new GitHubProjectStore(input.transport, projectStateCodec);
+    this.#runnerRuntime = input.runnerRuntime ?? bundledRunnerRuntime;
+    const codec = createProjectCodec(this.#runnerRuntime);
+    this.#projectIntegrityBoundary = codec.projectIntegrityBoundary;
+    this.#projectStateCodec = codec.projectStateCodec;
+    this.#store = new GitHubProjectStore(input.transport, codec.projectStateCodec);
     this.#now = input.now ?? (() => new Date());
     this.#cacheNow = input.cacheNow ?? (() => Date.now());
-    this.#cachePolicy = projectionCachePolicy(input.projectionCachePolicy);
+    this.#cachePolicy = cachePolicy(input.projectionCachePolicy);
   }
 
-  async call(name: string, argumentsValue: JsonRecord, context: AuthContext): Promise<ToolResponse<unknown>> {
+  async call(name: HunsuToolName, argumentsValue: JsonRecord, context: AuthContext): Promise<ToolResponse<unknown>> {
     const result = await this.invoke(name, argumentsValue, context);
     return result.ok
-      ? { ok: true, data: result.value.data, ...(result.value.stateHeadSha ? { stateHeadSha: result.value.stateHeadSha } : {}) }
+      ? {
+          ok: true,
+          data: result.value.data,
+          ...(result.value.stateHeadSha === undefined ? {} : { stateHeadSha: result.value.stateHeadSha })
+        }
       : { ok: false, error: pluginError(result.error) };
   }
 
   async invoke(name: string, input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha?: string }>> {
     try {
+      assertExactToolMutationInput(name, input);
       switch (name) {
-        case "hunsu.projects.list": return await this.#listProjectsTool(input, context);
-        case "hunsu.projects.get": return await this.#getProjectTool(input, context);
-        case "hunsu.projects.create": return await this.#createProjectTool(input, context);
-        case "hunsu.projects.update": return await this.#updateProjectTool(input, context);
-        case "hunsu.projects.rebuild": return await this.#rebuildProjectTool(input, context);
-        case "hunsu.goals.list": return await this.#listGoalsTool(input, context);
-        case "hunsu.goals.get": return await this.#getGoalTool(input, context);
-        case "hunsu.goals.create": return await this.#createGoalTool(input, context);
-        case "hunsu.goals.update": return await this.#updateGoalTool(input, context);
-        case "hunsu.goals.pause": return await this.#pauseGoalTool(input, context);
-        case "hunsu.goals.complete": return await this.#completeGoalTool(input, context);
-        case "hunsu.runners.list": return await this.#listRunnersTool(input, context);
-        case "hunsu.runners.get": return await this.#getRunnerTool(input, context);
-        case "hunsu.runners.create_player": return await this.#createPlayerTool(input, context);
-        case "hunsu.runners.create_team": return await this.#createTeamTool(input, context);
-        case "hunsu.runners.update": return await this.#updateRunnerTool(input, context);
-        case "hunsu.runs.get": return await this.#getRunTool(input, context);
-        case "hunsu.runs.start": return await this.#startRunTool(input, context);
-        case "hunsu.runs.checkpoint": return await this.#checkpointRunTool(input, context);
-        case "hunsu.runs.attach_evidence": return await this.#attachEvidenceTool(input, context);
-        case "hunsu.runs.complete": return await this.#completeRunTool(input, context);
-        case "hunsu.runs.fail": return await this.#failRunTool(input, context);
-        case "hunsu.runs.cancel": return await this.#cancelRunTool(input, context);
-        case "hunsu.coach.get": return await this.#getCoachTool(input, context);
-        case "hunsu.coach.review": return await this.#coachReviewTool(input, context);
-        case "hunsu.coach.propose_change": return await this.#coachProposeChangeTool(input, context);
-        case "hunsu.coach.propose_hunsu": return await this.#coachProposeHunsuTool(input, context);
-        case "hunsu.alternatives.compare": return await this.#compareAlternativesTool(input, context);
-        case "hunsu.alternatives.select": return await this.#selectAlternativeTool(input, context);
-        case "hunsu.alternatives.reject": return await this.#rejectAlternativeTool(input, context);
-        default: return invalidRequest(`Unknown Hunsu tool ${name}.`);
+        case "hunsu.projects.list": {
+          const installationId = optionalPositiveInteger(input, "installationId");
+          const loaded = await this.#loadAllReadProjects(context, installationId);
+          if (!loaded.ok) return loaded;
+          const repositoryFilter = optionalString(input, "repository")?.toLowerCase();
+          const projects = repositoryFilter
+            ? loaded.value.filter(item => `${item.repository.owner}/${item.repository.name}`.toLowerCase() === repositoryFilter)
+            : loaded.value;
+          const repositories = await this.#readRepositoryContexts(context, installationId, repositoryFilter);
+          if (!repositories.ok) return repositories;
+          return apiOk({ data: { ...this.#readProjectList(projects), repositories: repositories.value } });
+        }
+        case "hunsu.projects.get": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          return apiOk({ data: this.#readProjectContext(loaded.value), stateHeadSha: loaded.value.stateHeadSha });
+        }
+        case "hunsu.projects.create": {
+          const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+          if (!repository.ok) return repository;
+          const created = await this.#createProject(repository.value, context, input);
+          return created.ok
+            ? apiOk({ data: created.value, stateHeadSha: created.value.stateHeadSha })
+            : created;
+        }
+        case "hunsu.projects.rebuild": {
+          const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+          return repository.ok
+            ? this.#toolMutation(await this.#rebuildProjectMaterializations(repository.value, context, input))
+            : repository;
+        }
+        case "hunsu.nodes.graph": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const graph = await this.#readGraph(loaded.value, {
+            limit: optionalPositiveInteger(input, "limit") ?? 300,
+            cursor: optionalString(input, "cursor") ?? null
+          });
+          return graph.ok ? apiOk({ data: graph.value, stateHeadSha: loaded.value.stateHeadSha }) : graph;
+        }
+        case "hunsu.nodes.get": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const detail = await this.#readNode(loaded.value, requiredSha(input, "nodeSha"));
+          return detail.ok ? apiOk({ data: detail.value.node, stateHeadSha: loaded.value.stateHeadSha }) : detail;
+        }
+        case "hunsu.events.list": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const events = await this.#readEvents(loaded.value, input);
+          return events.ok ? apiOk({ data: events.value, stateHeadSha: loaded.value.stateHeadSha }) : events;
+        }
+        case "hunsu.events.get": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const event = await this.#readEvent(loaded.value, requiredString(input, "eventId"));
+          return event.ok ? apiOk({ data: event.value, stateHeadSha: loaded.value.stateHeadSha }) : event;
+        }
+        case "hunsu.runs.get": {
+          const loaded = await this.#loadToolReadProject(input, context);
+          if (!loaded.ok) return loaded;
+          const run = await this.#readRun(loaded.value, requiredString(input, "runId"));
+          return run.ok ? apiOk({ data: run.value.run, stateHeadSha: loaded.value.stateHeadSha }) : run;
+        }
+        case "hunsu.runs.start": {
+          const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+          if (!repository.ok) return repository;
+          const started = await this.#startRun(repository.value, context, input);
+          return started.ok
+            ? apiOk({ data: started.value.contract, stateHeadSha: started.value.stateHeadSha })
+            : started;
+        }
+        case "hunsu.runs.checkpoint": return this.#toolMutation(await this.#checkpointRunFromTool(context, input));
+        case "hunsu.runs.attach_evidence": return this.#toolMutation(await this.#attachEvidenceFromTool(context, input));
+        case "hunsu.runs.complete": return this.#toolMutation(await this.#completeRunFromTool(context, input));
+        case "hunsu.runs.fail": return this.#toolMutation(await this.#failRunFromTool(context, input));
+        case "hunsu.runs.cancel": return this.#toolMutation(await this.#cancelRunFromTool(context, input));
+        case "hunsu.coach.review": return this.#toolMutation(await this.#reviewFromTool(context, input));
+        case "hunsu.coach.propose_transition": return this.#toolMutation(await this.#proposalFromTool(context, input));
+        case "hunsu.coach.confirm_transition": return this.#toolMutation(await this.#confirmProposalFromTool(context, input));
+        case "hunsu.coach.reject_transition": return this.#toolMutation(await this.#rejectProposalFromTool(context, input));
+        case "hunsu.alternatives.compare": return this.#toolMutation(await this.#compareFromTool(context, input));
+        case "hunsu.alternatives.select": return this.#toolMutation(await this.#selectFromTool(context, input));
+        case "hunsu.alternatives.reject": return this.#toolMutation(await this.#rejectAlternativeFromTool(context, input));
+        default:
+          return isRetiredHunsuV1Tool(name)
+            ? apiFailure({
+                code: "unsupported_protocol_version",
+                message: `Hunsu v2 does not support retired tool ${name}.`,
+                status: 400,
+                retryable: false
+              })
+            : invalidRequest(`Unknown Hunsu tool ${name}.`);
       }
     } catch (error) {
       if (error instanceof BoundaryError) return apiFailure(error.apiError);
-      return apiFailure({ code: "temporarily_unavailable", message: "The Hunsu service could not complete the request.", status: 503, retryable: true });
+      return apiFailure({
+        code: "temporarily_unavailable",
+        message: "The Hunsu application service could not complete the request.",
+        status: 503,
+        retryable: true
+      });
     }
   }
 
   async sessionRepositories(context: AuthContext): Promise<ApiResult<{ repositories: unknown[] }>> {
-    const grants = await this.#authorizedRepositories(context);
-    if (!grants.ok) return grants;
-    const synchronizedAt = this.#timestamp();
-    const repositories: unknown[] = [];
-    for (const repository of grants.value) {
-      const state = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
-      if (!state.ok) return transportFailure(state.error);
-      const stateHeadSha = state.value ?? "";
-      repositories.push({
+    const repositories = await this.#authorizedRepositories(context);
+    if (!repositories.ok) return repositories;
+    const rows = await Promise.all(repositories.value.map(async repository => {
+      const state = await this.#repositoryV2State(repository);
+      if (!state.ok) return state;
+      return apiOk({
+        installationId: repository.installationId,
+        repositoryId: repository.repositoryId,
         owner: repository.owner,
         name: repository.name,
-        url: `https://github.com/${repository.owner}/${repository.name}`,
         defaultBranch: repository.defaultBranch,
-        installationId: repository.installationId,
         private: repository.private,
-        granted: true,
-        stateHeadSha,
-        updatedAt: synchronizedAt
+        permissions: repository.permissions,
+        state: state.value
       });
-    }
-    return apiOk({ repositories });
+    }));
+    const failure = rows.find(row => !row.ok);
+    if (failure && !failure.ok) return failure;
+    return apiOk({ repositories: rows.flatMap(row => row.ok ? [row.value] : []) });
   }
 
-  async webProjects(context: AuthContext): Promise<ApiResult<{ projects: unknown[] }>> {
-    const loaded = await this.#loadAllProjects(context);
+  async #readRepositoryContexts(
+    context: AuthContext,
+    installationId: number | undefined,
+    repositoryFilter: string | undefined
+  ): Promise<ApiResult<unknown[]>> {
+    const repositories = await this.#authorizedRepositories(context, installationId);
+    if (!repositories.ok) return repositories;
+    const filtered = repositoryFilter
+      ? repositories.value.filter(repository => `${repository.owner}/${repository.name}`.toLowerCase() === repositoryFilter)
+      : repositories.value;
+    const rows = await Promise.all(filtered.map(async repository => {
+      const state = await this.#repositoryV2State(repository);
+      if (!state.ok) return state;
+      return apiOk({
+        installationId: repository.installationId,
+        repositoryId: repository.repositoryId,
+        owner: repository.owner,
+        name: repository.name,
+        defaultBranch: repository.defaultBranch,
+        state: state.value
+      });
+    }));
+    const failure = rows.find(row => !row.ok);
+    if (failure && !failure.ok) return failure;
+    return apiOk(rows.flatMap(row => row.ok ? [row.value] : []));
+  }
+
+  async webProjects(context: AuthContext): Promise<ApiResult<unknown>> {
+    const loaded = await this.#loadAllReadProjects(context);
+    return loaded.ok ? apiOk(this.#readProjectList(loaded.value)) : loaded;
+  }
+
+  async webProjectContext(context: AuthContext, projectId: string): Promise<ApiResult<unknown>> {
+    const loaded = await this.#findReadProject(context, projectId);
+    return loaded.ok ? apiOk(this.#readProjectContext(loaded.value)) : loaded;
+  }
+
+  async webGraph(context: AuthContext, projectId: string, query: JsonRecord): Promise<ApiResult<unknown>> {
+    const loaded = await this.#findReadProject(context, projectId);
     if (!loaded.ok) return loaded;
-    return apiOk({ projects: projectListProjection(loaded.value.map(entry => ({ state: entry.state, context: projectionContext(entry) }))) });
+    return this.#readGraph(loaded.value, {
+      limit: optionalPositiveInteger(query, "limit") ?? 300,
+      cursor: optionalString(query, "cursor") ?? null
+    });
   }
 
-  async webProject(context: AuthContext, projectId: string): Promise<ApiResult<{ project: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#findProject(context, projectId);
+  async webNode(context: AuthContext, projectId: string, nodeSha: string): Promise<ApiResult<unknown>> {
+    const loaded = await this.#findReadProject(context, projectId);
     if (!loaded.ok) return loaded;
-    const projection = projectOverviewProjection(loaded.value.state, projectId, projectionContext(loaded.value));
-    return projection.ok ? apiOk({ project: projection.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projection);
+    return this.#readNode(loaded.value, requiredFullSha(nodeSha, "nodeSha"));
   }
 
-  async webGoal(context: AuthContext, projectId: string, goalId: string): Promise<ApiResult<{ goal: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#findProject(context, projectId);
+  async webEvents(context: AuthContext, projectId: string, query: JsonRecord): Promise<ApiResult<unknown>> {
+    const loaded = await this.#findReadProject(context, projectId);
     if (!loaded.ok) return loaded;
-    const projection = goalDetailProjection(loaded.value.state, projectId, goalId);
-    return projection.ok ? apiOk({ goal: projection.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projection);
+    return this.#readEvents(loaded.value, query);
   }
 
-  async webRunners(context: AuthContext, projectId: string): Promise<ApiResult<{ runners: unknown[] }>> {
-    const loaded = await this.#findProject(context, projectId);
+  async webEvent(context: AuthContext, projectId: string, eventId: string): Promise<ApiResult<unknown>> {
+    const loaded = await this.#findReadProject(context, projectId);
+    return loaded.ok ? this.#readEvent(loaded.value, eventId) : loaded;
+  }
+
+  async webRun(context: AuthContext, projectId: string, runId: string): Promise<ApiResult<unknown>> {
+    const loaded = await this.#findReadProject(context, projectId);
     if (!loaded.ok) return loaded;
-    const projection = runnerDirectoryProjection(loaded.value.state, projectId);
-    return projection.ok ? apiOk({ runners: projection.value }) : projectionFailure(projection);
+    return this.#readRun(loaded.value, runId);
   }
 
-  async webRun(context: AuthContext, projectId: string, runId: string): Promise<ApiResult<{ run: unknown }>> {
-    const loaded = await this.#findProject(context, projectId);
-    if (!loaded.ok) return loaded;
-    const projection = runDetailProjection(loaded.value.state, projectId, runId);
-    return projection.ok ? apiOk({ run: projection.value }) : projectionFailure(projection);
+  async webCreateProject(context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", [
+        "repository", "projectId", "title", "rootNodeSha", "initialPlan",
+        "idempotencyKey", "expectedStateSha", "confirmedByUser"
+      ]);
+      const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+      return repository.ok ? this.#createProject(repository.value, context, input) : repository;
+    });
   }
 
-  async webCoach(context: AuthContext, projectId: string): Promise<ApiResult<{ coach: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#findProject(context, projectId);
-    if (!loaded.ok) return loaded;
-    const projection = coachViewProjection(loaded.value.state, projectId);
-    return projection.ok ? apiOk({ coach: projection.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projection);
+  async webStartRun(context: AuthContext, projectId: string, sourceNodeSha: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["goalDigest", "runId", "idempotencyKey", "expectedStateSha"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      if (!loaded.ok) return loaded;
+      const started = await this.#startRun(loaded.value.repository, context, { ...input, projectId, sourceNodeSha });
+      return started.ok
+        ? apiOk({
+            schema: "hunsu.web.run-started.v2",
+            runId: started.value.contract.runId,
+            stateHeadSha: started.value.stateHeadSha,
+            synchronizedAt: started.value.synchronizedAt
+          })
+        : started;
+    });
   }
 
-  dropProjectionCache(): void {
-    this.#cache.clear();
-    this.#catalogCache.clear();
-    this.#cacheGenerations.clear();
+  async webCheckpointRun(context: AuthContext, projectId: string, runId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["summary", "location", "idempotencyKey", "expectedStateSha"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#checkpointRun(loaded.value.repository, context, { ...input, projectId, runId }) : loaded;
+    });
+  }
+
+  async webAttachRunEvidence(context: AuthContext, projectId: string, runId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["evidence", "idempotencyKey", "expectedStateSha"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#attachEvidence(loaded.value.repository, context, { ...input, projectId, runId }) : loaded;
+    });
+  }
+
+  async webCompleteRun(context: AuthContext, projectId: string, runId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["resultSha", "evidence", "idempotencyKey", "expectedStateSha"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#completeRun(loaded.value.repository, context, { ...input, projectId, runId }) : loaded;
+    });
+  }
+
+  async webFailRun(context: AuthContext, projectId: string, runId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["reason", "idempotencyKey", "expectedStateSha"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#terminalRun(loaded.value.repository, context, { ...input, projectId, runId }, "fail") : loaded;
+    });
+  }
+
+  async webCancelRun(context: AuthContext, projectId: string, runId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["reason", "idempotencyKey", "expectedStateSha"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#terminalRun(loaded.value.repository, context, { ...input, projectId, runId }, "cancel") : loaded;
+    });
+  }
+
+  async webCreateCoachingProposal(context: AuthContext, projectId: string, sourceNodeSha: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", [
+        "sourcePayloadDigest", "proposalId", "proposedPlan", "summary", "rationale",
+        "idempotencyKey", "expectedStateSha"
+      ]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#proposeTransition(loaded.value.repository, context, { ...input, projectId, sourceNodeSha }) : loaded;
+    });
+  }
+
+  async webConfirmCoachingProposal(context: AuthContext, projectId: string, proposalId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["idempotencyKey", "expectedStateSha", "confirmedByUser"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#confirmProposal(loaded.value.repository, context, { ...input, projectId, proposalId }) : loaded;
+    });
+  }
+
+  async webRejectCoachingProposal(context: AuthContext, projectId: string, proposalId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", ["reason", "idempotencyKey", "expectedStateSha", "confirmedByUser"]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#rejectProposal(loaded.value.repository, context, { ...input, projectId, proposalId }) : loaded;
+    });
+  }
+
+  async webCompareAlternatives(context: AuthContext, projectId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", [
+        "sourceNodeSha", "comparisonId", "nodeShas", "findings", "summary", "idempotencyKey", "expectedStateSha"
+      ]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#compareAlternatives(loaded.value.repository, context, { ...input, projectId }) : loaded;
+    });
+  }
+
+  async webSelectAlternative(context: AuthContext, projectId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", [
+        "comparisonId", "nodeSha", "rationale", "idempotencyKey", "expectedStateSha", "confirmedByUser"
+      ]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#decideAlternative(loaded.value.repository, context, { ...input, projectId }, "select") : loaded;
+    });
+  }
+
+  async webRejectAlternative(context: AuthContext, projectId: string, input: JsonRecord): Promise<ApiResult<unknown>> {
+    return webMutationBoundary(async () => {
+      assertExactRecord(input, "request body", [
+        "comparisonId", "nodeSha", "rationale", "idempotencyKey", "expectedStateSha", "confirmedByUser"
+      ]);
+      const loaded = await this.#findProject(context, projectId, true);
+      return loaded.ok ? this.#decideAlternative(loaded.value.repository, context, { ...input, projectId }, "reject") : loaded;
+    });
+  }
+
+  invalidateAll(): void {
+    this.#projects.clear();
+    this.#readProjects.clear();
+    this.#readStateFilesByHead.clear();
+    this.#installations.clear();
   }
 
   invalidateRepository(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): void {
-    this.#advanceCacheGeneration(repository);
-    for (const [key, entry] of this.#cache) {
-      if (entry.repository.installationId === repository.installationId && entry.repository.repositoryId === repository.repositoryId) this.#cache.delete(key);
-    }
-    this.#catalogCache.delete(repositoryCacheKey(repository));
+    this.#projects.delete(repositoryKey(repository));
+    this.#readProjects.delete(repositoryKey(repository));
+    this.#readStateFilesByHead.clear();
   }
 
   invalidateInstallation(installationId: number): void {
-    this.#installationCache.delete(installationCacheKey(installationId));
-    this.#advanceInstallationCacheGeneration(installationId);
-    for (const [key, entry] of this.#cache) if (entry.repository.installationId === installationId) this.#cache.delete(key);
-    for (const [key, entry] of this.#catalogCache) if (entry.repository.installationId === installationId) this.#catalogCache.delete(key);
-    const prefix = `${installationId}:`;
-    for (const key of this.#cacheGenerations.keys()) if (key.startsWith(prefix)) this.#cacheGenerations.delete(key);
+    this.#installations.delete(installationId);
+    for (const key of this.#projects.keys()) if (key.startsWith(`${installationId}:`)) this.#projects.delete(key);
+    for (const key of this.#readProjects.keys()) if (key.startsWith(`${installationId}:`)) this.#readProjects.delete(key);
+    this.#readStateFilesByHead.clear();
   }
 
-  async reconcileRepository(repository: RepositoryLocator): Promise<ApiResult<{ projectCount: number }>> {
-    this.invalidateRepository(repository);
-    const generation = this.#captureCacheGeneration(repository);
-    const reconstructed = await this.#store.reconstructRepository(repository);
-    if (!reconstructed.ok) return storeFailure(reconstructed.error);
-    const projects = reconstructed.value.projects;
-    const synchronizedAt = this.#timestamp();
-    const cachedAt = this.#cacheNow();
-    if (this.#cacheGenerationIsCurrent(generation)) {
-      this.invalidateRepository(repository);
-      for (const item of projects) {
-        this.#putCachedProject(
-          cacheKey(repository, projectIdOf(item.state)),
-          cachedProject(repository, item.state, item.stateHeadSha, synchronizedAt, cachedAt)
-        );
-      }
-      this.#putCachedCatalog(
-        repositoryCacheKey(repository),
-        cachedRepositoryCatalog(
-          repository,
-          reconstructed.value.kind === "state_branch" ? reconstructed.value.stateHeadSha : undefined,
-          projects.map(item => projectIdOf(item.state)),
-          synchronizedAt,
-          cachedAt
-        )
-      );
-    }
-    return apiOk({ projectCount: projects.length });
-  }
-
-  async webCreateProject(context: AuthContext, input: JsonRecord): Promise<ApiResult<MutationResult<{ projectId: string }>>> {
-    const idempotencyKey = requestIdempotency(input);
-    const projectId = generatedId("project", idempotencyKey);
-    const coachId = generatedId("coach", idempotencyKey);
-    const repository = await this.#repositoryByName(context, requiredString(record(input, "repository"), "owner"), requiredString(record(input, "repository"), "name"), true);
-    if (!repository.ok) return repository;
-    const tool = await this.#createProject(repository.value, context, {
-      projectId,
-      coachId,
-      title: requiredString(input, "title"),
-      objective: requiredString(input, "objective"),
-      baseRef: requiredString(input, "baseRef"),
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha")
-    });
-    return tool.ok ? apiOk(tool.value) : tool;
-  }
-
-  async webCreateGoal(context: AuthContext, projectId: string, input: JsonRecord): Promise<ApiResult<MutationResult<{ goalId: string }>>> {
-    const idempotencyKey = requestIdempotency(input);
-    const loaded = await this.#findProject(context, projectId, true);
-    if (!loaded.ok) return loaded;
-    return this.#createGoal(loaded.value.repository, context, {
-      projectId,
-      goalId: generatedId("goal", idempotencyKey),
-      title: requiredString(input, "title"),
-      desiredOutcome: requiredString(input, "desiredOutcome"),
-      acceptanceCriteria: requiredStringArray(input, "acceptanceCriteria", true),
-      constraints: requiredStringArray(input, "constraints", false),
-      priority: priorityNumber(input.priority),
-      runnerId: optionalString(input, "runnerId"),
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha")
-    });
-  }
-
-  async webUpdateGoal(context: AuthContext, projectId: string, goalId: string, input: JsonRecord): Promise<ApiResult<MutationResult<{ goalId: string }>>> {
-    const loaded = await this.#findProject(context, projectId, true);
-    if (!loaded.ok) return loaded;
-    const status = optionalString(input, "status");
-    if (status === "paused") {
-      return this.#pauseGoal(loaded.value.repository, context, projectId, goalId, requestIdempotency(input), optionalString(input, "expectedStateSha"), optionalString(input, "reason") ?? "Paused by the user");
-    }
-    if (status === "active") {
-      return this.#resumeGoal(loaded.value.repository, context, projectId, goalId, requestIdempotency(input), optionalString(input, "expectedStateSha"));
-    }
-    if (status === "completed") {
-      return this.#completeGoal(
-        loaded.value.repository,
-        context,
-        projectId,
-        goalId,
-        requiredString(input, "selectedRunId"),
-        requestIdempotency(input),
-        optionalString(input, "expectedStateSha")
-      );
-    }
-    return this.#updateGoal(loaded.value.repository, context, {
-      ...input,
-      projectId,
-      goalId,
-      idempotencyKey: requestIdempotency(input)
-    });
-  }
-
-  async webConfirmHunsu(context: AuthContext, projectId: string, goalId: string, input: JsonRecord): Promise<ApiResult<MutationResult<{ alternativeId: string }>>> {
-    const loaded = await this.#findProject(context, projectId, true);
-    if (!loaded.ok) return loaded;
-    const sourceRunId = requiredString(input, "sourceRunId");
-    const idempotencyKey = requestIdempotency(input);
-    const divergenceId = generatedId("divergence", idempotencyKey);
-    const result = await this.#mutate({
-      repository: loaded.value.repository,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "ConfirmHunsu", projectId, goalId, sourceRunId, divergenceId },
-      factories: [(_state, meta) => ({
-        type: "ConfirmHunsu",
-        meta: withActor(meta, userActor(context)),
-        divergenceId: asDivergenceId(divergenceId),
-        projectId: asProjectId(projectId),
-        goalId: asGoalId(goalId),
-        sourceRunId: asRunId(sourceRunId),
-        basis: { type: "user", reason: asReason(optionalString(input, "summary") ?? "User requested a deliberate alternative") }
-      })]
-    });
-    return result.ok ? apiOk({ ...result.value, value: { alternativeId: divergenceId } }) : result;
-  }
-
-  async webDecideAlternative(
-    context: AuthContext,
-    projectId: string,
-    goalId: string,
-    runId: string,
-    kind: "select" | "reject",
-    input: JsonRecord
-  ): Promise<ApiResult<MutationResult<{ decisionId: string }>>> {
-    const loaded = await this.#findProject(context, projectId, true);
-    if (!loaded.ok) return loaded;
-    const idempotencyKey = requestIdempotency(input);
-    const expectedStateSha = optionalString(input, "expectedStateSha");
-    const decisionId = generatedId("decision", idempotencyKey);
-    const comparisonId = optionalString(input, "comparisonId");
-    if (!comparisonId) return invalidRequest("comparisonId is required before selecting or rejecting an alternative.");
-    const comparison = loaded.value.state.comparisons.find(item => item.id === comparisonId);
-    if (!comparison) return notFound(`Alternative comparison ${comparisonId} was not found.`);
-    if (comparison.projectId !== projectId || comparison.goalId !== goalId || !comparison.runIds.includes(asRunId(runId))) {
-      return invalidRequest("The selected Run does not belong to the supplied alternative comparison.");
-    }
-    const rationale = optionalString(input, "rationale")
-      ?? (kind === "select" ? "User selected this alternative in Hunsu Web" : "User rejected this alternative in Hunsu Web");
-    const result = await this.#mutate({
-      repository: loaded.value.repository,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha,
-      semanticCommand: { type: kind === "select" ? "SelectAlternative" : "RejectAlternative", projectId, goalId, runId, comparisonId, rationale },
-      factories: [(_state, meta) => kind === "select"
-        ? {
-            type: "SelectAlternative",
-            meta: withActor(meta, userActor(context)),
-            decisionId: asDecisionId(decisionId),
-            comparisonId: comparison.id,
-            selectedRunId: asRunId(runId),
-            rationale: asReason(rationale)
-          }
-        : {
-            type: "RejectAlternatives",
-            meta: withActor(meta, userActor(context)),
-            decisionId: asDecisionId(decisionId),
-            comparisonId: comparison.id,
-            rejectedRunIds: [asRunId(runId)] as readonly [ReturnType<typeof asRunId>],
-            rationale: asReason(rationale)
-          }]
-    });
-    return result.ok ? apiOk({ ...result.value, value: { decisionId } }) : result;
-  }
-
-  async webCoachReview(context: AuthContext, projectId: string, input: JsonRecord): Promise<ApiResult<MutationResult<{ reviewId: string }>>> {
-    const loaded = await this.#findProject(context, projectId, true);
-    if (!loaded.ok) return loaded;
-    const idempotencyKey = requestIdempotency(input);
-    const reviewId = generatedId("review", idempotencyKey);
-    return this.#recordCoachReview(loaded.value.repository, context, {
-      projectId,
-      reviewId,
-      assessment: "Reviewed current Goals, Runs, evidence, and unresolved alternatives.",
-      findings: automaticCoachFindings(loaded.value.state),
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha")
-    });
-  }
-
-  async webConfirmCoachProposal(context: AuthContext, projectId: string, proposalId: string, input: JsonRecord): Promise<ApiResult<MutationResult<{ proposalId: string }>>> {
-    const loaded = await this.#findProject(context, projectId, true);
-    if (!loaded.ok) return loaded;
-    const proposal = loaded.value.state.coachProposals.find(item => item.id === proposalId);
-    if (!proposal) return notFound(`Coach proposal ${proposalId} was not found.`);
-    const idempotencyKey = requestIdempotency(input);
-    const expectedStateSha = optionalString(input, "expectedStateSha");
-    const divergenceId = generatedId("divergence", idempotencyKey);
-    const factories: MutationCommandFactory[] = [(_state, meta) => ({
-      type: "AcceptCoachProposal",
-      meta: withActor(meta, userActor(context)),
-      proposalId: proposal.id,
-      reason: asReason("User accepted the Coach proposal in Hunsu Web"),
-      application: proposal.type === "hunsu"
-        ? { type: "hunsu", divergenceId: asDivergenceId(divergenceId) }
-        : { type: "apply_change" }
-    })];
-    const result = await this.#mutate({
-      repository: loaded.value.repository,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha,
-      semanticCommand: { type: "ConfirmCoachProposal", projectId, proposalId },
-      factories
-    });
-    return result.ok ? apiOk({ ...result.value, value: { proposalId } }) : result;
-  }
-
-  async webRejectCoachProposal(context: AuthContext, projectId: string, proposalId: string, input: JsonRecord): Promise<ApiResult<MutationResult<{ proposalId: string }>>> {
-    const loaded = await this.#findProject(context, projectId, true);
-    if (!loaded.ok) return loaded;
-    if (!loaded.value.state.coachProposals.some(item => item.id === proposalId)) return notFound(`Coach proposal ${proposalId} was not found.`);
-    const result = await this.#mutate({
-      repository: loaded.value.repository,
-      projectId,
-      context,
-      idempotencyKey: requestIdempotency(input),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "RejectCoachProposal", proposalId },
-      factories: [(_state, meta) => ({
-        type: "RejectCoachProposal",
-        meta: withActor(meta, userActor(context)),
-        proposalId: asCoachProposalId(proposalId),
-        reason: asReason(optionalString(input, "reason") ?? "User rejected the Coach proposal in Hunsu Web")
-      })]
-    });
-    return result.ok ? apiOk({ ...result.value, value: { proposalId } }) : result;
-  }
-
-  async webRebuildProject(context: AuthContext, projectId: string): Promise<ApiResult<MutationResult<{ projectId: string }>>> {
-    const located = await this.#findProject(context, projectId);
-    if (!located.ok) return located;
-    this.invalidateRepository(located.value.repository);
-    const rebuilt = await this.#loadProject(located.value.repository, projectId, true);
-    return rebuilt.ok
-      ? apiOk({ value: { projectId }, stateHeadSha: rebuilt.value.stateHeadSha, synchronizedAt: rebuilt.value.synchronizedAt })
-      : rebuilt;
-  }
-
-  async #listProjectsTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown }>> {
-    const installationId = optionalPositiveInteger(input, "installationId");
-    const loaded = await this.#loadAllProjects(context, false, installationId);
-    if (!loaded.ok) return loaded;
-    const filter = optionalString(input, "repository");
-    const entries = filter ? loaded.value.filter(item => `${item.repository.owner}/${item.repository.name}` === filter) : loaded.value;
-    return apiOk({ data: { projects: projectListProjection(entries.map(entry => ({ state: entry.state, context: projectionContext(entry) }))) } });
-  }
-
-  async #getProjectTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), false);
-    if (!repository.ok) return repository;
+  async #createProject(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<{
+    schema: "hunsu.web.project-created.v2";
+    projectId: string;
+    rootNodeSha: string;
+    stateHeadSha: string;
+    synchronizedAt: string;
+  }>> {
+    requireConfirmation(input);
     const projectId = requiredString(input, "projectId");
-    const loaded = await this.#loadProject(repository.value, projectId);
-    if (!loaded.ok) return loaded;
-    const projected = projectOverviewProjection(loaded.value.state, projectId, projectionContext(loaded.value));
-    return projected.ok ? apiOk({ data: projected.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
-  }
-
-  async #createProjectTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const result = await this.#createProject(repository.value, context, {
-      projectId: requiredString(input, "projectId"),
-      coachId: requiredString(input, "coachId"),
-      title: requiredString(input, "title"),
-      objective: requiredString(input, "objective"),
-      baseRef: requiredString(input, "baseRef"),
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha")
-    });
-    return toolMutation(result);
-  }
-
-  async #updateProjectTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const requestedBaseRef = optionalString(input, "baseRef");
-    const normalizedBaseRef = requestedBaseRef ? normalizeRef(requestedBaseRef) : undefined;
-    if (normalizedBaseRef) {
-      const branch = normalizedBaseRef.replace(/^refs\/heads\//u, "");
-      const exists = await this.#transport.readBranch(repository.value, branch);
-      if (!exists.ok) return transportFailure(exists.error);
-      if (!exists.value) return apiFailure({ code: "stale_base", message: `Selected base ref ${normalizedBaseRef} does not exist.`, status: 412, retryable: false });
-    }
-    const patch: ProjectPatch = {
-      ...(optionalString(input, "title") ? { title: asProjectTitle(optionalString(input, "title")!) } : {}),
-      ...(optionalString(input, "objective") ? { objective: asProjectObjective(optionalString(input, "objective")!) } : {}),
-      ...(normalizedBaseRef ? { baseRef: asGitRef(normalizedBaseRef) } : {})
-    };
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "UpdateProject", projectId, patch },
-      factories: [(_state, meta) => ({ type: "UpdateProject", meta, projectId: asProjectId(projectId), patch })]
-    });
-    return toolMutation(result, { projectId });
-  }
-
-  async #rebuildProjectTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha?: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), false);
-    if (!repository.ok) return repository;
-    this.invalidateRepository(repository.value);
-    const generation = this.#captureCacheGeneration(repository.value);
-    const rebuilt = await this.#store.reconstructRepository(repository.value);
-    if (!rebuilt.ok) return storeFailure(rebuilt.error);
-    const projects = rebuilt.value.projects;
-    const synchronizedAt = this.#timestamp();
-    const cachedAt = this.#cacheNow();
-    if (this.#cacheGenerationIsCurrent(generation)) {
-      this.invalidateRepository(repository.value);
-      for (const item of projects) {
-        this.#putCachedProject(
-          cacheKey(repository.value, projectIdOf(item.state)),
-          cachedProject(repository.value, item.state, item.stateHeadSha, synchronizedAt, cachedAt)
-        );
-      }
-      this.#putCachedCatalog(
-        repositoryCacheKey(repository.value),
-        cachedRepositoryCatalog(
-          repository.value,
-          rebuilt.value.kind === "state_branch" ? rebuilt.value.stateHeadSha : undefined,
-          projects.map(item => projectIdOf(item.state)),
-          synchronizedAt,
-          cachedAt
-        )
-      );
-    }
-    const projectId = optionalString(input, "projectId");
-    const match = projectId ? projects.find(item => projectIdOf(item.state) === projectId) : undefined;
-    return apiOk({ data: { projectCount: projects.length, ...(projectId ? { projectId } : {}) }, ...(match ? { stateHeadSha: match.stateHeadSha } : {}) });
-  }
-
-  async #listGoalsTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#loadToolProject(input, context, false);
-    if (!loaded.ok) return loaded;
-    const projected = projectOverviewProjection(loaded.value.state, requiredString(input, "projectId"), projectionContext(loaded.value));
-    return projected.ok ? apiOk({ data: { goals: projected.value.goals }, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
-  }
-
-  async #getGoalTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#loadToolProject(input, context, false);
-    if (!loaded.ok) return loaded;
-    const projected = goalDetailProjection(loaded.value.state, requiredString(input, "projectId"), requiredString(input, "goalId"));
-    return projected.ok ? apiOk({ data: projected.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
-  }
-
-  async #createGoalTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const result = await this.#createGoal(repository.value, context, {
-      projectId: requiredString(input, "projectId"),
-      goalId: requiredString(input, "goalId"),
-      title: requiredString(input, "title"),
-      desiredOutcome: requiredString(input, "desiredOutcome"),
-      acceptanceCriteria: requiredStringArray(input, "acceptanceCriteria", true),
-      constraints: requiredStringArray(input, "constraints", false),
-      priority: optionalNonNegativeInteger(input, "priority") ?? 50,
-      runnerId: optionalString(input, "runnerId"),
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha")
-    });
-    return toolMutation(result);
-  }
-
-  async #updateGoalTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    return toolMutation(await this.#updateGoal(repository.value, context, input));
-  }
-
-  async #pauseGoalTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    return toolMutation(await this.#pauseGoal(
-      repository.value,
-      context,
-      requiredString(input, "projectId"),
-      requiredString(input, "goalId"),
-      requiredString(input, "idempotencyKey"),
-      optionalString(input, "expectedStateSha"),
-      requiredString(input, "reason")
-    ));
-  }
-
-  async #completeGoalTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    return toolMutation(await this.#completeGoal(
-      repository.value,
-      context,
-      requiredString(input, "projectId"),
-      requiredString(input, "goalId"),
-      requiredString(input, "selectedRunId"),
-      requiredString(input, "idempotencyKey"),
-      optionalString(input, "expectedStateSha")
-    ));
-  }
-
-  async #listRunnersTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#loadToolProject(input, context, false);
-    if (!loaded.ok) return loaded;
-    const projected = runnerDirectoryProjection(loaded.value.state, requiredString(input, "projectId"));
-    return projected.ok ? apiOk({ data: { runners: projected.value }, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
-  }
-
-  async #getRunnerTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#loadToolProject(input, context, false);
-    if (!loaded.ok) return loaded;
-    const projected = runnerDirectoryProjection(loaded.value.state, requiredString(input, "projectId"));
-    if (!projected.ok) return projectionFailure(projected);
-    const runnerId = requiredString(input, "runnerId");
-    const runner = projected.value.find(item => item.id === runnerId);
-    return runner ? apiOk({ data: runner, stateHeadSha: loaded.value.stateHeadSha }) : notFound(`Runner ${runnerId} was not found.`);
-  }
-
-  async #getRunTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#loadToolProject(input, context, false);
-    if (!loaded.ok) return loaded;
-    const projected = runDetailProjection(
-      loaded.value.state,
-      requiredString(input, "projectId"),
-      requiredString(input, "runId")
-    );
-    return projected.ok ? apiOk({ data: projected.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
-  }
-
-  async #getCoachTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const loaded = await this.#loadToolProject(input, context, false);
-    if (!loaded.ok) return loaded;
-    const projected = coachViewProjection(loaded.value.state, requiredString(input, "projectId"));
-    return projected.ok ? apiOk({ data: projected.value, stateHeadSha: loaded.value.stateHeadSha }) : projectionFailure(projected);
-  }
-
-  async #createPlayerTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    if ("name" in input) return invalidRequest("Runner definitions do not have a name; use runnerId as their canonical identity.");
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const runnerId = requiredString(input, "runnerId");
-    const at = this.#timestamp();
-    const player: Player = {
-      kind: "player",
-      id: asRunnerId(runnerId),
-      projectId: asProjectId(projectId),
-      promptTemplate: asPromptTemplate(requiredString(input, "promptTemplate")),
-      resources: parseResourceBindings(input.resources),
-      runtimePolicy: parseRuntimePolicy(record(input, "runtimePolicy")),
-      createdAt: asTimestamp(at),
-      updatedAt: asTimestamp(at)
-    };
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: {
-        type: "CreatePlayer",
-        projectId,
-        runnerId,
-        promptTemplate: requiredString(input, "promptTemplate"),
-        resources: input.resources,
-        runtimePolicy: input.runtimePolicy
-      },
-      factories: [(_state, meta) => ({ type: "CreatePlayer", meta, player })]
-    });
-    return toolMutation(result, { runnerId });
-  }
-
-  async #createTeamTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    if ("name" in input) return invalidRequest("Runner definitions do not have a name; use runnerId as their canonical identity.");
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const runnerId = requiredString(input, "runnerId");
-    const at = this.#timestamp();
-    const playersInput = array(input, "players", true).map((item, index) => {
-      const player = assertRecord(item, `players[${index}]`);
-      return {
-        playerId: asRunnerId(requiredString(player, "playerId")),
-        role: asText(requiredString(player, "role")),
-        order: asPositiveInteger(requiredPositiveInteger(player, "order"))
-      };
-    });
-    const players = asNonEmpty(playersInput, "players");
-    const strategyInput = record(input, "strategy");
-    const mode = requiredString(strategyInput, "mode");
-    const team: Team = {
-      kind: "team",
-      id: asRunnerId(runnerId),
-      projectId: asProjectId(projectId),
-      strategy: {
-        mode: strategyMode(mode),
-        promptTemplate: asPromptTemplate(requiredString(strategyInput, "promptTemplate")),
-        maxRounds: asPositiveInteger(requiredPositiveInteger(strategyInput, "maxRounds"))
-      },
-      players,
-      createdAt: asTimestamp(at),
-      updatedAt: asTimestamp(at)
-    };
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "CreateTeam", projectId, runnerId, strategy: input.strategy, players: input.players },
-      factories: [(_state, meta) => ({ type: "CreateTeam", meta, team })]
-    });
-    return toolMutation(result, { runnerId });
-  }
-
-  async #updateRunnerTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const runnerId = requiredString(input, "runnerId");
-    const definition = record(input, "definition");
-    const assertOnlyFields = (value: JsonRecord, fields: readonly string[], path: string): void => {
-      const unexpected = Object.keys(value).find(key => !fields.includes(key));
-      if (unexpected) throw boundaryInvalid(`${path}.${unexpected} is not supported.`);
-    };
-    const strictResources = (value: unknown): ResourceBinding[] => {
-      if (!Array.isArray(value)) throw boundaryInvalid("definition.resources must be an array.");
-      value.forEach((item, index) => assertOnlyFields(
-        assertRecord(item, `definition.resources[${index}]`),
-        ["kind", "name", "reference"],
-        `definition.resources[${index}]`
-      ));
-      return parseResourceBindings(value);
-    };
-    const strictRuntimePolicy = (value: unknown): RuntimePolicy => {
-      const policy = assertRecord(value, "definition.runtimePolicy");
-      assertOnlyFields(policy, ["filesystem", "network", "approvals"], "definition.runtimePolicy");
-      return parseRuntimePolicy(policy);
-    };
-    const kind = requiredString(definition, "kind");
-    let semanticDefinition: JsonRecord;
-    let playerUpdate: {
-      promptTemplate?: Player["promptTemplate"];
-      resources?: ResourceBinding[];
-      runtimePolicy?: RuntimePolicy;
-    } | undefined;
-    let teamUpdate: {
-      strategy?: Partial<Team["strategy"]>;
-      players?: Team["players"];
-    } | undefined;
-
-    if (kind === "player") {
-      assertOnlyFields(definition, ["kind", "promptTemplate", "resources", "runtimePolicy"], "definition");
-      const hasPromptTemplate = "promptTemplate" in definition;
-      const hasResources = "resources" in definition;
-      const hasRuntimePolicy = "runtimePolicy" in definition;
-      if (!hasPromptTemplate && !hasResources && !hasRuntimePolicy) {
-        return invalidRequest("A Player update must change promptTemplate, resources, or runtimePolicy.");
-      }
-      playerUpdate = {
-        ...(hasPromptTemplate ? { promptTemplate: asPromptTemplate(requiredString(definition, "promptTemplate")) } : {}),
-        ...(hasResources ? { resources: strictResources(definition.resources) } : {}),
-        ...(hasRuntimePolicy ? { runtimePolicy: strictRuntimePolicy(definition.runtimePolicy) } : {})
-      };
-      semanticDefinition = { kind, ...playerUpdate };
-    } else if (kind === "team") {
-      assertOnlyFields(definition, ["kind", "strategy", "players"], "definition");
-      const hasStrategy = "strategy" in definition;
-      const hasPlayers = "players" in definition;
-      if (!hasStrategy && !hasPlayers) return invalidRequest("A Team update must change strategy or Player membership.");
-      let strategy: Partial<Team["strategy"]> | undefined;
-      if (hasStrategy) {
-        const strategyInput = assertRecord(definition.strategy, "definition.strategy");
-        assertOnlyFields(strategyInput, ["mode", "promptTemplate", "maxRounds"], "definition.strategy");
-        const hasMode = "mode" in strategyInput;
-        const hasPromptTemplate = "promptTemplate" in strategyInput;
-        const hasMaxRounds = "maxRounds" in strategyInput;
-        if (!hasMode && !hasPromptTemplate && !hasMaxRounds) {
-          return invalidRequest("A Team strategy update must change mode, promptTemplate, or maxRounds.");
-        }
-        strategy = {
-          ...(hasMode ? { mode: strategyMode(requiredString(strategyInput, "mode")) } : {}),
-          ...(hasPromptTemplate ? { promptTemplate: asPromptTemplate(requiredString(strategyInput, "promptTemplate")) } : {}),
-          ...(hasMaxRounds ? { maxRounds: asPositiveInteger(requiredPositiveInteger(strategyInput, "maxRounds")) } : {})
-        };
-      }
-      let players: Team["players"] | undefined;
-      if (hasPlayers) {
-        const parsedPlayers = array(definition, "players", true).map((item, index) => {
-          const player = assertRecord(item, `definition.players[${index}]`);
-          assertOnlyFields(player, ["playerId", "role", "order"], `definition.players[${index}]`);
-          return {
-            playerId: asRunnerId(requiredString(player, "playerId")),
-            role: asText(requiredString(player, "role"), `definition.players[${index}].role`),
-            order: asPositiveInteger(requiredPositiveInteger(player, "order"))
-          };
-        });
-        players = asNonEmpty(parsedPlayers, "definition.players");
-      }
-      teamUpdate = { ...(strategy ? { strategy } : {}), ...(players ? { players } : {}) };
-      semanticDefinition = { kind, ...teamUpdate };
-    } else {
-      return invalidRequest("definition.kind must be player or team.");
-    }
-
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "UpdateRunner", projectId, runnerId, definition: semanticDefinition },
-      factories: [(state, meta) => {
-        const current = state.runners.find(item => item.id === runnerId);
-        if (!current) throw boundaryNotFound(`Runner ${runnerId} was not found.`);
-        const updatedAt = asTimestamp(this.#timestamp());
-        if (current.kind !== kind) {
-          throw boundaryInvalid(`Runner ${runnerId} is a ${current.kind}; a ${kind} definition cannot update it.`);
-        }
-        if (current.kind === "player" && playerUpdate) {
-          const player: Player = {
-            ...current,
-            ...playerUpdate,
-            updatedAt
-          };
-          return { type: "UpdatePlayer", meta, player };
-        }
-        if (current.kind !== "team" || !teamUpdate) throw boundaryInvalid("Runner update definition does not match the stored Runner kind.");
-        const team: Team = {
-          ...current,
-          ...(teamUpdate.strategy ? { strategy: { ...current.strategy, ...teamUpdate.strategy } } : {}),
-          ...(teamUpdate.players ? { players: teamUpdate.players } : {}),
-          updatedAt
-        };
-        return { type: "UpdateTeam", meta, team };
-      }]
-    });
-    return toolMutation(result, { runnerId });
-  }
-
-  async #createProject(
-    repository: RepositoryGrant,
-    context: AuthContext,
-    input: { projectId: string; coachId: string; title: string; objective: string; baseRef: string; idempotencyKey: string; expectedStateSha?: string }
-  ): Promise<ApiResult<MutationResult<{ projectId: string }>>> {
-    const selectedRef = normalizeRef(input.baseRef);
-    const selectedBranch = selectedRef.replace(/^refs\/heads\//u, "");
-    const exists = await this.#transport.readBranch(repository, selectedBranch);
-    if (!exists.ok) return transportFailure(exists.error);
-    if (!exists.value) return apiFailure({ code: "stale_base", message: `Selected base ref ${selectedRef} does not exist.`, status: 412, retryable: false });
+    const rootSha = requiredSha(input, "rootNodeSha");
+    const expectedStateSha = requiredStateSha(input);
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const plan = decodePlan(input.initialPlan, this.#runnerRuntime.runnerTypes);
+    const commit = await this.#transport.readCommit(repository, rootSha);
+    if (!commit.ok) return transportFailure(commit.error);
+    if (!commit.value) return staleBase(`Root commit ${rootSha} does not exist in ${repository.owner}/${repository.name}.`);
+    const anchored = await this.#store.anchorNode({ repository, projectId, nodeSha: rootSha });
+    if (!anchored.ok) return storeFailure(anchored.error);
     const at = this.#timestamp();
     const project: Project = {
-      id: asProjectId(input.projectId),
+      id: asProjectId(projectId),
       workspaceId: asWorkspaceId(`workspace-${repository.installationId}`),
       repository: { owner: asRepositoryOwner(repository.owner), name: asRepositoryName(repository.name) },
-      baseRef: asGitRef(selectedRef),
-      title: asProjectTitle(input.title),
-      objective: asProjectObjective(input.objective),
-      coachId: asCoachId(input.coachId),
-      goalIds: [],
-      runnerIds: [],
-      createdAt: asTimestamp(at),
-      updatedAt: asTimestamp(at)
+      baseRef: asGitRef(`refs/heads/${repository.defaultBranch}`),
+      title: asProjectTitle(requiredString(input, "title")),
+      rootNodeSha: asGitSha(rootSha),
+      createdAt: asTimestamp(at)
     };
-    const coach: Coach = {
-      id: asCoachId(input.coachId),
-      projectId: project.id,
-      promptTemplate: asPromptTemplate("Review Goals, Runs, evidence, and alternatives; propose changes without making consequential user decisions."),
-      resources: [],
-      policy: { goalChanges: "propose_only", runnerChanges: "propose_only", hunsu: "propose_only", selection: "user_only" },
-      createdAt: asTimestamp(at),
-      updatedAt: asTimestamp(at)
-    };
-    const result = await this.#mutate({
+    const node = buildNode({
+      type: "root",
+      projectId,
+      commitSha: rootSha,
+      treeSha: commit.value.treeSha,
+      commitTitle: firstCommitMessageLine(commit.value.message),
+      plan,
+      registeredAt: at
+    });
+    const envelope = encodeNode(node);
+    const semantic = { type: "CreateProject", projectId, rootSha, plan };
+    const applied = await this.#mutate({
       repository,
-      projectId: input.projectId,
+      projectId,
       context,
-      idempotencyKey: input.idempotencyKey,
-      expectedStateSha: input.expectedStateSha,
-      semanticCommand: {
+      idempotencyKey,
+      expectedStateSha,
+      semantic,
+      occurredAt: at,
+      domainActor: userActor(context),
+      factories: [(_state, meta) => ({
         type: "CreateProject",
-        projectId: input.projectId,
-        coachId: input.coachId,
-        title: input.title,
-        objective: input.objective,
-        baseRef: selectedRef,
-        repository: { installationId: repository.installationId, repositoryId: repository.repositoryId, owner: repository.owner, name: repository.name }
-      },
-      factories: [(_state, meta) => ({ type: "CreateProject", meta, project, coach })]
+        meta,
+        rootNodeEventId: asEventId(domainEventId(idempotencyKey, semantic, 1)),
+        project,
+        rootNode: node,
+        payload: envelope
+      })]
     });
-    return result.ok ? apiOk({ ...result.value, value: { projectId: input.projectId } }) : result;
+    return applied.ok ? apiOk({
+      schema: "hunsu.web.project-created.v2",
+      projectId,
+      rootNodeSha: rootSha,
+      stateHeadSha: applied.value.stateHeadSha,
+      synchronizedAt: applied.value.synchronizedAt
+    }) : applied;
   }
 
-  async #createGoal(
-    repository: RepositoryLocator,
+  async #rebuildProjectMaterializations(
+    repository: RepositoryGrant,
     context: AuthContext,
-    input: { projectId: string; goalId: string; title: string; desiredOutcome: string; acceptanceCriteria: string[]; constraints: string[]; priority: number; runnerId?: string; idempotencyKey: string; expectedStateSha?: string }
-  ): Promise<ApiResult<MutationResult<{ goalId: string }>>> {
+    input: JsonRecord
+  ): Promise<ApiResult<unknown>> {
+    requireConfirmation(input);
+    const projectId = requiredString(input, "projectId");
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
     const at = this.#timestamp();
-    const criteria = asNonEmpty(input.acceptanceCriteria.map((item, index) => asAcceptanceCriterion(item, `acceptanceCriteria[${index}]`)), "acceptanceCriteria");
-    const goal: ActiveGoal = {
-      id: asGoalId(input.goalId),
-      projectId: asProjectId(input.projectId),
-      title: asGoalTitle(input.title),
-      desiredOutcome: asDesiredOutcome(input.desiredOutcome),
-      acceptanceCriteria: criteria,
-      constraints: input.constraints.map((item, index) => asGoalConstraint(item, `constraints[${index}]`)),
-      priority: asNonNegativeInteger(input.priority),
-      assignment: input.runnerId ? { type: "assigned", runnerId: asRunnerId(input.runnerId) } : { type: "unassigned" },
-      relation: { type: "root" },
-      status: "active",
-      createdAt: asTimestamp(at),
-      updatedAt: asTimestamp(at)
-    };
-    const result = await this.#mutate({
+    const semantic = { type: "RebuildProjectMaterializations", projectId };
+    const applied = await this.#mutate({
       repository,
-      projectId: input.projectId,
+      projectId,
       context,
-      idempotencyKey: input.idempotencyKey,
-      expectedStateSha: input.expectedStateSha,
-      semanticCommand: {
-        type: "CreateGoal",
-        projectId: input.projectId,
-        goalId: input.goalId,
-        title: input.title,
-        desiredOutcome: input.desiredOutcome,
-        acceptanceCriteria: input.acceptanceCriteria,
-        constraints: input.constraints,
-        priority: input.priority,
-        runnerId: input.runnerId ?? null
-      },
-      factories: [(_state, meta) => ({ type: "CreateGoal", meta, goal })]
+      idempotencyKey,
+      expectedStateSha,
+      semantic,
+      occurredAt: at,
+      domainActor: userActor(context),
+      factories: [(_state, meta) => ({
+        type: "RebuildProjectMaterializations",
+        meta,
+        projectId: asProjectId(projectId)
+      })]
     });
-    return result.ok ? apiOk({ ...result.value, value: { goalId: input.goalId } }) : result;
+    return mutationResponse(applied, "hunsu.web.project-materializations-rebuilt.v2", { projectId });
   }
 
-  async #updateGoal(repository: RepositoryLocator, context: AuthContext, input: JsonRecord): Promise<ApiResult<MutationResult<{ goalId: string }>>> {
+  async #startRun(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<{
+    contract: RunContract;
+    stateHeadSha: string;
+    synchronizedAt: string;
+  }>> {
     const projectId = requiredString(input, "projectId");
-    const goalId = requiredString(input, "goalId");
-    const patch: GoalPatch = {
-      ...(optionalString(input, "title") ? { title: asGoalTitle(optionalString(input, "title")!) } : {}),
-      ...(optionalString(input, "desiredOutcome") ? { desiredOutcome: asDesiredOutcome(optionalString(input, "desiredOutcome")!) } : {}),
-      ...(input.acceptanceCriteria !== undefined ? {
-        acceptanceCriteria: asNonEmpty(requiredStringArray(input, "acceptanceCriteria", true).map((item, index) => asAcceptanceCriterion(item, `acceptanceCriteria[${index}]`)), "acceptanceCriteria")
-      } : {}),
-      ...(input.constraints !== undefined ? {
-        constraints: requiredStringArray(input, "constraints", false).map((item, index) => asGoalConstraint(item, `constraints[${index}]`))
-      } : {}),
-      ...(input.priority !== undefined ? { priority: asNonNegativeInteger(requiredNonNegativeInteger(input, "priority")) } : {}),
-      ...(input.runnerId !== undefined ? {
-        assignment: optionalString(input, "runnerId")
-          ? { type: "assigned" as const, runnerId: asRunnerId(optionalString(input, "runnerId")!) }
-          : { type: "unassigned" as const }
-      } : {})
-    };
-    if (Object.keys(patch).length === 0) return invalidRequest("A Goal update must change at least one field.");
-    const result = await this.#mutate({
-      repository,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "UpdateGoal", projectId, goalId, patch },
-      factories: [(_state, meta) => ({ type: "UpdateGoal", meta, goalId: asGoalId(goalId), patch })]
-    });
-    return result.ok ? apiOk({ ...result.value, value: { goalId } }) : result;
-  }
-
-  async #pauseGoal(
-    repository: RepositoryLocator,
-    context: AuthContext,
-    projectId: string,
-    goalId: string,
-    idempotencyKey: string,
-    expectedStateSha: string | undefined,
-    reason: string
-  ): Promise<ApiResult<MutationResult<{ goalId: string }>>> {
-    const result = await this.#mutate({
-      repository,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha,
-      semanticCommand: { type: "PauseGoal", projectId, goalId, reason },
-      factories: [(_state, meta) => ({ type: "PauseGoal", meta, goalId: asGoalId(goalId), reason: asReason(reason) })]
-    });
-    return result.ok ? apiOk({ ...result.value, value: { goalId } }) : result;
-  }
-
-  async #resumeGoal(
-    repository: RepositoryLocator,
-    context: AuthContext,
-    projectId: string,
-    goalId: string,
-    idempotencyKey: string,
-    expectedStateSha?: string
-  ): Promise<ApiResult<MutationResult<{ goalId: string }>>> {
-    const result = await this.#mutate({
-      repository,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha,
-      semanticCommand: { type: "ResumeGoal", projectId, goalId },
-      factories: [(_state, meta) => ({ type: "ResumeGoal", meta, goalId: asGoalId(goalId) })]
-    });
-    return result.ok ? apiOk({ ...result.value, value: { goalId } }) : result;
-  }
-
-  async #completeGoal(
-    repository: RepositoryLocator,
-    context: AuthContext,
-    projectId: string,
-    goalId: string,
-    selectedRunId: string,
-    idempotencyKey: string,
-    expectedStateSha?: string
-  ): Promise<ApiResult<MutationResult<{ goalId: string }>>> {
-    const result = await this.#mutate({
-      repository,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha,
-      semanticCommand: { type: "CompleteGoal", projectId, goalId, selectedRunId },
-      factories: [(_state, meta) => ({ type: "CompleteGoal", meta, goalId: asGoalId(goalId), selectedRunId: asRunId(selectedRunId) })]
-    });
-    return result.ok ? apiOk({ ...result.value, value: { goalId } }) : result;
-  }
-
-  async #startRunTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const goalId = requiredString(input, "goalId");
-    const runnerId = requiredString(input, "runnerId");
+    const sourceNodeSha = requiredSha(input, "sourceNodeSha");
+    const goalDigest = requiredString(input, "goalDigest");
     const runId = requiredString(input, "runId");
-    const baseSha = requiredString(input, "baseSha");
-    asGitSha(baseSha);
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const alternativeOfRunId = optionalString(input, "alternativeOfRunId");
-    const coachProposalId = optionalString(input, "coachProposalId");
-    const confirmedByUser = input.confirmedByUser === true;
-    if (input.confirmedByUser !== undefined && input.confirmedByUser !== true) {
-      return invalidRequest("confirmedByUser must be true when supplied.");
-    }
-    if (coachProposalId && !alternativeOfRunId) {
-      return invalidRequest("coachProposalId is valid only when starting a Hunsu alternative.");
-    }
-    if (confirmedByUser && !coachProposalId) {
-      return invalidRequest("confirmedByUser requires the exact Coach proposal id being accepted.");
-    }
-    if (coachProposalId && !confirmedByUser) {
-      return apiFailure({
-        code: "confirmation_required",
-        message: "Starting a Coach-proposed Hunsu alternative requires explicit user confirmation.",
-        status: 409,
-        retryable: false
-      });
-    }
-    const loaded = await this.#loadProject(repository.value, projectId, true);
+    const expectedStateSha = requiredStateSha(input);
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const loaded = await this.#loadProject(repository, projectId, true);
     if (!loaded.ok) return loaded;
-    const existingRun = loaded.value.state.runs.find(item => item.id === runId);
-    let proposalToAccept: HunsuProposal | undefined;
-    let origin: Run["origin"] = existingRun?.origin ?? { type: "primary" };
-    if (!existingRun && alternativeOfRunId) {
-      let divergence = [...loaded.value.state.divergences].reverse().find(item => item.sourceRunId === alternativeOfRunId && item.goalId === goalId);
-      if (divergence && coachProposalId
-        && (divergence.basis.type !== "coach_proposal" || divergence.basis.proposalId !== coachProposalId)) {
-        return invalidRequest("The confirmed Hunsu divergence does not match coachProposalId.");
-      }
-      if (!divergence) {
-        if (!confirmedByUser || !coachProposalId) {
-          return apiFailure({
-            code: "confirmation_required",
-            message: "Confirm the matching Coach Hunsu proposal before starting this alternative Run.",
-            status: 409,
-            retryable: false
-          });
-        }
-        const proposal = loaded.value.state.coachProposals.find(item => item.id === coachProposalId);
-        if (!proposal) return notFound(`Coach proposal ${coachProposalId} was not found.`);
-        if (proposal.type !== "hunsu"
-          || proposal.projectId !== projectId
-          || proposal.goalId !== goalId
-          || proposal.sourceRunId !== alternativeOfRunId) {
-          return invalidRequest("coachProposalId does not identify the matching Hunsu proposal for this sibling Run.");
-        }
-        if (loaded.value.state.coachProposalDecisions.some(item => item.proposalId === proposal.id)
-          || loaded.value.state.divergences.some(item => item.basis.type === "coach_proposal" && item.basis.proposalId === proposal.id)) {
-          return conflict(`Coach proposal ${coachProposalId} already has a recorded disposition.`);
-        }
-        const sourceRun = loaded.value.state.runs.find(item => item.id === alternativeOfRunId);
-        if (!sourceRun) return notFound(`Source Run ${alternativeOfRunId} was not found.`);
-        if (sourceRun.status !== "completed") return conflict("A Coach-proposed Hunsu alternative requires a completed source Run.");
-        if (sourceRun.baseSha !== baseSha) {
-          return apiFailure({ code: "stale_base", message: "Alternative Runs must start from the source Run's exact base SHA.", status: 412, retryable: false });
-        }
-        if (!loaded.value.state.goals.some(item => item.id === goalId)) return notFound(`Goal ${goalId} was not found.`);
-        const proposedRunnerId = proposal.alternative.type === "runner_change"
-          ? proposal.alternative.runnerId
-          : proposal.alternative.change.assignment?.type === "assigned"
-            ? proposal.alternative.change.assignment.runnerId
-            : sourceRun.runnerId;
-        if (proposedRunnerId !== runnerId) {
-          return invalidRequest("The requested Runner does not match the Coach-proposed Hunsu change.");
-        }
-        const divergenceId = asDivergenceId(generatedId("divergence", idempotencyKey));
-        proposalToAccept = proposal;
-        divergence = {
-          id: divergenceId,
-          projectId: asProjectId(projectId),
-          goalId: asGoalId(goalId),
-          sourceRunId: asRunId(alternativeOfRunId),
-          baseSha: asGitSha(baseSha),
-          basis: { type: "coach_proposal", proposalId: proposal.id },
-          alternativeRunIds: [],
-          confirmedAt: asTimestamp(this.#timestamp())
-        };
-      }
-      if (divergence.baseSha !== baseSha) return apiFailure({ code: "stale_base", message: "Alternative Runs must start from the confirmed shared base SHA.", status: 412, retryable: false });
-      origin = { type: "hunsu_alternative", divergenceId: divergence.id, sourceRunId: asRunId(alternativeOfRunId) };
-    } else if (!existingRun) {
-      const project = loaded.value.state.projects.find(item => item.id === projectId);
-      if (!project) return notFound(`Project ${projectId} was not found.`);
-      const branch = String(project.baseRef).replace(/^refs\/heads\//u, "");
-      const currentBase = await this.#transport.readBranch(repository.value, branch);
-      if (!currentBase.ok) return transportFailure(currentBase.error);
-      if (!currentBase.value || currentBase.value.headSha !== baseSha) {
-        return apiFailure({ code: "stale_base", message: "The selected Project base ref changed before the Run started.", status: 412, retryable: true, actualStateSha: currentBase.value?.headSha });
-      }
+    const source = loaded.value.state.nodes.find(node => node.projectId === projectId && node.commitSha === sourceNodeSha);
+    if (!source) return notFound(`Node ${sourceNodeSha} was not found.`);
+    const goal = source.plan.nextGoals.find(item => computeGoalDigest(item) === goalDigest);
+    if (!goal) return invalidRequest("goalDigest must identify exactly one next Goal on the source Node.");
+    const execution = this.#runnerRuntime.execute(source.plan.how);
+    if (!execution.ok) {
+      return integrityFailure(`Runner runtime rejected ${source.plan.how.type.origin}/${source.plan.how.type.key}@${source.plan.how.type.schemaVersion}: ${execution.error.message}`);
     }
-    const branch = existingRun?.branch ?? runBranchName(asProjectId(projectId), asGoalId(goalId), asRunId(runId));
-    const factories: MutationCommandFactory[] = [];
-    if (proposalToAccept) {
-      const acceptedProposal = proposalToAccept;
-      factories.push((_state, meta) => ({
-        type: "AcceptCoachProposal",
-        meta: withActor(meta, userActor(context)),
-        proposalId: acceptedProposal.id,
-        reason: asReason("User confirmed the Coach-proposed Hunsu alternative before starting its Run"),
-        application: { type: "hunsu", divergenceId: origin.type === "hunsu_alternative" ? origin.divergenceId : asDivergenceId(generatedId("divergence", idempotencyKey)) }
-      }));
-    }
-    factories.push((_state, meta) => ({
+    const branch = String(runBranchName(asProjectId(projectId), asGitSha(sourceNodeSha), asRunId(runId)));
+    const at = this.#timestamp();
+    const semantic = { type: "StartRun", projectId, sourceNodeSha, goalDigest, runId };
+    const meta = commandMetadata(idempotencyKey, semantic, 0, at, requestActor(context), expectedStateSha);
+    const preflight = applyProjectCommand(loaded.value.state, {
       type: "StartRun",
-      meta: withActor(meta, pluginActor(context)),
+      meta,
       runId: asRunId(runId),
       projectId: asProjectId(projectId),
-      goalId: asGoalId(goalId),
-      runnerId: asRunnerId(runnerId),
-      baseSha: asGitSha(baseSha),
-      branch,
-      origin
-    }));
-    const semanticCommand = {
-      type: "StartRun",
-      projectId,
-      goalId,
-      runnerId,
-      runId,
-      baseSha,
-      branch,
-      origin,
-      alternativeOfRunId: alternativeOfRunId ?? null,
-      coachProposalId: coachProposalId ?? null,
-      confirmedByUser
-    };
-    const expectedStateSha = optionalString(input, "expectedStateSha");
-    if (!existingRun && expectedStateSha && expectedStateSha !== loaded.value.stateHeadSha) {
-      return apiFailure({
-        code: "stale_state",
-        message: "Project state changed since it was loaded.",
-        status: 412,
-        retryable: true,
-        expectedStateSha,
-        actualStateSha: loaded.value.stateHeadSha
-      });
-    }
-    let preflightState = loaded.value.state;
-    const preflightAt = this.#timestamp();
-    for (let index = 0; index < factories.length; index += 1) {
-      const meta = commandMetadata(idempotencyKey, semanticCommand, index, preflightAt, requestActor(context));
-      const applied = applyProjectCommand(preflightState, factories[index](preflightState, meta));
-      if (!applied.ok) {
-        return storeFailure({ code: "invalid_event", message: `DOMAIN:${applied.error.code}:${applied.error.message}` });
-      }
-      preflightState = applied.value.state;
-    }
-    const branchCreated = await this.#store.createRunBranch({ repository: repository.value, projectId, goalId, runId, baseSha });
-    if (!branchCreated.ok) return storeFailure(branchCreated.error);
-    const result = await this.#mutate({
-      repository: repository.value,
+      sourceNodeSha: asGitSha(sourceNodeSha),
+      goalDigest: asGoalDigest(goalDigest),
+      branch: asGitBranch(branch)
+    }, this.#projectIntegrityBoundary);
+    if (!preflight.ok) return domainFailure(preflight.error.code, preflight.error.message);
+    const branchResult = await this.#store.createRunBranch({ repository, projectId, sourceNodeSha, runId });
+    if (!branchResult.ok) return storeFailure(branchResult.error);
+    const applied = await this.#mutate({
+      repository,
       projectId,
       context,
       idempotencyKey,
       expectedStateSha,
-      semanticCommand,
-      factories
+      semantic,
+      occurredAt: at,
+      factories: [(_state, commandMeta) => ({
+        type: "StartRun",
+        meta: commandMeta,
+        runId: asRunId(runId),
+        projectId: asProjectId(projectId),
+        sourceNodeSha: asGitSha(sourceNodeSha),
+        goalDigest: asGoalDigest(goalDigest),
+        branch: asGitBranch(branchResult.value)
+      })]
     });
-    if (!result.ok) return result;
-    const run = result.value.state.runs.find(item => item.id === runId);
-    if (!run) return apiFailure({ code: "temporarily_unavailable", message: "The started Run could not be projected.", status: 503, retryable: true });
-    return apiOk({ data: runContract(repository.value, run), stateHeadSha: result.value.stateHeadSha });
+    if (!applied.ok) return applied;
+    const run = applied.value.state.runs.find(item => item.id === runId);
+    if (!run) return integrityFailure(`Run ${runId} was not reconstructed after start.`);
+    return apiOk({
+      contract: runContract(run, repository, this.#now(), execution.value),
+      stateHeadSha: applied.value.stateHeadSha,
+      synchronizedAt: applied.value.synchronizedAt
+    });
   }
 
-  async #checkpointRunTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
+  async #checkpointRun(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
     const projectId = requiredString(input, "projectId");
     const runId = requiredString(input, "runId");
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const checkpointId = generatedId("checkpoint", idempotencyKey);
-    const checkpoint = {
-      id: asCheckpointId(checkpointId),
-      runId: asRunId(runId),
-      summary: asEvidenceSummary(requiredString(input, "summary")),
-      ...(optionalString(input, "commitSha") ? { commitSha: asGitSha(optionalString(input, "commitSha")!) } : {}),
-      recordedAt: asTimestamp(this.#timestamp())
-    };
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: {
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const at = this.#timestamp();
+    const location = parseCheckpointLocation(record(input, "location"));
+    const semantic = { type: "CheckpointRun", projectId, runId, summary: requiredString(input, "summary"), location };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      factories: [(_state, meta) => ({
         type: "CheckpointRun",
-        projectId,
-        runId,
-        checkpointId,
-        summary: requiredString(input, "summary"),
-        commitSha: optionalString(input, "commitSha") ?? null
-      },
-      factories: [(_state, meta) => ({ type: "CheckpointRun", meta, checkpoint })]
+        meta,
+        checkpoint: {
+          id: asCheckpointId(generatedId("checkpoint", idempotencyKey)),
+          runId: asRunId(runId),
+          summary: asEvidenceSummary(requiredString(input, "summary")),
+          location,
+          recordedAt: asTimestamp(at)
+        }
+      })]
     });
-    return toolMutation(result, { checkpointId });
+    return mutationResponse(applied, "hunsu.web.run-checkpointed.v2", { runId });
   }
 
-  async #attachEvidenceTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
+  async #attachEvidence(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
     const projectId = requiredString(input, "projectId");
     const runId = requiredString(input, "runId");
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const evidence = evidenceRef(projectId, runId, parseEvidence(record(input, "evidence")), generatedId("evidence", idempotencyKey), this.#timestamp());
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "AttachRunEvidence", projectId, runId, evidenceId: evidence.id, evidence: stableEvidence(parseEvidence(record(input, "evidence"))) },
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const at = this.#timestamp();
+    const evidence = evidenceRef(projectId, runId, input.evidence, generatedId("evidence", idempotencyKey), at);
+    const semantic = { type: "AttachRunEvidence", projectId, runId, evidence: input.evidence };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
       factories: [(_state, meta) => ({ type: "AttachRunEvidence", meta, evidence })]
     });
-    return toolMutation(result, { evidenceId: evidence.id });
+    return mutationResponse(applied, "hunsu.web.run-evidence-attached.v2", { runId, evidenceId: String(evidence.id) });
   }
 
-  async #completeRunTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
+  async #completeRun(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
     const projectId = requiredString(input, "projectId");
     const runId = requiredString(input, "runId");
-    const resultSha = requiredString(input, "resultSha");
-    asGitSha(resultSha);
-    const loaded = await this.#loadProject(repository.value, projectId, true);
+    const resultSha = requiredSha(input, "resultSha");
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const evidenceInputs = array(input, "evidence", true);
+    const loaded = await this.#loadProject(repository, projectId, true);
     if (!loaded.ok) return loaded;
     const run = loaded.value.state.runs.find(item => item.id === runId);
     if (!run) return notFound(`Run ${runId} was not found.`);
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const evidenceInputs = input.evidence === undefined ? [] : array(input, "evidence", false).map((item, index) => parseEvidence(assertRecord(item, `evidence[${index}]`), true));
-    const evidence = evidenceInputs.map((item, index) => evidenceRef(projectId, runId, item, generatedId(`evidence-${index + 1}`, idempotencyKey), this.#timestamp()));
-    if (run.evidenceIds.length + evidence.length === 0) return invalidRequest("A completed Run requires at least one evidence item.");
-    if (run.status !== "running" && run.status !== "completed") return conflict(`Run ${runId} is already ${run.status}.`);
-    if (run.status === "running") {
-      const verified = await this.#store.verifyRunResult({ repository: repository.value, branch: run.branch, baseSha: run.baseSha, resultSha });
-      if (!verified.ok) {
-        return apiFailure({ code: "result_unreachable", message: verified.error.message, status: 412, retryable: false });
+    if (run.status !== "running") {
+      if (run.status === "completed" && run.resultNodeSha === resultSha) {
+        const replay = await this.#mutateReplay(repository, context, projectId, input, { type: "CompleteRun", projectId, runId, resultSha, evidence: evidenceInputs });
+        return mutationResponse(replay, "hunsu.web.run-completed.v2", { runId, resultNodeSha: resultSha });
       }
+      return conflict(`Run ${runId} is already ${run.status}.`);
     }
-    const factories: MutationCommandFactory[] = [
+    const verified = await this.#store.verifyRunResult({ repository, branch: String(run.branch), baseSha: String(run.sourceNodeSha), resultSha });
+    if (!verified.ok) {
+      if (verified.error.code === "invalid_event" || verified.error.code === "state_not_found") {
+        return apiFailure({ code: "result_unreachable", message: verified.error.message, status: 412, retryable: true });
+      }
+      return storeFailure(verified.error);
+    }
+    const commit = await this.#transport.readCommit(repository, resultSha);
+    if (!commit.ok) return transportFailure(commit.error);
+    if (!commit.value) return apiFailure({ code: "result_unreachable", message: `Result commit ${resultSha} was not found.`, status: 412, retryable: true });
+    const anchored = await this.#store.anchorNode({ repository, projectId, nodeSha: resultSha });
+    if (!anchored.ok) return storeFailure(anchored.error);
+    const source = loaded.value.state.nodes.find(node => node.projectId === projectId && node.commitSha === run.sourceNodeSha);
+    if (!source) return integrityFailure(`Run ${runId} references a missing source Node.`);
+    const inherited = inheritRunChildPlan(source, run.goalDigest);
+    if (!inherited.ok) return domainFailure(inherited.error.code, inherited.error.message);
+    const at = this.#timestamp();
+    const node = buildNode({
+      type: "run_child",
+      projectId,
+      commitSha: resultSha,
+      treeSha: commit.value.treeSha,
+      commitTitle: firstCommitMessageLine(commit.value.message),
+      plan: inherited.value,
+      registeredAt: at,
+      parentSha: String(run.sourceNodeSha),
+      runId,
+      consumedGoalDigest: String(run.goalDigest)
+    });
+    const envelope = encodeNode(node);
+    const evidence = evidenceInputs.map((item, index) => evidenceRef(
+      projectId,
+      runId,
+      item,
+      generatedId(`evidence-${index + 1}`, idempotencyKey),
+      at
+    ));
+    const semantic = { type: "CompleteRun", projectId, runId, resultSha, evidence: evidenceInputs };
+    const factories: MutationFactory[] = [
       ...evidence.map(item => (_state: ProjectState, meta: CommandMetadata): ProjectCommand => ({ type: "AttachRunEvidence", meta, evidence: item })),
       (_state, meta) => ({
         type: "CompleteRun",
         meta,
-        result: { runId: asRunId(runId), branch: asGitBranch(run.branch), resultSha: asGitSha(resultSha), verifiedAt: asTimestamp(this.#timestamp()) }
+        nodeEventId: asEventId(domainEventId(idempotencyKey, semantic, evidence.length + 1)),
+        result: { runId: asRunId(runId), branch: run.branch, resultSha: asGitSha(resultSha), verifiedAt: asTimestamp(at) },
+        node,
+        payload: envelope
       })
     ];
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "CompleteRun", projectId, runId, resultSha, evidence: evidenceInputs.map(stableEvidence) },
-      factories
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at, factories
     });
-    return toolMutation(result, { runId, resultSha });
+    return mutationResponse(applied, "hunsu.web.run-completed.v2", { runId, resultNodeSha: resultSha });
   }
 
-  async #failRunTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const runId = requiredString(input, "runId");
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const inputs = array(input, "evidence", true).map((item, index) => parseEvidence(assertRecord(item, `evidence[${index}]`)));
-    const evidence = inputs.map((item, index) => evidenceRef(projectId, runId, item, generatedId(`evidence-${index + 1}`, idempotencyKey), this.#timestamp()));
-    const factories: MutationCommandFactory[] = [
-      ...evidence.map(item => (_state: ProjectState, meta: CommandMetadata): ProjectCommand => ({ type: "AttachRunEvidence", meta, evidence: item })),
-      (_state, meta) => ({ type: "FailRun", meta, runId: asRunId(runId), reason: asReason(requiredString(input, "reason")) })
-    ];
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "FailRun", projectId, runId, reason: requiredString(input, "reason"), evidence: inputs.map(stableEvidence) },
-      factories
-    });
-    return toolMutation(result, { runId });
-  }
-
-  async #cancelRunTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const runId = requiredString(input, "runId");
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "CancelRun", projectId, runId, reason: requiredString(input, "reason") },
-      factories: [(_state, meta) => ({ type: "CancelRun", meta, runId: asRunId(runId), reason: asReason(requiredString(input, "reason")) })]
-    });
-    return toolMutation(result, { runId });
-  }
-
-  async #coachReviewTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const result = await this.#recordCoachReview(repository.value, context, {
-      projectId: requiredString(input, "projectId"),
-      reviewId: generatedId("review", idempotencyKey),
-      goalId: optionalString(input, "goalId"),
-      runId: optionalString(input, "runId"),
-      assessment: requiredString(input, "assessment"),
-      findings: requiredStringArray(input, "findings", false),
-      recommendation: requiredString(input, "recommendation"),
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha")
-    });
-    return toolMutation(result);
-  }
-
-  async #recordCoachReview(
-    repository: RepositoryLocator,
+  async #terminalRun(
+    repository: RepositoryGrant,
     context: AuthContext,
-    input: { projectId: string; reviewId: string; goalId?: string; runId?: string; assessment: string; findings: string[]; recommendation?: string; idempotencyKey: string; expectedStateSha?: string }
-  ): Promise<ApiResult<MutationResult<{ reviewId: string }>>> {
-    const result = await this.#mutate({
-      repository,
-      projectId: input.projectId,
-      context,
-      idempotencyKey: input.idempotencyKey,
-      expectedStateSha: input.expectedStateSha,
-      semanticCommand: {
+    input: JsonRecord,
+    kind: "fail" | "cancel"
+  ): Promise<ApiResult<unknown>> {
+    const projectId = requiredString(input, "projectId");
+    const runId = requiredString(input, "runId");
+    const reason = requiredString(input, "reason");
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const at = this.#timestamp();
+    const semantic = { type: kind === "fail" ? "FailRun" : "CancelRun", projectId, runId, reason };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      factories: [(_state, meta) => kind === "fail"
+        ? { type: "FailRun", meta, runId: asRunId(runId), reason: asReason(reason) }
+        : { type: "CancelRun", meta, runId: asRunId(runId), reason: asReason(reason) }]
+    });
+    return mutationResponse(applied, kind === "fail" ? "hunsu.web.run-failed.v2" : "hunsu.web.run-canceled.v2", { runId });
+  }
+
+  async #recordReview(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
+    const projectId = requiredString(input, "projectId");
+    const nodeSha = requiredSha(input, "nodeSha");
+    const reviewId = requiredString(input, "reviewId");
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const at = this.#timestamp();
+    const recommendations = [
+      ...optionalStringArray(input, "findings"),
+      requiredString(input, "recommendation")
+    ];
+    const semantic = { type: "RecordCoachReview", projectId, nodeSha, reviewId, assessment: requiredString(input, "assessment"), recommendations };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      domainActor: coachActor(context),
+      factories: [(_state, meta) => ({
         type: "RecordCoachReview",
-        projectId: input.projectId,
-        reviewId: input.reviewId,
-        goalId: input.goalId ?? null,
-        runId: input.runId ?? null,
-        assessment: input.assessment,
-        findings: input.findings,
-        recommendation: input.recommendation ?? null
-      },
-      factories: [(state, meta) => {
-        const project = state.projects.find(item => item.id === input.projectId);
-        if (!project) throw boundaryNotFound(`Project ${input.projectId} was not found.`);
-        const recommendations = [...input.findings, ...(input.recommendation ? [input.recommendation] : [])].map((item, index) => asText(item, `recommendations[${index}]`));
-        return {
-          type: "RecordCoachReview",
-          meta: withActor(meta, { type: "coach", coachId: project.coachId }),
-          review: {
-            id: asCoachReviewId(input.reviewId),
-            projectId: project.id,
-            coachId: project.coachId,
-            target: input.runId
-              ? { type: "run", runId: asRunId(input.runId) }
-              : input.goalId
-                ? { type: "goal", goalId: asGoalId(input.goalId) }
-                : { type: "project", projectId: project.id },
-            assessment: asText(input.assessment),
-            recommendations,
-            recordedAt: asTimestamp(this.#timestamp())
-          }
-        };
-      }]
+        meta,
+        review: {
+          id: asCoachReviewId(reviewId),
+          projectId: asProjectId(projectId),
+          target: { type: "node", nodeSha: asGitSha(nodeSha) },
+          assessment: asText(requiredString(input, "assessment")),
+          recommendations: recommendations.map(item => asText(item)),
+          recordedAt: asTimestamp(at)
+        }
+      })]
     });
-    return result.ok ? apiOk({ ...result.value, value: { reviewId: input.reviewId } }) : result;
+    return mutationResponse(applied, "hunsu.web.coach-review-recorded.v2", { reviewId });
   }
 
-  async #coachProposeChangeTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
+  async #proposeTransition(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
+    const projectId = requiredString(input, "projectId");
+    const sourceNodeSha = requiredSha(input, "sourceNodeSha");
+    const proposalId = requiredString(input, "proposalId");
+    const sourcePayloadDigest = requiredString(input, "sourcePayloadDigest");
+    const proposedPlan = decodePlan(input.proposedPlan, this.#runnerRuntime.runnerTypes);
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const loaded = await this.#loadProject(repository, projectId, true);
+    if (!loaded.ok) return loaded;
+    const source = loaded.value.state.nodes.find(node => node.projectId === projectId && node.commitSha === sourceNodeSha);
+    if (!source) return notFound(`Node ${sourceNodeSha} was not found.`);
+    if (source.payloadDigest !== sourcePayloadDigest) return conflict("The Coaching proposal source payload digest is stale.");
+    const at = this.#timestamp();
+    const proposedPlanDigest = computeNodePlanDigest(proposedPlan);
+    const rationale = optionalString(input, "rationale") ?? optionalString(input, "summary") ?? "Coach proposed a Node plan transition.";
+    const semantic = { type: "RecordCoachingProposal", projectId, sourceNodeSha, sourcePayloadDigest, proposalId, proposedPlan, rationale };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      domainActor: coachActor(context),
+      factories: [(_state, meta) => ({
+        type: "RecordCoachingProposal",
+        meta,
+        proposal: {
+          id: asProposalId(proposalId),
+          projectId: asProjectId(projectId),
+          sourceNodeSha: asGitSha(sourceNodeSha),
+          sourcePayloadDigest: asNodePayloadDigest(sourcePayloadDigest),
+          sourcePlanDigest: source.planDigest,
+          proposedPlan,
+          proposedPlanDigest,
+          expectedStateSha: asGitSha(expectedStateSha),
+          reason: asReason(rationale),
+          proposedAt: asTimestamp(at)
+        }
+      })]
+    });
+    return mutationResponse(applied, "hunsu.web.coaching-proposal-recorded.v2", {
+      proposalId,
+      sourceNodeSha,
+      sourcePayloadDigest,
+      proposedPlanDigest: String(proposedPlanDigest)
+    });
+  }
+
+  async #confirmProposal(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
+    requireConfirmation(input);
     const projectId = requiredString(input, "projectId");
     const proposalId = requiredString(input, "proposalId");
-    const target = requiredString(input, "target");
-    const goalId = requiredString(input, "goalId");
-    if (target !== "goal" && target !== "runner") return invalidRequest("target must be goal or runner.");
-    if (target === "goal" && input.goalPatch === undefined) return invalidRequest("goalPatch is required for a Goal change proposal.");
-    if (target === "runner" && !optionalString(input, "runnerId")) return invalidRequest("runnerId is required for a Runner change proposal.");
-    const result = await this.#mutate({
-      repository: repository.value,
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const loaded = await this.#loadProject(repository, projectId, true);
+    if (!loaded.ok) return loaded;
+    const proposal = loaded.value.state.coachingProposals.find(item => item.id === proposalId);
+    if (!proposal) return notFound(`Coaching proposal ${proposalId} was not found.`);
+    const created = await this.#store.createCoachingNode({
+      repository,
       projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: {
-        type: "RecordCoachProposal",
-        projectId,
-        proposalId,
-        target,
-        goalId,
-        goalPatch: input.goalPatch ?? null,
-        runnerId: optionalString(input, "runnerId") ?? null,
-        summary: requiredString(input, "summary"),
-        rationale: requiredString(input, "rationale")
-      },
-      factories: [(state, meta) => {
-        const project = state.projects.find(item => item.id === projectId);
-        if (!project) throw boundaryNotFound(`Project ${projectId} was not found.`);
-        const base = {
-          id: asCoachProposalId(proposalId),
-          projectId: project.id,
-          coachId: project.coachId,
-          reason: asReason(requiredString(input, "rationale")),
-          proposedAt: asTimestamp(this.#timestamp())
-        };
-        const proposal: CoachProposal = target === "goal"
-          ? { ...base, type: "goal_change", goalId: asGoalId(goalId), change: parseGoalPatch(record(input, "goalPatch")) }
-          : { ...base, type: "runner_change", goalId: asGoalId(goalId), runnerId: asRunnerId(requiredString(input, "runnerId")) };
-        return { type: "RecordCoachProposal", meta: withActor(meta, { type: "coach", coachId: project.coachId }), proposal };
-      }]
+      sourceSha: String(proposal.sourceNodeSha),
+      proposalId,
+      planDigest: String(proposal.proposedPlanDigest),
+      proposedAt: String(proposal.proposedAt)
     });
-    return toolMutation(result, { proposalId });
+    if (!created.ok) return storeFailure(created.error);
+    const at = this.#timestamp();
+    const node = buildNode({
+      type: "coaching_child",
+      projectId,
+      commitSha: created.value.nodeSha,
+      treeSha: created.value.treeSha,
+      commitTitle: created.value.commitTitle,
+      plan: proposal.proposedPlan,
+      registeredAt: at,
+      parentSha: String(proposal.sourceNodeSha),
+      proposalId
+    });
+    const envelope = encodeNode(node);
+    const semantic = { type: "ConfirmCoachingProposal", projectId, proposalId, childNodeSha: created.value.nodeSha };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      domainActor: userActor(context),
+      factories: [(_state, meta) => ({
+        type: "ConfirmCoachingProposal",
+        meta,
+        nodeEventId: asEventId(domainEventId(idempotencyKey, semantic, 1)),
+        decisionId: asDecisionId(generatedId("decision", idempotencyKey)),
+        proposalId: asProposalId(proposalId),
+        reason: asReason(optionalString(input, "reason") ?? "User confirmed the Coaching transition."),
+        node,
+        payload: envelope
+      })]
+    });
+    return mutationResponse(applied, "hunsu.web.coaching-proposal-confirmed.v2", { proposalId, childNodeSha: created.value.nodeSha });
   }
 
-  async #coachProposeHunsuTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
+  async #rejectProposal(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
+    requireConfirmation(input);
     const projectId = requiredString(input, "projectId");
     const proposalId = requiredString(input, "proposalId");
-    const sourceRunId = requiredString(input, "sourceRunId");
-    const goalId = requiredString(input, "goalId");
-    const changedRunnerId = optionalString(input, "changedRunnerId");
-    const hasGoalChange = input.changedGoalPatch !== undefined;
-    if (hasGoalChange === (changedRunnerId !== undefined)) {
-      return invalidRequest("A Hunsu proposal must provide exactly one of changedGoalPatch or changedRunnerId.");
-    }
-    const alternative: HunsuProposal["alternative"] = hasGoalChange
-      ? { type: "goal_change", change: parseGoalPatch(record(input, "changedGoalPatch")) }
-      : { type: "runner_change", runnerId: asRunnerId(changedRunnerId!) };
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "RecordHunsuProposal", projectId, proposalId, sourceRunId, goalId, alternative },
-      factories: [(state, meta) => {
-        const project = state.projects.find(item => item.id === projectId);
-        if (!project) throw boundaryNotFound(`Project ${projectId} was not found.`);
-        const proposal: CoachProposal = {
-          type: "hunsu",
-          id: asCoachProposalId(proposalId),
-          projectId: project.id,
-          coachId: project.coachId,
-          goalId: asGoalId(goalId),
-          sourceRunId: asRunId(sourceRunId),
-          alternative,
-          reason: asReason(requiredString(input, "rationale")),
-          proposedAt: asTimestamp(this.#timestamp())
-        };
-        return { type: "RecordCoachProposal", meta: withActor(meta, { type: "coach", coachId: project.coachId }), proposal };
-      }]
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const reason = requiredString(input, "reason");
+    const at = this.#timestamp();
+    const semantic = { type: "RejectCoachingProposal", projectId, proposalId, reason };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      domainActor: userActor(context),
+      factories: [(_state, meta) => ({
+        type: "RejectCoachingProposal",
+        meta,
+        decisionId: asDecisionId(generatedId("decision", idempotencyKey)),
+        proposalId: asProposalId(proposalId),
+        reason: asReason(reason)
+      })]
     });
-    return toolMutation(result, { proposalId });
+    return mutationResponse(applied, "hunsu.web.coaching-proposal-rejected.v2", { proposalId });
   }
 
-  async #compareAlternativesTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
+  async #compareAlternatives(repository: RepositoryGrant, context: AuthContext, input: JsonRecord): Promise<ApiResult<unknown>> {
     const projectId = requiredString(input, "projectId");
+    const sourceNodeSha = requiredSha(input, "sourceNodeSha");
     const comparisonId = requiredString(input, "comparisonId");
-    const runIdsInput = requiredStringArray(input, "runIds", true);
-    if (runIdsInput.length < 2) return invalidRequest("A comparison requires at least two Runs.");
-    const runIds = runIdsInput.map(asRunId) as unknown as readonly [ReturnType<typeof asRunId>, ReturnType<typeof asRunId>, ...ReturnType<typeof asRunId>[]];
-    const findings = array(input, "findings", false).map((item, findingIndex) => {
-      const finding = assertRecord(item, `findings[${findingIndex}]`);
-      const summariesInput = array(finding, "summaries", true);
-      const summaries = summariesInput.map((summaryItem, summaryIndex) => {
-        const summary = assertRecord(summaryItem, `findings[${findingIndex}].summaries[${summaryIndex}]`);
-        return {
-          runId: asRunId(requiredString(summary, "runId")),
-          summary: asEvidenceSummary(requiredString(summary, "summary"))
-        };
-      });
-      return {
-        criterion: asAcceptanceCriterion(requiredString(finding, "criterion")),
-        summaries: asNonEmpty(summaries, `findings[${findingIndex}].summaries`)
-      };
-    });
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey: requiredString(input, "idempotencyKey"),
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: {
-        type: "CompareAlternatives",
-        projectId,
-        comparisonId,
-        divergenceId: requiredString(input, "divergenceId"),
-        goalId: requiredString(input, "goalId"),
-        runIds: runIdsInput,
-        findings: input.findings,
-        summary: requiredString(input, "summary")
-      },
+    const nodeShas = requiredShaArray(input, "nodeShas", 2);
+    const findings = parseComparisonFindings(input.findings);
+    const summary = requiredString(input, "summary");
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const loaded = await this.#loadProject(repository, projectId, true);
+    if (!loaded.ok) return loaded;
+    const compared = loaded.value.state.nodes.filter(node => nodeShas.includes(String(node.commitSha)));
+    if (compared.length !== nodeShas.length || compared.some(node => node.type !== "run_child" || node.parentSha !== sourceNodeSha)) {
+      return invalidRequest("Compared Nodes must be completed Run siblings of sourceNodeSha.");
+    }
+    const at = this.#timestamp();
+    const semantic = { type: "CompareAlternatives", projectId, sourceNodeSha, comparisonId, nodeShas, findings, summary };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      domainActor: coachActor(context),
       factories: [(_state, meta) => ({
         type: "CompareAlternatives",
         meta,
         comparisonId: asComparisonId(comparisonId),
-        divergenceId: asDivergenceId(requiredString(input, "divergenceId")),
-        runIds,
+        projectId: asProjectId(projectId),
+        nodeShas: asAtLeastTwo(nodeShas.map(asGitSha), "nodeShas"),
         findings,
-        summary: asEvidenceSummary(requiredString(input, "summary"))
+        summary: asEvidenceSummary(summary)
       })]
     });
-    if (!result.ok) return result;
-    const projection = alternativeComparisonProjection(result.value.state, projectId, comparisonId);
-    return projection.ok
-      ? apiOk({ data: projection.value, stateHeadSha: result.value.stateHeadSha })
-      : projectionFailure(projection);
+    return mutationResponse(applied, "hunsu.web.alternatives-compared.v2", { comparisonId, sourceNodeSha, nodeShas });
   }
 
-  async #selectAlternativeTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    if (input.confirmedByUser !== true) return apiFailure({ code: "confirmation_required", message: "Alternative selection requires explicit user confirmation.", status: 409, retryable: false });
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
+  async #decideAlternative(
+    repository: RepositoryGrant,
+    context: AuthContext,
+    input: JsonRecord,
+    kind: "select" | "reject"
+  ): Promise<ApiResult<unknown>> {
+    requireConfirmation(input);
     const projectId = requiredString(input, "projectId");
-    const runId = requiredString(input, "runId");
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const decisionId = generatedId("decision", idempotencyKey);
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "SelectAlternative", projectId, runId, comparisonId: requiredString(input, "comparisonId") },
-      factories: [(_state, meta) => ({
-        type: "SelectAlternative",
-        meta: withActor(meta, userActor(context)),
-        decisionId: asDecisionId(decisionId),
-        comparisonId: asComparisonId(requiredString(input, "comparisonId")),
-        selectedRunId: asRunId(runId),
-        rationale: asReason(requiredString(input, "rationale"))
-      })]
+    const comparisonId = requiredString(input, "comparisonId");
+    const nodeSha = requiredSha(input, "nodeSha");
+    const rationale = requiredString(input, "rationale");
+    const idempotencyKey = requiredIdempotencyKey(input);
+    const expectedStateSha = requiredStateSha(input);
+    const at = this.#timestamp();
+    const semantic = { type: kind === "select" ? "SelectAlternative" : "RejectAlternatives", projectId, comparisonId, nodeSha, rationale };
+    const applied = await this.#mutate({
+      repository, projectId, context, idempotencyKey, expectedStateSha, semantic, occurredAt: at,
+      domainActor: userActor(context),
+      factories: [(_state, meta) => kind === "select"
+        ? {
+            type: "SelectAlternative",
+            meta,
+            decisionId: asDecisionId(generatedId("decision", idempotencyKey)),
+            projectId: asProjectId(projectId),
+            comparisonId: asComparisonId(comparisonId),
+            selectedNodeSha: asGitSha(nodeSha),
+            rationale: asReason(rationale)
+          }
+        : {
+            type: "RejectAlternatives",
+            meta,
+            decisionId: asDecisionId(generatedId("decision", idempotencyKey)),
+            projectId: asProjectId(projectId),
+            comparisonId: asComparisonId(comparisonId),
+            rejectedNodeShas: asNonEmpty([asGitSha(nodeSha)], "nodeShas"),
+            rationale: asReason(rationale)
+          }]
     });
-    return toolMutation(result, { decisionId });
-  }
-
-  async #rejectAlternativeTool(input: JsonRecord, context: AuthContext): Promise<ApiResult<{ data: unknown; stateHeadSha: string }>> {
-    if (input.confirmedByUser !== true) return apiFailure({ code: "confirmation_required", message: "Alternative rejection requires explicit user confirmation.", status: 409, retryable: false });
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
-    if (!repository.ok) return repository;
-    const projectId = requiredString(input, "projectId");
-    const runId = requiredString(input, "runId");
-    const idempotencyKey = requiredString(input, "idempotencyKey");
-    const decisionId = generatedId("decision", idempotencyKey);
-    const result = await this.#mutate({
-      repository: repository.value,
-      projectId,
-      context,
-      idempotencyKey,
-      expectedStateSha: optionalString(input, "expectedStateSha"),
-      semanticCommand: { type: "RejectAlternative", projectId, runId, comparisonId: requiredString(input, "comparisonId") },
-      factories: [(_state, meta) => ({
-        type: "RejectAlternatives",
-        meta: withActor(meta, userActor(context)),
-        decisionId: asDecisionId(decisionId),
-        comparisonId: asComparisonId(requiredString(input, "comparisonId")),
-        rejectedRunIds: [asRunId(runId)],
-        rationale: asReason(requiredString(input, "rationale"))
-      })]
-    });
-    return toolMutation(result, { decisionId });
+    return mutationResponse(applied, kind === "select" ? "hunsu.web.alternative-selected.v2" : "hunsu.web.alternative-rejected.v2", { comparisonId, nodeSha });
   }
 
   async #mutate(input: {
-    repository: RepositoryLocator;
+    repository: RepositoryGrant;
     projectId: string;
     context: AuthContext;
     idempotencyKey: string;
-    expectedStateSha?: string;
-    semanticCommand: unknown;
-    factories: readonly MutationCommandFactory[];
-  }): Promise<ApiResult<{ state: ProjectState; stateHeadSha: string; synchronizedAt: string; value: unknown }>> {
-    if (!input.idempotencyKey.trim() || input.idempotencyKey.length > 256) return invalidRequest("An idempotency key containing 1 to 256 characters is required.");
-    if (input.factories.length === 0) return invalidRequest("A mutation must contain at least one command.");
-    const base = await this.#transport.readBranch(input.repository, input.repository.defaultBranch);
+    expectedStateSha: string;
+    semantic: unknown;
+    occurredAt: string;
+    factories: readonly MutationFactory[];
+    domainActor?: DomainActor;
+  }): Promise<ApiResult<MutationApplied>> {
+    const base = await this.#transport.readBranchHead(input.repository, input.repository.defaultBranch);
     if (!base.ok) return transportFailure(base.error);
-    if (!base.value) return apiFailure({ code: "stale_base", message: "The repository default branch is unavailable.", status: 412, retryable: true });
-    const at = this.#timestamp();
-    const domainActor = requestActor(input.context);
+    if (!base.value) return staleBase(`Default branch ${input.repository.defaultBranch} is unavailable.`);
+    const actor = input.domainActor ?? requestActor(input.context);
     const appended = await this.#store.append({
       repository: input.repository,
       projectId: input.projectId,
-      baseSha: base.value.headSha,
-      ...(input.expectedStateSha ? { expectedHeadSha: input.expectedStateSha } : {}),
+      baseSha: base.value,
+      expectedHeadSha: input.expectedStateSha,
       idempotencyKey: input.idempotencyKey,
-      occurredAt: at,
+      occurredAt: input.occurredAt,
       actor: stateActor(input.context),
-      command: input.semanticCommand,
+      command: input.semantic,
       decide: current => {
         let state = current ?? emptyProjectState();
         const events: DomainEvent[] = [];
         for (let index = 0; index < input.factories.length; index += 1) {
-          const meta = commandMetadata(input.idempotencyKey, input.semanticCommand, index, at, domainActor);
-          const command = input.factories[index](state, meta);
-          const applied = applyProjectCommand(state, command);
-          if (!applied.ok) {
-            return {
-              ok: false,
-              error: { code: "invalid_event", message: `DOMAIN:${applied.error.code}:${applied.error.message}` }
-            };
-          }
+          const meta = commandMetadata(
+            input.idempotencyKey,
+            input.semantic,
+            index,
+            input.occurredAt,
+            actor,
+            input.expectedStateSha
+          );
+          const applied = applyProjectCommand(state, input.factories[index]!(state, meta), this.#projectIntegrityBoundary);
+          if (!applied.ok) return {
+            ok: false as const,
+            error: { code: "invalid_event" as const, message: `DOMAIN:${applied.error.code}:${applied.error.message}` }
+          };
           state = applied.value.state;
           events.push(...applied.value.emittedEvents);
         }
-        return { ok: true, value: events };
+        return { ok: true as const, value: events };
       }
     });
     if (!appended.ok) return storeFailure(appended.error);
-    const synchronizedAt = this.#timestamp();
     this.invalidateRepository(input.repository);
-    this.#putCachedProject(
-      cacheKey(input.repository, input.projectId),
-      cachedProject(input.repository, appended.value.state, appended.value.stateHeadSha, synchronizedAt, this.#cacheNow())
-    );
     return apiOk({
       state: appended.value.state,
       stateHeadSha: appended.value.stateHeadSha,
-      synchronizedAt,
-      value: { idempotentReplay: appended.value.idempotentReplay }
+      synchronizedAt: this.#timestamp(),
+      idempotentReplay: appended.value.idempotentReplay
     });
   }
 
-  async #loadToolProject(input: JsonRecord, context: AuthContext, requireWrite: boolean): Promise<ApiResult<AuthorizedProject>> {
-    const repository = await this.#repositoryFromInput(context, record(input, "repository"), requireWrite);
+  async #mutateReplay(
+    repository: RepositoryGrant,
+    context: AuthContext,
+    projectId: string,
+    input: JsonRecord,
+    semantic: unknown
+  ): Promise<ApiResult<MutationApplied>> {
+    return this.#mutate({
+      repository,
+      projectId,
+      context,
+      idempotencyKey: requiredIdempotencyKey(input),
+      expectedStateSha: requiredStateSha(input),
+      semantic,
+      occurredAt: this.#timestamp(),
+      // The Store resolves a genuine lost-response retry before this factory is
+      // evaluated. A different idempotency key reaches Core and is rejected as
+      // an invalid terminal transition without appending an event.
+      factories: [(_state, meta) => ({
+        type: "FailRun",
+        meta,
+        runId: asRunId(requiredString(input, "runId")),
+        reason: asReason("Run completion is already terminal.")
+      })]
+    });
+  }
+
+  #readProjectList(loaded: readonly ReadProject[]) {
+    return {
+      schema: "hunsu.web.project-list.v2" as const,
+      projects: loaded.map(item => ({
+        ...readProjectSummary(item),
+        nodeCount: item.catalog.counts.nodes,
+        activeRunCount: item.catalog.counts.activeRuns,
+        unresolvedDivergenceCount: item.catalog.counts.unresolvedDivergences,
+        integrity: { status: "valid" as const },
+        synchronizedAt: item.synchronizedAt
+      }))
+    };
+  }
+
+  #readProjectContext(loaded: ReadProject) {
+    return {
+      schema: "hunsu.web.project-context.v2" as const,
+      project: readProjectSummary(loaded),
+      stateHeadSha: loaded.stateHeadSha,
+      repositoryState: initializedRepositoryV2State(loaded.stateHeadSha),
+      integrity: { status: "valid" as const },
+      activeRunCount: loaded.catalog.counts.activeRuns
+    };
+  }
+
+  async #readGraph(loaded: ReadProject, options: { limit: number; cursor: string | null }): Promise<ApiResult<unknown>> {
+    const limit = Math.max(1, Math.min(GRAPH_PAGE_SIZE, Math.trunc(options.limit)));
+    const cursorMatch = options.cursor === null ? undefined : options.cursor.match(EXACT_GRAPH_CURSOR);
+    if (options.cursor !== null && (!cursorMatch || cursorMatch[1] !== loaded.stateHeadSha)) {
+      return invalidRequest("Graph continuation cursor is not bound to this exact state head.");
+    }
+    const offset = cursorMatch?.[2] === undefined ? 0 : Number(cursorMatch[2]);
+    if (!Number.isSafeInteger(offset) || offset < 0) return invalidRequest("Graph continuation cursor is invalid.");
+    const pageIndexes = [Math.floor(offset / GRAPH_PAGE_SIZE)];
+    const window = await this.#loadGraphWindow(loaded, pageIndexes);
+    if (!window.ok) return window;
+    if (offset > window.value.manifest.nodeCount) return integrityFailure("Graph continuation cursor is outside the current projection.");
+    const end = Math.min(window.value.manifest.nodeCount, offset + limit, (pageIndexes[0]! + 1) * GRAPH_PAGE_SIZE);
+    const nodes = window.value.pages.flatMap(page => page.nodes).filter(node => node.ordinal >= offset && node.ordinal < end);
+    const visibleTargets = new Set(nodes.map(node => node.sha));
+    const edges = window.value.pages.flatMap(page => page.edges).filter(edge => visibleTargets.has(edge.targetSha));
+    const activeRuns = window.value.pages.flatMap(page => page.activeRuns).filter(run => visibleTargets.has(run.sourceNodeSha));
+    const hasMore = end < window.value.manifest.nodeCount;
+    return apiOk({
+      schema: "hunsu.web.project-graph.v2",
+      project: readProjectSummary(loaded),
+      stateHeadSha: loaded.stateHeadSha,
+      integrity: { status: "valid" },
+      nodes: nodes.map(readGraphNode),
+      edges: edges.map(readGraphEdge),
+      activeRuns,
+      window: {
+        limit,
+        hasMore,
+        continuationCursor: hasMore ? `${loaded.stateHeadSha}:${end}` : null
+      }
+    });
+  }
+
+  async #readNode(loaded: ReadProject, nodeSha: string): Promise<ApiResult<{ schema: "hunsu.web.node-detail.v2"; stateHeadSha: string; node: unknown }>> {
+    const bundle = await this.#loadNodeReadBundle(loaded, nodeSha);
+    if (!bundle.ok) return bundle;
+    const { graphNode, activity, payload } = bundle.value;
+    const card = graphNode.node;
+    const payloadError = nodePayloadIntegrityError(loaded, card, payload);
+    if (payloadError) return integrityFailure(payloadError);
+    const nodeRunIds = new Set(activity.runs.map(run => run.id));
+    const outgoingEdges = graphNode.outgoingEdges.map(readGraphEdge);
+    return apiOk({
+      schema: "hunsu.web.node-detail.v2",
+      stateHeadSha: loaded.stateHeadSha,
+      node: {
+        sha: card.sha,
+        title: card.commitTitle,
+        commitUrl: `https://github.com/${loaded.repository.owner}/${loaded.repository.name}/commit/${card.sha}`,
+        treeSha: card.treeSha,
+        managedRef: card.managedRef,
+        integrity: { status: "valid" },
+        status: card.status,
+        lineage: readNodeLineage(card),
+        plan: {
+          schema: payload.plan.schema,
+          nextGoals: payload.plan.nextGoals.map(goal => ({
+            digest: String(computeGoalDigest(goal)), key: String(goal.key), title: String(goal.title),
+            desiredOutcome: String(goal.desiredOutcome), acceptanceCriteria: goal.acceptanceCriteria.map(String),
+            constraints: goal.constraints.map(String), priority: Number(goal.priority)
+          })),
+          how: {
+            schema: payload.plan.how.schema,
+            name: String(payload.plan.how.name),
+            typeKey: String(payload.plan.how.type.key),
+            schemaVersion: String(payload.plan.how.type.schemaVersion),
+            digest: String(computeRunnerDigest(payload.plan.how)),
+            type: {
+              origin: String(payload.plan.how.type.origin), key: String(payload.plan.how.type.key),
+              schemaVersion: String(payload.plan.how.type.schemaVersion), integrity: String(payload.plan.how.type.integrity)
+            },
+            value: payload.plan.how.value
+          }
+        },
+        outgoingEdges,
+        activeRuns: graphNode.activeRuns,
+        evidence: activity.evidence.filter(item => nodeRunIds.has(item.runId)).map(item => readEvidenceSummary(loaded, activity, item)),
+        comparisons: activity.comparisons.filter(item => item.parentNodeSha === nodeSha || item.nodeShas.includes(nodeSha)).map(item => ({
+          id: item.id, summary: item.summary, siblingNodeShas: item.nodeShas, recordedAt: item.recordedAt
+        })),
+        decisions: activity.decisions.flatMap(decision => decision.nodeShas.includes(nodeSha)
+          ? [{
+              kind: decision.type === "selection" ? "selected" : "rejected",
+              id: decision.id, nodeSha, reason: decision.rationale, recordedAt: decision.decidedAt
+            }]
+          : [])
+      }
+    });
+  }
+
+  async #readEvents(loaded: ReadProject, query: JsonRecord): Promise<ApiResult<unknown>> {
+    const manifest = await this.#loadEventManifest(loaded);
+    if (!manifest.ok) return manifest;
+    const limit = optionalPositiveInteger(query, "limit") ?? 50;
+    if (limit > 50) return invalidRequest("Events limit cannot exceed 50.");
+    const rawCursor = optionalString(query, "cursor");
+    const cursorMatch = rawCursor === undefined ? undefined : rawCursor.match(EXACT_EVENT_CURSOR);
+    if (rawCursor !== undefined && (!cursorMatch || cursorMatch[1] !== loaded.stateHeadSha)) {
+      return invalidRequest("Events cursor must be bound to this exact state head and a positive sequence number.");
+    }
+    const cursor = cursorMatch?.[2] === undefined ? manifest.value.checkpoint.lastSequence + 1 : Number(cursorMatch[2]);
+    if (!Number.isSafeInteger(cursor) || cursor < 1 || cursor > manifest.value.checkpoint.lastSequence + 1) {
+      return invalidRequest("Events cursor is outside the current exact-head Event index.");
+    }
+    const eventType = optionalString(query, "eventType") ?? optionalString(query, "type");
+    const nodeSha = optionalString(query, "nodeSha");
+    if (nodeSha !== undefined) requiredFullSha(nodeSha, "nodeSha");
+    const actor = optionalString(query, "actor")?.toLowerCase();
+    const from = optionalString(query, "occurredFrom") ?? optionalString(query, "from");
+    const to = optionalString(query, "occurredTo") ?? optionalString(query, "to");
+    const search = optionalString(query, "search")?.toLowerCase();
+    if (from !== undefined) asTimestamp(from);
+    if (to !== undefined) asTimestamp(to);
+    const fromEpoch = from === undefined ? undefined : Date.parse(from);
+    const toEpoch = to === undefined ? undefined : Date.parse(to);
+    if (fromEpoch !== undefined && toEpoch !== undefined && fromEpoch > toEpoch) {
+      return invalidRequest("Events from timestamp cannot be later than the to timestamp.");
+    }
+    const newestSequence = Math.min(cursor - 1, manifest.value.checkpoint.lastSequence);
+    const newestShard = newestSequence === 0 ? -1 : Math.floor((newestSequence - 1) / EVENT_INDEX_SHARD_SIZE);
+    const shardIndexes: number[] = [];
+    for (let index = newestShard; index >= 0 && shardIndexes.length < MAX_EVENT_SHARDS_PER_PAGE; index -= 1) shardIndexes.push(index);
+    const shards = await this.#loadEventShards(loaded, manifest.value, shardIndexes);
+    if (!shards.ok) return shards;
+    const scanned = scanReverseEventShards(shards.value, cursor, limit, item => {
+        if (eventType !== undefined && item.eventType !== eventType) return false;
+        if (nodeSha !== undefined && !eventReferencesNode(item.reference as Parameters<typeof eventReferencesNode>[0], nodeSha)) return false;
+        if (actor !== undefined && !item.actor.id.toLowerCase().includes(actor) && !item.actor.label.toLowerCase().includes(actor)) return false;
+        const occurredAt = Date.parse(item.occurredAt);
+        if (fromEpoch !== undefined && occurredAt < fromEpoch) return false;
+        if (toEpoch !== undefined && occurredAt > toEpoch) return false;
+        if (search !== undefined && !`${item.eventType} ${item.summary}`.toLowerCase().includes(search)) return false;
+        return true;
+      });
+    return apiOk({
+      schema: "hunsu.web.events.v2",
+      project: readProjectSummary(loaded),
+      stateHeadSha: loaded.stateHeadSha,
+      events: scanned.entries.map(readEventIndexEntry),
+      nextCursor: scanned.hasOlder ? `${loaded.stateHeadSha}:${scanned.lastInspectedSequence}` : null
+    });
+  }
+
+  async #readEvent(loaded: ReadProject, eventId: string): Promise<ApiResult<unknown>> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(eventId) || eventId.includes("..")) return invalidRequest("Event id is invalid.");
+    const indexed = await this.#loadEventLocator(loaded, eventId);
+    if (!indexed.ok) return indexed;
+    const event = indexed.value.entry;
+    const path = parseAuthoritativeEventPath(loaded.catalog.project.id, event.path);
+    if (!path.ok) return path;
+    const files = await this.#readStateFiles(loaded, [{ kind: "event", projectId: loaded.catalog.project.id, ...path.value }]);
+    if (!files.ok) return files;
+    const raw = parseJsonFile(files.value, event.path, "Authoritative Event");
+    if (!raw.ok) return raw;
+    const authoritative = decodeStoredProjectEventEnvelope(raw.value, this.#projectStateCodec);
+    if (!authoritative.ok) return integrityFailure(`${event.path}: ${authoritative.error.message}`);
+    const mismatch = authoritativeEventMismatch(loaded, event, authoritative.value);
+    if (mismatch) return integrityFailure(mismatch);
+    return apiOk({
+      schema: "hunsu.web.event-detail.v2",
+      project: readProjectSummary(loaded),
+      stateHeadSha: loaded.stateHeadSha,
+      event: readEventIndexEntry(event)
+    });
+  }
+
+  async #readRun(loaded: ReadProject, runId: string): Promise<ApiResult<{ schema: "hunsu.web.run-detail.v2"; stateHeadSha: string; run: unknown }>> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(runId) || runId.includes("..")) return invalidRequest("Run id is invalid.");
+    const activity = await this.#loadRunActivity(loaded, runId);
+    if (!activity.ok) return activity;
+    const run = activity.value.run;
+    const source = await this.#loadGraphNodeAndPayload(loaded, run.sourceNodeSha);
+    if (!source.ok) return source;
+    const goal = source.value.payload.plan.nextGoals.find(item => String(computeGoalDigest(item)) === run.goalDigest);
+    if (!goal || String(goal.title) !== run.goalTitle || String(computeRunnerDigest(source.value.payload.plan.how)) !== run.runnerDigest) {
+      return integrityFailure(`Run ${runId} does not match its source Node Goal and Runner payload.`);
+    }
+    const domainRun = readDomainRun(loaded, run, goal, source.value.payload.plan.how);
+    return apiOk({
+      schema: "hunsu.web.run-detail.v2",
+      stateHeadSha: loaded.stateHeadSha,
+      run: {
+        run: domainRun,
+        evidence: activity.value.evidence.map(item => readDomainEvidence(loaded, item)),
+        sourceNodeTitle: source.value.graphNode.node.commitTitle
+      }
+    });
+  }
+
+  async #loadGraphWindow(loaded: ReadProject, requestedIndexes: readonly number[]): Promise<ApiResult<{ manifest: ProjectGraphManifestReadModel; pages: readonly ProjectGraphPageReadModel[] }>> {
+    const indexes = [...new Set(requestedIndexes)].filter(index => index >= 0);
+    const files = await this.#readStateFiles(loaded, [
+      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "graph" },
+      ...indexes.map(page => ({ kind: "graph_page" as const, projectId: loaded.catalog.project.id, page }))
+    ]);
+    if (!files.ok) return files;
+    const manifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.graphManifest), decodeGraphManifest);
+    if (!manifest.ok) return manifest;
+    const manifestError = graphManifestIntegrityError(loaded, manifest.value);
+    if (manifestError) return integrityFailure(manifestError);
+    const pages: ProjectGraphPageReadModel[] = [];
+    for (const index of indexes) {
+      const descriptor = manifest.value.pages[index];
+      if (!descriptor) return integrityFailure(`Graph page ${index} is missing from its exact-head manifest.`);
+      const path = readModelPath(loaded, descriptor.path);
+      const page = decodeMaterialized(files.value, path, decodeGraphPage);
+      if (!page.ok) return page;
+      if (page.value.index !== index || page.value.projectId !== loaded.catalog.project.id || !sameCheckpoint(page.value.checkpoint, manifest.value.checkpoint)
+        || page.value.nodes.length !== descriptor.nodeCount || page.value.edges.length !== descriptor.edgeCount
+        || materializedEnvelopeDigest(files.value, path) !== descriptor.digest
+      ) return integrityFailure(`Graph page ${index} does not match its exact-head manifest.`);
+      pages.push(page.value);
+    }
+    return apiOk({ manifest: manifest.value, pages });
+  }
+
+  async #loadNodeReadBundle(loaded: ReadProject, nodeSha: string): Promise<ApiResult<{ graphNode: ProjectGraphNodeReadModel; activity: NodeActivityShardReadModel; payload: NodePayload }>> {
+    const files = await this.#readStateFiles(loaded, [
+      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "graph" },
+      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "activity" },
+      { kind: "graph_node", projectId: loaded.catalog.project.id, nodeSha },
+      { kind: "node_activity", projectId: loaded.catalog.project.id, nodeSha },
+      { kind: "node_payload", projectId: loaded.catalog.project.id, nodeSha }
+    ]);
+    if (!files.ok) return files;
+    const graphManifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.graphManifest), decodeGraphManifest);
+    if (!graphManifest.ok) return graphManifest;
+    const activityManifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.activityManifest), decodeActivityManifest);
+    if (!activityManifest.ok) return activityManifest;
+    const graphNode = decodeMaterialized(files.value, readModelPath(loaded, `graph/nodes/${nodeSha}.json`), decodeGraphNodeShard);
+    if (!graphNode.ok) return graphNode;
+    const activity = decodeMaterialized(files.value, readModelPath(loaded, `snapshots/nodes/${nodeSha}.json`), decodeNodeActivityShard);
+    if (!activity.ok) return activity;
+    const manifestError = graphManifestIntegrityError(loaded, graphManifest.value)
+      ?? activityManifestIntegrityError(loaded, activityManifest.value)
+      ?? graphNodeIntegrityError(loaded, graphManifest.value, graphNode.value, nodeSha)
+      ?? activityShardIntegrityError(loaded, activityManifest.value, activity.value, nodeSha);
+    if (manifestError) return integrityFailure(manifestError);
+    const payload = decodeNodePayloadFile(files.value, nodePayloadPath(loaded, nodeSha), this.#runnerRuntime.runnerTypes);
+    if (!payload.ok) return payload;
+    const payloadError = nodePayloadIntegrityError(loaded, graphNode.value.node, payload.value);
+    if (payloadError) return integrityFailure(payloadError);
+    const anchor = await this.#verifyNodeAnchor(loaded, graphNode.value.node);
+    return anchor.ok ? apiOk({ graphNode: graphNode.value, activity: activity.value, payload: payload.value }) : anchor;
+  }
+
+  async #loadGraphNodeAndPayload(loaded: ReadProject, nodeSha: string): Promise<ApiResult<{ graphNode: ProjectGraphNodeReadModel; payload: NodePayload }>> {
+    const files = await this.#readStateFiles(loaded, [
+      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "graph" },
+      { kind: "graph_node", projectId: loaded.catalog.project.id, nodeSha },
+      { kind: "node_payload", projectId: loaded.catalog.project.id, nodeSha }
+    ]);
+    if (!files.ok) return files;
+    const manifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.graphManifest), decodeGraphManifest);
+    if (!manifest.ok) return manifest;
+    const graphNode = decodeMaterialized(files.value, readModelPath(loaded, `graph/nodes/${nodeSha}.json`), decodeGraphNodeShard);
+    if (!graphNode.ok) return graphNode;
+    const error = graphManifestIntegrityError(loaded, manifest.value) ?? graphNodeIntegrityError(loaded, manifest.value, graphNode.value, nodeSha);
+    if (error) return integrityFailure(error);
+    const payload = decodeNodePayloadFile(files.value, nodePayloadPath(loaded, nodeSha), this.#runnerRuntime.runnerTypes);
+    if (!payload.ok) return payload;
+    const payloadError = nodePayloadIntegrityError(loaded, graphNode.value.node, payload.value);
+    if (payloadError) return integrityFailure(payloadError);
+    const anchor = await this.#verifyNodeAnchor(loaded, graphNode.value.node);
+    return anchor.ok ? apiOk({ graphNode: graphNode.value, payload: payload.value }) : anchor;
+  }
+
+  async #loadRunActivity(loaded: ReadProject, runId: string): Promise<ApiResult<RunActivityShardReadModel>> {
+    const files = await this.#readStateFiles(loaded, [
+      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "activity" },
+      { kind: "run_activity", projectId: loaded.catalog.project.id, runId }
+    ]);
+    if (!files.ok) return files;
+    const manifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.activityManifest), decodeActivityManifest);
+    if (!manifest.ok) return manifest;
+    const activity = decodeMaterialized(files.value, readModelPath(loaded, `snapshots/runs/${runId}.json`), decodeRunActivityShard);
+    if (!activity.ok) return activity;
+    const error = activityManifestIntegrityError(loaded, manifest.value);
+    if (error || activity.value.projectId !== loaded.catalog.project.id || activity.value.run.id !== runId || !sameCheckpoint(activity.value.checkpoint, manifest.value.checkpoint)) {
+      return integrityFailure(error ?? `Run activity ${runId} does not match its exact-head snapshot manifest.`);
+    }
+    return activity;
+  }
+
+  async #loadEventManifest(loaded: ReadProject): Promise<ApiResult<ProjectEventManifestReadModel>> {
+    const files = await this.#readStateFiles(loaded, [{ kind: "project_read_model", projectId: loaded.catalog.project.id, model: "event_index" }]);
+    if (!files.ok) return files;
+    const indexed = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.eventManifest), decodeEventManifest);
+    if (!indexed.ok) return indexed;
+    return indexed.value.projectId === loaded.catalog.project.id && sameCheckpoint(indexed.value.checkpoint, loaded.catalog.checkpoint)
+      ? indexed
+      : integrityFailure("Project Event manifest does not match its exact-head catalog checkpoint.");
+  }
+
+  async #loadEventShards(loaded: ReadProject, manifest: ProjectEventManifestReadModel, indexes: readonly number[]) {
+    if (indexes.length === 0) return apiOk<readonly import("./sharded-read-models.ts").ProjectEventShardReadModel[]>([]);
+    const files = await this.#readStateFiles(loaded, indexes.map(shard => ({ kind: "event_index_shard" as const, projectId: loaded.catalog.project.id, shard })));
+    if (!files.ok) return files;
+    const shards = [];
+    for (const index of indexes) {
+      const descriptor = manifest.shards[index];
+      if (!descriptor) return integrityFailure(`Event shard ${index} is missing from its exact-head manifest.`);
+      const path = readModelPath(loaded, descriptor.path);
+      const shard = decodeMaterialized(files.value, path, decodeEventShard);
+      if (!shard.ok) return shard;
+      if (shard.value.projectId !== loaded.catalog.project.id || shard.value.index !== index || !sameCheckpoint(shard.value.checkpoint, manifest.checkpoint)
+        || shard.value.sequenceStart !== descriptor.sequenceStart || shard.value.sequenceEnd !== descriptor.sequenceEnd
+        || shard.value.entries.length !== descriptor.count || materializedEnvelopeDigest(files.value, path) !== descriptor.digest
+        || shard.value.entries[0]?.storedEventId !== descriptor.firstStoredEventId
+        || shard.value.entries.at(-1)?.storedEventId !== descriptor.lastStoredEventId
+        || shard.value.entries[0]?.domainEventId !== descriptor.firstDomainEventId
+        || shard.value.entries.at(-1)?.domainEventId !== descriptor.lastDomainEventId
+      ) return integrityFailure(`Event shard ${index} does not match its exact-head manifest.`);
+      shards.push(shard.value);
+    }
+    return apiOk(shards);
+  }
+
+  async #loadEventLocator(loaded: ReadProject, eventId: string) {
+    const files = await this.#readStateFiles(loaded, [
+      { kind: "project_read_model", projectId: loaded.catalog.project.id, model: "event_index" },
+      { kind: "event_locator", projectId: loaded.catalog.project.id, eventId }
+    ]);
+    if (!files.ok) return files;
+    const manifest = decodeMaterialized(files.value, readModelPath(loaded, SHARDED_READ_MODEL_PATHS.eventManifest), decodeEventManifest);
+    if (!manifest.ok) return manifest;
+    if (manifest.value.projectId !== loaded.catalog.project.id || !sameCheckpoint(manifest.value.checkpoint, loaded.catalog.checkpoint)) {
+      return integrityFailure("Project Event manifest does not match its exact-head catalog checkpoint.");
+    }
+    const locator = decodeMaterialized(files.value, readModelPath(loaded, `indexes/events/by-domain/${eventId}.json`), decodeEventLocator);
+    if (!locator.ok) return locator;
+    return locator.value.projectId === loaded.catalog.project.id && locator.value.eventId === eventId && sameCheckpoint(locator.value.checkpoint, manifest.value.checkpoint)
+      ? locator
+      : integrityFailure(`Event locator ${eventId} does not match its exact-head Event manifest.`);
+  }
+
+  async #verifyNodeAnchor(loaded: ReadProject, card: ProjectGraphNode): Promise<ApiResult<true>> {
+    return this.#verifyNodeAnchors(loaded, [card]);
+  }
+
+  async #verifyNodeAnchors(loaded: ReadProject, cards: readonly ProjectGraphNode[]): Promise<ApiResult<true>> {
+    if (cards.length === 0) return apiOk(true);
+    const anchors = await this.#transport.readManagedNodeAnchors(loaded.repository, loaded.catalog.project.id, cards.map(card => card.sha));
+    if (!anchors.ok) return transportFailure(anchors.error);
+    const bySha = new Map(anchors.value.map(anchor => [anchor.nodeSha, anchor]));
+    if (bySha.size !== cards.length) return integrityFailure("Exact managed Node verification returned duplicate or missing anchors.");
+    for (const card of cards) {
+      const anchor = bySha.get(card.sha);
+      if (!anchor || anchor.managedRef !== card.managedRef || anchor.treeSha !== card.treeSha || commitTitle(anchor.commitMessage) !== card.commitTitle) {
+        return integrityFailure(`Managed Node ref ${card.managedRef} does not match its Graph registration metadata.`);
+      }
+    }
+    return apiOk(true);
+  }
+
+  async #readStateFiles(
+    loaded: ReadProject,
+    selections: readonly StateFileSelection[]
+  ): Promise<ApiResult<Readonly<Record<string, string>>>> {
+    const requested = selections.map(selection => ({ selection, path: exactStateFilePath(selection) }));
+    const missing = requested.filter(item => !this.#readStateFilesByHead.has(readFileCacheKey(loaded, item.path)));
+    if (missing.length > 0) {
+      const read = await this.#transport.readStateFilesAtHead(loaded.repository, loaded.stateHeadSha, missing.map(item => item.selection));
+      if (!read.ok) return read.error.code === "not_found" ? integrityFailure(read.error.message) : transportFailure(read.error);
+      if (read.value.stateHeadSha !== loaded.stateHeadSha) return integrityFailure("Targeted state read returned a different state head.");
+      if (read.value.v2State !== "present") return integrityFailure("Targeted Project read resolved an absent Hunsu v2 state tree.");
+      const returned = Object.keys(read.value.files).sort();
+      const expected = missing.map(item => item.path).sort();
+      if (returned.length !== expected.length || returned.some((path, index) => path !== expected[index])) {
+        return integrityFailure("Targeted state read returned missing or unrequested resources.");
+      }
+      for (const [path, content] of Object.entries(read.value.files)) {
+        this.#readStateFilesByHead.set(readFileCacheKey(loaded, path), content);
+      }
+    }
+    const files: Record<string, string> = {};
+    for (const item of requested) {
+      const content = this.#readStateFilesByHead.get(readFileCacheKey(loaded, item.path));
+      if (content === undefined) return integrityFailure(`Targeted state cache is missing ${item.path}.`);
+      Object.defineProperty(files, item.path, { value: content, enumerable: true, configurable: true, writable: true });
+    }
+    return apiOk(files);
+  }
+
+  #projectList(loaded: readonly LoadedProject[]) {
+    return {
+      schema: "hunsu.web.project-list.v2" as const,
+      projects: projectListProjection(loaded.map(item => ({ state: item.state, context: projectionContext(item) })))
+    };
+  }
+
+  #projectContext(loaded: LoadedProject) {
+    const graph = projectGraphProjection(loaded.state, projectIdOf(loaded.state), projectionContext(loaded), { limit: 1, cursor: null });
+    if (!graph.ok) throw new BoundaryError(projectionApiError(graph.error));
+    return {
+      schema: "hunsu.web.project-context.v2" as const,
+      project: graph.value.project,
+      stateHeadSha: loaded.stateHeadSha,
+      repositoryState: initializedRepositoryV2State(loaded.stateHeadSha),
+      integrity: graph.value.integrity,
+      activeRunCount: loaded.state.runs.filter(run => run.status === "running").length
+    };
+  }
+
+  #graph(loaded: LoadedProject, options: { limit: number; cursor: string | null }): ApiResult<unknown> {
+    const projected = projectGraphProjection(loaded.state, projectIdOf(loaded.state), projectionContext(loaded), options);
+    return projected.ok
+      ? apiOk({ schema: "hunsu.web.project-graph.v2", ...projected.value })
+      : projectionFailure(projected);
+  }
+
+  #events(loaded: LoadedProject, query: JsonRecord): ApiResult<unknown> {
+    const projectId = projectIdOf(loaded.state);
+    const limit = optionalPositiveInteger(query, "limit") ?? 50;
+    if (limit > 50) return invalidRequest("Events limit cannot exceed 50.");
+    const rawCursor = optionalString(query, "cursor");
+    if (rawCursor !== undefined && !EVENT_CURSOR.test(rawCursor)) return invalidRequest("Events cursor must be a positive sequence number.");
+    const cursor = rawCursor === undefined ? Number.POSITIVE_INFINITY : Number(rawCursor);
+    const eventType = optionalString(query, "eventType") ?? optionalString(query, "type");
+    const nodeSha = optionalString(query, "nodeSha");
+    if (nodeSha !== undefined) requiredFullSha(nodeSha, "nodeSha");
+    const actor = optionalString(query, "actor")?.toLowerCase();
+    const from = optionalString(query, "occurredFrom") ?? optionalString(query, "from");
+    const to = optionalString(query, "occurredTo") ?? optionalString(query, "to");
+    const search = optionalString(query, "search")?.toLowerCase();
+    if (from !== undefined) asTimestamp(from);
+    if (to !== undefined) asTimestamp(to);
+    const fromEpoch = from === undefined ? undefined : Date.parse(from);
+    const toEpoch = to === undefined ? undefined : Date.parse(to);
+    if (fromEpoch !== undefined && toEpoch !== undefined && fromEpoch > toEpoch) {
+      return invalidRequest("Events from timestamp cannot be later than the to timestamp.");
+    }
+    const sequenced: SequencedDomainEvent[] = loaded.events
+      .map(entry => ({ sequence: entry.sequence, event: entry.event, actor: entry.event.meta.actor }))
+      .filter(entry => entry.sequence < cursor)
+      .sort((left, right) => right.sequence - left.sequence);
+    const projected = eventListProjection(loaded.state, sequenced).filter(item => {
+      if (eventType !== undefined && item.type !== eventType) return false;
+      if (nodeSha !== undefined && !eventReferencesNode(item.reference, nodeSha)) return false;
+      if (actor !== undefined && !item.actor.id.toLowerCase().includes(actor) && !item.actor.label.toLowerCase().includes(actor)) return false;
+      const occurredAt = Date.parse(item.occurredAt);
+      if (fromEpoch !== undefined && occurredAt < fromEpoch) return false;
+      if (toEpoch !== undefined && occurredAt > toEpoch) return false;
+      if (search !== undefined && !`${item.type} ${item.summary}`.toLowerCase().includes(search)) return false;
+      return true;
+    });
+    const page = projected.slice(0, limit);
+    const nextCursor = projected.length > page.length && page.length > 0 ? String(page[page.length - 1]!.sequence) : null;
+    const graph = projectGraphProjection(loaded.state, projectId, projectionContext(loaded), { limit: 1, cursor: null });
+    if (!graph.ok) return projectionFailure(graph);
+    return apiOk({
+      schema: "hunsu.web.events.v2",
+      project: graph.value.project,
+      stateHeadSha: loaded.stateHeadSha,
+      events: page,
+      nextCursor
+    });
+  }
+
+  #event(loaded: LoadedProject, eventId: string): ApiResult<unknown> {
+    const entry = loaded.events.find(item => item.event.meta.eventId === eventId);
+    if (!entry) return notFound(`Event ${eventId} was not found.`);
+    const event = eventListProjection(loaded.state, [{ sequence: entry.sequence, event: entry.event, actor: entry.event.meta.actor }])[0]!;
+    const graph = projectGraphProjection(loaded.state, projectIdOf(loaded.state), projectionContext(loaded), { limit: 1, cursor: null });
+    if (!graph.ok) return projectionFailure(graph);
+    return apiOk({
+      schema: "hunsu.web.event-detail.v2",
+      project: graph.value.project,
+      stateHeadSha: loaded.stateHeadSha,
+      event
+    });
+  }
+
+  async #checkpointRunFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#checkpointRun(repository.value, context, input) : repository;
+  }
+
+  async #attachEvidenceFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#attachEvidence(repository.value, context, input) : repository;
+  }
+
+  async #completeRunFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#completeRun(repository.value, context, input) : repository;
+  }
+
+  async #failRunFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#terminalRun(repository.value, context, input, "fail") : repository;
+  }
+
+  async #cancelRunFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#terminalRun(repository.value, context, input, "cancel") : repository;
+  }
+
+  async #reviewFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#recordReview(repository.value, context, input) : repository;
+  }
+
+  async #proposalFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#proposeTransition(repository.value, context, input) : repository;
+  }
+
+  async #confirmProposalFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#confirmProposal(repository.value, context, input) : repository;
+  }
+
+  async #rejectProposalFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#rejectProposal(repository.value, context, input) : repository;
+  }
+
+  async #compareFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#compareAlternatives(repository.value, context, input) : repository;
+  }
+
+  async #selectFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#decideAlternative(repository.value, context, input, "select") : repository;
+  }
+
+  async #rejectAlternativeFromTool(context: AuthContext, input: JsonRecord) {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), true);
+    return repository.ok ? this.#decideAlternative(repository.value, context, input, "reject") : repository;
+  }
+
+  #toolMutation(result: ApiResult<unknown>): ApiResult<{ data: unknown; stateHeadSha?: string }> {
+    if (!result.ok) return result;
+    const value = assertRecord(result.value, "mutation result");
+    const stateHeadSha = optionalString(value, "stateHeadSha");
+    return apiOk({ data: result.value, ...(stateHeadSha === undefined ? {} : { stateHeadSha }) });
+  }
+
+  async #loadToolProject(input: JsonRecord, context: AuthContext, write: boolean): Promise<ApiResult<LoadedProject>> {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), write);
     return repository.ok ? this.#loadProject(repository.value, requiredString(input, "projectId")) : repository;
   }
 
-  async #loadProject(repository: RepositoryGrant, projectId: string, force = false): Promise<ApiResult<AuthorizedProject>> {
-    const key = cacheKey(repository, projectId);
-    const cached = force ? undefined : this.#getCachedProject(key, this.#cacheNow());
-    if (!force) {
-      if (cached && cacheIsFresh(cached, this.#cacheNow())) return apiOk(authorizeProject(cached, repository));
-    }
-
-    let generation = this.#captureCacheGeneration(repository);
-    if (cached) {
-      const stateHead = await this.#stateHead(repository);
-      if (!stateHead.ok) return stateHead;
-      if (stateHead.value === cached.stateHeadSha) {
-        if (!this.#cacheGenerationIsCurrent(generation)) return apiOk(authorizeProject(cached, repository));
-        const cachedAt = this.#cacheNow();
-        const refreshed = { ...cached, synchronizedAt: this.#timestamp(), cachedAt };
-        this.#putCachedProject(key, refreshed);
-        return apiOk(authorizeProject(refreshed, repository));
-      }
-      if (this.#cacheGenerationIsCurrent(generation)) {
-        this.invalidateRepository(repository);
-        generation = this.#captureCacheGeneration(repository);
-      }
-    }
-
-    const read = await this.#store.readProject(repository, projectId);
-    if (!read.ok) return storeFailure(read.error);
-    const entry = cachedProject(repository, read.value.state, read.value.stateHeadSha, this.#timestamp(), this.#cacheNow());
-    if (this.#cacheGenerationIsCurrent(generation)) {
-      this.invalidateRepository(repository);
-      this.#putCachedProject(key, entry);
-    }
-    return apiOk(authorizeProject(entry, repository));
+  async #loadToolReadProject(input: JsonRecord, context: AuthContext): Promise<ApiResult<ReadProject>> {
+    const repository = await this.#repositoryFromInput(context, record(input, "repository"), false);
+    return repository.ok ? this.#loadReadProject(repository.value, requiredString(input, "projectId")) : repository;
   }
 
-  async #loadAllProjects(context: AuthContext, force = false, installationId?: number): Promise<ApiResult<AuthorizedProject[]>> {
-    const repositories = await this.#authorizedRepositories(context, installationId);
-    if (!repositories.ok) return repositories;
-    const entries: AuthorizedProject[] = [];
-    for (const repository of repositories.value) {
-      const loaded = await this.#loadRepositoryProjects(repository, force);
-      if (!loaded.ok) return loaded;
-      entries.push(...loaded.value);
-    }
-    return apiOk(entries);
-  }
-
-  async #findProject(context: AuthContext, projectId: string, requireWrite = false): Promise<ApiResult<AuthorizedProject>> {
+  async #findReadProject(context: AuthContext, projectId: string): Promise<ApiResult<ReadProject>> {
     asProjectId(projectId);
     const repositories = await this.#authorizedRepositories(context);
     if (!repositories.ok) return repositories;
-    const matches: AuthorizedProject[] = [];
+    const matches: ReadProject[] = [];
     for (const repository of repositories.value) {
-      const now = this.#cacheNow();
-      const cached = this.#getCachedProject(cacheKey(repository, projectId), now);
-      if (cached && cacheIsFresh(cached, now)) {
-        matches.push(authorizeProject(cached, repository));
-        continue;
-      }
-
-      const catalog = this.#getCachedCatalog(repositoryCacheKey(repository), now);
-      if (catalog && cacheIsFresh(catalog, now)) {
-        if (!catalog.projectIds.includes(projectId)) continue;
-        const loaded = await this.#loadProject(repository, projectId);
-        if (!loaded.ok) {
-          if (loaded.error.code === "not_found") continue;
-          return loaded;
-        }
-        matches.push(loaded.value);
-        continue;
-      }
-
-      const loaded = await this.#loadRepositoryProjects(repository, false);
+      const loaded = await this.#loadRepositoryReadProjects(repository);
       if (!loaded.ok) return loaded;
-      const match = loaded.value.find(entry => projectIdOf(entry.state) === projectId);
-      if (match) matches.push(match);
+      matches.push(...loaded.value.filter(item => item.catalog.project.id === projectId));
     }
     if (matches.length === 0) return notFound(`Project ${projectId} was not found.`);
-    if (matches.length > 1) return conflict(`Project id ${projectId} is ambiguous across the authorized repositories.`);
-    const match = matches[0];
-    if (requireWrite && match.repository.permissions.contents !== "write") {
-      return forbidden("The user's repository access does not allow Hunsu state writes.");
+    if (matches.length > 1) return conflict(`Project id ${projectId} exists in more than one authorized repository; use an MCP repository-qualified request.`);
+    return apiOk(matches[0]!);
+  }
+
+  async #loadAllReadProjects(context: AuthContext, installationId?: number): Promise<ApiResult<ReadProject[]>> {
+    const repositories = await this.#authorizedRepositories(context, installationId);
+    if (!repositories.ok) return repositories;
+    const loaded = await Promise.all(repositories.value.map(repository => this.#loadRepositoryReadProjects(repository)));
+    const failure = loaded.find(item => !item.ok);
+    if (failure && !failure.ok) return failure;
+    return apiOk(loaded.flatMap(item => item.ok ? [...item.value] : []));
+  }
+
+  async #loadReadProject(repository: RepositoryGrant, projectId: string): Promise<ApiResult<ReadProject>> {
+    const loaded = await this.#loadRepositoryReadProjects(repository);
+    if (!loaded.ok) return loaded;
+    const project = loaded.value.find(item => item.catalog.project.id === projectId);
+    return project ? apiOk(project) : notFound(`Project ${projectId} was not found in ${repository.owner}/${repository.name}.`);
+  }
+
+  async #loadRepositoryReadProjects(repository: RepositoryGrant): Promise<ApiResult<readonly ReadProject[]>> {
+    const key = repositoryKey(repository);
+    const stateHead = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
+    if (!stateHead.ok) return transportFailure(stateHead.error);
+    if (stateHead.value === undefined) {
+      this.#readProjects.set(key, { value: [], stateHeadSha: undefined, cachedAt: this.#cacheNow() });
+      return apiOk([]);
     }
+    const cached = this.#readProjects.get(key);
+    // State blobs are immutable at an exact head, but managed Node refs are a
+    // separate GitHub authority boundary. Revalidate the root anchor after the
+    // bounded Project TTL even when hunsu/state itself has not moved.
+    if (cached?.stateHeadSha === stateHead.value
+      && fresh(cached.cachedAt, this.#cacheNow(), this.#cachePolicy.projectTtlMs)
+    ) return apiOk(cached.value);
+    const workspaceSnapshot = await this.#transport.readStateFilesAtHead(repository, stateHead.value, [{ kind: "workspace" }]);
+    if (!workspaceSnapshot.ok) {
+      return workspaceSnapshot.error.code === "not_found"
+        ? integrityFailure(workspaceSnapshot.error.message)
+        : transportFailure(workspaceSnapshot.error);
+    }
+    if (workspaceSnapshot.value.stateHeadSha !== stateHead.value) return integrityFailure("Hunsu workspace was read from a different state head.");
+    if (workspaceSnapshot.value.v2State === "absent") {
+      this.#readProjects.set(key, { value: [], stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
+      return apiOk([]);
+    }
+    const workspace = decodeWorkspace(
+      workspaceSnapshot.value.files[".hunsu/v2/workspace.json"],
+      repository
+    );
+    if (!workspace.ok) return workspace;
+    if (workspace.value.projectIds.length === 0) {
+      this.#readProjects.set(key, { value: [], stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
+      return apiOk([]);
+    }
+    const snapshot = await this.#transport.readStateFilesAtHead(repository, stateHead.value, workspace.value.projectIds.map(projectId => ({
+      kind: "project_read_model" as const,
+      projectId,
+      model: "catalog" as const
+    })));
+    if (!snapshot.ok) return snapshot.error.code === "not_found" ? integrityFailure(snapshot.error.message) : transportFailure(snapshot.error);
+    if (snapshot.value.stateHeadSha !== stateHead.value) return integrityFailure("Project catalogs were read from a different state head.");
+    if (snapshot.value.v2State !== "present") return integrityFailure("Hunsu v2 workspace references catalogs in an absent v2 state tree.");
+    const synchronizedAt = this.#timestamp();
+    const projects: ReadProject[] = [];
+    for (const [path, content] of Object.entries(snapshot.value.files).sort(([left], [right]) => left.localeCompare(right))) {
+      const match = path.match(/^\.hunsu\/v2\/projects\/([^/]+)\/project\.json$/u);
+      if (!match?.[1]) return integrityFailure(`Targeted catalog read returned an unsupported path ${path}.`);
+      let input: unknown;
+      try {
+        input = JSON.parse(content);
+      } catch {
+        return integrityFailure(`Project catalog ${path} is not valid JSON.`);
+      }
+      const decoded = decodeShardedProjectCatalog(input);
+      if (!decoded.ok) return integrityFailure(decoded.error.message);
+      if (decoded.value.project.id !== match[1]
+        || decoded.value.project.repository.owner.toLowerCase() !== repository.owner.toLowerCase()
+        || decoded.value.project.repository.name.toLowerCase() !== repository.name.toLowerCase()
+      ) return integrityFailure(`Project catalog ${path} does not match its repository or Project path.`);
+      const anchor = decoded.value.rootAnchor;
+      const verified = await this.#transport.readManagedNodeAnchors(repository, decoded.value.project.id, [anchor.nodeSha]);
+      if (!verified.ok) return transportFailure(verified.error);
+      const actual = verified.value[0];
+      if (!actual || actual.managedRef !== anchor.managedRef || actual.nodeSha !== anchor.nodeSha
+        || actual.treeSha !== anchor.treeSha || commitTitle(actual.commitMessage) !== anchor.commitTitle) {
+        return integrityFailure(`Root managed Node ref ${anchor.managedRef} does not match its exact-head Project catalog.`);
+      }
+      projects.push({ repository, stateHeadSha: stateHead.value, synchronizedAt, catalog: decoded.value });
+    }
+    if (projects.length !== workspace.value.projectIds.length
+      || projects.some((project, index) => project.catalog.project.id !== workspace.value.projectIds[index])
+    ) return integrityFailure("Hunsu workspace Project ids do not exactly match the catalog materializations.");
+    this.#readProjects.set(key, { value: projects, stateHeadSha: stateHead.value, cachedAt: this.#cacheNow() });
+    return apiOk(projects);
+  }
+
+  async #findProject(context: AuthContext, projectId: string, write = false): Promise<ApiResult<LoadedProject>> {
+    asProjectId(projectId);
+    const repositories = await this.#authorizedRepositories(context);
+    if (!repositories.ok) return repositories;
+    const matches: LoadedProject[] = [];
+    for (const repository of repositories.value) {
+      const loaded = await this.#loadRepositoryProjects(repository);
+      if (!loaded.ok) return loaded;
+      matches.push(...loaded.value.filter(item => projectIdOf(item.state) === projectId));
+    }
+    if (matches.length === 0) return notFound(`Project ${projectId} was not found.`);
+    if (matches.length > 1) return conflict(`Project id ${projectId} exists in more than one authorized repository; use an MCP repository-qualified request.`);
+    if (write && matches[0]!.repository.permissions.contents !== "write") return forbidden("This repository grant does not allow Hunsu state writes.");
+    return apiOk(matches[0]!);
+  }
+
+  async #loadAllProjects(context: AuthContext, installationId?: number): Promise<ApiResult<LoadedProject[]>> {
+    const repositories = await this.#authorizedRepositories(context, installationId);
+    if (!repositories.ok) return repositories;
+    const loaded = await Promise.all(repositories.value.map(repository => this.#loadRepositoryProjects(repository)));
+    const failure = loaded.find(item => !item.ok);
+    if (failure && !failure.ok) return failure;
+    return apiOk(loaded.flatMap(item => item.ok ? [...item.value] : []));
+  }
+
+  async #loadProject(repository: RepositoryGrant, projectId: string, force = false): Promise<ApiResult<LoadedProject>> {
+    const loaded = await this.#loadRepositoryProjects(repository, force);
+    if (!loaded.ok) return loaded;
+    const project = loaded.value.find(item => projectIdOf(item.state) === projectId);
+    return project ? apiOk(project) : notFound(`Project ${projectId} was not found in ${repository.owner}/${repository.name}.`);
+  }
+
+  async #loadRepositoryProjects(repository: RepositoryGrant, force = false): Promise<ApiResult<readonly LoadedProject[]>> {
+    const key = repositoryKey(repository);
+    const cached = this.#projects.get(key);
+    if (!force && cached && fresh(cached.cachedAt, this.#cacheNow(), this.#cachePolicy.projectTtlMs)) return apiOk(cached.value);
+    const reconstructed = await this.#store.reconstructRepository(repository);
+    if (!reconstructed.ok) return storeFailure(reconstructed.error);
+    const synchronizedAt = this.#timestamp();
+    const value: LoadedProject[] = reconstructed.value.kind === "state_branch_missing"
+      ? []
+      : reconstructed.value.projects.map(project => ({
+          repository,
+          state: project.state,
+          stateHeadSha: project.stateHeadSha,
+          synchronizedAt,
+          events: project.events
+        }));
+    this.#projects.set(key, { value, cachedAt: this.#cacheNow() });
+    return apiOk(value);
+  }
+
+  async #repositoryFromInput(context: AuthContext, input: JsonRecord, write: boolean): Promise<ApiResult<RepositoryGrant>> {
+    assertExactRecord(input, "repository", ["installationId", "repositoryId", "owner", "name", "defaultBranch"]);
+    const owner = requiredString(input, "owner");
+    const name = requiredString(input, "name");
+    const installationId = optionalPositiveInteger(input, "installationId");
+    const repositoryId = optionalPositiveInteger(input, "repositoryId");
+    const repositories = await this.#authorizedRepositories(context, installationId);
+    if (!repositories.ok) return repositories;
+    const match = repositories.value.find(repository =>
+      repository.owner.toLowerCase() === owner.toLowerCase()
+      && repository.name.toLowerCase() === name.toLowerCase()
+      && (repositoryId === undefined || repository.repositoryId === repositoryId));
+    if (!match) return forbidden(`Repository ${owner}/${name} is not granted to this session.`);
+    if (write && match.permissions.contents !== "write") return forbidden(`Repository ${owner}/${name} does not grant Contents write access.`);
     return apiOk(match);
   }
 
-  async #loadRepositoryProjects(repository: RepositoryGrant, force: boolean): Promise<ApiResult<AuthorizedProject[]>> {
-    const key = repositoryCacheKey(repository);
-    const cached = force ? undefined : this.#getCachedCatalog(key, this.#cacheNow());
-    if (cached && cacheIsFresh(cached, this.#cacheNow())) {
-      const entries = this.#projectsFromCatalog(cached, repository);
-      if (entries) return apiOk(entries);
-    }
-
-    const generation = this.#captureCacheGeneration(repository);
-    let observedHead: string | undefined;
-    if (!force) {
-      const stateHead = await this.#stateHead(repository);
-      if (!stateHead.ok) return stateHead;
-      observedHead = stateHead.value;
-      if (cached && cached.stateHeadSha === observedHead && this.#cacheGenerationIsCurrent(generation)) {
-        const synchronizedAt = this.#timestamp();
-        const cachedAt = this.#cacheNow();
-        const refreshed = { ...cached, synchronizedAt, cachedAt };
-        const entries = this.#projectsFromCatalog(refreshed, repository, { synchronizedAt, cachedAt });
-        if (entries) {
-          this.#putCachedCatalog(key, refreshed);
-          return apiOk(entries);
-        }
+  async #repositoryV2State(repository: RepositoryGrant): Promise<ApiResult<RepositoryV2InitializationState>> {
+    const stateHead = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
+    if (!stateHead.ok) return transportFailure(stateHead.error);
+    if (stateHead.value === undefined) {
+      const defaultHead = await this.#transport.readBranchHead(repository, repository.defaultBranch);
+      if (!defaultHead.ok) return transportFailure(defaultHead.error);
+      if (defaultHead.value === undefined || !FULL_SHA.test(defaultHead.value)) {
+        return integrityFailure(`Default branch ${repository.defaultBranch} does not resolve to a full commit SHA.`);
       }
-      if (observedHead === undefined) {
-        if (this.#cacheGenerationIsCurrent(generation)) {
-          this.invalidateRepository(repository);
-          const cachedAt = this.#cacheNow();
-          this.#putCachedCatalog(
-            key,
-            cachedRepositoryCatalog(repository, undefined, [], this.#timestamp(), cachedAt)
-          );
-        }
-        return apiOk([]);
+      return apiOk({
+        status: "uninitialized",
+        expectedStateSource: "default_branch_head",
+        expectedStateSha: defaultHead.value
+      });
+    }
+    if (!FULL_SHA.test(stateHead.value)) return integrityFailure("hunsu/state does not resolve to a full commit SHA.");
+    const snapshot = await this.#transport.readStateFilesAtHead(repository, stateHead.value, [{ kind: "workspace" }]);
+    if (!snapshot.ok) {
+      return snapshot.error.code === "not_found"
+        ? integrityFailure(snapshot.error.message)
+        : transportFailure(snapshot.error);
+    }
+    if (snapshot.value.stateHeadSha !== stateHead.value) {
+      return integrityFailure("Hunsu v2 initialization status was read from a different state head.");
+    }
+    if (snapshot.value.v2State === "absent") {
+      return apiOk({
+        status: "uninitialized",
+        expectedStateSource: "state_branch_head",
+        stateHeadSha: stateHead.value,
+        expectedStateSha: stateHead.value
+      });
+    }
+    const workspace = decodeWorkspace(snapshot.value.files[".hunsu/v2/workspace.json"], repository);
+    if (!workspace.ok) return workspace;
+    return apiOk(initializedRepositoryV2State(stateHead.value));
+  }
+
+  async #authorizedRepositories(context: AuthContext, onlyInstallationId?: number): Promise<ApiResult<readonly RepositoryGrant[]>> {
+    const installations = context.installations.filter(item => onlyInstallationId === undefined || item.id === onlyInstallationId);
+    if (onlyInstallationId !== undefined && installations.length === 0) return forbidden(`Installation ${onlyInstallationId} is not authorized for this session.`);
+    const collected: RepositoryGrant[] = [];
+    for (const installation of installations) {
+      let repositories = this.#installations.get(installation.id);
+      if (!repositories || !fresh(repositories.cachedAt, this.#cacheNow(), this.#cachePolicy.installationTtlMs)) {
+        const listed = await this.#transport.listInstallationRepositories(installation.id);
+        if (!listed.ok) return transportFailure(listed.error);
+        repositories = { value: listed.value, cachedAt: this.#cacheNow() };
+        this.#installations.set(installation.id, repositories);
       }
-    }
-
-    const reconstructed = await this.#store.reconstructRepository(repository);
-    if (!reconstructed.ok) return storeFailure(reconstructed.error);
-    const projects = reconstructed.value.projects;
-    const synchronizedAt = this.#timestamp();
-    const cachedAt = this.#cacheNow();
-    const loaded: AuthorizedProject[] = [];
-    const entries: Array<{ key: string; entry: CachedProject }> = [];
-    for (const item of projects) {
-      const entry = cachedProject(repository, item.state, item.stateHeadSha, synchronizedAt, cachedAt);
-      entries.push({ key: cacheKey(repository, projectIdOf(item.state)), entry });
-      loaded.push(authorizeProject(entry, repository));
-    }
-    if (this.#cacheGenerationIsCurrent(generation)) {
-      this.invalidateRepository(repository);
-      for (const item of entries) this.#putCachedProject(item.key, item.entry);
-      this.#putCachedCatalog(
-        key,
-        cachedRepositoryCatalog(
-          repository,
-          reconstructed.value.kind === "state_branch" ? reconstructed.value.stateHeadSha : undefined,
-          projects.map(item => projectIdOf(item.state)),
-          synchronizedAt,
-          cachedAt
-        )
-      );
-    }
-    return apiOk(loaded);
-  }
-
-  #getCachedProject(key: string, now: number): CachedProject | undefined {
-    this.#pruneProjectionCaches(now);
-    const entry = this.#cache.get(key);
-    if (!entry) return undefined;
-    entry.lastAccessedAt = now;
-    entry.lastAccessOrder = this.#cacheAccessOrder();
-    return entry;
-  }
-
-  #putCachedProject(key: string, entry: CachedProject): void {
-    const now = this.#cacheNow();
-    this.#pruneProjectionCaches(now);
-    if (entry.sizeBytes > this.#cachePolicy.maxProjectBytes) {
-      this.#cache.delete(key);
-      return;
-    }
-    entry.lastAccessedAt = now;
-    entry.lastAccessOrder = this.#cacheAccessOrder();
-    this.#cache.set(key, entry);
-    this.#enforceProjectCacheBounds();
-  }
-
-  #getCachedCatalog(key: string, now: number): CachedRepositoryCatalog | undefined {
-    this.#pruneProjectionCaches(now);
-    const entry = this.#catalogCache.get(key);
-    if (!entry) return undefined;
-    entry.lastAccessedAt = now;
-    entry.lastAccessOrder = this.#cacheAccessOrder();
-    return entry;
-  }
-
-  #putCachedCatalog(key: string, entry: CachedRepositoryCatalog): void {
-    const now = this.#cacheNow();
-    this.#pruneProjectionCaches(now);
-    if (entry.sizeBytes > this.#cachePolicy.maxCatalogBytes) {
-      this.#catalogCache.delete(key);
-      return;
-    }
-    entry.lastAccessedAt = now;
-    entry.lastAccessOrder = this.#cacheAccessOrder();
-    this.#catalogCache.set(key, entry);
-    this.#enforceCatalogCacheBounds();
-  }
-
-  #getCachedInstallationRepositories(key: string, now: number): CachedInstallationRepositories | undefined {
-    this.#pruneInstallationCache(now);
-    const entry = this.#installationCache.get(key);
-    if (!entry) return undefined;
-    entry.lastAccessedAt = now;
-    entry.lastAccessOrder = this.#cacheAccessOrder();
-    return entry;
-  }
-
-  #putCachedInstallationRepositories(key: string, entry: CachedInstallationRepositories): void {
-    const now = this.#cacheNow();
-    this.#pruneInstallationCache(now);
-    if (entry.sizeBytes > this.#cachePolicy.maxInstallationBytes) {
-      this.#installationCache.delete(key);
-      return;
-    }
-    entry.lastAccessedAt = now;
-    entry.lastAccessOrder = this.#cacheAccessOrder();
-    this.#installationCache.set(key, entry);
-    this.#enforceInstallationCacheBounds();
-  }
-
-  #projectsFromCatalog(
-    catalog: CachedRepositoryCatalog,
-    repository: RepositoryGrant,
-    refresh?: { synchronizedAt: string; cachedAt: number }
-  ): AuthorizedProject[] | undefined {
-    const entries: AuthorizedProject[] = [];
-    for (const projectId of catalog.projectIds) {
-      const key = cacheKey(repository, projectId);
-      const cached = this.#getCachedProject(key, this.#cacheNow());
-      if (!cached || cached.stateHeadSha !== catalog.stateHeadSha) return undefined;
-      const entry = refresh ? { ...cached, ...refresh } : cached;
-      if (refresh) this.#putCachedProject(key, entry);
-      entries.push(authorizeProject(entry, repository));
-    }
-    return entries;
-  }
-
-  #captureCacheGeneration(
-    repository: Pick<RepositoryLocator, "installationId" | "repositoryId">
-  ): CacheGenerationToken {
-    const now = this.#cacheNow();
-    this.#pruneCacheGenerations(now);
-    const repositoryKey = repositoryCacheKey(repository);
-    const current = this.#cacheGenerations.get(repositoryKey);
-    const generation = current?.generation ?? this.#cacheGeneration();
-    this.#cacheGenerations.set(repositoryKey, {
-      generation,
-      lastAccessedAt: now,
-      lastAccessOrder: this.#cacheAccessOrder()
-    });
-    this.#enforceGenerationCacheBounds();
-    return { repositoryKey, generation };
-  }
-
-  #advanceCacheGeneration(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): void {
-    const now = this.#cacheNow();
-    this.#pruneCacheGenerations(now);
-    this.#cacheGenerations.set(repositoryCacheKey(repository), {
-      generation: this.#cacheGeneration(),
-      lastAccessedAt: now,
-      lastAccessOrder: this.#cacheAccessOrder()
-    });
-    this.#enforceGenerationCacheBounds();
-  }
-
-  #cacheGenerationIsCurrent(token: CacheGenerationToken): boolean {
-    return this.#cacheGenerations.get(token.repositoryKey)?.generation === token.generation;
-  }
-
-  #captureInstallationCacheGeneration(installationId: number): InstallationCacheGenerationToken {
-    const now = this.#cacheNow();
-    this.#pruneCacheGenerations(now);
-    const installationKey = installationCacheKey(installationId);
-    const current = this.#installationCacheGenerations.get(installationKey);
-    const generation = current?.generation ?? this.#cacheGeneration();
-    this.#installationCacheGenerations.set(installationKey, {
-      generation,
-      lastAccessedAt: now,
-      lastAccessOrder: this.#cacheAccessOrder()
-    });
-    this.#enforceInstallationGenerationCacheBounds();
-    return { installationKey, generation };
-  }
-
-  #advanceInstallationCacheGeneration(installationId: number): void {
-    const now = this.#cacheNow();
-    this.#pruneCacheGenerations(now);
-    this.#installationCacheGenerations.set(installationCacheKey(installationId), {
-      generation: this.#cacheGeneration(),
-      lastAccessedAt: now,
-      lastAccessOrder: this.#cacheAccessOrder()
-    });
-    this.#enforceInstallationGenerationCacheBounds();
-  }
-
-  #installationCacheGenerationIsCurrent(token: InstallationCacheGenerationToken): boolean {
-    return this.#installationCacheGenerations.get(token.installationKey)?.generation === token.generation;
-  }
-
-  #pruneProjectionCaches(now: number): void {
-    for (const [key, entry] of this.#cache) {
-      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#cache.delete(key);
-    }
-    for (const [key, entry] of this.#catalogCache) {
-      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#catalogCache.delete(key);
-    }
-    this.#enforceProjectCacheBounds();
-    this.#enforceCatalogCacheBounds();
-  }
-
-  #pruneInstallationCache(now: number): void {
-    for (const [key, entry] of this.#installationCache) {
-      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#installationCache.delete(key);
-    }
-    this.#enforceInstallationCacheBounds();
-  }
-
-  #pruneCacheGenerations(now: number): void {
-    for (const [key, entry] of this.#cacheGenerations) {
-      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#cacheGenerations.delete(key);
-    }
-    for (const [key, entry] of this.#installationCacheGenerations) {
-      if (cacheEntryIsIdle(entry.lastAccessedAt, now, this.#cachePolicy.idleTtlMs)) this.#installationCacheGenerations.delete(key);
-    }
-    this.#enforceGenerationCacheBounds();
-    this.#enforceInstallationGenerationCacheBounds();
-  }
-
-  #enforceProjectCacheBounds(): void {
-    let totalBytes = 0;
-    for (const entry of this.#cache.values()) totalBytes += entry.sizeBytes;
-    if (this.#cache.size <= this.#cachePolicy.maxProjectEntries && totalBytes <= this.#cachePolicy.maxProjectBytes) return;
-    const candidates = sortedCacheEntries(this.#cache);
-    for (const [key, entry] of candidates) {
-      if (this.#cache.size <= this.#cachePolicy.maxProjectEntries && totalBytes <= this.#cachePolicy.maxProjectBytes) break;
-      if (this.#cache.delete(key)) totalBytes -= entry.sizeBytes;
-    }
-  }
-
-  #enforceCatalogCacheBounds(): void {
-    let totalBytes = 0;
-    for (const entry of this.#catalogCache.values()) totalBytes += entry.sizeBytes;
-    if (this.#catalogCache.size <= this.#cachePolicy.maxCatalogEntries && totalBytes <= this.#cachePolicy.maxCatalogBytes) return;
-    const candidates = sortedCacheEntries(this.#catalogCache);
-    for (const [key, entry] of candidates) {
-      if (this.#catalogCache.size <= this.#cachePolicy.maxCatalogEntries && totalBytes <= this.#cachePolicy.maxCatalogBytes) break;
-      if (this.#catalogCache.delete(key)) totalBytes -= entry.sizeBytes;
-    }
-  }
-
-  #enforceInstallationCacheBounds(): void {
-    let totalBytes = 0;
-    for (const entry of this.#installationCache.values()) totalBytes += entry.sizeBytes;
-    if (this.#installationCache.size <= this.#cachePolicy.maxInstallationEntries
-      && totalBytes <= this.#cachePolicy.maxInstallationBytes) return;
-    const candidates = sortedCacheEntries(this.#installationCache);
-    for (const [key, entry] of candidates) {
-      if (this.#installationCache.size <= this.#cachePolicy.maxInstallationEntries
-        && totalBytes <= this.#cachePolicy.maxInstallationBytes) break;
-      if (this.#installationCache.delete(key)) totalBytes -= entry.sizeBytes;
-    }
-  }
-
-  #enforceGenerationCacheBounds(): void {
-    if (this.#cacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) return;
-    const candidates = sortedCacheEntries(this.#cacheGenerations);
-    for (const [key] of candidates) {
-      if (this.#cacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) break;
-      this.#cacheGenerations.delete(key);
-    }
-  }
-
-  #enforceInstallationGenerationCacheBounds(): void {
-    if (this.#installationCacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) return;
-    const candidates = sortedCacheEntries(this.#installationCacheGenerations);
-    for (const [key] of candidates) {
-      if (this.#installationCacheGenerations.size <= this.#cachePolicy.maxGenerationEntries) break;
-      this.#installationCacheGenerations.delete(key);
-    }
-  }
-
-  #cacheGeneration(): number {
-    const generation = this.#nextCacheGeneration;
-    this.#nextCacheGeneration += 1;
-    return generation;
-  }
-
-  #cacheAccessOrder(): number {
-    const order = this.#nextCacheAccessOrder;
-    this.#nextCacheAccessOrder += 1;
-    return order;
-  }
-
-  async #stateHead(repository: RepositoryLocator): Promise<ApiResult<string | undefined>> {
-    const result = await this.#transport.readBranchHead(repository, HUNSU_STATE_BRANCH);
-    return result.ok ? apiOk(result.value) : transportFailure(result.error);
-  }
-
-  async #installationRepositories(installationId: number): Promise<ApiResult<readonly RepositoryGrant[]>> {
-    const key = installationCacheKey(installationId);
-    const now = this.#cacheNow();
-    const cached = this.#getCachedInstallationRepositories(key, now);
-    if (cached && installationCacheIsFresh(cached, now, this.#cachePolicy.installationTtlMs)) {
-      return apiOk(cached.repositories);
-    }
-
-    const generation = this.#captureInstallationCacheGeneration(installationId);
-    const inFlight = this.#installationRepositoryFlights.get(key);
-    if (inFlight?.generation === generation.generation) return inFlight.promise;
-
-    const promise = this.#fetchInstallationRepositories(installationId, generation);
-    this.#installationRepositoryFlights.set(key, { generation: generation.generation, promise });
-    try {
-      return await promise;
-    } finally {
-      if (this.#installationRepositoryFlights.get(key)?.promise === promise) {
-        this.#installationRepositoryFlights.delete(key);
+      const authorized = new Map(installation.repositories.map(item => [item.repositoryId, item.permissions.contents]));
+      for (const repository of repositories.value) {
+        const contents = authorized.get(repository.repositoryId);
+        if (!contents) continue;
+        collected.push({ ...repository, permissions: { contents } });
       }
     }
-  }
-
-  async #fetchInstallationRepositories(
-    installationId: number,
-    generation: InstallationCacheGenerationToken
-  ): Promise<ApiResult<readonly RepositoryGrant[]>> {
-    const listed = await this.#transport.listInstallationRepositories(installationId);
-    if (!listed.ok) return transportFailure(listed.error);
-    const repositories = listed.value.map(cloneRepositoryGrant);
-    if (this.#installationCacheGenerationIsCurrent(generation)) {
-      const cachedAt = this.#cacheNow();
-      this.#putCachedInstallationRepositories(
-        generation.installationKey,
-        cachedInstallationRepositories(installationId, repositories, cachedAt)
-      );
-    }
-    return apiOk(repositories);
-  }
-
-  async #authorizedRepositories(context: AuthContext, requestedInstallationId?: number): Promise<ApiResult<RepositoryGrant[]>> {
-    const installations = new Map(context.installations.map(item => [item.id, item] as const));
-    if (installations.size !== context.installations.length) return forbidden("The GitHub authorization context contains duplicate installations.");
-    const installationIds = [...installations.keys()];
-    if (requestedInstallationId !== undefined && !installationIds.includes(requestedInstallationId)) {
-      return forbidden("The GitHub installation is not authorized for this user.");
-    }
-    const selected = requestedInstallationId !== undefined
-      ? [requestedInstallationId]
-      : context.client === "web" && context.selectedInstallationId !== undefined
-        ? [context.selectedInstallationId]
-        : installationIds;
-    const repositories: RepositoryGrant[] = [];
-    for (const installationId of selected) {
-      const installation = installations.get(installationId);
-      if (!installation) return forbidden("The selected GitHub installation is not authorized for this user.");
-      const userAccess = new Map(installation.repositories.map(repository => [repository.repositoryId, repository.permissions.contents] as const));
-      if (userAccess.size !== installation.repositories.length) {
-        return forbidden("The GitHub authorization context contains duplicate repositories.");
-      }
-      const listed = await this.#installationRepositories(installationId);
-      if (!listed.ok) return listed;
-      for (const repository of listed.value) {
-        const userPermission = userAccess.get(repository.repositoryId);
-        if (!userPermission) continue;
-        repositories.push({
-          ...repository,
-          permissions: {
-            contents: userPermission === "write" && repository.permissions.contents === "write" ? "write" : "read"
-          }
-        });
-      }
-    }
-    return apiOk(repositories);
-  }
-
-  async #repositoryFromInput(context: AuthContext, input: JsonRecord, requireWrite: boolean): Promise<ApiResult<RepositoryGrant>> {
-    const installationId = optionalPositiveInteger(input, "installationId");
-    const repositoryId = optionalPositiveInteger(input, "repositoryId");
-    if ((installationId === undefined) !== (repositoryId === undefined)) {
-      return invalidRequest("installationId and repositoryId must be supplied together when selecting by numeric identity.");
-    }
-    const repositories = await this.#authorizedRepositories(context, installationId);
-    if (!repositories.ok) return repositories;
-    const owner = requiredString(input, "owner");
-    const name = requiredString(input, "name");
-    const matches = repositories.value.filter(item => (repositoryId === undefined || item.repositoryId === repositoryId)
-      && item.owner.toLowerCase() === owner.toLowerCase()
-      && item.name.toLowerCase() === name.toLowerCase());
-    if (matches.length === 0) return forbidden("The repository is not granted to this GitHub App installation.");
-    if (matches.length > 1) return conflict("The repository name is ambiguous across authorized GitHub App installations; include installationId and repositoryId.");
-    const repository = matches[0];
-    if (requireWrite && repository.permissions.contents !== "write") return forbidden("The repository grant does not allow Hunsu state writes.");
-    return apiOk(repository);
-  }
-
-  async #repositoryByName(context: AuthContext, owner: string, name: string, requireWrite: boolean): Promise<ApiResult<RepositoryGrant>> {
-    const repositories = await this.#authorizedRepositories(context);
-    if (!repositories.ok) return repositories;
-    const matches = repositories.value.filter(item => item.owner.toLowerCase() === owner.toLowerCase() && item.name.toLowerCase() === name.toLowerCase());
-    if (matches.length === 0) return forbidden("The repository is not granted to an authorized GitHub App installation.");
-    if (matches.length > 1) return conflict("The repository is granted through more than one selected installation.");
-    if (requireWrite && matches[0].permissions.contents !== "write") return forbidden("The repository grant does not allow Hunsu state writes.");
-    return apiOk(matches[0]);
+    return apiOk(collected);
   }
 
   #timestamp(): string {
-    return this.#now().toISOString();
+    const value = this.#now();
+    if (!Number.isFinite(value.valueOf())) throw new Error("Clock returned an invalid timestamp.");
+    return value.toISOString();
   }
 }
 
-function runContract(repository: RepositoryLocator, run: Run): RunContract {
-  const runner = run.runnerSnapshot.kind === "player"
-    ? {
-        kind: "player" as const,
-        id: run.runnerSnapshot.id,
-        promptTemplate: run.runnerSnapshot.promptTemplate,
-        resources: run.runnerSnapshot.resources.map(resource => resource.type === "skill"
-          ? { kind: "skill", name: resource.name, reference: resource.source }
-          : { kind: "plugin", name: resource.name, reference: resource.version }),
-        runtimePolicy: pluginRuntimePolicy(run.runnerSnapshot.runtimePolicy)
-      }
-    : {
-        kind: "team" as const,
-        id: run.runnerSnapshot.id,
-        strategy: {
-          mode: run.runnerSnapshot.strategy.mode,
-          promptTemplate: run.runnerSnapshot.strategy.promptTemplate,
-          maxRounds: run.runnerSnapshot.strategy.maxRounds
-        },
-        players: run.runnerSnapshot.players.map(item => ({
-          id: item.player.id,
-          role: item.slot.role,
-          order: item.slot.order,
-          promptTemplate: item.player.promptTemplate,
-          resources: item.player.resources.map(resource => resource.type === "skill"
-            ? { kind: "skill", name: resource.name, reference: resource.source }
-            : { kind: "plugin", name: resource.name, reference: resource.version }),
-          runtimePolicy: pluginRuntimePolicy(item.player.runtimePolicy)
-        }))
-      };
-  const toolPolicy = run.runnerSnapshot.kind === "player"
-    ? pluginRuntimePolicy(run.runnerSnapshot.runtimePolicy)
-    : aggregateTeamRuntimePolicy(run.runnerSnapshot.players.map(item => item.player.runtimePolicy));
-  const expiresAt = new Date(Date.parse(run.startedAt) + 4 * 60 * 60 * 1000).toISOString();
+function buildNode(input: {
+  type: "root";
+  projectId: string;
+  commitSha: string;
+  treeSha: string;
+  commitTitle: string;
+  plan: NodePlan;
+  registeredAt: string;
+}): RootNode;
+function buildNode(input: {
+  type: "run_child";
+  projectId: string;
+  commitSha: string;
+  treeSha: string;
+  commitTitle: string;
+  plan: NodePlan;
+  registeredAt: string;
+  parentSha: string;
+  runId: string;
+  consumedGoalDigest: string;
+}): RunChildNode;
+function buildNode(input: {
+  type: "coaching_child";
+  projectId: string;
+  commitSha: string;
+  treeSha: string;
+  commitTitle: string;
+  plan: NodePlan;
+  registeredAt: string;
+  parentSha: string;
+  proposalId: string;
+}): CoachingChildNode;
+function buildNode(input: {
+  type: "root";
+  projectId: string;
+  commitSha: string;
+  treeSha: string;
+  commitTitle: string;
+  plan: NodePlan;
+  registeredAt: string;
+} | {
+  type: "run_child";
+  projectId: string;
+  commitSha: string;
+  treeSha: string;
+  commitTitle: string;
+  plan: NodePlan;
+  registeredAt: string;
+  parentSha: string;
+  runId: string;
+  consumedGoalDigest: string;
+} | {
+  type: "coaching_child";
+  projectId: string;
+  commitSha: string;
+  treeSha: string;
+  commitTitle: string;
+  plan: NodePlan;
+  registeredAt: string;
+  parentSha: string;
+  proposalId: string;
+}): Node {
+  const projectId = asProjectId(input.projectId);
+  const commitSha = asGitSha(input.commitSha);
+  const base = {
+    projectId,
+    commitSha,
+    treeSha: asTreeSha(input.treeSha),
+    managedRef: managedNodeRef(projectId, commitSha),
+    commitTitle: asText(input.commitTitle),
+    plan: input.plan,
+    planDigest: computeNodePlanDigest(input.plan),
+    payloadDigest: asNodePayloadDigest("hunsu-node-payload-v1:sha256:" + "0".repeat(64)),
+    registeredAt: asTimestamp(input.registeredAt)
+  };
+  const provisional: Node = input.type === "root"
+    ? { ...base, type: "root" }
+    : input.type === "run_child"
+      ? {
+          ...base,
+          type: "run_child",
+          parentSha: asGitSha(input.parentSha),
+          runId: asRunId(input.runId),
+          consumedGoalDigest: asGoalDigest(input.consumedGoalDigest)
+        }
+      : {
+          ...base,
+          type: "coaching_child",
+          parentSha: asGitSha(input.parentSha),
+          proposalId: asProposalId(input.proposalId)
+        };
+  const payload: NodePayload = {
+    schema: NODE_PAYLOAD_SCHEMA,
+    projectId,
+    commitSha,
+    treeSha: base.treeSha,
+    plan: input.plan
+  };
+  return { ...provisional, payloadDigest: computeNodePayloadDigest(payload) };
+}
+
+function encodeNode(node: Node) {
+  const encoded = encodeNodeEnvelope({
+    schema: NODE_PAYLOAD_SCHEMA,
+    projectId: node.projectId,
+    commitSha: node.commitSha,
+    treeSha: node.treeSha,
+    plan: node.plan
+  });
+  if (!encoded.ok) throw boundaryInvalid(encoded.error.message);
+  return encoded.value;
+}
+
+function runContract(run: Run, repository: RepositoryGrant, now: Date, execution: RunnerExecution): RunContract {
+  const runner = plainRunner(run.runner);
+  const goal = {
+    key: String(run.goal.key),
+    title: String(run.goal.title),
+    desiredOutcome: String(run.goal.desiredOutcome),
+    acceptanceCriteria: run.goal.acceptanceCriteria.map(String) as [string, ...string[]],
+    constraints: run.goal.constraints.map(String),
+    priority: Number(run.goal.priority)
+  };
   return {
-    schema: "hunsu.run-contract.v1",
-    runId: run.id,
-    projectId: run.projectId,
-    goal: {
-      id: run.goalSnapshot.id,
-      title: run.goalSnapshot.title,
-      desiredOutcome: run.goalSnapshot.desiredOutcome,
-      acceptanceCriteria: [...run.goalSnapshot.acceptanceCriteria],
-      constraints: [...run.goalSnapshot.constraints]
-    },
+    schema: "hunsu.run-contract.v2",
+    runId: String(run.id),
+    projectId: String(run.projectId),
+    sourceNodeSha: String(run.sourceNodeSha),
+    goal,
+    goalDigest: String(run.goalDigest) as RunContract["goalDigest"],
     runner,
+    runnerDigest: String(run.runnerDigest) as RunContract["runnerDigest"],
     repository: {
       installationId: repository.installationId,
       repositoryId: repository.repositoryId,
       owner: repository.owner,
       name: repository.name,
-      baseSha: run.baseSha,
-      branch: run.branch
+      branch: String(run.branch)
     },
-    instructions: run.runnerSnapshot.kind === "player" ? run.runnerSnapshot.promptTemplate : run.runnerSnapshot.strategy.promptTemplate,
-    acceptanceCriteria: [...run.goalSnapshot.acceptanceCriteria],
-    constraints: [...run.goalSnapshot.constraints],
-    requiredEvidence: run.goalSnapshot.acceptanceCriteria.map(criterion => ({
+    instructions: execution.instructions,
+    requiredEvidence: goal.acceptanceCriteria.map(criterion => ({
       criterion,
-      kind: "check",
-      description: `Provide GitHub-verifiable evidence for: ${criterion}`,
+      kind: "check" as const,
+      description: `Provide immutable evidence that satisfies: ${criterion}`,
       required: true
     })),
-    toolPolicy,
-    lease: { expiresAt, checkpointAfterSeconds: 900 }
-  };
-}
-
-function pluginRuntimePolicy(policy: RuntimePolicy): RunContract["toolPolicy"] {
-  return {
-    filesystem: policy.fileAccess === "project_write" ? "worktree_write" : "read_only",
-    network: policy.network === "allowed" ? "enabled" : "disabled",
-    approvals: policy.approval === "user" ? "on_request" : "never"
-  };
-}
-
-function aggregateTeamRuntimePolicy(policies: readonly RuntimePolicy[]): RunContract["toolPolicy"] {
-  return {
-    filesystem: policies.some(policy => policy.fileAccess === "project_write") ? "worktree_write" : "read_only",
-    network: policies.some(policy => policy.network === "allowed") ? "enabled" : "disabled",
-    approvals: policies.some(policy => policy.approval === "user") ? "on_request" : "never"
-  };
-}
-
-function evidenceRef(projectId: string, runId: string, input: EvidenceInput, evidenceId: string, recordedAt: string): EvidenceRef {
-  const location: EvidenceRef["location"] = input.url
-    ? { type: "url", url: asText(input.url, "evidence.url") }
-    : input.sha
-      ? { type: "git", commitSha: asGitSha(input.sha), path: asText(".", "evidence.path") }
-      : { type: "text", text: asText(input.summary, "evidence.summary") };
-  return {
-    id: asEvidenceId(evidenceId),
-    projectId: asProjectId(projectId),
-    runId: asRunId(runId),
-    ...(input.criterion ? { criterion: asAcceptanceCriterion(input.criterion, "evidence.criterion") } : {}),
-    kind: input.kind === "check" ? "check" : input.kind === "commit" ? "diff" : input.kind === "artifact" ? "report" : "note",
-    summary: asEvidenceSummary(input.summary),
-    location,
-    recordedAt: asTimestamp(recordedAt)
-  };
-}
-
-function parseEvidence(input: JsonRecord, requireCriterion = false): EvidenceInput {
-  const kind = requiredString(input, "kind");
-  if (kind !== "check" && kind !== "commit" && kind !== "artifact" && kind !== "observation") {
-    throw boundaryInvalid("Evidence kind is invalid.");
-  }
-  const url = optionalString(input, "url");
-  if (url) {
-    try { new URL(url); } catch { throw boundaryInvalid("Evidence URL must be absolute."); }
-  }
-  const sha = optionalString(input, "sha");
-  if (sha) asGitSha(sha);
-  const criterion = optionalString(input, "criterion");
-  if (requireCriterion && !criterion) throw boundaryInvalid("Completion evidence must identify its Goal acceptance criterion.");
-  return {
-    kind,
-    summary: requiredString(input, "summary"),
-    ...(url ? { url } : {}),
-    ...(sha ? { sha } : {}),
-    ...(criterion ? { criterion } : {})
-  };
-}
-
-function stableEvidence(input: EvidenceInput): JsonRecord {
-  return {
-    kind: input.kind,
-    summary: input.summary,
-    ...(input.url ? { url: input.url } : {}),
-    ...(input.sha ? { sha: input.sha } : {}),
-    ...(input.criterion ? { criterion: input.criterion } : {})
-  };
-}
-
-function parseResourceBindings(value: unknown): ResourceBinding[] {
-  if (!Array.isArray(value)) throw boundaryInvalid("resources must be an array.");
-  return value.map((item, index) => {
-    const resource = assertRecord(item, `resources[${index}]`);
-    const kind = requiredString(resource, "kind");
-    if (kind === "skill") return {
-      type: "skill",
-      name: asResourceName(requiredString(resource, "name")),
-      source: asText(requiredString(resource, "reference"), `resources[${index}].reference`)
-    };
-    if (kind === "plugin") return {
-      type: "plugin",
-      name: asResourceName(requiredString(resource, "name")),
-      version: asText(requiredString(resource, "reference"), `resources[${index}].reference`)
-    };
-    throw boundaryInvalid(`resources[${index}].kind must be skill or plugin.`);
-  });
-}
-
-function parseRuntimePolicy(value: JsonRecord): RuntimePolicy {
-  const filesystem = requiredString(value, "filesystem");
-  const network = requiredString(value, "network");
-  const approvals = requiredString(value, "approvals");
-  if (filesystem !== "read_only" && filesystem !== "worktree_write") throw boundaryInvalid("runtimePolicy.filesystem is invalid.");
-  if (network !== "disabled" && network !== "enabled") throw boundaryInvalid("runtimePolicy.network is invalid.");
-  if (approvals !== "never" && approvals !== "on_request") throw boundaryInvalid("runtimePolicy.approvals is invalid.");
-  return {
-    fileAccess: filesystem === "worktree_write" ? "project_write" : "read_only",
-    network: network === "enabled" ? "allowed" : "denied",
-    approval: approvals === "on_request" ? "user" : "automatic"
-  };
-}
-
-function parseGoalPatch(input: JsonRecord): GoalPatch {
-  const patch: GoalPatch = {
-    ...(optionalString(input, "title") ? { title: asGoalTitle(optionalString(input, "title")!) } : {}),
-    ...(optionalString(input, "desiredOutcome") ? { desiredOutcome: asDesiredOutcome(optionalString(input, "desiredOutcome")!) } : {}),
-    ...(input.acceptanceCriteria !== undefined ? {
-      acceptanceCriteria: asNonEmpty(requiredStringArray(input, "acceptanceCriteria", true).map((value, index) => asAcceptanceCriterion(value, `acceptanceCriteria[${index}]`)), "acceptanceCriteria")
-    } : {}),
-    ...(input.constraints !== undefined ? { constraints: requiredStringArray(input, "constraints", false).map((value, index) => asGoalConstraint(value, `constraints[${index}]`)) } : {}),
-    ...(input.priority !== undefined ? { priority: asNonNegativeInteger(requiredNonNegativeInteger(input, "priority")) } : {})
-  };
-  if (Object.keys(patch).length === 0) throw boundaryInvalid("A proposed Goal patch must change at least one field.");
-  return patch;
-}
-
-function automaticCoachFindings(state: ProjectState): string[] {
-  const findings: string[] = [];
-  const activeWithoutRuns = state.goals.filter(goal => goal.status === "active" && !state.runs.some(run => run.goalId === goal.id));
-  if (activeWithoutRuns.length > 0) findings.push(`${activeWithoutRuns.length} active Goal(s) have no Run evidence.`);
-  const runningWithoutCheckpoints = state.runs.filter(run => run.status === "running" && run.checkpoints.length === 0);
-  if (runningWithoutCheckpoints.length > 0) findings.push(`${runningWithoutCheckpoints.length} Run(s) have not reported a checkpoint.`);
-  const openDivergences = state.divergences.filter(divergence => !state.comparisons.some(comparison => comparison.divergenceId === divergence.id));
-  if (openDivergences.length > 0) findings.push(`${openDivergences.length} Hunsu divergence(s) still need comparison evidence.`);
-  return findings;
-}
-
-function projectIdOf(state: ProjectState): string {
-  const project = state.projects[0];
-  if (!project) throw new Error("Projected state has no Project.");
-  return project.id;
-}
-
-function cacheKey(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">, projectId: string): string {
-  return `${repository.installationId}:${repository.repositoryId}:${projectId}`;
-}
-
-function repositoryCacheKey(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): string {
-  return `${repository.installationId}:${repository.repositoryId}`;
-}
-
-function installationCacheKey(installationId: number): string {
-  return String(installationId);
-}
-
-function repositoryLocator(repository: RepositoryLocator): RepositoryLocator {
-  return {
-    installationId: repository.installationId,
-    repositoryId: repository.repositoryId,
-    owner: repository.owner,
-    name: repository.name,
-    defaultBranch: repository.defaultBranch
-  };
-}
-
-function cachedProject(
-  repository: RepositoryLocator,
-  state: ProjectState,
-  stateHeadSha: string,
-  synchronizedAt: string,
-  cachedAt: number
-): CachedProject {
-  const locator = repositoryLocator(repository);
-  return {
-    repository: locator,
-    state,
-    stateHeadSha,
-    synchronizedAt,
-    cachedAt,
-    lastAccessedAt: cachedAt,
-    lastAccessOrder: 0,
-    sizeBytes: encodedCacheSize({ repository: locator, state, stateHeadSha, synchronizedAt })
-  };
-}
-
-function cachedRepositoryCatalog(
-  repository: RepositoryLocator,
-  stateHeadSha: string | undefined,
-  projectIds: readonly string[],
-  synchronizedAt: string,
-  cachedAt: number
-): CachedRepositoryCatalog {
-  const locator = repositoryLocator(repository);
-  return {
-    repository: locator,
-    stateHeadSha,
-    projectIds: [...projectIds],
-    synchronizedAt,
-    cachedAt,
-    lastAccessedAt: cachedAt,
-    lastAccessOrder: 0,
-    sizeBytes: encodedCacheSize({ repository: locator, stateHeadSha, projectIds, synchronizedAt })
-  };
-}
-
-function cachedInstallationRepositories(
-  installationId: number,
-  repositories: readonly RepositoryGrant[],
-  cachedAt: number
-): CachedInstallationRepositories {
-  const grants = repositories.map(cloneRepositoryGrant);
-  return {
-    installationId,
-    repositories: grants,
-    cachedAt,
-    lastAccessedAt: cachedAt,
-    lastAccessOrder: 0,
-    sizeBytes: encodedCacheSize({ installationId, repositories: grants })
-  };
-}
-
-function cloneRepositoryGrant(repository: RepositoryGrant): RepositoryGrant {
-  return {
-    installationId: repository.installationId,
-    repositoryId: repository.repositoryId,
-    owner: repository.owner,
-    name: repository.name,
-    defaultBranch: repository.defaultBranch,
-    private: repository.private,
-    permissions: { contents: repository.permissions.contents }
-  };
-}
-
-function authorizeProject(entry: CachedProject, repository: RepositoryGrant): AuthorizedProject {
-  return {
-    repository,
-    state: entry.state,
-    stateHeadSha: entry.stateHeadSha,
-    synchronizedAt: entry.synchronizedAt,
-    cachedAt: entry.cachedAt
-  };
-}
-
-function cacheIsFresh(entry: { cachedAt: number }, now: number): boolean {
-  const age = now - entry.cachedAt;
-  return age >= 0 && age < PROJECTION_CACHE_TTL_MS;
-}
-
-function installationCacheIsFresh(entry: { cachedAt: number }, now: number, ttlMs: number): boolean {
-  const age = now - entry.cachedAt;
-  return age >= 0 && age < ttlMs;
-}
-
-function projectionCachePolicy(overrides: Partial<ProjectionCachePolicy> | undefined): ProjectionCachePolicy {
-  const policy = { ...DEFAULT_PROJECTION_CACHE_POLICY, ...overrides };
-  for (const [name, value] of Object.entries(policy)) {
-    if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${name} must be a positive safe integer.`);
-  }
-  return policy;
-}
-
-function encodedCacheSize(value: unknown): number {
-  const serialized = JSON.stringify(value);
-  return serialized === undefined ? 0 : UTF8_ENCODER.encode(serialized).byteLength;
-}
-
-function cacheEntryIsIdle(lastAccessedAt: number, now: number, idleTtlMs: number): boolean {
-  const idleFor = now - lastAccessedAt;
-  return idleFor < 0 || idleFor >= idleTtlMs;
-}
-
-function sortedCacheEntries<T extends { lastAccessOrder: number }>(cache: Map<string, T>): Array<[string, T]> {
-  return [...cache.entries()].sort(([leftKey, left], [rightKey, right]) =>
-    left.lastAccessOrder - right.lastAccessOrder || (leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0));
-}
-
-function projectionContext(entry: Pick<AuthorizedProject, "repository" | "stateHeadSha" | "synchronizedAt">): ProjectionContext {
-  return {
-    health: {
-      repositoryAccess: entry.repository.permissions.contents === "read" ? "read_only" : "healthy",
-      stateRef: "healthy",
-      stateRefName: HUNSU_STATE_BRANCH,
-      stateHeadSha: entry.stateHeadSha,
-      projection: "current",
-      synchronizedAt: entry.synchronizedAt
+    toolPolicy: execution.toolPolicy,
+    lease: {
+      expiresAt: new Date(now.valueOf() + 60 * 60 * 1_000).toISOString(),
+      checkpointAfterSeconds: 300
     }
   };
 }
 
-function commandMetadata(rawIdempotencyKey: string, semantic: unknown, index: number, at: string, actor: DomainActor): CommandMetadata {
+function plainRunner(runner: RunnerValue): RunContract["runner"] {
   return {
-    eventId: unwrap(makeEventId(hashHex(`event:${rawIdempotencyKey}:${canonicalJson(semantic)}:${index}`).slice(0, 32))),
+    schema: "hunsu.runner-value.v1",
+    type: {
+      origin: String(runner.type.origin),
+      key: String(runner.type.key),
+      schemaVersion: String(runner.type.schemaVersion),
+      integrity: String(runner.type.integrity) as RunContract["runner"]["type"]["integrity"]
+    },
+    name: String(runner.name),
+    value: runner.value
+  };
+}
+
+function evidenceRef(projectId: string, runId: string, value: unknown, evidenceId: string, at: string): EvidenceRef {
+  const input = assertExactRecord(value, "evidence", ["kind", "summary", "target", "location"]);
+  const kind = requiredString(input, "kind");
+  if (kind !== "diff" && kind !== "check" && kind !== "screenshot" && kind !== "report" && kind !== "note") {
+    throw boundaryInvalid("evidence.kind is invalid.");
+  }
+  const targetRecord = assertRecord(input.target, "evidence.target");
+  const targetType = requiredString(targetRecord, "type");
+  const targetInput = assertExactRecord(
+    targetRecord,
+    "evidence.target",
+    targetType === "criterion" ? ["type", "criterion"] : ["type"]
+  );
+  const target = targetType === "run"
+    ? { type: "run" as const }
+    : targetType === "criterion"
+      ? { type: "criterion" as const, criterion: asAcceptanceCriterion(requiredString(targetInput, "criterion"), "evidence.target.criterion") }
+      : (() => { throw boundaryInvalid("evidence.target.type is invalid."); })();
+  const locationRecord = assertRecord(input.location, "evidence.location");
+  const locationType = requiredString(locationRecord, "type");
+  const locationInput = assertExactRecord(
+    locationRecord,
+    "evidence.location",
+    locationType === "git" ? ["type", "commitSha", "path"] : locationType === "url" ? ["type", "url"] : ["type", "text"]
+  );
+  const location = locationType === "git"
+    ? {
+        type: "git" as const,
+        commitSha: asGitSha(requiredSha(locationInput, "commitSha")),
+        path: asGitTreePath(requiredString(locationInput, "path"), "evidence.location.path")
+      }
+    : locationType === "url"
+      ? { type: "url" as const, url: asText(safeHttpUrl(requiredString(locationInput, "url")), "evidence.location.url") }
+      : locationType === "text"
+        ? { type: "text" as const, text: asText(requiredString(locationInput, "text"), "evidence.location.text") }
+        : (() => { throw boundaryInvalid("evidence.location.type is invalid."); })();
+  return {
+    id: asEvidenceId(evidenceId),
+    projectId: asProjectId(projectId),
+    runId: asRunId(runId),
+    target,
+    kind,
+    summary: asEvidenceSummary(requiredString(input, "summary")),
+    location,
+    recordedAt: asTimestamp(at)
+  };
+}
+
+function parseCheckpointLocation(input: JsonRecord) {
+  const type = requiredString(input, "type");
+  if (type === "observation") {
+    assertExactRecord(input, "location", ["type"]);
+    return { type: "observation" as const };
+  }
+  if (type === "commit") {
+    assertExactRecord(input, "location", ["type", "commitSha"]);
+    return { type: "commit" as const, commitSha: asGitSha(requiredSha(input, "commitSha")) };
+  }
+  throw boundaryInvalid("location.type must be observation or commit.");
+}
+
+function parseComparisonFindings(value: unknown): readonly ComparisonFinding[] {
+  if (!Array.isArray(value)) throw boundaryInvalid("findings must be an array.");
+  return value.map((item, index) => {
+    const finding = assertExactRecord(item, `findings[${index}]`, ["criterion", "summaries"]);
+    const summariesInput = array(finding, "summaries", true);
+    const summaries = summariesInput.map((summary, summaryIndex) => {
+      const row = assertExactRecord(summary, `findings[${index}].summaries[${summaryIndex}]`, ["nodeSha", "summary"]);
+      return {
+        nodeSha: asGitSha(requiredSha(row, "nodeSha")),
+        summary: asEvidenceSummary(requiredString(row, "summary"))
+      };
+    });
+    return {
+      subject: asText(requiredString(finding, "criterion")),
+      summaries: asNonEmpty(summaries, `findings[${index}].summaries`)
+    };
+  });
+}
+
+function decodePlan(value: unknown, runnerTypes: RunnerValueTypeRegistry): NodePlan {
+  const decoded = decodeNodePlan(value, runnerTypes, "nodePlan");
+  if (!decoded.ok) throw boundaryInvalid(`${decoded.error.path}: ${decoded.error.message}`);
+  return decoded.value;
+}
+
+function decodeWorkspace(
+  content: string | undefined,
+  repository: RepositoryGrant
+): ApiResult<{ projectIds: readonly string[] }> {
+  if (content === undefined) return integrityFailure("Exact Hunsu workspace read did not return workspace.json.");
+  let input: unknown;
+  try {
+    input = JSON.parse(content);
+  } catch {
+    return integrityFailure("Hunsu workspace is not valid JSON.");
+  }
+  if (!isRecord(input)) return integrityFailure("Hunsu workspace must be an object.");
+  const keys = Object.keys(input).sort();
+  const expected = ["installationId", "projectIds", "repository", "repositoryId", "schema"];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    return integrityFailure("Hunsu workspace contains missing or unsupported fields.");
+  }
+  if (input.schema !== "hunsu.workspace.v2"
+    || input.installationId !== repository.installationId
+    || input.repositoryId !== repository.repositoryId
+    || typeof input.repository !== "string"
+    || input.repository.toLowerCase() !== `${repository.owner}/${repository.name}`.toLowerCase()
+    || !Array.isArray(input.projectIds)
+    || input.projectIds.some(projectId => typeof projectId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(projectId))
+  ) return integrityFailure("Hunsu workspace does not match its authorized repository identity.");
+  const projectIds = input.projectIds as string[];
+  if (new Set(projectIds).size !== projectIds.length
+    || projectIds.some((projectId, index) => index > 0 && projectIds[index - 1]!.localeCompare(projectId) >= 0)
+  ) return integrityFailure("Hunsu workspace Project ids must be unique and canonically ordered.");
+  return apiOk({ projectIds });
+}
+
+function readProjectSummary(loaded: ReadProject) {
+  const project = loaded.catalog.project;
+  return {
+    id: project.id,
+    title: project.title,
+    repository: {
+      owner: loaded.repository.owner,
+      name: loaded.repository.name,
+      url: `https://github.com/${loaded.repository.owner}/${loaded.repository.name}`,
+      defaultBranch: loaded.repository.defaultBranch
+    },
+    rootNodeSha: project.rootNodeSha
+  };
+}
+
+function initializedRepositoryV2State(stateHeadSha: string): RepositoryV2InitializationState {
+  if (!FULL_SHA.test(stateHeadSha)) throw new Error("Initialized repository state requires a full state-head SHA.");
+  return {
+    status: "initialized",
+    expectedStateSource: "state_branch_head",
+    stateHeadSha,
+    expectedStateSha: stateHeadSha
+  };
+}
+
+function readGraphNode(node: ProjectGraphNode) {
+  return {
+    sha: node.sha,
+    title: node.commitTitle,
+    status: node.status,
+    runner: {
+      name: node.runner.name,
+      typeKey: node.runner.typeKey,
+      schemaVersion: node.runner.schemaVersion,
+      digest: node.runner.digest
+    },
+    nextGoalCount: node.nextGoalCount,
+    integrity: "valid" as const
+  };
+}
+
+function readGraphEdge(edge: ProjectGraphEdge) {
+  return edge.type === "run"
+    ? {
+        kind: "run" as const, id: `run:${edge.runId}`, sourceSha: edge.sourceSha, targetSha: edge.targetSha,
+        runId: edge.runId, goal: { digest: edge.goalDigest, title: edge.goalTitle }, completedAt: edge.completedAt
+      }
+    : {
+        kind: "coaching" as const, id: `coaching:${edge.proposalId}`, sourceSha: edge.sourceSha, targetSha: edge.targetSha,
+        proposalId: edge.proposalId, summary: edge.summary, confirmedAt: edge.confirmedAt
+      };
+}
+
+function readNodeLineage(node: ProjectGraphNode) {
+  return node.lineage.type === "root"
+    ? { kind: "root" as const }
+    : node.lineage.type === "run"
+      ? { kind: "run_child" as const, parentSha: node.lineage.parentSha, runId: node.lineage.runId, goalDigest: node.lineage.consumedGoalDigest }
+      : { kind: "coaching_child" as const, parentSha: node.lineage.parentSha, proposalId: node.lineage.proposalId };
+}
+
+function readEvidenceSummary(loaded: ReadProject, activity: Pick<NodeActivityShardReadModel, "runs">, evidence: EvidenceActivityReadModel) {
+  const run = activity.runs.find(item => item.id === evidence.runId);
+  const kind = evidence.kind === "diff" ? "commit"
+    : evidence.kind === "check" ? "check"
+      : evidence.kind === "report" ? "report"
+        : evidence.kind === "screenshot" ? "artifact" : "link";
+  return {
+    id: evidence.id,
+    kind,
+    title: evidence.summary,
+    summary: evidence.summary,
+    criterion: evidence.target.type === "criterion" && run
+      ? { kind: "linked" as const, goalDigest: run.goalDigest, criterion: evidence.target.criterion }
+      : { kind: "unlinked" as const },
+    location: evidence.location.type === "url"
+      ? { kind: "url" as const, url: evidence.location.url }
+      : evidence.location.type === "git"
+        ? { kind: "url" as const, url: `https://github.com/${loaded.repository.owner}/${loaded.repository.name}/blob/${evidence.location.commitSha}/${evidence.location.path}` }
+        : { kind: "none" as const },
+    createdAt: evidence.recordedAt
+  };
+}
+
+function readEventIndexEntry(entry: EventIndexEntryReadModel) {
+  return {
+    sequence: entry.sequence,
+    id: entry.domainEventId,
+    type: entry.eventType,
+    summary: entry.summary,
+    actor: entry.actor,
+    occurredAt: entry.occurredAt,
+    reference: entry.reference
+  };
+}
+
+function readDomainRun(
+  loaded: ReadProject,
+  run: RunActivityReadModel,
+  goal: NodePlan["nextGoals"][number],
+  runner: RunnerValue
+): Record<string, unknown> {
+  const base = {
+    id: run.id,
+    projectId: loaded.catalog.project.id,
+    sourceNodeSha: run.sourceNodeSha,
+    goal,
+    goalDigest: run.goalDigest,
+    runner,
+    runnerDigest: run.runnerDigest,
+    branch: run.branch,
+    checkpoints: run.checkpoints,
+    evidenceIds: run.evidenceIds,
+    startedAt: run.startedAt
+  };
+  switch (run.outcome.type) {
+    case "running": return { ...base, status: "running" };
+    case "completed": return { ...base, status: "completed", resultNodeSha: run.outcome.nodeSha, verifiedAt: run.outcome.verifiedAt, completedAt: run.outcome.completedAt };
+    case "failed": return { ...base, status: "failed", failedAt: run.outcome.failedAt, failureReason: run.outcome.reason };
+    case "canceled": return { ...base, status: "canceled", canceledAt: run.outcome.canceledAt, cancellationReason: run.outcome.reason };
+  }
+}
+
+function readDomainEvidence(loaded: ReadProject, evidence: EvidenceActivityReadModel) {
+  return {
+    id: evidence.id,
+    projectId: loaded.catalog.project.id,
+    runId: evidence.runId,
+    target: evidence.target,
+    kind: evidence.kind,
+    summary: evidence.summary,
+    location: evidence.location,
+    recordedAt: evidence.recordedAt
+  };
+}
+
+function readModelPath(loaded: ReadProject, relativePath: string): string {
+  return `.hunsu/v2/projects/${loaded.catalog.project.id}/${relativePath}`;
+}
+
+function nodePayloadPath(loaded: ReadProject, nodeSha: string): string {
+  return `.hunsu/v2/projects/${loaded.catalog.project.id}/nodes/${nodeSha}/node.hunsu`;
+}
+
+function readFileCacheKey(loaded: ReadProject, path: string): string {
+  return `${repositoryKey(loaded.repository)}:${loaded.stateHeadSha}:${path}`;
+}
+
+function decodeMaterialized<T>(
+  files: Readonly<Record<string, string>>,
+  path: string,
+  decoder: (input: unknown) => { ok: true; value: T } | { ok: false; error: { message: string } }
+): ApiResult<T> {
+  const content = files[path];
+  if (content === undefined) return integrityFailure(`Required materialization ${path} is missing.`);
+  let input: unknown;
+  try {
+    input = JSON.parse(content);
+  } catch {
+    return integrityFailure(`Materialization ${path} is not valid JSON.`);
+  }
+  const decoded = decoder(input);
+  return decoded.ok ? apiOk(decoded.value) : integrityFailure(`${path}: ${decoded.error.message}`);
+}
+
+function materializedEnvelopeDigest(files: Readonly<Record<string, string>>, path: string): string | undefined {
+  const parsed = parseJsonFile(files, path, "Materialization");
+  return parsed.ok && isRecord(parsed.value) && typeof parsed.value.digest === "string" ? parsed.value.digest : undefined;
+}
+
+function parseJsonFile(
+  files: Readonly<Record<string, string>>,
+  path: string,
+  label: string
+): ApiResult<unknown> {
+  const content = files[path];
+  if (content === undefined) return integrityFailure(`${label} ${path} is missing.`);
+  try {
+    return apiOk(JSON.parse(content) as unknown);
+  } catch {
+    return integrityFailure(`${label} ${path} is not valid JSON.`);
+  }
+}
+
+function parseAuthoritativeEventPath(
+  projectId: string,
+  path: string
+): ApiResult<{ year: number; month: number; eventId: string }> {
+  const escapedProjectId = projectId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = path.match(new RegExp(`^\\.hunsu/v2/projects/${escapedProjectId}/events/(\\d{4})/(\\d{2})/([0-9a-f]{32})\\.json$`, "u"));
+  if (!match) return integrityFailure("Event locator contains an invalid authoritative Event path.");
+  return apiOk({ year: Number(match[1]), month: Number(match[2]), eventId: match[3]! });
+}
+
+function authoritativeEventMismatch(
+  loaded: ReadProject,
+  indexed: EventIndexEntryReadModel,
+  stored: StoredProjectEvent<DomainEvent>
+): string | undefined {
+  const event = stored.event;
+  const actor = event.meta.actor.type === "system"
+    ? { id: "system", label: "System" }
+    : { id: String(event.meta.actor.id), label: event.meta.actor.type === "coach" ? "Coach" : event.meta.actor.type === "plugin" ? "Plugin" : "User" };
+  if (stored.projectId !== loaded.catalog.project.id
+    || stored.repository.installationId !== loaded.repository.installationId
+    || stored.repository.repositoryId !== loaded.repository.repositoryId
+    || stored.repository.owner.toLowerCase() !== loaded.repository.owner.toLowerCase()
+    || stored.repository.name.toLowerCase() !== loaded.repository.name.toLowerCase()
+    || stored.eventId !== indexed.storedEventId
+    || stored.sequence !== indexed.sequence
+    || stored.occurredAt !== indexed.occurredAt
+    || String(event.meta.recordedAt) !== indexed.occurredAt
+    || String(event.meta.eventId) !== indexed.domainEventId
+    || event.type !== indexed.eventType
+    || authoritativeEventSummary(event) !== indexed.summary
+    || actor.id !== indexed.actor.id
+    || actor.label !== indexed.actor.label
+    || !eventReferenceMatchesAuthoritative(indexed, event)
+  ) return `Authoritative Event ${stored.eventId} does not match its exact-head Event locator metadata.`;
+  return undefined;
+}
+
+function authoritativeEventSummary(event: DomainEvent): string {
+  switch (event.type) {
+    case "ProjectCreated": return `Created Project ${event.project.title}`;
+    case "ProjectMaterializationsRebuilt": return `Rebuilt Project ${event.projectId} materializations`;
+    case "RootNodeRegistered": return `Registered root Node ${String(event.node.commitSha).slice(0, 8)}`;
+    case "RunStarted": return `Started Run ${event.run.id} for ${event.run.goal.title}`;
+    case "RunCheckpointed": return `Recorded checkpoint for Run ${event.checkpoint.runId}`;
+    case "RunEvidenceAttached": return `Attached evidence to Run ${event.evidence.runId}`;
+    case "RunCompleted": return `Completed Run ${event.result.runId}`;
+    case "RunChildNodeRegistered": return `Registered Run child Node ${String(event.node.commitSha).slice(0, 8)}`;
+    case "RunFailed": return `Failed Run ${event.runId}`;
+    case "RunCanceled": return `Canceled Run ${event.runId}`;
+    case "CoachReviewRecorded": return `Recorded Coach review ${event.review.id}`;
+    case "CoachingProposalRecorded": return `Proposed Coaching transition ${event.proposal.id}`;
+    case "CoachingProposalConfirmed": return `Confirmed Coaching transition ${event.decision.proposalId}`;
+    case "CoachingChildNodeRegistered": return `Registered Coaching child Node ${String(event.node.commitSha).slice(0, 8)}`;
+    case "CoachingProposalRejected": return `Rejected Coaching transition ${event.decision.proposalId}`;
+    case "AlternativesCompared": return `Compared ${event.comparison.nodeShas.length} sibling Nodes`;
+    case "AlternativeSelected": return `Selected Node ${String(event.decision.selectedNodeSha).slice(0, 8)}`;
+    case "AlternativesRejected": return `Rejected ${event.decision.rejectedNodeShas.length} Node alternative(s)`;
+  }
+}
+
+function eventReferenceMatchesAuthoritative(indexed: EventIndexEntryReadModel, event: DomainEvent): boolean {
+  const reference = indexed.reference;
+  switch (event.type) {
+    case "ProjectCreated": return reference.kind === "project";
+    case "ProjectMaterializationsRebuilt": return reference.kind === "project";
+    case "RootNodeRegistered":
+    case "RunChildNodeRegistered":
+    case "CoachingChildNodeRegistered": return reference.kind === "node" && reference.nodeSha === String(event.node.commitSha);
+    case "RunStarted": return reference.kind === "run" && reference.runId === String(event.run.id)
+      && reference.sourceNodeSha === String(event.run.sourceNodeSha) && reference.target.kind === "pending";
+    case "RunCheckpointed": return reference.kind === "run" && reference.runId === String(event.checkpoint.runId);
+    case "RunEvidenceAttached": return reference.kind === "run" && reference.runId === String(event.evidence.runId);
+    case "RunCompleted": return reference.kind === "run" && reference.runId === String(event.result.runId)
+      && reference.target.kind === "registered" && reference.target.nodeSha === String(event.result.resultSha);
+    case "RunFailed":
+    case "RunCanceled": return reference.kind === "run" && reference.runId === String(event.runId);
+    case "CoachReviewRecorded": {
+      if (event.review.target.type === "node") return reference.kind === "node" && reference.nodeSha === String(event.review.target.nodeSha);
+      if (event.review.target.type === "run") return reference.kind === "run" && reference.runId === String(event.review.target.runId);
+      return reference.kind === "node" || reference.kind === "project";
+    }
+    case "CoachingProposalRecorded": return reference.kind === "node" && reference.nodeSha === String(event.proposal.sourceNodeSha);
+    case "CoachingProposalConfirmed": return reference.kind === "node" && reference.nodeSha === String(event.decision.childNodeSha);
+    case "CoachingProposalRejected": return reference.kind === "node" || reference.kind === "project";
+    case "AlternativesCompared": return reference.kind === "node" && reference.nodeSha === String(event.comparison.parentNodeSha);
+    case "AlternativeSelected": return reference.kind === "node" && reference.nodeSha === String(event.decision.selectedNodeSha);
+    case "AlternativesRejected": return reference.kind === "node" && reference.nodeSha === String(event.decision.rejectedNodeShas[0]);
+  }
+}
+
+function decodeNodePayloadFile(
+  files: Readonly<Record<string, string>>,
+  path: string,
+  runnerTypes: RunnerValueTypeRegistry
+): ApiResult<NodePayload> {
+  const content = files[path];
+  if (content === undefined) return integrityFailure(`Required Node payload ${path} is missing.`);
+  let input: unknown;
+  try {
+    input = JSON.parse(content);
+  } catch {
+    return integrityFailure(`Node payload ${path} is not valid JSON.`);
+  }
+  const envelope = decodeNodeEnvelope(input);
+  if (!envelope.ok) return integrityFailure(`${path}: ${envelope.error.message}`);
+  const decoded = decodeNodePayload(envelope.value.value, runnerTypes, path);
+  return decoded.ok ? apiOk(decoded.value) : integrityFailure(`${decoded.error.path}: ${decoded.error.message}`);
+}
+
+function sameCheckpoint(left: EventLogCheckpoint, right: EventLogCheckpoint): boolean {
+  return left.schema === right.schema
+    && left.eventCount === right.eventCount
+    && left.lastSequence === right.lastSequence
+    && left.lastStoredEventId === right.lastStoredEventId
+    && left.lastDomainEventId === right.lastDomainEventId
+    && left.chainDigest === right.chainDigest;
+}
+
+function graphManifestIntegrityError(loaded: ReadProject, graph: ProjectGraphManifestReadModel): string | undefined {
+  const catalog = loaded.catalog;
+  if (graph.projectId !== catalog.project.id || graph.rootNodeSha !== catalog.project.rootNodeSha || !sameCheckpoint(graph.checkpoint, catalog.checkpoint)) {
+    return "Project Graph manifest does not match its exact-head Project checkpoint or identity.";
+  }
+  if (graph.nodeCount !== catalog.counts.nodes || graph.edgeCount !== graph.nodeCount - 1) {
+    return "Project Graph manifest counts do not describe the catalog's single-root tree.";
+  }
+  return undefined;
+}
+
+function activityManifestIntegrityError(loaded: ReadProject, activity: ProjectActivityManifestReadModel): string | undefined {
+  return activity.projectId !== loaded.catalog.project.id || !sameCheckpoint(activity.checkpoint, loaded.catalog.checkpoint)
+    || activity.counts.nodes !== loaded.catalog.counts.nodes
+    ? "Project snapshot manifest does not match its exact-head Project checkpoint or Node count."
+    : undefined;
+}
+
+function graphNodeIntegrityError(
+  loaded: ReadProject,
+  manifest: ProjectGraphManifestReadModel,
+  shard: ProjectGraphNodeReadModel,
+  nodeSha: string
+): string | undefined {
+  if (shard.projectId !== loaded.catalog.project.id || shard.node.sha !== nodeSha || !sameCheckpoint(shard.checkpoint, manifest.checkpoint)
+    || shard.node.ordinal >= manifest.nodeCount
+    || shard.node.managedRef !== `refs/tags/hunsu/node/${loaded.catalog.project.id}/${nodeSha}`
+  ) return `Graph Node shard ${nodeSha} does not match its exact-head Graph manifest.`;
+  if ((shard.node.ordinal === 0) !== (shard.node.type === "root")
+    || shard.node.type === "root" && shard.node.sha !== manifest.rootNodeSha
+  ) return `Graph Node shard ${nodeSha} violates the single-root topology.`;
+  return undefined;
+}
+
+function activityShardIntegrityError(
+  loaded: ReadProject,
+  manifest: ProjectActivityManifestReadModel,
+  shard: NodeActivityShardReadModel,
+  nodeSha: string
+): string | undefined {
+  return shard.projectId !== loaded.catalog.project.id || shard.nodeSha !== nodeSha || !sameCheckpoint(shard.checkpoint, manifest.checkpoint)
+    ? `Node activity shard ${nodeSha} does not match its exact-head snapshot manifest.`
+    : undefined;
+}
+
+function nodePayloadIntegrityError(loaded: ReadProject, card: ProjectGraphNode, payload: NodePayload): string | undefined {
+  const digest = String(computeNodePayloadDigest(payload));
+  if (String(payload.projectId) !== loaded.catalog.project.id
+    || String(payload.commitSha) !== card.sha
+    || String(payload.treeSha) !== card.treeSha
+    || digest !== card.payloadDigest
+    || String(computeNodePlanDigest(payload.plan)) !== card.planDigest
+    || String(computeRunnerDigest(payload.plan.how)) !== card.runner.digest
+  ) return `Node payload ${card.sha} does not match its exact-head Graph registration metadata.`;
+  return undefined;
+}
+
+function commitTitle(message: string): string {
+  return message.split(/\r?\n/u, 1)[0]!.trim();
+}
+
+function projectionContext(loaded: LoadedProject): ProjectionContext {
+  return {
+    defaultBranch: loaded.repository.defaultBranch,
+    stateHeadSha: loaded.stateHeadSha,
+    synchronizedAt: loaded.synchronizedAt,
+    digestGoal: goal => String(computeGoalDigest(goal)),
+    digestRunner: runner => String(computeRunnerDigest(runner))
+  };
+}
+
+function commandMetadata(
+  rawIdempotencyKey: string,
+  semantic: unknown,
+  index: number,
+  at: string,
+  actor: DomainActor,
+  expectedStateSha: string
+): CommandMetadata {
+  return {
+    eventId: asEventId(domainEventId(rawIdempotencyKey, semantic, index)),
     idempotencyKey: unwrap(makeIdempotencyKey(hashHex(`domain-idempotency:${rawIdempotencyKey}:${index}`))),
-    fingerprint: unwrap(makeCommandFingerprint(hashHex(`domain-fingerprint:${canonicalJson(semantic)}:${index}`))),
+    fingerprint: unwrap(makeCommandFingerprint(hashHex(`domain-fingerprint:${canonicalJsonValue(semantic)}:${index}`))),
+    expectedStateSha: asGitSha(expectedStateSha),
     actor,
     requestedAt: asTimestamp(at)
   };
 }
 
+function domainEventId(idempotencyKey: string, semantic: unknown, index: number): string {
+  return `event-${hashHex(`${idempotencyKey}:${canonicalJsonValue(semantic)}:${index}`).slice(0, 24)}`;
+}
+
+function canonicalJsonValue(value: unknown): string {
+  return canonicalJson(value as Parameters<typeof canonicalJson>[0]);
+}
+
 function requestActor(context: AuthContext): DomainActor {
   return context.client === "mcp"
-    ? pluginActor(context)
+    ? { type: "plugin", id: asText(`mcp:${context.user.id}`) }
     : userActor(context);
 }
 
-function pluginActor(context: AuthContext): DomainActor & { type: "plugin" } {
-  return { type: "plugin", id: asText(`mcp:${context.user.id}`) };
-}
-
-function userActor(context: AuthContext): DomainActor & { type: "user" } {
+function userActor(context: AuthContext): DomainActor {
   return { type: "user", id: asText(context.user.id, "user.id") };
 }
 
-function withActor(meta: CommandMetadata, actor: DomainActor): CommandMetadata {
-  return { ...meta, actor };
+function coachActor(context: AuthContext): DomainActor {
+  return { type: "coach", id: asText(`coach:${context.user.id}`) };
 }
 
 function stateActor(context: AuthContext): StateActor {
   return context.client === "mcp"
-    ? { kind: "plugin", userId: context.user.id, clientId: "hunsu-mcp" }
+    ? { kind: "plugin", userId: context.user.id, clientId: "hunsu-mcp-v2" }
     : { kind: "user", id: context.user.id };
 }
 
+function mutationResponse(applied: ApiResult<MutationApplied>, schema: string, value: JsonRecord): ApiResult<unknown> {
+  return applied.ok
+    ? apiOk({ schema, ...value, stateHeadSha: applied.value.stateHeadSha, synchronizedAt: applied.value.synchronizedAt })
+    : applied;
+}
+
+function eventReferencesNode(reference: ReturnType<typeof eventListProjection>[number]["reference"], sha: string): boolean {
+  if (reference.kind === "node") return reference.nodeSha === sha;
+  return reference.kind === "run"
+    && (reference.sourceNodeSha === sha || (reference.target.kind === "registered" && reference.target.nodeSha === sha));
+}
+
+function projectIdOf(state: ProjectState): string {
+  if (state.projects.length !== 1 || !state.projects[0]) throw new Error("A Project stream must contain exactly one Project.");
+  return String(state.projects[0].id);
+}
+
+function repositoryKey(repository: Pick<RepositoryLocator, "installationId" | "repositoryId">): string {
+  return `${repository.installationId}:${repository.repositoryId}`;
+}
+
 function generatedId(prefix: string, idempotencyKey: string): string {
-  const normalized = prefix.toLowerCase().replace(/[^a-z0-9-]/gu, "-").replace(/-+/gu, "-").replace(/^-|-$/gu, "") || "id";
-  return `${normalized}-${hashHex(idempotencyKey).slice(0, 16)}`;
+  return `${prefix}-${hashHex(idempotencyKey).slice(0, 20)}`;
+}
+
+function firstCommitMessageLine(message: string): string {
+  const title = message.split(/\r?\n/u, 1)[0]?.trim();
+  if (!title) throw new Error("GitHub returned a commit without a title.");
+  return title;
 }
 
 function hashHex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function normalizeRef(value: string): string {
-  const ref = value.startsWith("refs/heads/") ? value : `refs/heads/${value}`;
-  asGitRef(ref);
-  return ref;
+function cachePolicy(overrides: Partial<ProjectionCachePolicy> | undefined): ProjectionCachePolicy {
+  const value = { ...DEFAULT_CACHE_POLICY, ...overrides };
+  for (const [key, item] of Object.entries(value)) {
+    if (!Number.isSafeInteger(item) || item <= 0) throw new TypeError(`${key} must be a positive safe integer.`);
+  }
+  return value;
 }
 
-function strategyMode(value: string): Team["strategy"]["mode"] {
-  if (value === "sequence" || value === "parallel" || value === "coordinated") return value;
-  throw boundaryInvalid("Team strategy mode must be sequence, parallel, or coordinated.");
-}
-
-function priorityNumber(value: unknown): number {
-  if (value === "low") return 10;
-  if (value === "normal") return 50;
-  if (value === "high") return 70;
-  if (value === "urgent") return 100;
-  if (Number.isSafeInteger(value) && Number(value) >= 0) return Number(value);
-  throw boundaryInvalid("Goal priority is invalid.");
-}
-
-function requestIdempotency(input: JsonRecord): string {
-  return requiredString(input, "idempotencyKey");
-}
-
-function toolMutation<T>(
-  result: ApiResult<MutationResult<T> | { state: ProjectState; stateHeadSha: string; synchronizedAt: string; value: unknown }>,
-  data?: unknown
-): ApiResult<{ data: unknown; stateHeadSha: string }> {
-  if (!result.ok) return result;
-  return apiOk({ data: data ?? result.value.value, stateHeadSha: result.value.stateHeadSha });
+function fresh(cachedAt: number, now: number, ttl: number): boolean {
+  const age = now - cachedAt;
+  return age >= 0 && age < ttl;
 }
 
 function projectionFailure<T>(result: ProjectionResult<T>): ApiResult<never> {
-  return result.ok ? apiFailure({ code: "temporarily_unavailable", message: "Projection failed unexpectedly.", status: 503, retryable: true }) : notFound(result.error.message);
+  return result.ok
+    ? integrityFailure("Projection failed without an error.")
+    : apiFailure(projectionApiError(result.error));
+}
+
+function projectionApiError(error: { code: string; message: string }): ApiError {
+  return error.code === "integrity_error"
+    ? { code: "integrity_error", message: error.message, status: 409, retryable: false }
+    : { code: "not_found", message: error.message, status: 404, retryable: false };
 }
 
 function storeFailure(error: StoreError): ApiResult<never> {
-  if (error.code === "stale_state") {
-    return apiFailure({
-      code: "stale_state",
-      message: error.message,
-      status: 412,
-      retryable: true,
-      ...(error.expectedHeadSha ? { expectedStateSha: error.expectedHeadSha } : {}),
-      ...(error.actualHeadSha ? { actualStateSha: error.actualHeadSha } : {})
-    });
-  }
+  if (error.code === "stale_state") return apiFailure({
+    code: "stale_state",
+    message: error.message,
+    status: 412,
+    retryable: true,
+    ...(error.expectedHeadSha === undefined ? {} : { expectedStateSha: error.expectedHeadSha }),
+    ...(error.actualHeadSha === undefined ? {} : { actualStateSha: error.actualHeadSha })
+  });
   if (error.code === "idempotency_conflict") return conflict(error.message);
   if (error.code === "state_not_found" || error.code === "project_not_found") return notFound(error.message);
+  if (error.code === "integrity") return integrityFailure(error.message);
   if (error.code === "unsafe_state") return invalidRequest(error.message);
   if (error.code === "invalid_event" && error.message.startsWith("DOMAIN:")) {
-    const [, code, ...messageParts] = error.message.split(":");
-    const message = messageParts.join(":");
-    if (code === "USER_CONFIRMATION_REQUIRED") return apiFailure({ code: "confirmation_required", message, status: 409, retryable: false });
-    if (code === "INVALID_TRANSITION" || code === "DUPLICATE_ID" || code === "IDEMPOTENCY_CONFLICT") return conflict(message);
-    if (code === "NOT_FOUND") return notFound(message);
-    return invalidRequest(message);
+    const [, code, ...parts] = error.message.split(":");
+    return domainFailure(code ?? "INVARIANT_VIOLATION", parts.join(":"));
   }
+  if (error.code === "invalid_event") return invalidRequest(error.message);
   if (error.code === "transport" && error.cause) return transportFailure(error.cause);
-  return apiFailure({ code: error.code === "invalid_event" ? "invalid_request" : "temporarily_unavailable", message: error.message, status: error.code === "invalid_event" ? 400 : 503, retryable: error.code !== "invalid_event" });
+  return apiFailure({ code: "temporarily_unavailable", message: error.message, status: 503, retryable: true });
+}
+
+function domainFailure(code: string, message: string): ApiResult<never> {
+  if (code === "USER_CONFIRMATION_REQUIRED") return apiFailure({ code: "confirmation_required", message, status: 409, retryable: false });
+  if (code === "NOT_FOUND") return notFound(message);
+  if (code === "INVALID_TRANSITION" || code === "DUPLICATE_ID" || code === "IDEMPOTENCY_CONFLICT") return conflict(message);
+  return invalidRequest(message);
 }
 
 function transportFailure(error: GitHubTransportError): ApiResult<never> {
-  if (error.code === "forbidden") {
-    return apiFailure({
-      code: "forbidden",
-      message: error.message,
-      status: 403,
-      retryable: false,
-      ...(error.requestId === undefined ? {} : { requestId: error.requestId })
-    });
-  }
+  if (error.code === "forbidden") return apiFailure({
+    code: "forbidden",
+    message: error.message,
+    status: 403,
+    retryable: false,
+    ...(error.requestId === undefined ? {} : { requestId: error.requestId })
+  });
   if (error.code === "rate_limited") {
-    const retryAfterSeconds = Number.isSafeInteger(error.retryAfterSeconds) && (error.retryAfterSeconds ?? 0) > 0
-      ? error.retryAfterSeconds!
-      : 60;
+    const retryAfterSeconds = error.retryAfterSeconds && error.retryAfterSeconds > 0 ? error.retryAfterSeconds : 60;
     return apiFailure({
       code: "temporarily_unavailable",
       message: `GitHub is temporarily rate limiting this installation. Retry after at least ${retryAfterSeconds} seconds.`,
@@ -2823,16 +2835,22 @@ function pluginError(error: ApiError): PluginSafeError {
     code: error.code,
     message: error.message,
     retryable: error.retryable,
-    ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
-    ...(error.requestId !== undefined ? { requestId: error.requestId } : {}),
-    ...(error.expectedStateSha ? { expectedStateSha: error.expectedStateSha } : {}),
-    ...(error.actualStateSha ? { actualStateSha: error.actualStateSha } : {}),
-    recovery: error.retryAfterSeconds !== undefined
-      ? `Wait at least ${error.retryAfterSeconds} seconds before retrying. Continuing during the GitHub rate-limit window can extend the outage.`
-      : error.retryable
-        ? "Reload the Project state and retry with the new state SHA."
-        : undefined
+    ...(error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: error.retryAfterSeconds }),
+    ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
+    ...(error.expectedStateSha === undefined ? {} : { expectedStateSha: error.expectedStateSha }),
+    ...(error.actualStateSha === undefined ? {} : { actualStateSha: error.actualStateSha }),
+    ...(error.retryAfterSeconds === undefined ? {} : {
+      recovery: `Wait at least ${error.retryAfterSeconds} seconds before retrying. Continuing during the GitHub rate-limit window can extend the outage.`
+    })
   };
+}
+
+function staleBase(message: string): ApiResult<never> {
+  return apiFailure({ code: "stale_base", message, status: 412, retryable: true });
+}
+
+function integrityFailure(message: string): ApiResult<never> {
+  return apiFailure({ code: "integrity_error", message, status: 409, retryable: false });
 }
 
 function notFound(message: string): ApiResult<never> {
@@ -2857,12 +2875,34 @@ class BoundaryError extends Error {
   }
 }
 
+async function webMutationBoundary<T>(operation: () => Promise<ApiResult<T>>): Promise<ApiResult<T>> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof BoundaryError) return apiFailure(error.apiError);
+    throw error;
+  }
+}
+
+function assertExactToolMutationInput(name: string, input: JsonRecord): void {
+  const tool = findHunsuTool(name);
+  if (!tool || tool.readOnly) return;
+  const properties = tool.inputSchema.properties;
+  if (!isRecord(properties)) throw new Error(`Tool ${name} has no object properties schema.`);
+  assertExactRecord(input, "arguments", Object.keys(properties));
+}
+
 function boundaryInvalid(message: string): BoundaryError {
   return new BoundaryError({ code: "invalid_request", message, status: 400, retryable: false });
 }
 
-function boundaryNotFound(message: string): BoundaryError {
-  return new BoundaryError({ code: "not_found", message, status: 404, retryable: false });
+function requireConfirmation(input: JsonRecord): void {
+  if (input.confirmedByUser !== true) throw new BoundaryError({
+    code: "confirmation_required",
+    message: "This mutation requires separate explicit user confirmation.",
+    status: 409,
+    retryable: true
+  });
 }
 
 function assertRecord(value: unknown, field: string): JsonRecord {
@@ -2870,8 +2910,20 @@ function assertRecord(value: unknown, field: string): JsonRecord {
   return value;
 }
 
+function assertExactRecord(value: unknown, field: string, keys: readonly string[]): JsonRecord {
+  const result = assertRecord(value, field);
+  const allowed = new Set(keys);
+  const unknown = Object.keys(result).filter(key => !allowed.has(key));
+  if (unknown.length > 0) throw boundaryInvalid(`${field} contains unsupported fields: ${unknown.join(", ")}.`);
+  return result;
+}
+
 function record(input: JsonRecord, field: string): JsonRecord {
   return assertRecord(input[field], field);
+}
+
+function recordAt(value: unknown, field: string, child: string): JsonRecord {
+  return record(assertRecord(value, field), child);
 }
 
 function requiredString(input: JsonRecord, field: string): string {
@@ -2887,24 +2939,11 @@ function optionalString(input: JsonRecord, field: string): string | undefined {
   return value;
 }
 
-function requiredPositiveInteger(input: JsonRecord, field: string): number {
+function optionalPositiveInteger(input: JsonRecord, field: string): number | undefined {
   const value = input[field];
+  if (value === undefined) return undefined;
   if (!Number.isSafeInteger(value) || Number(value) <= 0) throw boundaryInvalid(`${field} must be a positive integer.`);
   return Number(value);
-}
-
-function requiredNonNegativeInteger(input: JsonRecord, field: string): number {
-  const value = input[field];
-  if (!Number.isSafeInteger(value) || Number(value) < 0) throw boundaryInvalid(`${field} must be a non-negative integer.`);
-  return Number(value);
-}
-
-function optionalNonNegativeInteger(input: JsonRecord, field: string): number | undefined {
-  return input[field] === undefined ? undefined : requiredNonNegativeInteger(input, field);
-}
-
-function optionalPositiveInteger(input: JsonRecord, field: string): number | undefined {
-  return input[field] === undefined ? undefined : requiredPositiveInteger(input, field);
 }
 
 function array(input: JsonRecord, field: string, nonEmpty: boolean): unknown[] {
@@ -2913,11 +2952,53 @@ function array(input: JsonRecord, field: string, nonEmpty: boolean): unknown[] {
   return value;
 }
 
-function requiredStringArray(input: JsonRecord, field: string, nonEmpty: boolean): string[] {
-  return array(input, field, nonEmpty).map((value, index) => {
+function optionalStringArray(input: JsonRecord, field: string): string[] {
+  if (input[field] === undefined) return [];
+  return array(input, field, false).map((value, index) => {
     if (typeof value !== "string" || value.trim() === "") throw boundaryInvalid(`${field}[${index}] must be non-empty text.`);
     return value;
   });
+}
+
+function requiredSha(input: JsonRecord, field: string): string {
+  return requiredFullSha(requiredString(input, field), field);
+}
+
+function requiredFullSha(value: string, field: string): string {
+  if (!FULL_SHA.test(value)) throw boundaryInvalid(`${field} must be a full lowercase Git SHA.`);
+  return value;
+}
+
+function requiredStateSha(input: JsonRecord): string {
+  return requiredSha(input, "expectedStateSha");
+}
+
+function requiredIdempotencyKey(input: JsonRecord): string {
+  const value = requiredString(input, "idempotencyKey");
+  if (value.length > 256) throw boundaryInvalid("idempotencyKey must contain at most 256 characters.");
+  return value;
+}
+
+function requiredShaArray(input: JsonRecord, field: string, minimum: number): string[] {
+  const values = array(input, field, true).map((value, index) => {
+    if (typeof value !== "string") throw boundaryInvalid(`${field}[${index}] must be a Git SHA.`);
+    return requiredFullSha(value, `${field}[${index}]`);
+  });
+  if (values.length < minimum || new Set(values).size !== values.length) throw boundaryInvalid(`${field} must contain at least ${minimum} unique SHAs.`);
+  return values;
+}
+
+function safeHttpUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw boundaryInvalid("Evidence URL is invalid.");
+  }
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) {
+    throw boundaryInvalid("Evidence URL must be a credential-free HTTP(S) URL.");
+  }
+  return value;
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -2930,19 +3011,18 @@ function unwrap<T>(result: { ok: true; value: T } | { ok: false; error: { messag
 }
 
 function asProjectId(value: string) { return unwrap(makeProjectId(value)); }
-function asGoalId(value: string) { return unwrap(makeGoalId(value)); }
-function asRunnerId(value: string) { return unwrap(makeRunnerId(value)); }
-function asCoachId(value: string) { return unwrap(makeCoachId(value)); }
-function asRunId(value: string) { return unwrap(makeRunId(value)); }
 function asWorkspaceId(value: string) { return unwrap(makeWorkspaceId(value)); }
+function asRunId(value: string) { return unwrap(makeRunId(value)); }
 function asEvidenceId(value: string) { return unwrap(makeEvidenceId(value)); }
 function asCheckpointId(value: string) { return unwrap(makeCheckpointId(value)); }
 function asCoachReviewId(value: string) { return unwrap(makeCoachReviewId(value)); }
-function asCoachProposalId(value: string) { return unwrap(makeCoachProposalId(value)); }
-function asDivergenceId(value: string) { return unwrap(makeDivergenceId(value)); }
+function asProposalId(value: string) { return unwrap(makeCoachingProposalId(value)); }
 function asComparisonId(value: string) { return unwrap(makeComparisonId(value)); }
 function asDecisionId(value: string) { return unwrap(makeDecisionId(value)); }
+function asEventId(value: string) { return unwrap(makeEventId(value)); }
 function asGitSha(value: string) { return unwrap(makeGitCommitSha(value)); }
+function asTreeSha(value: string) { return unwrap(makeGitTreeSha(value)); }
+function asGitTreePath(value: string, field?: string) { return unwrap(makeGitTreePath(value, field)); }
 function asGitRef(value: string) { return unwrap(makeGitRef(value)); }
 function asGitBranch(value: string) { return unwrap(makeGitBranchName(value)); }
 function asRepositoryOwner(value: string) { return unwrap(makeRepositoryOwner(value)); }
@@ -2950,15 +3030,11 @@ function asRepositoryName(value: string) { return unwrap(makeRepositoryName(valu
 function asTimestamp(value: string) { return unwrap(makeIsoTimestamp(value)); }
 function asText(value: string, field?: string) { return unwrap(makeNonEmptyText(value, field)); }
 function asProjectTitle(value: string) { return unwrap(makeProjectTitle(value)); }
-function asProjectObjective(value: string) { return unwrap(makeProjectObjective(value)); }
-function asGoalTitle(value: string) { return unwrap(makeGoalTitle(value)); }
-function asDesiredOutcome(value: string) { return unwrap(makeDesiredOutcome(value)); }
-function asAcceptanceCriterion(value: string, field?: string) { return unwrap(makeAcceptanceCriterion(value, field)); }
-function asGoalConstraint(value: string, field?: string) { return unwrap(makeGoalConstraint(value, field)); }
-function asPromptTemplate(value: string) { return unwrap(makePromptTemplate(value)); }
+function asGoalDigest(value: string) { return unwrap(makeGoalDigest(value)); }
+function asNodePlanDigest(value: string) { return unwrap(makeNodePlanDigest(value)); }
+function asNodePayloadDigest(value: string) { return unwrap(makeNodePayloadDigest(value)); }
 function asEvidenceSummary(value: string) { return unwrap(makeEvidenceSummary(value)); }
-function asResourceName(value: string) { return unwrap(makeResourceName(value)); }
+function asAcceptanceCriterion(value: string, field?: string) { return unwrap(makeAcceptanceCriterion(value, field)); }
 function asReason(value: string) { return unwrap(makeReason(value)); }
-function asPositiveInteger(value: number) { return unwrap(makePositiveInteger(value)); }
-function asNonNegativeInteger(value: number) { return unwrap(makeNonNegativeInteger(value)); }
-function asNonEmpty<T>(value: T[], field: string) { return unwrap(makeNonEmptyArray(value, field)); }
+function asNonEmpty<T>(value: readonly T[], field: string) { return unwrap(makeNonEmptyArray([...value], field)); }
+function asAtLeastTwo<T>(value: readonly T[], field: string) { return unwrap(makeAtLeastTwo([...value], field)); }

@@ -1,326 +1,207 @@
-export type ProjectionHealth = {
-  repositoryAccess: "healthy" | "read_only" | "revoked" | "unavailable";
-  stateRef: "healthy" | "missing" | "conflicted" | "unavailable";
-  stateRefName: "hunsu/state";
-  stateHeadSha?: string;
-  projection: "current" | "rebuilding" | "stale" | "failed";
-  synchronizedAt: string;
-  message?: string;
-};
+import type {
+  CanonicalJsonValue,
+  DomainActor,
+  DomainEvent,
+  GoalValue,
+  ProjectState,
+  RunnerValue
+} from "@hunsu/protocol";
+
+export type ProjectIntegrityProjection =
+  | { readonly status: "valid" }
+  | { readonly status: "invalid"; readonly code: string; readonly message: string };
 
 export type ProjectionContext = {
-  health: ProjectionHealth;
+  readonly defaultBranch: string;
+  readonly stateHeadSha: string;
+  readonly synchronizedAt: string;
+  readonly digestGoal: (goal: GoalValue) => string;
+  readonly digestRunner: (runner: RunnerValue) => string;
 };
 
 export type RepositoryProjection = {
-  owner: string;
-  name: string;
-  url: string;
-  defaultBranch: string;
+  readonly owner: string;
+  readonly name: string;
+  readonly url: string;
+  readonly defaultBranch: string;
 };
 
-export type RunnerReferenceProjection = {
-  id: string;
-  kind: "player" | "team";
-  name: string;
+export type ProjectSummaryProjection = {
+  readonly id: string;
+  readonly title: string;
+  readonly repository: RepositoryProjection;
+  readonly rootNodeSha: string;
 };
 
-export type EvidenceProjection = {
-  id: string;
-  kind: "commit" | "check" | "report" | "artifact" | "link";
-  title: string;
-  criterion?: string;
-  summary?: string;
-  url?: string;
-  commitSha?: string;
-  createdAt: string;
+export type ProjectListItemProjection = ProjectSummaryProjection & {
+  readonly nodeCount: number;
+  readonly activeRunCount: number;
+  readonly unresolvedDivergenceCount: number;
+  readonly integrity: ProjectIntegrityProjection;
+  readonly synchronizedAt: string;
 };
 
-export type RunSummaryProjection = {
-  id: string;
-  goalId: string;
-  goalTitle: string;
-  runner: RunnerReferenceProjection;
-  baseSha: string;
-  branch: string;
-  status: "running" | "completed" | "failed" | "canceled";
-  resultSha?: string;
-  resultUrl?: string;
-  evidenceCount: number;
-  startedAt: string;
-  updatedAt: string;
-  completedAt?: string;
+export type RunnerSummaryProjection = {
+  readonly name: string;
+  readonly typeKey: string;
+  readonly schemaVersion: string;
+  readonly digest: string;
 };
 
-export type CompletedRunSummaryProjection = RunSummaryProjection & {
-  status: "completed";
-  resultSha: string;
-  resultUrl: string;
-  completedAt: string;
+export type GraphNodeStatusProjection = "available" | "current" | "selected" | "rejected";
+
+export type GraphNodeSummaryProjection = {
+  readonly sha: string;
+  readonly title: string;
+  readonly status: GraphNodeStatusProjection;
+  readonly runner: RunnerSummaryProjection;
+  readonly nextGoalCount: number;
+  readonly integrity: "valid";
 };
 
-export type GoalSummaryProjection = {
-  id: string;
-  title: string;
-  desiredOutcome: string;
-  status: "active" | "paused" | "completed";
-  priority: "low" | "normal" | "high" | "urgent";
-  runner?: RunnerReferenceProjection;
-  runCount: number;
-  activeRunCount: number;
-  alternativeCount: number;
-  updatedAt: string;
+export type RunGraphEdgeProjection = {
+  readonly kind: "run";
+  readonly id: string;
+  readonly sourceSha: string;
+  readonly targetSha: string;
+  readonly runId: string;
+  readonly goal: { readonly digest: string; readonly title: string };
+  readonly completedAt: string;
 };
 
-export type ProjectListItemProjection = {
-  id: string;
-  title: string;
-  objective: string;
-  repository: RepositoryProjection;
-  activeGoalCount: number;
-  activeRunCount: number;
-  latestResult?: {
-    runId: string;
-    goalTitle: string;
-    status: RunSummaryProjection["status"];
-    resultSha?: string;
-    updatedAt: string;
+export type CoachingGraphEdgeProjection = {
+  readonly kind: "coaching";
+  readonly id: string;
+  readonly sourceSha: string;
+  readonly targetSha: string;
+  readonly proposalId: string;
+  readonly summary: string;
+  readonly confirmedAt: string;
+};
+
+export type GraphEdgeProjection = RunGraphEdgeProjection | CoachingGraphEdgeProjection;
+
+export type ActiveRunSummaryProjection = {
+  readonly id: string;
+  readonly sourceNodeSha: string;
+  readonly goalDigest: string;
+  readonly goalTitle: string;
+  readonly runnerName: string;
+  readonly startedAt: string;
+};
+
+export type ProjectGraphProjection = {
+  readonly project: ProjectSummaryProjection;
+  readonly stateHeadSha: string;
+  readonly integrity: ProjectIntegrityProjection;
+  readonly nodes: readonly GraphNodeSummaryProjection[];
+  readonly edges: readonly GraphEdgeProjection[];
+  readonly activeRuns: readonly ActiveRunSummaryProjection[];
+  readonly window: {
+    readonly limit: number;
+    readonly hasMore: boolean;
+    readonly continuationCursor: string | null;
   };
-  coachReviewStatus: "not_requested" | "ready" | "changes_recommended";
-  unresolvedAlternativeCount: number;
-  synchronizedAt: string;
 };
 
-export type AlternativeGroupProjection = {
-  id: string;
-  goalId: string;
-  goalTitle: string;
-  baseSha: string;
-  runIds: string[];
-  status: "open" | "selected" | "rejected";
+export type GoalValueProjection = {
+  readonly digest: string;
+  readonly key: string;
+  readonly title: string;
+  readonly desiredOutcome: string;
+  readonly acceptanceCriteria: readonly string[];
+  readonly constraints: readonly string[];
+  readonly priority: number;
 };
 
-export type DecisionProjection = {
-  id: string;
-  goalId: string;
-  title: string;
-  status: "confirmed" | "rejected";
-  recommendedRunId?: string;
-  reason: string;
-  createdAt: string;
+export type RunnerValueProjection = RunnerSummaryProjection & {
+  readonly schema: "hunsu.runner-value.v1";
+  readonly type: {
+    readonly origin: string;
+    readonly key: string;
+    readonly schemaVersion: string;
+    readonly integrity: string;
+  };
+  readonly value: CanonicalJsonValue;
 };
 
-export type ProjectOverviewProjection = {
-  id: string;
-  title: string;
-  objective: string;
-  baseRef: string;
-  repository: RepositoryProjection;
-  goals: GoalSummaryProjection[];
-  runs: RunSummaryProjection[];
-  recentEvidence: EvidenceProjection[];
-  alternatives: AlternativeGroupProjection[];
-  decisions: DecisionProjection[];
-  health: ProjectionHealth;
-  createdAt: string;
-  updatedAt: string;
+export type NodeLineageProjection =
+  | { readonly kind: "root" }
+  | { readonly kind: "run_child"; readonly parentSha: string; readonly runId: string; readonly goalDigest: string }
+  | { readonly kind: "coaching_child"; readonly parentSha: string; readonly proposalId: string };
+
+export type EvidenceSummaryProjection = {
+  readonly id: string;
+  readonly kind: "commit" | "check" | "report" | "artifact" | "link";
+  readonly title: string;
+  readonly summary: string;
+  readonly criterion:
+    | { readonly kind: "unlinked" }
+    | { readonly kind: "linked"; readonly goalDigest: string; readonly criterion: string };
+  readonly location: { readonly kind: "none" } | { readonly kind: "url"; readonly url: string };
+  readonly createdAt: string;
 };
 
-export type RunnerProjection =
+export type ComparisonSummaryProjection = {
+  readonly id: string;
+  readonly summary: string;
+  readonly siblingNodeShas: readonly string[];
+  readonly recordedAt: string;
+};
+
+export type DecisionSummaryProjection =
+  | { readonly kind: "selected"; readonly id: string; readonly nodeSha: string; readonly reason: string; readonly recordedAt: string }
+  | { readonly kind: "rejected"; readonly id: string; readonly nodeSha: string; readonly reason: string; readonly recordedAt: string };
+
+export type NodeDetailProjection = {
+  readonly sha: string;
+  readonly title: string;
+  readonly commitUrl: string;
+  readonly treeSha: string;
+  readonly managedRef: string;
+  readonly integrity: ProjectIntegrityProjection;
+  readonly status: GraphNodeStatusProjection;
+  readonly lineage: NodeLineageProjection;
+  readonly plan: {
+    readonly schema: "hunsu.node-plan.v1";
+    readonly nextGoals: readonly GoalValueProjection[];
+    readonly how: RunnerValueProjection;
+  };
+  readonly outgoingEdges: readonly GraphEdgeProjection[];
+  readonly activeRuns: readonly ActiveRunSummaryProjection[];
+  readonly evidence: readonly EvidenceSummaryProjection[];
+  readonly comparisons: readonly ComparisonSummaryProjection[];
+  readonly decisions: readonly DecisionSummaryProjection[];
+};
+
+export type RunDetailProjection = {
+  readonly run: ProjectState["runs"][number];
+  readonly evidence: readonly ProjectState["evidence"][number][];
+  readonly sourceNodeTitle: string;
+};
+
+export type SequencedDomainEvent = {
+  readonly sequence: number;
+  readonly event: DomainEvent;
+  readonly actor: DomainActor;
+};
+
+export type EventReferenceProjection =
+  | { readonly kind: "project" }
+  | { readonly kind: "node"; readonly nodeSha: string }
   | {
-      kind: "player";
-      id: string;
-      name: string;
-      promptTemplate: string;
-      resources: ResourceProjection[];
-      runtimePolicy: {
-        filesystem: "read_only" | "worktree_write";
-        network: "disabled" | "enabled";
-        approvals: "never" | "on_request";
-      };
-      goalCount: number;
-      recentResults: RunSummaryProjection[];
-    }
-  | {
-      kind: "team";
-      id: string;
-      name: string;
-      strategy: {
-        mode: "sequence" | "parallel" | "coordinated";
-        promptTemplate: string;
-        maxRounds: number;
-      };
-      players: Array<{ playerId: string; playerName: string; role: string; order: number }>;
-      goalCount: number;
-      recentResults: RunSummaryProjection[];
+      readonly kind: "run";
+      readonly runId: string;
+      readonly sourceNodeSha: string;
+      readonly target: { readonly kind: "pending" } | { readonly kind: "registered"; readonly nodeSha: string };
     };
 
-export type GoalAlternativeProjection = {
-  run: RunSummaryProjection;
-  label: string;
-  summary: string;
-  strengths: string[];
-  tradeoffs: string[];
-  evidence: EvidenceProjection[];
-  selected: boolean;
-  rejected: boolean;
-};
-
-export type GoalDetailProjection = {
-  id: string;
-  projectId: string;
-  title: string;
-  desiredOutcome: string;
-  acceptanceCriteria: string[];
-  constraints: string[];
-  status: "active" | "paused" | "completed";
-  priority: "low" | "normal" | "high" | "urgent";
-  parentGoalId?: string;
-  relatedGoalIds: string[];
-  runner?: RunnerReferenceProjection;
-  runs: RunSummaryProjection[];
-  evidence: EvidenceProjection[];
-  alternatives: GoalAlternativeProjection[];
-  comparisons: AlternativeComparisonProjection[];
-  coachReview?: {
-    id: string;
-    status: "ready" | "changes_recommended";
-    summary: string;
-    strengths: string[];
-    concerns: string[];
-    recommendation?: string;
-    createdAt: string;
-  };
-  decision?: DecisionProjection;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type RunDetailProjection = RunSummaryProjection & {
-  projectId: string;
-  goalSnapshot: {
-    title: string;
-    desiredOutcome: string;
-    acceptanceCriteria: string[];
-    constraints: string[];
-  };
-  runnerSnapshot: RunnerProjection;
-  instructions: string;
-  checkpoints: Array<{ id: string; summary: string; commitSha?: string; createdAt: string }>;
-  evidence: EvidenceProjection[];
-  failure?: { code: string; message: string; retryable: boolean };
-};
-
-export type AssignedRunnerProjection = { type: "assigned"; runnerId: string; runner: RunnerReferenceProjection };
-
-export type GoalAssignmentProjection =
-  | { type: "unassigned" }
-  | AssignedRunnerProjection;
-
-export type GoalPatchProjection = {
-  title?: string;
-  desiredOutcome?: string;
-  acceptanceCriteria?: string[];
-  constraints?: string[];
-  priority?: number;
-  assignment?: GoalAssignmentProjection;
-  relation?:
-    | { type: "root" }
-    | { type: "child"; parentGoalId: string }
-    | { type: "related"; goalIds: string[] };
-};
-
-export type RunnerAssignmentChangeProjection = {
-  from: GoalAssignmentProjection;
-  to: AssignedRunnerProjection;
-};
-
-type CoachProposalProjectionBase = {
-  id: string;
-  title: string;
-  rationale: string;
-  summary: string;
-  consequential: true;
-  status: "proposed" | "confirmed" | "rejected";
-  createdAt: string;
-};
-
-export type CoachProposalProjection =
-  | (CoachProposalProjectionBase & {
-      kind: "goal_change";
-      goalId: string;
-      change: GoalPatchProjection;
-    })
-  | (CoachProposalProjectionBase & {
-      kind: "runner_change";
-      goalId: string;
-      change: RunnerAssignmentChangeProjection;
-    })
-  | (CoachProposalProjectionBase & {
-      kind: "hunsu";
-      goalId: string;
-      sourceRun: CompletedRunSummaryProjection;
-      alternative:
-        | { type: "goal_change"; change: GoalPatchProjection }
-        | { type: "runner_change"; change: RunnerAssignmentChangeProjection };
-    });
-
-export type CoachComparisonRecommendationProjection = {
-  id: string;
-  divergenceId: string;
-  goalId: string;
-  goalTitle: string;
-  baseSha: string;
-  runIds: string[];
-  completedRunCount: number;
-  status: "gather_evidence" | "ready_to_compare" | "comparison_recorded";
-  recommendation: string;
-  comparisonId?: string;
-};
-
-export type CoachSelectionRecommendationProjection = {
-  id: string;
-  comparisonId: string;
-  goalId: string;
-  goalTitle: string;
-  runIds: string[];
-  status: "awaiting_user" | "decision_recorded";
-  action: "review_selection" | "select" | "another_experiment";
-  recommendation: string;
-  basis: "coach_review" | "comparison_evidence" | "recorded_decision";
-  recommendedRunId?: string;
-  requiresUserConfirmation: true;
-};
-
-export type CoachProjection = {
-  id: string;
-  name: string;
-  promptTemplate: string;
-  resources: ResourceProjection[];
-  assessment: { summary: string; updatedAt: string };
-  weakGoals: GoalSummaryProjection[];
-  stalledRuns: RunSummaryProjection[];
-  proposals: CoachProposalProjection[];
-  comparisonRecommendations: CoachComparisonRecommendationProjection[];
-  selectionRecommendations: CoachSelectionRecommendationProjection[];
-};
-
-export type ResourceProjection =
-  | { id: string; kind: "skill"; name: string; reference: string }
-  | { id: string; kind: "plugin"; name: string; reference: string };
-
-export type AlternativeComparisonProjection = {
-  id: string;
-  projectId: string;
-  goalId: string;
-  divergenceId: string;
-  baseSha: string;
-  runIds: string[];
-  summary: string;
-  findings: Array<{
-    criterion: string;
-    summaries: Array<{ runId: string; summary: string }>;
-  }>;
-  alternatives: GoalAlternativeProjection[];
-  recordedAt: string;
+export type DomainEventListItemProjection = {
+  readonly sequence: number;
+  readonly id: string;
+  readonly type: DomainEvent["type"];
+  readonly summary: string;
+  readonly actor: { readonly id: string; readonly label: string };
+  readonly occurredAt: string;
+  readonly reference: EventReferenceProjection;
 };

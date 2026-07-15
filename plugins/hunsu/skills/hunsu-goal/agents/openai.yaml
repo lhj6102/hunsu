@@ -1,4 +1,0 @@
-interface:
-  display_name: "Hunsu Goal"
-  short_description: "Create and refine outcome-oriented Hunsu Goals."
-  default_prompt: "Use $hunsu-goal to create a Goal with measurable acceptance criteria."
