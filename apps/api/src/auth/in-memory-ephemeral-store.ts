@@ -1,8 +1,16 @@
 import {
   clonePendingAuthorizationCode,
+  cloneRefreshGrant,
+  decodeRefreshGrant,
+  decodeRefreshGrantRotation,
+  encodeRefreshGrant,
+  encodeRefreshGrantRotation,
   type ConsentState,
   type EphemeralStateStore,
-  type PendingAuthorizationCode
+  type PendingAuthorizationCode,
+  type RefreshGrant,
+  type RefreshGrantRotation,
+  type RefreshGrantRotationResult
 } from "./ephemeral-store.ts";
 
 const MAXIMUM_RECORDS = 10_000;
@@ -16,6 +24,7 @@ export class InMemoryEphemeralStateStore implements EphemeralStateStore {
   readonly #now: () => number;
   readonly #consents = new Map<string, ConsentState>();
   readonly #authorizationCodes = new Map<string, PendingAuthorizationCode>();
+  readonly #refreshGrants = new Map<string, RefreshGrant>();
   readonly #webhookDeliveries = new Map<string, WebhookDeliveryState>();
 
   constructor(input: { now?: () => number } = {}) {
@@ -46,6 +55,49 @@ export class InMemoryEphemeralStateStore implements EphemeralStateStore {
     return pending !== undefined && pending.expiresAt > this.#now()
       ? clonePendingAuthorizationCode(pending)
       : undefined;
+  }
+
+  async createRefreshGrant(input: RefreshGrant): Promise<boolean> {
+    const decoded = decodeRefreshGrant(encodeRefreshGrant(input));
+    if (!decoded.ok) return false;
+    const grant = decoded.value;
+    this.#pruneExpired();
+    if (grant.expiresAt <= this.#now()) return false;
+    if (this.#refreshGrants.has(grant.familyId)) return false;
+    this.#refreshGrants.set(grant.familyId, cloneRefreshGrant(grant));
+    trimMap(this.#refreshGrants);
+    return true;
+  }
+
+  async rotateRefreshGrant(input: RefreshGrantRotation): Promise<RefreshGrantRotationResult> {
+    const decoded = decodeRefreshGrantRotation(encodeRefreshGrantRotation(input));
+    if (!decoded.ok) return { status: "invalid" };
+    const rotation = decoded.value;
+    const current = this.#refreshGrants.get(rotation.familyId);
+    if (!current) return { status: "missing" };
+    if (current.expiresAt <= this.#now()) {
+      this.#refreshGrants.delete(rotation.familyId);
+      return { status: "expired" };
+    }
+    if (current.status === "revoked") return { status: "revoked" };
+    if (!rotationBindingsMatch(current, rotation)) {
+      return { status: "invalid" };
+    }
+    if (rotation.presentedGeneration < current.currentGeneration) {
+      this.#refreshGrants.set(rotation.familyId, cloneRefreshGrant({ ...current, status: "revoked" }));
+      return { status: "replayed" };
+    }
+    if (rotation.presentedGeneration !== current.currentGeneration
+      || rotation.presentedTokenDigest !== current.currentTokenDigest) {
+      return { status: "invalid" };
+    }
+    const rotated = cloneRefreshGrant({
+      ...current,
+      currentGeneration: rotation.nextGeneration,
+      currentTokenDigest: rotation.nextTokenDigest
+    });
+    this.#refreshGrants.set(rotation.familyId, rotated);
+    return { status: "rotated", grant: cloneRefreshGrant(rotated) };
   }
 
   async claimWebhookDelivery(deliveryId: string, expiresAt: number): Promise<boolean> {
@@ -99,10 +151,20 @@ export class InMemoryEphemeralStateStore implements EphemeralStateStore {
     for (const [code, pending] of this.#authorizationCodes) {
       if (pending.expiresAt <= now) this.#authorizationCodes.delete(code);
     }
+    for (const [familyId, grant] of this.#refreshGrants) {
+      if (grant.expiresAt <= now) this.#refreshGrants.delete(familyId);
+    }
     for (const [deliveryId, state] of this.#webhookDeliveries) {
       if (state.expiresAt <= now) this.#webhookDeliveries.delete(deliveryId);
     }
   }
+}
+
+function rotationBindingsMatch(grant: RefreshGrant, input: RefreshGrantRotation): boolean {
+  return grant.familyId === input.familyId
+    && grant.clientDigest === input.clientDigest
+    && grant.scope === input.scope
+    && grant.audience === input.audience;
 }
 
 function trimMap<K, V>(values: Map<K, V>): void {

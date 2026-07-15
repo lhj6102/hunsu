@@ -1,7 +1,10 @@
 import { err, ok, type Result } from "@hunsu/protocol";
+import { createHash } from "node:crypto";
 import type { AuthContext } from "../types.ts";
 
 const AUTHORIZATION_CODE_SCHEMA = "hunsu.ephemeral-authorization-code.v1";
+const REFRESH_GRANT_SCHEMA = "hunsu.ephemeral-refresh-grant.v1";
+const REFRESH_ROTATION_SCHEMA = "hunsu.ephemeral-refresh-rotation.v1";
 
 export type ConsentState = Readonly<{
   id: string;
@@ -12,9 +15,38 @@ export type PendingAuthorizationCode = Readonly<{
   clientId: string;
   redirectUri: string;
   challenge: string;
+  audience: string;
   context: AuthContext;
   expiresAt: number;
 }>;
+
+export type RefreshGrant = Readonly<{
+  familyId: string;
+  clientDigest: string;
+  context: AuthContext;
+  contextDigest: string;
+  scope: "hunsu";
+  audience: string;
+  currentGeneration: number;
+  currentTokenDigest: string;
+  status: "active" | "revoked";
+  expiresAt: number;
+}>;
+
+export type RefreshGrantRotation = Readonly<{
+  familyId: string;
+  clientDigest: string;
+  scope: "hunsu";
+  audience: string;
+  presentedGeneration: number;
+  presentedTokenDigest: string;
+  nextGeneration: number;
+  nextTokenDigest: string;
+}>;
+
+export type RefreshGrantRotationResult =
+  | Readonly<{ status: "rotated"; grant: RefreshGrant }>
+  | Readonly<{ status: "corrupt" | "expired" | "invalid" | "missing" | "replayed" | "revoked" }>;
 
 export interface EphemeralStateStore {
   createConsent(input: ConsentState): Promise<void>;
@@ -22,6 +54,9 @@ export interface EphemeralStateStore {
 
   createAuthorizationCode(code: string, input: PendingAuthorizationCode): Promise<void>;
   consumeAuthorizationCode(code: string): Promise<PendingAuthorizationCode | undefined>;
+
+  createRefreshGrant(input: RefreshGrant): Promise<boolean>;
+  rotateRefreshGrant(input: RefreshGrantRotation): Promise<RefreshGrantRotationResult>;
 
   claimWebhookDelivery(deliveryId: string, expiresAt: number): Promise<boolean>;
   completeWebhookDelivery(
@@ -45,6 +80,7 @@ export function decodePendingAuthorizationCode(
     "clientId",
     "redirectUri",
     "challenge",
+    "audience",
     "context",
     "expiresAt"
   ])
@@ -55,7 +91,9 @@ export function decodePendingAuthorizationCode(
     || input.redirectUri.length === 0
     || typeof input.challenge !== "string"
     || !/^[A-Za-z0-9_-]{43,128}$/u.test(input.challenge)
-    || !isAuthContext(input.context)
+    || typeof input.audience !== "string"
+    || !isSafeAudience(input.audience)
+    || !isExactAuthContext(input.context)
     || !isExpiry(input.expiresAt)) {
     return err({
       code: "invalid_ephemeral_state",
@@ -67,6 +105,7 @@ export function decodePendingAuthorizationCode(
     clientId: input.clientId,
     redirectUri: input.redirectUri,
     challenge: input.challenge,
+    audience: input.audience,
     context: cloneAuthContext(input.context),
     expiresAt: input.expiresAt
   });
@@ -79,6 +118,7 @@ export function encodePendingAuthorizationCode(input: PendingAuthorizationCode):
     clientId: cloned.clientId,
     redirectUri: cloned.redirectUri,
     challenge: cloned.challenge,
+    audience: cloned.audience,
     context: cloned.context,
     expiresAt: cloned.expiresAt
   };
@@ -89,12 +129,162 @@ export function clonePendingAuthorizationCode(input: PendingAuthorizationCode): 
     clientId: input.clientId,
     redirectUri: input.redirectUri,
     challenge: input.challenge,
+    audience: input.audience,
     context: cloneAuthContext(input.context),
     expiresAt: input.expiresAt
   };
 }
 
-function isAuthContext(value: unknown): value is AuthContext {
+export function decodeRefreshGrant(
+  input: unknown
+): Result<RefreshGrant, EphemeralStateDecodeError> {
+  if (!hasExactKeys(input, [
+    "schema",
+    "familyId",
+    "clientDigest",
+    "context",
+    "contextDigest",
+    "scope",
+    "audience",
+    "currentGeneration",
+    "currentTokenDigest",
+    "status",
+    "expiresAt"
+  ])
+    || input.schema !== REFRESH_GRANT_SCHEMA
+    || typeof input.familyId !== "string"
+    || !/^[A-Za-z0-9_-]{24}$/u.test(input.familyId)
+    || typeof input.clientDigest !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(input.clientDigest)
+    || !isExactAuthContext(input.context, "mcp")
+    || typeof input.contextDigest !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(input.contextDigest)
+    || input.contextDigest !== authContextDigest(input.context)
+    || input.scope !== "hunsu"
+    || typeof input.audience !== "string"
+    || !isSafeAudience(input.audience)
+    || !isNonNegativeInteger(input.currentGeneration)
+    || typeof input.currentTokenDigest !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(input.currentTokenDigest)
+    || (input.status !== "active" && input.status !== "revoked")
+    || !isExpiry(input.expiresAt)) {
+    return err({
+      code: "invalid_ephemeral_state",
+      message: "Stored OAuth refresh-grant state is invalid."
+    });
+  }
+
+  return ok({
+    familyId: input.familyId,
+    clientDigest: input.clientDigest,
+    context: cloneAuthContext(input.context),
+    contextDigest: input.contextDigest,
+    scope: input.scope,
+    audience: input.audience,
+    currentGeneration: input.currentGeneration,
+    currentTokenDigest: input.currentTokenDigest,
+    status: input.status,
+    expiresAt: input.expiresAt
+  });
+}
+
+export function encodeRefreshGrant(input: RefreshGrant): unknown {
+  const cloned = cloneRefreshGrant(input);
+  return {
+    schema: REFRESH_GRANT_SCHEMA,
+    familyId: cloned.familyId,
+    clientDigest: cloned.clientDigest,
+    context: cloned.context,
+    contextDigest: cloned.contextDigest,
+    scope: cloned.scope,
+    audience: cloned.audience,
+    currentGeneration: cloned.currentGeneration,
+    currentTokenDigest: cloned.currentTokenDigest,
+    status: cloned.status,
+    expiresAt: cloned.expiresAt
+  };
+}
+
+export function cloneRefreshGrant(input: RefreshGrant): RefreshGrant {
+  return {
+    familyId: input.familyId,
+    clientDigest: input.clientDigest,
+    context: cloneAuthContext(input.context),
+    contextDigest: input.contextDigest,
+    scope: input.scope,
+    audience: input.audience,
+    currentGeneration: input.currentGeneration,
+    currentTokenDigest: input.currentTokenDigest,
+    status: input.status,
+    expiresAt: input.expiresAt
+  };
+}
+
+export function decodeRefreshGrantRotation(
+  input: unknown
+): Result<RefreshGrantRotation, EphemeralStateDecodeError> {
+  if (!hasExactKeys(input, [
+    "schema",
+    "familyId",
+    "clientDigest",
+    "scope",
+    "audience",
+    "presentedGeneration",
+    "presentedTokenDigest",
+    "nextGeneration",
+    "nextTokenDigest"
+  ])
+    || input.schema !== REFRESH_ROTATION_SCHEMA
+    || typeof input.familyId !== "string"
+    || !/^[A-Za-z0-9_-]{24}$/u.test(input.familyId)
+    || typeof input.clientDigest !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(input.clientDigest)
+    || input.scope !== "hunsu"
+    || typeof input.audience !== "string"
+    || !isSafeAudience(input.audience)
+    || !isNonNegativeInteger(input.presentedGeneration)
+    || typeof input.presentedTokenDigest !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(input.presentedTokenDigest)
+    || !isNonNegativeInteger(input.nextGeneration)
+    || input.nextGeneration !== input.presentedGeneration + 1
+    || typeof input.nextTokenDigest !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/u.test(input.nextTokenDigest)) {
+    return err({
+      code: "invalid_ephemeral_state",
+      message: "OAuth refresh rotation input is invalid."
+    });
+  }
+
+  return ok({
+    familyId: input.familyId,
+    clientDigest: input.clientDigest,
+    scope: input.scope,
+    audience: input.audience,
+    presentedGeneration: input.presentedGeneration,
+    presentedTokenDigest: input.presentedTokenDigest,
+    nextGeneration: input.nextGeneration,
+    nextTokenDigest: input.nextTokenDigest
+  });
+}
+
+export function encodeRefreshGrantRotation(input: RefreshGrantRotation): unknown {
+  return {
+    schema: REFRESH_ROTATION_SCHEMA,
+    familyId: input.familyId,
+    clientDigest: input.clientDigest,
+    scope: input.scope,
+    audience: input.audience,
+    presentedGeneration: input.presentedGeneration,
+    presentedTokenDigest: input.presentedTokenDigest,
+    nextGeneration: input.nextGeneration,
+    nextTokenDigest: input.nextTokenDigest
+  };
+}
+
+export function isExactAuthContext(
+  value: unknown,
+  expectedClient: "web" | "mcp" = "web"
+): value is AuthContext {
   return hasExactKeys(
     value,
     ["subject", "user", "installations", "client"],
@@ -102,7 +292,7 @@ function isAuthContext(value: unknown): value is AuthContext {
   )
     && typeof value.subject === "string"
     && value.subject.length > 0
-    && value.client === "web"
+    && value.client === expectedClient
     && hasExactKeys(value.user, ["id", "login"], ["name", "avatarUrl"])
     && typeof value.user.id === "string"
     && value.user.id.length > 0
@@ -117,6 +307,35 @@ function isAuthContext(value: unknown): value is AuthContext {
       || (Number.isSafeInteger(value.selectedInstallationId)
         && Number(value.selectedInstallationId) > 0
         && value.installations.some(item => isRecord(item) && item.id === value.selectedInstallationId)));
+}
+
+export function authContextDigest(context: AuthContext): string {
+  return createHash("sha256").update(JSON.stringify({
+    subject: context.subject,
+    user: {
+      id: context.user.id,
+      login: context.user.login,
+      ...(context.user.name === undefined ? {} : { name: context.user.name }),
+      ...(context.user.avatarUrl === undefined ? {} : { avatarUrl: context.user.avatarUrl })
+    },
+    installations: [...context.installations]
+      .map(item => ({
+        id: item.id,
+        accountLogin: item.accountLogin,
+        accountType: item.accountType,
+        repositories: [...item.repositories]
+          .map(repository => ({
+            repositoryId: repository.repositoryId,
+            permissions: { contents: repository.permissions.contents }
+          }))
+          .sort((left, right) => left.repositoryId - right.repositoryId)
+      }))
+      .sort((left, right) => left.id - right.id || left.accountLogin.localeCompare(right.accountLogin)),
+    ...(context.selectedInstallationId === undefined
+      ? {}
+      : { selectedInstallationId: context.selectedInstallationId }),
+    client: context.client
+  }), "utf8").digest("base64url");
 }
 
 function isInstallation(value: unknown): boolean {
@@ -144,6 +363,22 @@ function uniqueIds(values: readonly unknown[], key: "id" | "repositoryId"): bool
 
 function isExpiry(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isSafeAudience(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "https:" || url.protocol === "http:")
+      && !url.username
+      && !url.password
+      && !url.hash;
+  } catch {
+    return false;
+  }
 }
 
 function cloneAuthContext(context: AuthContext): AuthContext {

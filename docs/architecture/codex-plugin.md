@@ -6,6 +6,8 @@ The repository marketplace exposes `plugins/hunsu`. Its required manifest is `.c
 
 The plugin authenticates through MCP OAuth, stores no permanent GitHub credential, and never writes `hunsu/state` directly.
 
+The OAuth grant is bound to the canonical MCP resource URI and the exact public client. Access tokens are short-lived. A refresh token belongs to one server-side family with a fixed session-lifetime expiry; every successful refresh atomically rotates it, and reuse of an older signed generation revokes the family. Refresh state stores the authorized context and token digests, never raw access or refresh tokens.
+
 ## Project bootstrap context
 
 `hunsu.projects.list` returns each authorized repository's v2 initialization status and an exact `expectedStateSha`. When `hunsu/state` is absent, that SHA is the current full default-branch head because the first CAS mutation creates the state branch from it. When `hunsu/state` exists without `.hunsu/v2`, the repository is still v2-uninitialized and the expected SHA is the existing state-branch head. No v1 file is decoded or migrated. For an initialized repository, Project context returns the current state head as both `stateHeadSha` and `repositoryState.expectedStateSha`.

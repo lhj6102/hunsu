@@ -26,7 +26,8 @@ export function createHunsuRuntime(env: Env, stateStore: EphemeralStateStore) {
   const mcpOAuth = new McpOAuthService({
     baseUrl: githubConfig.publicApiUrl,
     secret: sessionConfig.secret,
-    stateStore
+    stateStore,
+    refreshTokenTtlSeconds: sessionConfig.ttlSeconds
   });
   const webhooks = new GitHubWebhookProcessor({
     secret: githubConfig.webhookSecret,

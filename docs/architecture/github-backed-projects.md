@@ -83,4 +83,4 @@ An active, failed, or canceled Run creates no structural edge. A completed Run a
 
 ## Authentication and secrets
 
-The service uses short-lived Contents-write GitHub App installation tokens. GitHub login and MCP OAuth retain only scoped grants in secure sessions. Private keys, client secrets, webhook secrets, OAuth tokens, installation tokens, Codex credentials, and mutable local paths never enter Node payloads, Events, logs, or plugin files.
+The service uses short-lived Contents-write GitHub App installation tokens. GitHub login and MCP OAuth retain only scoped grants in secure sessions. MCP access tokens are short-lived and audience-bound; refresh grants use fixed-lifetime, server-side families with atomic rotation and replay revocation. Durable refresh state stores only strict authorization context plus token digests, never raw tokens. Private keys, client secrets, webhook secrets, OAuth tokens, installation tokens, Codex credentials, and mutable local paths never enter Node payloads, Events, logs, or plugin files.

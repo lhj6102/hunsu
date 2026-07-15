@@ -157,8 +157,8 @@ function validateMcpConfig(value) {
   if (server.auth !== "oauth") {
     issue("Hunsu MCP server must use OAuth authentication.");
   }
-  if (url !== undefined && oauthResource !== undefined && url.origin !== oauthResource.origin) {
-    issue("Hunsu MCP URL and OAuth resource must use the same origin.");
+  if (url !== undefined && oauthResource !== undefined && url.href !== oauthResource.href) {
+    issue("Hunsu MCP OAuth resource must equal the canonical MCP URL.");
   }
 
   const forbiddenKeys = [

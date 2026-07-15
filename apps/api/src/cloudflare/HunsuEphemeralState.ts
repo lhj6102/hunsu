@@ -1,14 +1,22 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  cloneRefreshGrant,
   decodePendingAuthorizationCode,
+  decodeRefreshGrant,
+  decodeRefreshGrantRotation,
   encodePendingAuthorizationCode,
+  encodeRefreshGrant,
   type ConsentState,
-  type PendingAuthorizationCode
+  type PendingAuthorizationCode,
+  type RefreshGrant,
+  type RefreshGrantRotation,
+  type RefreshGrantRotationResult
 } from "../auth/ephemeral-store.ts";
 
 type RecordKind =
   | "consent"
   | "authorization_code"
+  | "refresh_grant"
   | "webhook_processing"
   | "webhook_completed";
 type StoredRow = { kind: string; payload: string | null; expires_at: number };
@@ -59,6 +67,68 @@ export class HunsuEphemeralState extends DurableObject<Env> {
     } catch {
       return undefined;
     }
+  }
+
+  async createRefreshGrant(input: unknown, now: number): Promise<boolean> {
+    const decoded = decodeRefreshGrant(input);
+    if (!decoded.ok || decoded.value.expiresAt <= now) return false;
+    const current = this.#read();
+    if (current && current.expires_at > now) return false;
+    if (current) this.#delete();
+    const grant = decoded.value;
+    this.#replace(
+      "refresh_grant",
+      JSON.stringify(encodeRefreshGrant(grant)),
+      grant.expiresAt
+    );
+    await this.#scheduleExpiry(grant.expiresAt);
+    return true;
+  }
+
+  async rotateRefreshGrant(input: unknown, now: number): Promise<RefreshGrantRotationResult> {
+    const rotationResult = decodeRefreshGrantRotation(input);
+    if (!rotationResult.ok) return { status: "invalid" };
+    const rotation = rotationResult.value;
+    const row = this.#read();
+    if (!row) return { status: "missing" };
+    if (row.kind !== "refresh_grant" || !row.payload) {
+      this.#delete();
+      await this.ctx.storage.deleteAlarm();
+      return { status: "corrupt" };
+    }
+    if (row.expires_at <= now) {
+      this.#delete();
+      await this.ctx.storage.deleteAlarm();
+      return { status: "expired" };
+    }
+    const grant = decodeRefreshGrantPayload(row.payload);
+    if (!grant) {
+      this.#delete();
+      await this.ctx.storage.deleteAlarm();
+      return { status: "corrupt" };
+    }
+    if (grant.expiresAt <= now) {
+      this.#delete();
+      await this.ctx.storage.deleteAlarm();
+      return { status: "expired" };
+    }
+    if (grant.status === "revoked") return { status: "revoked" };
+    if (!rotationBindingsMatch(grant, rotation)) return { status: "invalid" };
+    if (rotation.presentedGeneration < grant.currentGeneration) {
+      this.#storeRefreshGrant({ ...grant, status: "revoked" });
+      return { status: "replayed" };
+    }
+    if (rotation.presentedGeneration !== grant.currentGeneration
+      || rotation.presentedTokenDigest !== grant.currentTokenDigest) {
+      return { status: "invalid" };
+    }
+    const rotated = cloneRefreshGrant({
+      ...grant,
+      currentGeneration: rotation.nextGeneration,
+      currentTokenDigest: rotation.nextTokenDigest
+    });
+    this.#storeRefreshGrant(rotated);
+    return { status: "rotated", grant: cloneRefreshGrant(rotated) };
   }
 
   async claimWebhookDelivery(expiresAt: number, now: number): Promise<boolean> {
@@ -144,7 +214,34 @@ export class HunsuEphemeralState extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM ephemeral_record WHERE singleton = 1");
   }
 
+  #storeRefreshGrant(input: RefreshGrant): void {
+    this.#replace(
+      "refresh_grant",
+      JSON.stringify(encodeRefreshGrant(input)),
+      input.expiresAt
+    );
+  }
+
   async #scheduleExpiry(expiresAt: number): Promise<void> {
     await this.ctx.storage.setAlarm(expiresAt * 1000);
   }
+}
+
+function decodeRefreshGrantPayload(payload: string): RefreshGrant | undefined {
+  try {
+    const decoded = decodeRefreshGrant(JSON.parse(payload) as unknown);
+    return decoded.ok ? decoded.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rotationBindingsMatch(
+  grant: RefreshGrant,
+  input: RefreshGrantRotation
+): boolean {
+  return grant.familyId === input.familyId
+    && grant.clientDigest === input.clientDigest
+    && grant.scope === input.scope
+    && grant.audience === input.audience;
 }

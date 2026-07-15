@@ -287,6 +287,76 @@ test("REST mutation boundaries reject unsupported top-level lifecycle fields", a
   }
 });
 
+test("OAuth JSON endpoints normalize malformed and internal failures without leaking credentials", async () => {
+  const app = createOAuthBoundaryApp();
+  const malformedRequests = [
+    new Request(`${API}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "registration-input-secret"
+    }),
+    new Request(`${API}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not-json"
+    }),
+    new Request(`${API}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "token-input-secret"
+    }),
+    new Request(`${API}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: `refresh_token=${"x".repeat(65_537)}`
+    })
+  ];
+  for (const request of malformedRequests) {
+    const response = await app.handle(request);
+    const body = await assertOAuthJsonError(response, 400, "invalid_request");
+    assert.doesNotMatch(JSON.stringify(body), /registration-input-secret|token-input-secret|x{32}/u);
+  }
+  await assertOAuthJsonError(await app.handle(new Request(`${API}/oauth/register`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: Array.from(
+        { length: 17 },
+        (_, index) => `https://client-${index}.example.test/callback`
+      )
+    })
+  })), 400, "invalid_request");
+
+  const internalSecret = "internal-oauth-failure-secret";
+  const throwingOAuth = {
+    register: (): never => { throw new Error(internalSecret); },
+    exchange: async (): Promise<never> => { throw new Error(internalSecret); }
+  } as unknown as McpOAuthService;
+  const failingApp = createOAuthBoundaryApp(throwingOAuth);
+  const internalRequests = [
+    new Request(`${API}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["https://client.example.test/callback"] })
+    }),
+    new Request(`${API}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: "presented-refresh-secret",
+        client_id: "presented-client-id",
+        resource: `${API}/mcp`
+      })
+    })
+  ];
+  for (const request of internalRequests) {
+    const response = await failingApp.handle(request);
+    const body = await assertOAuthJsonError(response, 500, "server_error");
+    assert.doesNotMatch(JSON.stringify(body), /internal-oauth-failure-secret|presented-refresh-secret|presented-client-id/u);
+  }
+});
+
 test("OAuth authorization requires an explicit, same-session, single-use consent POST", async () => {
   let now = Date.UTC(2026, 6, 13, 1, 0, 0);
   const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
@@ -327,6 +397,8 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
   authorizationUrl.searchParams.set("state", "<unsafe-client-state>");
   authorizationUrl.searchParams.set("code_challenge", challenge);
   authorizationUrl.searchParams.set("code_challenge_method", "S256");
+  authorizationUrl.searchParams.append("resource", `${API}/mcp`);
+  authorizationUrl.searchParams.append("resource", `${API}/mcp`);
 
   const unauthenticated = await app.handle(new Request(authorizationUrl));
   assert.equal(unauthenticated.status, 302);
@@ -408,11 +480,95 @@ test("OAuth authorization requires an explicit, same-session, single-use consent
       code,
       client_id: clientId,
       redirect_uri: redirectUri,
-      code_verifier: verifier
+      code_verifier: verifier,
+      resource: `${API}/mcp`
     })
   }));
   assert.equal(tokenResponse.status, 200);
-  assert.equal(typeof (await tokenResponse.json() as { access_token: unknown }).access_token, "string");
+  assert.equal(tokenResponse.headers.get("cache-control"), "no-store");
+  assert.equal(tokenResponse.headers.get("pragma"), "no-cache");
+  const tokenBody = await tokenResponse.json() as {
+    access_token: unknown;
+    refresh_token: unknown;
+    expires_in: unknown;
+  };
+  assert.equal(typeof tokenBody.access_token, "string");
+  assert.equal(typeof tokenBody.refresh_token, "string");
+  assert.equal(tokenBody.expires_in, 3_600);
+
+  const refreshRequest = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: String(tokenBody.refresh_token),
+    client_id: clientId
+  });
+  refreshRequest.append("resource", `${API}/mcp`);
+  refreshRequest.append("resource", `${API}/mcp`);
+
+  const wrongScopeRequest = new URLSearchParams(refreshRequest);
+  wrongScopeRequest.set("scope", "other");
+  await assertOAuthJsonError(await app.handle(new Request(`${API}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: wrongScopeRequest
+  })), 400, "invalid_scope");
+
+  const duplicateScopeRequest = new URLSearchParams(refreshRequest);
+  duplicateScopeRequest.append("scope", "hunsu");
+  duplicateScopeRequest.append("scope", "hunsu");
+  await assertOAuthJsonError(await app.handle(new Request(`${API}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: duplicateScopeRequest
+  })), 400, "invalid_request");
+
+  const formSecretRequest = new URLSearchParams(refreshRequest);
+  formSecretRequest.set("client_secret", "form-secret-sentinel");
+  const formSecretResponse = await app.handle(new Request(`${API}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: formSecretRequest
+  }));
+  const formSecretBody = await assertOAuthJsonError(formSecretResponse, 400, "invalid_client");
+  assert.equal(formSecretResponse.headers.get("www-authenticate"), null);
+  assert.doesNotMatch(JSON.stringify(formSecretBody), /form-secret-sentinel/u);
+
+  const headerSecretResponse = await app.handle(new Request(`${API}/oauth/token`, {
+    method: "POST",
+    headers: {
+      authorization: "Basic header-secret-sentinel",
+      "content-type": "application/x-www-form-urlencoded"
+    },
+    body: refreshRequest
+  }));
+  const headerSecretBody = await assertOAuthJsonError(headerSecretResponse, 401, "invalid_client");
+  assert.equal(headerSecretResponse.headers.get("www-authenticate"), "Basic realm=\"hunsu-oauth\"");
+  assert.doesNotMatch(JSON.stringify(headerSecretBody), /header-secret-sentinel/u);
+
+  const refreshedResponse = await app.handle(new Request(`${API}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: refreshRequest
+  }));
+  assert.equal(refreshedResponse.status, 200);
+  assert.equal(refreshedResponse.headers.get("cache-control"), "no-store");
+  assert.equal(refreshedResponse.headers.get("pragma"), "no-cache");
+  const refreshedBody = await refreshedResponse.json() as {
+    access_token: unknown;
+    refresh_token: unknown;
+  };
+  assert.equal(typeof refreshedBody.access_token, "string");
+  assert.equal(typeof refreshedBody.refresh_token, "string");
+  assert.notEqual(refreshedBody.refresh_token, tokenBody.refresh_token);
+
+  const replayedResponse = await app.handle(new Request(`${API}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: refreshRequest
+  }));
+  assert.equal(replayedResponse.status, 400);
+  assert.equal(replayedResponse.headers.get("cache-control"), "no-store");
+  assert.equal(replayedResponse.headers.get("pragma"), "no-cache");
+  assert.equal((await replayedResponse.json() as { error: string }).error, "invalid_grant");
 
   const denialConsent = await getConsent();
   const denied = await app.handle(consentRequest(cookie, new URLSearchParams({
@@ -763,6 +919,53 @@ function assertOAuthDiagnostic(
   });
   const serialized = JSON.stringify(result.body);
   for (const forbidden of result.forbidden) assert.doesNotMatch(serialized, new RegExp(forbidden, "u"));
+}
+
+function createOAuthBoundaryApp(mcpOAuth?: McpOAuthService): HunsuHttpApp {
+  const transport = new MemoryGitHubTransport([{ repository, initialSha: INITIAL_SHA }]);
+  const service = new HunsuApplicationService({ transport });
+  const sessions = new SessionManager({
+    secret: "test-session-secret-that-is-at-least-thirty-two-bytes",
+    ttlSeconds: 3_600,
+    cookieName: "hunsu_session",
+    secure: true
+  });
+  const stateStore = new InMemoryEphemeralStateStore();
+  return new HunsuHttpApp({
+    service,
+    sessions,
+    githubOAuth: {
+      authorizationUrl: () => "https://github.example.test/authorize",
+      authenticate: async () => ({
+        ok: true,
+        value: { user: webContext.user, installations: [...webContext.installations] }
+      })
+    } as unknown as GitHubOAuthClient,
+    mcpOAuth: mcpOAuth ?? new McpOAuthService({
+      baseUrl: API,
+      secret: sessions.config.secret,
+      stateStore
+    }),
+    webhooks: new GitHubWebhookProcessor({ secret: WEBHOOK_SECRET, service, stateStore }),
+    publicApiUrl: API,
+    webUrl: WEB,
+    githubAppSlug: "hunsu-test"
+  });
+}
+
+async function assertOAuthJsonError(
+  response: Response,
+  status: number,
+  code: string
+): Promise<{ error: string; error_description: string }> {
+  assert.equal(response.status, status);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("pragma"), "no-cache");
+  const body = await response.json() as { error: string; error_description: string };
+  assert.deepEqual(Object.keys(body).sort(), ["error", "error_description"]);
+  assert.equal(body.error, code);
+  assert.equal(typeof body.error_description, "string");
+  return body;
 }
 
 function consentRequest(cookie: string, body: URLSearchParams, origin = API): Request {

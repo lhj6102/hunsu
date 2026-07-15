@@ -2,7 +2,12 @@ import { env } from "cloudflare:workers";
 import { evictAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { DurableObjectEphemeralStateStore } from "../../apps/api/src/auth/cloudflare-ephemeral-store.ts";
-import type { PendingAuthorizationCode } from "../../apps/api/src/auth/ephemeral-store.ts";
+import {
+  authContextDigest,
+  type PendingAuthorizationCode,
+  type RefreshGrant,
+  type RefreshGrantRotation
+} from "../../apps/api/src/auth/ephemeral-store.ts";
 
 // Keep scheduled alarms in the future while expiry decisions use the adapter's
 // injected clock. This prevents real-time alarm delivery from racing the tests.
@@ -12,6 +17,7 @@ const pendingAuthorizationCode: PendingAuthorizationCode = {
   clientId: "client-id",
   redirectUri: "https://client.example.test/callback",
   challenge: "c".repeat(43),
+  audience: "https://api.example.test/mcp",
   context: {
     subject: "github:7",
     user: { id: "7", login: "octocat" },
@@ -25,6 +31,11 @@ const pendingAuthorizationCode: PendingAuthorizationCode = {
     client: "web"
   },
   expiresAt: NOW + 300
+};
+
+const mcpContext = {
+  ...pendingAuthorizationCode.context,
+  client: "mcp" as const
 };
 
 describe("HunsuEphemeralState Durable Object", () => {
@@ -83,6 +94,76 @@ describe("HunsuEphemeralState Durable Object", () => {
     expect(await storeAt(NOW + 5).consumeAuthorizationCode("expired-code")).toBeUndefined();
     expect(await storeAt(NOW + 1).consumeAuthorizationCode("expired-code")).toBeUndefined();
     expect(await alarmFor("authorization-code", "expired-code")).toBeNull();
+  });
+
+  it("persists and rotates a refresh family across Durable Object eviction", async () => {
+    const grant = refreshGrant("p".repeat(24));
+    expect(await storeAt(NOW).createRefreshGrant(grant)).toBe(true);
+    expect(await storeAt(NOW).createRefreshGrant(grant)).toBe(false);
+
+    await evictAllDurableObjects();
+    const result = await storeAt(NOW + 1).rotateRefreshGrant(refreshRotation(grant));
+    expect(result.status).toBe("rotated");
+    if (result.status !== "rotated") throw new Error("Expected refresh rotation to succeed.");
+    expect(result.grant).toEqual({
+      ...grant,
+      currentGeneration: 1,
+      currentTokenDigest: "n".repeat(43)
+    });
+    expect(await alarmFor("refresh-grant", grant.familyId)).not.toBeNull();
+  });
+
+  it("allows one concurrent refresh rotation and revokes the family on replay", async () => {
+    const grant = refreshGrant("r".repeat(24));
+    expect(await storeAt(NOW).createRefreshGrant(grant)).toBe(true);
+    const rotation = refreshRotation(grant);
+
+    const results = await Promise.all([
+      storeAt(NOW + 1).rotateRefreshGrant(rotation),
+      storeAt(NOW + 1).rotateRefreshGrant(rotation)
+    ]);
+    expect(results.filter(result => result.status === "rotated")).toHaveLength(1);
+    expect(results.filter(result => result.status === "replayed")).toHaveLength(1);
+    expect((await storeAt(NOW + 1).rotateRefreshGrant({
+      ...rotation,
+      presentedGeneration: 1,
+      presentedTokenDigest: rotation.nextTokenDigest,
+      nextGeneration: 2,
+      nextTokenDigest: "z".repeat(43)
+    })).status).toBe("revoked");
+  });
+
+  it("does not let an invalid refresh binding revoke the current family", async () => {
+    const grant = refreshGrant("b".repeat(24));
+    expect(await storeAt(NOW).createRefreshGrant(grant)).toBe(true);
+    const rotation = refreshRotation(grant);
+    expect((await storeAt(NOW + 1).rotateRefreshGrant({
+      ...rotation,
+      clientDigest: "x".repeat(43)
+    })).status).toBe("invalid");
+    expect((await storeAt(NOW + 1).rotateRefreshGrant(rotation)).status).toBe("rotated");
+  });
+
+  it("distinguishes corrupt refresh state and clears its expiry alarm", async () => {
+    const grant = refreshGrant("c".repeat(24));
+    expect(await storeAt(NOW).createRefreshGrant(grant)).toBe(true);
+    const stub = await stubFor("refresh-grant", grant.familyId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE ephemeral_record SET payload = ? WHERE singleton = 1",
+        JSON.stringify({ schema: "hunsu.ephemeral-refresh-grant.v1", corrupt: true })
+      );
+    });
+
+    expect((await storeAt(NOW + 1).rotateRefreshGrant(refreshRotation(grant))).status).toBe("corrupt");
+    expect(await alarmFor("refresh-grant", grant.familyId)).toBeNull();
+  });
+
+  it("expires refresh families without allowing them to be recreated early", async () => {
+    const grant = { ...refreshGrant("e".repeat(24)), expiresAt: NOW + 5 };
+    expect(await storeAt(NOW).createRefreshGrant(grant)).toBe(true);
+    expect((await storeAt(NOW + 5).rotateRefreshGrant(refreshRotation(grant))).status).toBe("expired");
+    expect(await alarmFor("refresh-grant", grant.familyId)).toBeNull();
   });
 
   it("coordinates active webhook leases, crash recovery, and explicit release", async () => {
@@ -179,8 +260,36 @@ function storeAt(now: number): DurableObjectEphemeralStateStore {
   });
 }
 
+function refreshGrant(familyId: string): RefreshGrant {
+  return {
+    familyId,
+    clientDigest: "d".repeat(43),
+    context: mcpContext,
+    contextDigest: authContextDigest(mcpContext),
+    scope: "hunsu",
+    audience: "https://api.example.test/mcp",
+    currentGeneration: 0,
+    currentTokenDigest: "t".repeat(43),
+    status: "active",
+    expiresAt: NOW + 3_600
+  };
+}
+
+function refreshRotation(grant: RefreshGrant): RefreshGrantRotation {
+  return {
+    familyId: grant.familyId,
+    clientDigest: grant.clientDigest,
+    scope: grant.scope,
+    audience: grant.audience,
+    presentedGeneration: grant.currentGeneration,
+    presentedTokenDigest: grant.currentTokenDigest,
+    nextGeneration: grant.currentGeneration + 1,
+    nextTokenDigest: "n".repeat(43)
+  };
+}
+
 async function alarmFor(
-  kind: "consent" | "authorization-code" | "webhook-delivery",
+  kind: "consent" | "authorization-code" | "refresh-grant" | "webhook-delivery",
   key: string
 ): Promise<number | null> {
   const stub = await stubFor(kind, key);
@@ -188,7 +297,7 @@ async function alarmFor(
 }
 
 async function stubFor(
-  kind: "consent" | "authorization-code" | "webhook-delivery",
+  kind: "consent" | "authorization-code" | "refresh-grant" | "webhook-delivery",
   key: string
 ) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${kind}\0${key}`));
